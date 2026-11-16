@@ -119,6 +119,11 @@ pub struct AgentConfig {
     /// `OPENCODE_SERVER_PASSWORD`. The same rules as `token_file`: a regular file owned by the
     /// agent's account with no group or other access.
     pub opencode_password_file: Option<String>,
+    /// A command that wraps the harness, such as `["podman", "exec", "-i", "--workdir", "{cwd}",
+    /// "--env", "OPENCODE_SERVER_PASSWORD", "opencode-agent"]`, so it runs inside a container.
+    /// `{cwd}` becomes the job's working tree. Empty runs the harness directly.
+    #[serde(default)]
+    pub harness_wrapper: Vec<String>,
     #[serde(default = "default_slots")]
     pub slots: u32,
     #[serde(default = "default_heartbeat_secs")]
@@ -440,6 +445,17 @@ impl AgentConfig {
                     "opencode_password_file must not be empty".to_owned(),
                 );
             }
+        }
+        if self
+            .harness_wrapper
+            .iter()
+            .any(|a| a.is_empty() || a.chars().any(char::is_control))
+        {
+            return invalid(
+                "[agent]",
+                "harness_wrapper entries must be non-empty text without control characters"
+                    .to_owned(),
+            );
         }
         if let Some(group) = &self.workspace_group {
             let ok = !group.is_empty()

@@ -5,9 +5,16 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-16
+
 ### Added
 
+- `[agent] harness_wrapper`: a command that wraps the harness, such as `podman exec` into a container, so no harness binary runs on the host. `{cwd}` becomes the job's working tree.
 - The agent sends its local Reiki's key health with each heartbeat when `reiki_health_url` and `reiki_token_file` are set, so the controller knows which providers a node can use.
+
+### Fixed
+
+- A job cancelled while running now ends as `cancelled`. It stayed `running` because the agent never reported it.
 
 ## [0.1.2] - 2026-11-16
 

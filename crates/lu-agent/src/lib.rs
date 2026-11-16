@@ -128,6 +128,7 @@ pub struct Agent {
     /// The last health read from it, sent with every heartbeat.
     health: health::Shared,
     harness: String,
+    harness_wrapper: Vec<String>,
     builder: Arc<CommandBuilder>,
 }
 
@@ -197,6 +198,7 @@ impl Agent {
             reiki_probe,
             health: health::Shared::default(),
             harness: config.harness,
+            harness_wrapper: config.harness_wrapper,
             builder: Arc::new(|task_file, model, server, message| {
                 lu_supervise::opencode_command(task_file, model, server, message)
                     .map_err(|error| error.to_string())
@@ -431,6 +433,7 @@ impl Agent {
             "Follow the task in the provided file.",
         ) {
             Ok(command) => {
+                let command = wrap_command(&self.harness_wrapper, command, staged.path());
                 let command = command.cwd(staged.path());
                 match &self.opencode_password {
                     Some(password) => command.env("OPENCODE_SERVER_PASSWORD", &**password),
@@ -1089,3 +1092,62 @@ fn create_work_dir(path: &Path) -> Result<(), AgentError> {
 
 #[cfg(test)]
 mod tests;
+
+/// Prefixes `command` with the configured wrapper, substituting `{cwd}` with the job's tree.
+fn wrap_command(wrapper: &[String], command: CommandSpec, cwd: &Path) -> CommandSpec {
+    let Some((program, rest)) = wrapper.split_first() else {
+        return command;
+    };
+    let cwd = cwd.to_string_lossy();
+    let mut wrapped = CommandSpec::new(program);
+    for arg in rest {
+        wrapped = wrapped.arg(arg.replace("{cwd}", &cwd));
+    }
+    wrapped = wrapped.arg(command.program.as_os_str().to_owned());
+    for arg in command.args {
+        wrapped = wrapped.arg(arg);
+    }
+    wrapped.env = command.env;
+    wrapped
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    #[test]
+    fn wrapper_prefixes_and_substitutes_cwd() {
+        let inner = CommandSpec::new("opencode").arg("run").arg("x");
+        let wrapped = wrap_command(
+            &[
+                "podman".into(),
+                "exec".into(),
+                "--workdir".into(),
+                "{cwd}".into(),
+                "c".into(),
+            ],
+            inner,
+            Path::new("/w/job"),
+        );
+        assert_eq!(wrapped.program, Path::new("podman"));
+        let args: Vec<_> = wrapped
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            ["exec", "--workdir", "/w/job", "c", "opencode", "run", "x"]
+        );
+    }
+
+    #[test]
+    fn empty_wrapper_leaves_command() {
+        let wrapped = wrap_command(
+            &[],
+            CommandSpec::new("opencode").arg("run"),
+            Path::new("/w"),
+        );
+        assert_eq!(wrapped.program, Path::new("opencode"));
+    }
+}

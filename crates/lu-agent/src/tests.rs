@@ -250,6 +250,7 @@ fn make_agent(
         reiki_probe: None,
         health: Default::default(),
         harness: "opencode".to_owned(),
+        harness_wrapper: Vec::new(),
         builder: Arc::new(move |task_file, _model, _server, _message| {
             Ok(harness_script(task_file))
         }),
