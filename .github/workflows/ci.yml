@@ -33,3 +33,27 @@ jobs:
       - run: cargo test --locked --workspace --features tui
       - run: cargo install cargo-deny --locked --version 0.20.2
       - run: cargo deny check
+
+  # The release builds static musl binaries; build one here so a release is never the first try.
+  musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.99 --profile minimal -t x86_64-unknown-linux-musl
+          rustup default 1.99
+      - name: Build
+        run: cargo build --release --locked -p lu --features tui --target x86_64-unknown-linux-musl
+        env:
+          CFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
+      - name: Smoke-run the static binary
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/lu
+          "$bin" --version
+          "$bin" check --config lu.toml
+          file "$bin" | grep -q "statically linked"

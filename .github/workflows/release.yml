@@ -27,21 +27,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # GNU binaries, built on a runner with the same architecture. These link
-          # the runner's glibc; they are not fully static.
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-    runs-on: ${{ matrix.os }}
+          # Static musl binaries: the target hosts run an older glibc than the runners do.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, musl: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, musl: true }
+        runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Install Rust
         run: |
           rustup toolchain install 1.99 --profile minimal -t ${{ matrix.target }}
           rustup default 1.99
       - name: Build
         run: cargo build --release --locked -p lu --features tui --target ${{ matrix.target }}
+        env:
+          CFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
       - name: Smoke-run the binary on hosts that can run it
         shell: bash
         run: |
