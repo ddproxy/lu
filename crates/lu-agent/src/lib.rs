@@ -265,7 +265,8 @@ impl Agent {
         };
         if let Err(error) = spec.validate() {
             let summary = format!("invalid job spec: {error}");
-            self.complete_failure(&job_id, epoch, &summary).await?;
+            self.complete_failure(&job_id, epoch, &summary, FailureClass::Execution)
+                .await?;
             return Ok(JobEnd::Finished);
         }
 
@@ -282,7 +283,8 @@ impl Agent {
             Ok(staged) => staged,
             Err(error) => {
                 let summary = format!("staging failed: {error}");
-                self.complete_failure(&job_id, epoch, &summary).await?;
+                self.complete_failure(&job_id, epoch, &summary, FailureClass::Execution)
+                    .await?;
                 return Ok(JobEnd::Finished);
             }
         };
@@ -290,7 +292,8 @@ impl Agent {
         let task_file = staged.path().join(".git").join("lu-task.md");
         if let Err(error) = std::fs::write(&task_file, spec.task.as_bytes()) {
             let summary = format!("could not write the task file: {error}");
-            self.complete_failure(&job_id, epoch, &summary).await?;
+            self.complete_failure(&job_id, epoch, &summary, FailureClass::Execution)
+                .await?;
             return Ok(JobEnd::Finished);
         }
 
@@ -476,7 +479,12 @@ impl Agent {
             JobEnd::Cancelled | JobEnd::Stale => return Ok(end),
             JobEnd::Shutdown => {
                 let _ = self
-                    .complete_failure(&job_id, epoch, "agent shut down while the job was running")
+                    .complete_failure(
+                        &job_id,
+                        epoch,
+                        "agent shut down while the job was running",
+                        FailureClass::Node,
+                    )
                     .await;
                 return Ok(JobEnd::Shutdown);
             }
@@ -522,11 +530,12 @@ impl Agent {
         job_id: &JobId,
         epoch: u64,
         summary: &str,
+        class: FailureClass,
     ) -> Result<(), AgentError> {
         let completion = Completion {
             job_id: job_id.clone(),
             epoch,
-            outcome: Outcome::Failed(FailureClass::Execution),
+            outcome: Outcome::Failed(class),
             exit_code: None,
             summary: Some(summarise(summary)),
         };

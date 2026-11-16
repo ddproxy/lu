@@ -2,11 +2,16 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use lu_client::{ApiError, Controller, PollRequest};
-use lu_proto::{AgentEvent, ArtifactName, Completion, JobId, JobSpec, LogChunk, NodeName};
+use lu_proto::{
+    AgentEvent, ArtifactName, Completion, FailureClass, JobId, JobSpec, LogChunk, NodeName,
+    Outcome, MAX_LOG_BYTES,
+};
 use lu_staging::Staging;
 use lu_supervise::CommandSpec;
 use tempfile::TempDir;
@@ -15,6 +20,9 @@ use tokio::sync::oneshot;
 use super::{Agent, AgentError};
 
 const TEST_HEARTBEAT_SECS: u64 = 5;
+const IDLE_POLL: Duration = Duration::from_millis(10);
+const JOB_TIMEOUT: Duration = Duration::from_secs(30);
+const EPOCH: u64 = 1;
 
 /// A recorded call to the fake controller.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +76,11 @@ impl FakeController {
 
     fn take_calls(&self) -> Vec<Call> {
         std::mem::take(&mut *self.calls.lock().unwrap())
+    }
+
+    /// Runs `f` over the recorded calls without taking them.
+    fn check<R>(&self, f: impl FnOnce(&[Call]) -> R) -> R {
+        f(&self.calls.lock().unwrap())
     }
 
     fn push_poll(&self, reply: Result<Vec<AgentEvent>, ApiError>) {
@@ -126,7 +139,17 @@ impl Controller for FakeController {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AgentEvent>, ApiError>> + Send + 'a>> {
         let request = request.clone();
         self.record(Call::Poll(request));
-        Box::pin(async move { self.pop_poll().unwrap_or(Ok(Vec::new())) })
+        // An empty poll sleeps so the run loop yields; a ready future would spin a
+        // current-thread runtime forever once the scripted replies run out.
+        Box::pin(async move {
+            match self.pop_poll() {
+                Some(reply) => reply,
+                None => {
+                    tokio::time::sleep(IDLE_POLL).await;
+                    Ok(Vec::new())
+                }
+            }
+        })
     }
 
     fn start<'a>(
@@ -784,4 +807,635 @@ async fn provider_marker_detects_various_patterns() {
     assert!(super::provider_marker("429 Too Many Requests"));
     assert!(super::provider_marker("rate limit hit"));
     assert!(!super::provider_marker("normal output"));
+}
+
+// ---------------------------------------------------------------------------
+// Job-level tests. Each one scripts `poll` to assign one job, lets the job run
+// until the expected terminal state is recorded, then shuts the agent down.
+// ---------------------------------------------------------------------------
+
+/// A temp root with a work directory and a one-file git repository. The temp dir lives as long
+/// as the fixture.
+struct Fixture {
+    _tmp: TempDir,
+    work_dir: PathBuf,
+    repo_dir: PathBuf,
+}
+
+fn fixture() -> Fixture {
+    let tmp = TempDir::new().unwrap();
+    let work_dir = tmp.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir(&repo_dir).unwrap();
+    create_git_repo(&repo_dir);
+    Fixture {
+        _tmp: tmp,
+        work_dir,
+        repo_dir,
+    }
+}
+
+/// A harness that runs `script` under `sh -c`.
+fn sh(script: &'static str) -> impl Fn(&Path) -> CommandSpec + Send + Sync + 'static {
+    move |_task_file| CommandSpec::new("sh").arg("-c").arg(script)
+}
+
+/// An agent whose heartbeat fires after one second, so control-loop cancels arrive quickly.
+fn fast_agent(
+    work_dir: &Path,
+    controller: Arc<FakeController>,
+    script: impl Fn(&Path) -> CommandSpec + Send + Sync + 'static,
+) -> Agent {
+    let mut agent = make_agent(work_dir, controller, script);
+    agent.heartbeat_secs = 1;
+    agent
+}
+
+/// A controller whose first poll assigns `job_id`. Later polls are empty unless the caller
+/// pushes more replies first.
+fn assigned_controller(job_id: &JobId, spec: JobSpec) -> Arc<FakeController> {
+    let controller = Arc::new(FakeController::new());
+    controller.push_poll(Ok(vec![AgentEvent::Assign {
+        job_id: job_id.clone(),
+        epoch: EPOCH,
+        spec,
+    }]));
+    controller
+}
+
+/// Ready once the job has completed and its workspace is gone.
+fn job_finished(workspace: PathBuf) -> impl Fn(&[Call]) -> bool {
+    move |calls| has_complete(calls) && !workspace.exists()
+}
+
+/// Ready once `trigger` has been recorded and the workspace is gone, for jobs that stop
+/// without completing.
+fn job_stopped(workspace: PathBuf, trigger: fn(&Call) -> bool) -> impl Fn(&[Call]) -> bool {
+    move |calls| calls.iter().any(trigger) && !workspace.exists()
+}
+
+fn has_complete(calls: &[Call]) -> bool {
+    calls.iter().any(|c| matches!(c, Call::Complete(_)))
+}
+
+/// Runs the agent until `done` holds over the recorded calls, then sends shutdown and waits for
+/// the agent to stop. Returns every recorded call, polls included.
+async fn run_job(
+    controller: &Arc<FakeController>,
+    agent: Agent,
+    done: impl Fn(&[Call]) -> bool,
+) -> Vec<Call> {
+    let (shutdown_tx, handle) = run_agent_with_shutdown(agent);
+    let deadline = Instant::now() + JOB_TIMEOUT;
+    while !controller.check(|calls| done(calls)) {
+        assert!(
+            Instant::now() < deadline,
+            "job never reached the expected state; {} calls recorded",
+            controller.check(|calls| calls.len())
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = shutdown_tx.send(());
+    let result = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("agent did not stop after shutdown")
+        .expect("agent task panicked");
+    assert!(result.is_ok(), "agent run failed: {result:?}");
+    controller.take_calls()
+}
+
+/// The job's own calls, with the idle and heartbeat polls removed.
+fn job_calls(calls: &[Call]) -> Vec<Call> {
+    calls
+        .iter()
+        .filter(|c| !matches!(c, Call::Poll(_)))
+        .cloned()
+        .collect()
+}
+
+fn kind(call: &Call) -> &'static str {
+    match call {
+        Call::Poll(_) => "poll",
+        Call::Start { .. } => "start",
+        Call::Renew { .. } => "renew",
+        Call::AppendLog(_) => "append_log",
+        Call::PutArtifact { .. } => "put_artifact",
+        Call::Complete(_) => "complete",
+    }
+}
+
+fn completions(calls: &[Call]) -> Vec<Completion> {
+    calls
+        .iter()
+        .filter_map(|c| match c {
+            Call::Complete(completion) => Some(completion.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn appended(calls: &[Call]) -> Vec<(u64, String)> {
+    calls
+        .iter()
+        .filter_map(|c| match c {
+            Call::AppendLog(chunk) => Some((chunk.seq, chunk.data.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn artifact(calls: &[Call], wanted: ArtifactName) -> Vec<u8> {
+    calls
+        .iter()
+        .find_map(|c| match c {
+            Call::PutArtifact { name, bytes, .. } if *name == wanted => Some(bytes.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no {wanted:?} artifact uploaded"))
+}
+
+fn log_text(calls: &[Call]) -> String {
+    appended(calls).into_iter().map(|(_, data)| data).collect()
+}
+
+#[tokio::test]
+async fn job_happy_path_calls_in_order() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo working; echo added >> README.md; echo done"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let job = job_calls(&calls);
+    let kinds: Vec<&str> = job.iter().map(kind).collect();
+    assert_eq!(kinds.first(), Some(&"start"), "{kinds:?}");
+    let n = kinds.len();
+    assert!(n > 4, "{kinds:?}");
+    assert_eq!(
+        &kinds[n - 3..],
+        ["put_artifact", "put_artifact", "complete"]
+    );
+    assert!(
+        kinds[1..n - 3].iter().all(|k| *k == "append_log"),
+        "{kinds:?}"
+    );
+
+    assert!(matches!(
+        &job[0],
+        Call::Start { job_id: started, epoch: EPOCH } if *started == job_id
+    ));
+    let names: Vec<ArtifactName> = job
+        .iter()
+        .filter_map(|c| match c {
+            Call::PutArtifact { name, epoch, .. } => {
+                assert_eq!(*epoch, EPOCH);
+                Some(*name)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, [ArtifactName::DiffPatch, ArtifactName::ReportJson]);
+
+    let diff = String::from_utf8(artifact(&calls, ArtifactName::DiffPatch)).unwrap();
+    assert!(diff.contains("+added"), "{diff}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    assert_eq!(report["exit_code"], 0);
+    assert_eq!(report["outcome"], "done");
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Done);
+    assert_eq!(done[0].exit_code, Some(0));
+    assert_eq!(done[0].job_id, job_id);
+    assert_eq!(done[0].epoch, EPOCH);
+    assert!(log_text(&calls).contains("working"));
+}
+
+#[tokio::test]
+async fn job_log_offset_resumes_at_conflict_length() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    // "first\n" is stored, then "second\n" conflicts: the controller already holds ten bytes,
+    // so only the four bytes past offset 6 are missing from the stored stream.
+    controller.push_append_log(Ok(()));
+    controller.push_append_log(Err(ApiError::Conflict { length: 10 }));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo first; sleep 0.5; echo second"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert_eq!(
+        appended(&calls),
+        vec![
+            (0, "first\n".to_owned()),
+            (6, "second\n".to_owned()),
+            (10, "nd\n".to_owned()),
+        ]
+    );
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+}
+
+#[tokio::test]
+async fn job_failed_exit_completes_execution_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo failure; exit 1"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Execution));
+    assert_eq!(done[0].exit_code, Some(1));
+}
+
+#[tokio::test]
+async fn job_provider_marker_completes_provider_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo \"every key in this stream's chain is unavailable\"; exit 1"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Provider));
+    assert_eq!(done[0].exit_code, Some(1));
+}
+
+#[tokio::test]
+async fn job_unsupported_harness_completes_execution_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.harness = "pi".to_owned();
+    let controller = assigned_controller(&job_id, spec);
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo should not run"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Execution));
+    let summary = done[0].summary.clone().unwrap_or_default();
+    assert!(summary.contains("unsupported harness"), "{summary}");
+    assert!(appended(&calls).is_empty(), "the harness must not run");
+}
+
+#[tokio::test]
+async fn job_missing_repository_completes_execution_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let missing = f.work_dir.parent().unwrap().join("no-such-repo");
+    let controller = assigned_controller(&job_id, test_spec(&missing.to_string_lossy()));
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo should not run"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Execution));
+    let summary = done[0].summary.clone().unwrap_or_default();
+    assert!(summary.starts_with("staging failed"), "{summary}");
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Start { .. })),
+        "a job that cannot be staged must not be started"
+    );
+}
+
+#[tokio::test]
+async fn job_child_env_is_allowlisted() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("env"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let log = log_text(&calls);
+    let names: Vec<&str> = log
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(key, _)| key))
+        .collect();
+    assert!(names.contains(&"PATH"), "env was not dumped: {log}");
+    let allowed = ["PATH", "HOME", "LANG", "PWD", "SHLVL", "_", "OLDPWD"];
+    for name in &names {
+        assert!(allowed.contains(name), "unexpected variable {name}: {log}");
+    }
+    let lower = log.to_ascii_lowercase();
+    assert!(!lower.contains("token"), "{log}");
+    assert!(!lower.contains("http"), "{log}");
+}
+
+#[tokio::test]
+async fn job_poll_unauthorized_ends_agent() {
+    let f = fixture();
+    let controller = Arc::new(FakeController::new());
+    controller.push_poll(Err(ApiError::Unauthorized));
+    let agent = make_agent(&f.work_dir, controller.clone(), sh("true"));
+    let (_shutdown_tx, handle) = run_agent_with_shutdown(agent);
+    let result = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("agent did not end")
+        .expect("agent task panicked");
+    assert!(
+        matches!(result, Err(AgentError::Unauthorized)),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn job_transient_poll_errors_back_off_and_recover() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = Arc::new(FakeController::new());
+    controller.push_poll(Err(ApiError::Network {
+        message: "connection reset".to_owned(),
+    }));
+    controller.push_poll(Err(ApiError::Network {
+        message: "connection reset".to_owned(),
+    }));
+    controller.push_poll(Ok(vec![AgentEvent::Assign {
+        job_id: job_id.clone(),
+        epoch: EPOCH,
+        spec: test_spec(&f.repo_dir.to_string_lossy()),
+    }]));
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo recovered"));
+    // Backoff uses tokio timers on the real clock (the test-util feature is not enabled), so
+    // the first two delays are at least one and two seconds.
+    let started = Instant::now();
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "retries did not back off: {:?}",
+        started.elapsed()
+    );
+    let polls = calls.iter().filter(|c| matches!(c, Call::Poll(_))).count();
+    assert!(polls >= 3, "expected at least three polls, saw {polls}");
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+}
+
+#[tokio::test]
+async fn job_stale_start_completes_nothing() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    controller.push_start(Err(ApiError::StaleEpoch));
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo should not run"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_stopped(f.work_dir.join(job_id.as_str()), |c| {
+            matches!(c, Call::Start { .. })
+        }),
+    )
+    .await;
+
+    assert!(completions(&calls).is_empty(), "{calls:?}");
+    assert!(appended(&calls).is_empty());
+}
+
+#[tokio::test]
+async fn job_stale_log_append_stops_without_completing() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    controller.push_append_log(Err(ApiError::StaleEpoch));
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo hi; sleep 30"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_stopped(f.work_dir.join(job_id.as_str()), |c| {
+            matches!(c, Call::AppendLog(_))
+        }),
+    )
+    .await;
+
+    assert!(completions(&calls).is_empty(), "{calls:?}");
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::PutArtifact { .. })),
+        "a stale job must not upload artifacts"
+    );
+}
+
+#[tokio::test]
+async fn job_renew_true_stops_harness_without_completing() {
+    // The first renew fires after the 20 second renew period, so this test is slow.
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    controller.push_renew(Ok(true));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo started; sleep 60"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_stopped(f.work_dir.join(job_id.as_str()), |c| {
+            matches!(c, Call::Renew { .. })
+        }),
+    )
+    .await;
+
+    assert!(
+        calls.iter().any(|c| matches!(c, Call::Renew { .. })),
+        "the lease was never renewed"
+    );
+    assert!(completions(&calls).is_empty(), "{calls:?}");
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::PutArtifact { .. })),
+        "a cancelled job must not upload artifacts"
+    );
+}
+
+#[tokio::test]
+async fn job_renew_stale_stops_without_completing() {
+    // The first renew fires after the 20 second renew period, so this test is slow.
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    controller.push_renew(Err(ApiError::StaleEpoch));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo started; sleep 60"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_stopped(f.work_dir.join(job_id.as_str()), |c| {
+            matches!(c, Call::Renew { .. })
+        }),
+    )
+    .await;
+
+    assert!(completions(&calls).is_empty(), "{calls:?}");
+}
+
+#[tokio::test]
+async fn job_workspace_removed_after_success() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo ok"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+    assert!(!f.work_dir.join(job_id.as_str()).exists());
+}
+
+#[tokio::test]
+async fn job_workspace_removed_after_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo bad; exit 3"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert_eq!(
+        completions(&calls)[0].outcome,
+        Outcome::Failed(FailureClass::Execution)
+    );
+    assert!(!f.work_dir.join(job_id.as_str()).exists());
+}
+
+#[tokio::test]
+async fn job_workspace_removed_after_cancel() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    // The first heartbeat poll, one second in, carries the cancel.
+    controller.push_poll(Ok(vec![AgentEvent::Cancel {
+        job_id: job_id.clone(),
+        epoch: EPOCH,
+    }]));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo started; sleep 30"),
+    );
+    let workspace = f.work_dir.join(job_id.as_str());
+    let calls = run_job(&controller, agent, {
+        let workspace = workspace.clone();
+        move |calls| calls.iter().any(|c| matches!(c, Call::Start { .. })) && !workspace.exists()
+    })
+    .await;
+
+    assert!(completions(&calls).is_empty(), "{calls:?}");
+    assert!(!workspace.exists());
+}
+
+#[tokio::test]
+async fn job_output_over_cap_is_bounded_and_completes() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    // Sixty megabytes against a fifty megabyte cap.
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("yes 'a line of harness output' | head -c 60000000"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let uploaded: u64 = appended(&calls)
+        .iter()
+        .map(|(_, data)| data.len() as u64)
+        .sum();
+    assert!(uploaded > 0, "no log reached the controller");
+    assert!(
+        uploaded <= MAX_LOG_BYTES,
+        "uploaded {uploaded} bytes, cap is {MAX_LOG_BYTES}"
+    );
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Execution));
+}
+
+#[tokio::test]
+async fn job_shutdown_while_running_reports_node_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo started; sleep 10"),
+    );
+    let calls = run_job(&controller, agent, |calls| {
+        log_text(calls).contains("started")
+    })
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Node));
 }
