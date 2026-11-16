@@ -109,6 +109,8 @@ pub struct Agent {
     work_dir: PathBuf,
     heartbeat_secs: u64,
     opencode_server: Option<String>,
+    /// The group that may write each job's working tree, resolved once at start.
+    workspace_gid: Option<u32>,
     harness: String,
     builder: Arc<CommandBuilder>,
 }
@@ -124,6 +126,13 @@ impl Agent {
         create_work_dir(&work_dir)?;
         let staging = Staging::new(&work_dir)
             .map_err(|error| AgentError::Config(format!("work_dir: {error}")))?;
+        let workspace_gid = match config.workspace_group.as_deref() {
+            Some(group) => Some(
+                lu_staging::resolve_group(group)
+                    .map_err(|error| AgentError::Config(format!("workspace_group: {error}")))?,
+            ),
+            None => None,
+        };
         Ok(Self {
             node,
             controller,
@@ -131,6 +140,7 @@ impl Agent {
             work_dir,
             heartbeat_secs: config.heartbeat_secs,
             opencode_server: config.opencode_server,
+            workspace_gid,
             harness: config.harness,
             builder: Arc::new(|task_file, model, server, message| {
                 lu_supervise::opencode_command(task_file, model, server, message)
@@ -288,6 +298,16 @@ impl Agent {
                 return Ok(JobEnd::Finished);
             }
         };
+
+        if let Some(gid) = self.workspace_gid {
+            if let Err(error) = self.staging.share_with_group(&staged, gid) {
+                let summary = format!("could not share the workspace with its group: {error}");
+                let _ = self.staging.clean(staged.job_id());
+                self.complete_failure(&job_id, epoch, &summary, FailureClass::Execution)
+                    .await?;
+                return Ok(JobEnd::Finished);
+            }
+        }
 
         let task_file = staged.path().join(".git").join("lu-task.md");
         if let Err(error) = std::fs::write(&task_file, spec.task.as_bytes()) {

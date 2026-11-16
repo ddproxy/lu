@@ -161,7 +161,9 @@ The units apply `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `Priva
 `PrivateDevices`, restricted address families, an empty capability set, a system-call filter
 and `LimitNOFILE`. They are `Type=simple`; there is no `sd_notify` support.
 
-**0.1.0 limitation:** the agent runs the harness as its own user. The harness gets a minimal
+**Separating the harness.** With `[agent] workspace_group` set, the working tree is shared with that group and never `.git`. An agent that runs as one account can then drive a harness that works as another, such as an opencode server in a container, and the harness can neither read the agent's token nor change `.git`.
+
+**Without it:** the agent runs the harness as its own user. The harness gets a minimal
 environment and never receives the token as an argument or variable, but it can read any file
 the agent can, including the token file. Run the agent as a dedicated account that holds no other
 secrets, and treat a job's harness as able to act with that account's rights. Separating the

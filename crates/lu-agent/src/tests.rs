@@ -245,6 +245,7 @@ fn make_agent(
         work_dir: work_dir.to_path_buf(),
         heartbeat_secs: TEST_HEARTBEAT_SECS,
         opencode_server: None,
+        workspace_gid: None,
         harness: "opencode".to_owned(),
         builder: Arc::new(move |task_file, _model, _server, _message| {
             Ok(harness_script(task_file))

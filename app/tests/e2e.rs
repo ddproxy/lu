@@ -142,9 +142,10 @@ async fn a_job_runs_from_submit_to_diff() {
     drop(file);
     let agent_config = lu_config::Config::parse(&format!(
         "[agent]\nname = \"node-a\"\ncontroller_url = \"{url}\"\ntoken_file = \"{tf}\"\n\
-         work_dir = \"{work}\"\nharness = \"opencode\"\n",
+         work_dir = \"{work}\"\nharness = \"opencode\"\nworkspace_group = \"{gid}\"\n",
         tf = token_file.display(),
         work = work.display(),
+        gid = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(root).unwrap()),
     ))
     .unwrap()
     .agent

@@ -3,6 +3,12 @@
 All notable changes are recorded here. The format follows Keep a Changelog, and the project
 uses semantic versioning once it reaches 1.0.
 
+## [0.1.1] - 2026-11-16
+
+### Added
+
+- `[agent] workspace_group`: gives a group write access to each job's working tree (never `.git`) after the checkout. It lets the agent run as the account that may use git while the harness works as another account, for example an opencode server in a container.
+
 ## [0.1.0] - 2026-11-16
 
 First packaging release.
@@ -30,7 +36,7 @@ First packaging release.
 
 ### Known gaps in 0.1.0
 
-- The agent runs the harness as its own user, so a harness can read the agent's token file.
+- The agent runs the harness as its own user unless `workspace_group` is used with a harness that runs as another account, so by default a harness can read the agent's token file.
   Run the agent as a dedicated account that holds nothing else. Privilege separation is planned.
 - Leaf agents use their own credentials to check out private repositories; controller-side
   fetch is planned.

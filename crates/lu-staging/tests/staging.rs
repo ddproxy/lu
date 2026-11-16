@@ -820,3 +820,89 @@ fn the_exported_diff_does_not_run_external_diff_or_textconv_drivers() {
     let _ = fs::remove_dir_all(repo);
     let _ = fs::remove_dir_all(root.parent().unwrap());
 }
+
+#[test]
+fn sharing_with_a_group_opens_the_tree_but_never_git_or_symlink_targets() {
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    require_git!();
+    let repo = init_repo();
+    let root = make_work_root();
+    let staging = Staging::new(&root).unwrap();
+    let staged = staging
+        .stage(StageRequest {
+            job_id: "job-share".to_string(),
+            source: Source::Path(repo.clone()),
+            git_ref: "main".to_string(),
+        })
+        .unwrap();
+    let outside = root.parent().unwrap().join("outside");
+    fs::write(&outside, "keep").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(&outside, staged.path().join("link")).unwrap();
+    fs::create_dir(staged.path().join("sub")).unwrap();
+    fs::write(staged.path().join("sub/run.sh"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(
+        staged.path().join("sub/run.sh"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let git_before = fs::metadata(staged.path().join(".git")).unwrap().mode();
+
+    // The caller's own group: changing to it needs no privilege, and the mode bits are the test.
+    let gid = fs::metadata(staged.path()).unwrap().gid();
+    staging.share_with_group(&staged, gid).unwrap();
+
+    let mode = |p: &str| fs::symlink_metadata(staged.path().join(p)).unwrap().mode() & 0o7777;
+    assert_eq!(
+        fs::metadata(staged.path()).unwrap().mode() & 0o7777,
+        0o2770,
+        "the checkout is setgid, group read and write"
+    );
+    assert_eq!(
+        mode("hello.txt") & 0o060,
+        0o060,
+        "tracked files are group writable"
+    );
+    assert_eq!(
+        mode("sub") & 0o2070,
+        0o2070,
+        "new directories inherit the group"
+    );
+    assert_eq!(
+        mode("sub/run.sh") & 0o070,
+        0o070,
+        "an executable stays group executable"
+    );
+    assert_eq!(
+        fs::metadata(staged.path().join(".git")).unwrap().mode(),
+        git_before,
+        ".git is untouched"
+    );
+    assert_eq!(
+        fs::metadata(&outside).unwrap().mode() & 0o7777,
+        0o600,
+        "a symlink's target is not followed"
+    );
+    let _ = fs::remove_dir_all(repo);
+    let _ = fs::remove_dir_all(root.parent().unwrap());
+}
+
+#[test]
+fn a_group_is_found_by_name_or_number() {
+    let dir = unique_temp_dir("groups");
+    let file = dir.join("group");
+    fs::write(
+        &file,
+        "root:x:0:\nopencode:x:1001:root\nbad line\nstaff:x:notanumber:\n",
+    )
+    .unwrap();
+    assert_eq!(
+        lu_staging::resolve_group_in(&file, "opencode").unwrap(),
+        1001
+    );
+    assert_eq!(lu_staging::resolve_group_in(&file, "root").unwrap(), 0);
+    assert_eq!(lu_staging::resolve_group_in(&file, "4242").unwrap(), 4242);
+    assert!(lu_staging::resolve_group_in(&file, "staff").is_err());
+    assert!(lu_staging::resolve_group_in(&file, "nobody-here").is_err());
+    let _ = fs::remove_dir_all(dir);
+}

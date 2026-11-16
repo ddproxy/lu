@@ -343,6 +343,48 @@ impl Staging {
     /// Remove `<work_root>/<job_id>` safely.
     ///
     /// A missing directory is not an error.
+    /// Lets `gid` write the working tree of a staged checkout and never the `.git` directory.
+    ///
+    /// For a harness that runs as another account and cannot run git itself: the agent clones
+    /// and diffs, the group edits files. The checkout and every directory in it get the group,
+    /// group read and write, and the setgid bit so files made later inherit the group. Symlinks
+    /// are re-grouped but never followed. `.git` is left exactly as git made it, so the group
+    /// cannot plant a hook or change a ref.
+    pub fn share_with_group(&self, staged: &StagedDir, gid: u32) -> Result<(), StageError> {
+        use std::os::unix::fs::{lchown, MetadataExt, PermissionsExt};
+
+        fn share(path: &Path, gid: u32) -> io::Result<()> {
+            let meta = fs::symlink_metadata(path)?;
+            if meta.file_type().is_symlink() {
+                return lchown(path, None, Some(gid));
+            }
+            std::os::unix::fs::chown(path, None, Some(gid))?;
+            let mode = meta.mode() & 0o7777;
+            if meta.is_dir() {
+                fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o2070))?;
+                for entry in fs::read_dir(path)? {
+                    share(&entry?.path(), gid)?;
+                }
+            } else {
+                let group_exec = if mode & 0o100 != 0 { 0o010 } else { 0 };
+                fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o060 | group_exec))?;
+            }
+            Ok(())
+        }
+
+        let root = staged.path();
+        std::os::unix::fs::chown(root, None, Some(gid))?;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o2770))?;
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            share(&entry.path(), gid)?;
+        }
+        Ok(())
+    }
+
     pub fn clean(&self, job_id: &str) -> Result<(), StageError> {
         validate_job_id(job_id).map_err(StageError::InvalidJobId)?;
         let target = self.work_root.join(job_id);
@@ -433,6 +475,31 @@ impl Staging {
         remove_dir_all_robust(&canon_target)?;
         Ok(())
     }
+}
+
+/// The numeric id of a group, given its name or the number itself, read from `/etc/group`.
+pub fn resolve_group(group: &str) -> Result<u32, StageError> {
+    resolve_group_in(Path::new("/etc/group"), group)
+}
+
+/// [`resolve_group`] against a group file in the usual `name:x:gid:members` format.
+pub fn resolve_group_in(file: &Path, group: &str) -> Result<u32, StageError> {
+    if let Ok(gid) = group.parse::<u32>() {
+        return Ok(gid);
+    }
+    let text = fs::read_to_string(file)?;
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':');
+            let name = fields.next()?;
+            let _password = fields.next()?;
+            let gid = fields.next()?.parse::<u32>().ok()?;
+            (name == group).then_some(gid)
+        })
+        .next()
+        .ok_or_else(|| StageError::Git {
+            message: format!("group {group:?} not found"),
+        })
 }
 
 fn validate_work_root(work_root: &Path) -> Result<(), StageError> {

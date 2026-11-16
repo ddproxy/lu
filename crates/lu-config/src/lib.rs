@@ -112,6 +112,9 @@ pub struct AgentConfig {
     pub work_dir: String,
     pub harness: String,
     pub opencode_server: Option<String>,
+    /// A group (name or number) given write access to each job's working tree, for a harness
+    /// that runs as another account, such as a container. Never covers `.git`.
+    pub workspace_group: Option<String>,
     #[serde(default = "default_slots")]
     pub slots: u32,
     #[serde(default = "default_heartbeat_secs")]
@@ -424,6 +427,19 @@ impl AgentConfig {
         if let Some(s) = &self.opencode_server {
             if s.is_empty() {
                 return invalid("[agent]", "opencode_server must not be empty".to_owned());
+            }
+        }
+        if let Some(group) = &self.workspace_group {
+            let ok = !group.is_empty()
+                && group.len() <= 32
+                && group
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+            if !ok {
+                return invalid(
+                    "[agent]",
+                    "workspace_group must be 1 to 32 letters, digits, '_', '-' or '.'".to_owned(),
+                );
             }
         }
         if !(1..=1).contains(&self.slots) {
@@ -876,6 +892,28 @@ heartbeat_secs = 15
         assert!(Config::parse(&base("slots", "1")).is_ok());
         assert!(Config::parse(&base("heartbeat_secs", "2")).is_ok());
         assert!(Config::parse(&base("heartbeat_secs", "300")).is_ok());
+    }
+
+    #[test]
+    fn a_workspace_group_is_a_plain_group_name_or_number() {
+        let base = |val: &str| {
+            format!(
+                "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\nworkspace_group={val}\n"
+            )
+        };
+        for ok in ["\"opencode\"", "\"1001\"", "\"dev.group-1_a\""] {
+            assert!(Config::parse(&base(ok)).is_ok(), "{ok}");
+        }
+        for bad in [
+            "\"\"",
+            "\"has space\"",
+            "\"a/b\"",
+            "\"semi;colon\"",
+            "\"colon:x\"",
+            "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+        ] {
+            expect_table(&base(bad), "[agent]");
+        }
     }
 
     #[test]
