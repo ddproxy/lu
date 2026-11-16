@@ -246,6 +246,7 @@ fn make_agent(
         heartbeat_secs: TEST_HEARTBEAT_SECS,
         opencode_server: None,
         workspace_gid: None,
+        opencode_password: None,
         harness: "opencode".to_owned(),
         builder: Arc::new(move |task_file, _model, _server, _message| {
             Ok(harness_script(task_file))
@@ -1171,6 +1172,27 @@ async fn job_child_env_is_allowlisted() {
     let lower = log.to_ascii_lowercase();
     assert!(!lower.contains("token"), "{log}");
     assert!(!lower.contains("http"), "{log}");
+}
+
+#[tokio::test]
+async fn job_harness_gets_the_opencode_password_only_when_one_is_configured() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let mut agent = fast_agent(&f.work_dir, controller.clone(), sh("env"));
+    agent.opencode_password = Some(Arc::from("test-password-value"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+    let log = log_text(&calls);
+    assert!(
+        log.lines()
+            .any(|line| line == "OPENCODE_SERVER_PASSWORD=test-password-value"),
+        "the harness did not get the password: {log}"
+    );
 }
 
 #[tokio::test]

@@ -111,6 +111,8 @@ pub struct Agent {
     opencode_server: Option<String>,
     /// The group that may write each job's working tree, resolved once at start.
     workspace_gid: Option<u32>,
+    /// The opencode server password, kept out of `Debug` and logs.
+    opencode_password: Option<Arc<str>>,
     harness: String,
     builder: Arc<CommandBuilder>,
 }
@@ -133,6 +135,24 @@ impl Agent {
             ),
             None => None,
         };
+        let opencode_password = match config.opencode_password_file.as_deref() {
+            Some(file) => {
+                let text = lu_config::read_private_file(
+                    "[agent] opencode_password_file",
+                    Path::new(file),
+                    4096,
+                )
+                .map_err(|error| AgentError::Config(error.to_string()))?;
+                let password = text.trim_end_matches(['\r', '\n']);
+                if password.is_empty() || password.chars().any(char::is_control) {
+                    return Err(AgentError::Config(
+                        "opencode_password_file must hold one line of text".to_owned(),
+                    ));
+                }
+                Some(Arc::from(password))
+            }
+            None => None,
+        };
         Ok(Self {
             node,
             controller,
@@ -141,6 +161,7 @@ impl Agent {
             heartbeat_secs: config.heartbeat_secs,
             opencode_server: config.opencode_server,
             workspace_gid,
+            opencode_password,
             harness: config.harness,
             builder: Arc::new(|task_file, model, server, message| {
                 lu_supervise::opencode_command(task_file, model, server, message)
@@ -366,7 +387,13 @@ impl Agent {
             self.opencode_server.as_deref(),
             "Follow the task in the provided file.",
         ) {
-            Ok(command) => command.cwd(staged.path()),
+            Ok(command) => {
+                let command = command.cwd(staged.path());
+                match &self.opencode_password {
+                    Some(password) => command.env("OPENCODE_SERVER_PASSWORD", &**password),
+                    None => command,
+                }
+            }
             Err(error) => {
                 let summary = format!("could not build the harness command: {error}");
                 self.finish(&Finish {

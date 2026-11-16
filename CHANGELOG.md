@@ -3,6 +3,12 @@
 All notable changes are recorded here. The format follows Keep a Changelog, and the project
 uses semantic versioning once it reaches 1.0.
 
+## [0.1.2] - 2026-11-16
+
+### Added
+
+- `[agent] opencode_password_file`: the opencode server's password, read from a private file and passed to the harness as `OPENCODE_SERVER_PASSWORD`. A password-protected server could not be used before.
+
 ## [0.1.1] - 2026-11-16
 
 ### Added

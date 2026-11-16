@@ -58,6 +58,7 @@ The `[agent]` table describes an agent host. The operator CLI also reads `contro
 | `work_dir` | yes | — | Absolute path; must not contain `..`. Staging also requires it to exist, be a real directory (not a symlink), and not be `/` or a bare top-level directory. |
 | `harness` | yes | — | Non-empty. The configured harness name; jobs use the harness named in their spec, and 0.1.0 runs `opencode` only. |
 | `opencode_server` | no | — | Non-empty when set. Opaque endpoint passed to the harness launcher. |
+| `opencode_password_file` | no | — | A private file (a regular file owned by the agent's account, no group or other access) whose single line is the opencode server's password. The agent reads it at start and passes it to the harness as `OPENCODE_SERVER_PASSWORD`, the only variable beyond `PATH`, `HOME` and `LANG` the harness gets. |
 | `workspace_group` | no | — | A group name or number, 1 to 32 letters, digits, `_`, `-` or `.`. When set, each job's working tree is given to this group with group read and write and the setgid bit; `.git` is left as git made it. For a harness that runs as another account, such as an opencode server in a container, while the agent runs as the account that can use git. Resolved from `/etc/group` at start; an unknown group stops the agent. |
 | `slots` | no | `1` | Exactly `1` in 0.1.0 (`1` to `1`). |
 | `heartbeat_secs` | no | `15` | Integer `2` to `300`. When a `[controller]` table is also present, `heartbeat_secs * 2` must be strictly less than `lease_secs`. |

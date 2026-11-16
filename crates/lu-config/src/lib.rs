@@ -115,6 +115,10 @@ pub struct AgentConfig {
     /// A group (name or number) given write access to each job's working tree, for a harness
     /// that runs as another account, such as a container. Never covers `.git`.
     pub workspace_group: Option<String>,
+    /// A private file holding the opencode server's password, passed to the harness as
+    /// `OPENCODE_SERVER_PASSWORD`. The same rules as `token_file`: a regular file owned by the
+    /// agent's account with no group or other access.
+    pub opencode_password_file: Option<String>,
     #[serde(default = "default_slots")]
     pub slots: u32,
     #[serde(default = "default_heartbeat_secs")]
@@ -427,6 +431,14 @@ impl AgentConfig {
         if let Some(s) = &self.opencode_server {
             if s.is_empty() {
                 return invalid("[agent]", "opencode_server must not be empty".to_owned());
+            }
+        }
+        if let Some(file) = &self.opencode_password_file {
+            if file.is_empty() {
+                return invalid(
+                    "[agent]",
+                    "opencode_password_file must not be empty".to_owned(),
+                );
             }
         }
         if let Some(group) = &self.workspace_group {
@@ -892,6 +904,17 @@ heartbeat_secs = 15
         assert!(Config::parse(&base("slots", "1")).is_ok());
         assert!(Config::parse(&base("heartbeat_secs", "2")).is_ok());
         assert!(Config::parse(&base("heartbeat_secs", "300")).is_ok());
+    }
+
+    #[test]
+    fn an_opencode_password_file_must_not_be_empty() {
+        let base = |val: &str| {
+            format!(
+                "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\nopencode_password_file={val}\n"
+            )
+        };
+        assert!(Config::parse(&base("\"/etc/lu/opencode.password\"")).is_ok());
+        expect_table(&base("\"\""), "[agent]");
     }
 
     #[test]
