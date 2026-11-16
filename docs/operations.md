@@ -12,14 +12,14 @@ The contributed units assume this layout:
 | --- | --- | --- |
 | `/usr/local/bin/lu` | `root:root`, `0755` | binary installed by `make install` as root |
 | `/etc/lu/lu.toml` | `root:lu`, `0640` | controller config (hashes and paths only) |
-| `/etc/lu/agent.toml` | `root:lu`, `0640` | agent config (when an agent runtime exists) |
+| `/etc/lu/agent.toml` | `root:lu`, `0640` | agent config |
 | `/etc/lu/agent.token` | `lu:lu`, `0600` | agent token, readable only by the agent user |
 | `/etc/lu/operator.token` | operator user, `0600` | operator token, not installed by the unit |
 | `/etc/lu/tls/cert.pem` | `root:lu`, `0644` | TLS certificate |
 | `/etc/lu/tls/key.pem` | `lu:lu`, `0600` | TLS private key |
 | `/var/lib/lu/lu.db` | `lu:lu`, `0600` | SQLite database (plus `-wal` and `-shm` while running) |
 | `/var/lib/lu/artifacts/` | `lu:lu`, `0700` | per-job logs and artifacts |
-| `/var/lib/lu/work/` | `lu:lu-harness`, `0770` | agent staging root (when an agent runtime exists) |
+| `/var/lib/lu/work/` | `lu:lu-harness`, `0770` | agent staging root |
 | `/var/lib/lu-harness/` | `lu-harness:lu-harness`, `0700` | harness home |
 
 If `PREFIX` is not `/usr/local`, change `ExecStart` in the units to match.
@@ -208,7 +208,7 @@ Logs are stored at `<artifacts_dir>/<job id>/run.log`; artifacts are `diff.patch
 | TLS key refused | Mode must be `0600` or tighter and the file must be owned by `lu`; symlinks are refused. |
 | `401 unauthorized` | Wrong token, wrong scope, a hash mismatch, or a token file with the wrong contents. Operator commands need an operator token; agent routes need an agent token. |
 | `403 forbidden` | The token is valid but the job or heartbeat belongs to a different node. |
-| Job stays `queued` | No agent runtime in this tree, node is busy/draining, provider missing, or provider cordon. Inspect `lu nodes --json`. |
+| Job stays `queued` | No agent is polling, the node is busy or draining, provider missing, or provider cordon. Inspect `lu nodes --json`. |
 | `lu nodes` shows `DRAINED no` after a drain | Known client mismatch; use `lu nodes --json`. |
 | `lu drain <node>` fails to decode | Use `lu drain --json <node>`; the request itself succeeds. |
 | `logs --follow` never stops | Known client mismatch; `Ctrl-C` and use `lu show`/`lu logs`. |
