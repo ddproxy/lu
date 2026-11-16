@@ -1,6 +1,6 @@
 # Lu HTTP API, version 1 (0.1.0)
 
-Controller serves JSON over HTTPS (HTTP only on loopback). Every request carries `Authorization: Bearer <token>`. Tokens are scoped `operator` or `agent`; an agent token is bound to one node name. A wrong scope is 403, a missing or unknown token 401. Bodies are capped (1 MiB, log chunks 64 KiB plus framing). Errors are `{"error":"<code>","message":"<text>"}` with codes `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `stale_epoch`, `too_large`, `rate_limited`, `internal`. Times are RFC 3339 UTC. Ids are 26-character `JobId`s. Unknown JSON fields are rejected.
+Controller serves JSON over HTTPS (HTTP only on loopback). Every request carries `Authorization: Bearer <token>`. Tokens are scoped `operator` or `agent`; an agent token is bound to one node name. A token of the wrong scope, a missing token and an unknown token all get the same 401, so a probe cannot tell them apart. A valid agent token acting on another node's job is 403. Bodies are capped (1 MiB, log chunks 64 KiB plus framing). Errors are `{"error":"<code>","message":"<text>"}` with codes `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `stale_epoch`, `too_large`, `rate_limited`, `internal`. Times are RFC 3339 UTC. Ids are 26-character `JobId`s. Unknown JSON fields are rejected.
 
 Agents poll; there is no push channel in 0.1.0. Lease expiry is measured on the controller's monotonic clock.
 
