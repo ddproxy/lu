@@ -9,8 +9,8 @@ use crate::limits::{MAX_LOG_CHUNK_BYTES, MAX_SUMMARY_BYTES};
 use crate::spec::JobSpec;
 
 /// A message from the controller to an agent, tagged by `kind`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEvent {
     Assign {
         job_id: JobId,
@@ -28,14 +28,102 @@ pub enum AgentEvent {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RawAgentEvent {
+    Assign {
+        job_id: JobId,
+        epoch: u64,
+        spec: JobSpec,
+    },
+    Followup {
+        job_id: JobId,
+        epoch: u64,
+        message: String,
+    },
+    Cancel {
+        job_id: JobId,
+        epoch: u64,
+    },
+}
+
+impl TryFrom<RawAgentEvent> for AgentEvent {
+    type Error = String;
+    fn try_from(raw: RawAgentEvent) -> Result<Self, Self::Error> {
+        Ok(match raw {
+            RawAgentEvent::Assign {
+                job_id,
+                epoch,
+                spec,
+            } => AgentEvent::Assign {
+                job_id,
+                epoch,
+                spec,
+            },
+            RawAgentEvent::Followup {
+                job_id,
+                epoch,
+                message,
+            } => AgentEvent::Followup {
+                job_id,
+                epoch,
+                message,
+            },
+            RawAgentEvent::Cancel { job_id, epoch } => AgentEvent::Cancel { job_id, epoch },
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawAgentEvent::deserialize(deserializer)?;
+        AgentEvent::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A piece of a harness's output, streamed to the controller.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LogChunk {
     pub job_id: JobId,
     pub epoch: u64,
     pub seq: u64,
     pub data: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLogChunk {
+    pub job_id: JobId,
+    pub epoch: u64,
+    pub seq: u64,
+    pub data: String,
+}
+
+impl TryFrom<RawLogChunk> for LogChunk {
+    type Error = LogChunkError;
+    fn try_from(raw: RawLogChunk) -> Result<Self, Self::Error> {
+        let lc = LogChunk {
+            job_id: raw.job_id,
+            epoch: raw.epoch,
+            seq: raw.seq,
+            data: raw.data,
+        };
+        lc.validate()?;
+        Ok(lc)
+    }
+}
+
+impl<'de> Deserialize<'de> for LogChunk {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawLogChunk::deserialize(deserializer)?;
+        LogChunk::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 impl LogChunk {
@@ -78,8 +166,7 @@ pub enum Outcome {
 }
 
 /// The agent's final report for a job.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Completion {
     pub job_id: JobId,
     pub epoch: u64,
@@ -88,6 +175,43 @@ pub struct Completion {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCompletion {
+    pub job_id: JobId,
+    pub epoch: u64,
+    pub outcome: Outcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl TryFrom<RawCompletion> for Completion {
+    type Error = CompletionError;
+    fn try_from(raw: RawCompletion) -> Result<Self, Self::Error> {
+        let c = Completion {
+            job_id: raw.job_id,
+            epoch: raw.epoch,
+            outcome: raw.outcome,
+            exit_code: raw.exit_code,
+            summary: raw.summary,
+        };
+        c.validate()?;
+        Ok(c)
+    }
+}
+
+impl<'de> Deserialize<'de> for Completion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawCompletion::deserialize(deserializer)?;
+        Completion::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Completion {

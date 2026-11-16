@@ -1,7 +1,7 @@
 use std::io::ErrorKind;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +50,7 @@ impl Supervisor {
         let (out_tx, out_rx) = mpsc::channel::<OutputChunk>(CHANNEL_CAPACITY);
         let control = Arc::new(Control {
             stop: Notify::new(),
+            reaped: AtomicBool::new(false),
         });
 
         match command.spawn() {
@@ -144,7 +145,17 @@ impl Running {
     /// Asks the supervisor to end the process group: terminate signal, grace
     /// period, then forced-stop signal.
     pub fn stop(&self) {
+        if self.control.reaped.load(Ordering::SeqCst) {
+            return;
+        }
         self.control.stop.notify_one();
+    }
+
+    /// Reports whether the supervisor has reaped the direct child and finished
+    /// its own final cleanup.
+    #[cfg(test)]
+    pub(crate) fn reaped(&self) -> bool {
+        self.control.reaped.load(Ordering::SeqCst)
     }
 
     /// Waits for the run to end. The result is cached, so later calls return it again.
@@ -171,8 +182,10 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         // Dropping without waiting must not leave the group running. The
-        // supervisor normally does this, but it may already be gone.
-        if !self.finished {
+        // supervisor normally does this, but it may already be gone. Once the
+        // child has been reaped and the run is over, never signal the group:
+        // the process id could have been recycled.
+        if !self.finished && !self.control.reaped.load(Ordering::SeqCst) {
             if let Some(pgid) = self.pgid {
                 let _ = kill_process_group(pgid, Signal::KILL);
             }
@@ -188,6 +201,7 @@ fn closed_channel() -> mpsc::Receiver<OutputChunk> {
 
 struct Control {
     stop: Notify,
+    reaped: AtomicBool,
 }
 
 /// A reason to end the run that is not the process exiting on its own.
@@ -281,7 +295,11 @@ async fn supervise(job: Job) {
         Finish::Status(status) => {
             // The direct child is gone; end any descendant still in the group.
             let _ = kill_process_group(pgid, Signal::KILL);
-            status_to_outcome(status)
+            let outcome = status_to_outcome(status);
+            // A group that is already empty and a recycled id is the one residual
+            // window; it is accepted because there is no group state to prove emptiness.
+            control.reaped.store(true, Ordering::SeqCst);
+            outcome
         }
         Finish::Reason(reason) => {
             let _ = kill_process_group(pgid, Signal::TERM);
@@ -294,6 +312,9 @@ async fn supervise(job: Job) {
             }
             // Descendants that ignored the terminate signal are ended now.
             let _ = kill_process_group(pgid, Signal::KILL);
+            // A group that is already empty and a recycled id is the one residual
+            // window; it is accepted because there is no group state to prove emptiness.
+            control.reaped.store(true, Ordering::SeqCst);
             reason
         }
     };
@@ -370,5 +391,48 @@ fn status_to_outcome(status: std::io::Result<ExitStatus>) -> Outcome {
             (None, None) => Outcome::Exited(-1),
         },
         Err(error) => Outcome::SpawnFailed(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::Supervisor;
+    use crate::{CommandSpec, Limits};
+
+    fn limits() -> Limits {
+        Limits {
+            wall_timeout: Duration::from_secs(30),
+            idle_output_timeout: None,
+            max_output_bytes: 64 * 1024 * 1024,
+            grace: Duration::from_millis(200),
+        }
+    }
+
+    fn sh(script: &str) -> CommandSpec {
+        CommandSpec::new("sh").arg("-c").arg(script)
+    }
+
+    #[tokio::test]
+    async fn a_run_that_ends_by_itself_is_reaped_before_drop_without_wait() {
+        let run = Supervisor::spawn(sh("exit 0"), limits());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !run.reaped() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("run should be reaped");
+        assert!(run.reaped());
+        drop(run);
+    }
+
+    #[tokio::test]
+    async fn a_run_dropped_while_still_running_is_not_reaped() {
+        let run = Supervisor::spawn(sh("sleep 300"), limits());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!run.reaped());
+        drop(run);
     }
 }

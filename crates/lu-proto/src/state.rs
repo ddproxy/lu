@@ -39,6 +39,7 @@ impl JobState {
 
     /// Whether the controller may move a job from `from` to `to`. The table test below lists
     /// every allowed edge, and terminal states have none.
+    // Running -> Queued is the lease-lost edge, gated by the lease epoch; NeedsInput is reserved and unreachable in this version.
     pub fn can_transition(from: Self, to: Self) -> bool {
         use JobState::{Cancelled, Done, Failed, Leased, NeedsInput, Queued, Recovering, Running};
         matches!(

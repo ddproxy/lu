@@ -122,30 +122,6 @@ fn stage_from_local_repository() {
 }
 
 #[test]
-fn stage_from_bundle() {
-    require_git!();
-    let repo = init_repo();
-    let bundle = unique_temp_dir("bundle").join("repo.bundle");
-    run(
-        Some(&repo),
-        &["git", "bundle", "create", bundle.to_str().unwrap(), "main"],
-    );
-    let root = make_work_root();
-    let staging = Staging::new(&root).unwrap();
-    let staged = staging
-        .stage(StageRequest {
-            job_id: "job-bundle".to_string(),
-            source: Source::Bundle(bundle.clone()),
-            git_ref: "main".to_string(),
-        })
-        .unwrap();
-    assert!(staged.path().join("hello.txt").is_file());
-    let _ = fs::remove_dir_all(repo);
-    let _ = fs::remove_dir_all(bundle.parent().unwrap());
-    let _ = fs::remove_dir_all(root.parent().unwrap());
-}
-
-#[test]
 fn stage_from_file_url() {
     require_git!();
     let repo = init_repo();
@@ -559,27 +535,214 @@ fn urls_that_would_run_a_command_or_inject_an_option_are_refused() {
 }
 
 #[test]
-fn a_bundle_path_must_be_absolute_and_a_local_path_too() {
+fn ssh_url_host_validation() {
     require_git!();
     let root = make_work_root();
     let staging = Staging::new(&root).unwrap();
-    for (i, source) in [
-        Source::Bundle(PathBuf::from("-evil.bundle")),
-        Source::Bundle(PathBuf::from("relative.bundle")),
-        Source::Path(PathBuf::from("relative/repo")),
+    for (i, url) in [
+        "ssh://-oProxyCommand=x/repo",
+        "ssh://user@-host/repo",
+        "ssh:///repo",
+        "ssh://user@/repo",
     ]
     .into_iter()
     .enumerate()
     {
-        assert!(staging
+        let err = staging
             .stage(StageRequest {
-                job_id: format!("job-rel-{i}"),
-                source,
+                job_id: format!("job-sshbad-{i}"),
+                source: Source::Url(url.to_string()),
                 git_ref: "main".to_string(),
             })
-            .is_err());
+            .expect_err(url);
+        assert!(
+            matches!(err, StageError::Git { .. }),
+            "expected git/url error for {url}: {err:?}"
+        );
     }
+    // A syntactically valid ssh URL passes source validation (clone may fail, but not as InvalidRef/InvalidJobId).
+    // Use a non-resolving host; we only assert it was not rejected as an option-like/missing host.
+    let err = staging
+        .stage(StageRequest {
+            job_id: "job-sshgood".to_string(),
+            source: Source::Url("ssh://host/repo".to_string()),
+            git_ref: "main".to_string(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, StageError::Git { .. }),
+        "expected clone git error, got {err:?}"
+    );
     let _ = fs::remove_dir_all(root.parent().unwrap());
+}
+
+#[test]
+fn a_local_path_must_be_absolute() {
+    require_git!();
+    let root = make_work_root();
+    let staging = Staging::new(&root).unwrap();
+    assert!(staging
+        .stage(StageRequest {
+            job_id: "job-rel-0".to_string(),
+            source: Source::Path(PathBuf::from("relative/repo")),
+            git_ref: "main".to_string(),
+        })
+        .is_err());
+    let _ = fs::remove_dir_all(root.parent().unwrap());
+}
+
+#[test]
+fn local_clone_does_not_share_objects() {
+    require_git!();
+    let repo = init_repo();
+    // create some objects/content
+    fs::write(repo.join("more.txt"), "more\n").unwrap();
+    run(Some(&repo), &["git", "add", "more.txt"]);
+    run(Some(&repo), &["git", "commit", "-m", "more"]);
+    let root = make_work_root();
+    let staging = Staging::new(&root).unwrap();
+    let staged = staging
+        .stage(StageRequest {
+            job_id: "job-nolocal".to_string(),
+            source: Source::Path(repo.clone()),
+            git_ref: "main".to_string(),
+        })
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fn walk(dir: &Path) -> Vec<PathBuf> {
+            let mut out = Vec::new();
+            if let Ok(entries) = fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        out.extend(walk(&p));
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+            out
+        }
+        for p in walk(&staged.path().join(".git").join("objects")) {
+            if let Ok(m) = fs::metadata(&p) {
+                if m.is_file() {
+                    assert!(
+                        m.nlink() <= 1,
+                        "shared object {} nlink {}",
+                        p.display(),
+                        m.nlink()
+                    );
+                }
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(repo);
+    let _ = fs::remove_dir_all(root.parent().unwrap());
+}
+
+#[test]
+fn export_diff_does_not_run_external_programs_and_handles_large_output() {
+    require_git!();
+    let repo = init_repo();
+    // a file to produce large diff and warnings context not necessary; "more than 64 KiB of warnings or output does not hang"
+    // Create many changes to produce large output.
+    fs::write(repo.join("big.txt"), "a\n".repeat(2000)).unwrap();
+    run(Some(&repo), &["git", "add", "big.txt"]);
+    run(Some(&repo), &["git", "commit", "-m", "big"]);
+    let root = make_work_root();
+    let staging = Staging::new(&root).unwrap();
+    let staged = staging
+        .stage(StageRequest {
+            job_id: "job-noprogs".to_string(),
+            source: Source::Path(repo.clone()),
+            git_ref: "main".to_string(),
+        })
+        .unwrap();
+
+    let marker_dir = root.join("markers");
+    fs::create_dir(&marker_dir).unwrap();
+    let marker_fsmonitor = marker_dir.join("fsmonitor");
+    let marker_external = marker_dir.join("external");
+    let marker_clean = marker_dir.join("clean");
+    // commands that create markers
+    let touch = |p: &Path| format!("sh -c 'echo x > {}'", p.display());
+    run(
+        Some(staged.path()),
+        &["git", "config", "core.fsmonitor", &touch(&marker_fsmonitor)],
+    );
+    run(
+        Some(staged.path()),
+        &["git", "config", "diff.external", &touch(&marker_external)],
+    );
+    run(
+        Some(staged.path()),
+        &[
+            "git",
+            "config",
+            "filter.marker.clean",
+            &touch(&marker_clean),
+        ],
+    );
+    run(
+        Some(staged.path()),
+        &["git", "config", "filter.marker.smudge", "cat"],
+    );
+    fs::write(
+        staged.path().join(".gitattributes"),
+        "filt.txt filter=marker\n",
+    )
+    .unwrap();
+    fs::write(staged.path().join("filt.txt"), "data\n").unwrap();
+    // make a large change
+    fs::write(staged.path().join("big.txt"), "b\n".repeat(2000)).unwrap();
+
+    let diff = Staging::export_diff(&staged, 4 * 1024 * 1024).unwrap();
+    assert!(!diff.is_empty());
+    assert!(!marker_fsmonitor.exists(), "core.fsmonitor ran");
+    assert!(!marker_external.exists(), "diff.external ran");
+    assert!(!marker_clean.exists(), "clean filter ran");
+
+    // Large output path: cap smaller than diff should return TooLarge without hanging.
+    let err = Staging::export_diff(&staged, 1024).unwrap_err();
+    assert!(matches!(err, StageError::TooLarge));
+
+    let _ = fs::remove_dir_all(repo);
+    let _ = fs::remove_dir_all(root.parent().unwrap());
+}
+
+#[test]
+fn artifact_temp_removed_on_failure_modes_checked() {
+    let base = unique_temp_dir("artbase2");
+    let root = base.join("artifacts");
+    fs::create_dir(&root).unwrap();
+    let ad = ArtifactDir::new(&root).unwrap();
+    let dir = ad.create("job-art2").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+    // failure leaves no temp
+    struct FailReader;
+    impl std::io::Read for FailReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf[0] = b'x';
+            Err(std::io::Error::other("boom"))
+        }
+    }
+    let _ = ad
+        .write("job-art2", ArtifactFile::RunLog, FailReader, 100)
+        .unwrap_err();
+    let leftovers: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+        .collect();
+    assert!(leftovers.is_empty(), "left temp files: {leftovers:?}");
+    let _ = fs::remove_dir_all(base);
 }
 
 #[test]

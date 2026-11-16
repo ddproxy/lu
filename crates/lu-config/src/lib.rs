@@ -5,13 +5,26 @@ mod error;
 mod secret;
 
 use std::io::Read;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path};
 
 use serde::Deserialize;
 
 pub use error::ConfigError;
-pub use secret::check_private_file;
+pub use secret::{check_private_file, read_private_file};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Host {
+    Ip(IpAddr),
+    Name(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedUrl {
+    pub https: bool,
+    pub host: Host,
+    pub port: Option<u16>,
+}
 
 /// A config is a few KiB. The cap stops a runaway or hostile file from being read whole.
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -510,123 +523,152 @@ fn validate_abs_no_dotdot(table: &str, field: &str, value: &str) -> Result<(), C
     Ok(())
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
+fn host_is_loopback(host: &Host) -> bool {
+    match host {
+        Host::Name(name) => name.eq_ignore_ascii_case("localhost"),
+        Host::Ip(ip) => ip.to_canonical().is_loopback(),
     }
-    // strip brackets for IPv6 literal
-    let h = host
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(host);
-    h.parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
 }
 
-fn parse_url_parts(url: &str) -> Option<(&str, &str, &str)> {
-    // returns (scheme, host, rest_path_maybe) best-effort; rejects creds/query/fragment in validate
-    let (scheme, rest) = url.split_once("://")?;
-    // authority is up to first '/' or end
-    let (authority, _path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, ""),
+fn url_err<T>(reason: String) -> Result<T, ConfigError> {
+    Err(ConfigError::Invalid {
+        table: "[url]".to_owned(),
+        reason,
+    })
+}
+
+pub fn parse_http_url(url: &str) -> Result<ParsedUrl, ConfigError> {
+    if url.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return url_err("URL must not contain control characters".to_owned());
+    }
+    if url.contains('@') {
+        return url_err("URL must not contain credentials".to_owned());
+    }
+    if url.contains('?') {
+        return url_err("URL must not contain a query".to_owned());
+    }
+    if url.contains('#') {
+        return url_err("URL must not contain a fragment".to_owned());
+    }
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| ConfigError::Invalid {
+        table: "[url]".to_owned(),
+        reason: "URL must include a scheme and authority".to_owned(),
+    })?;
+    let https = if scheme.eq_ignore_ascii_case("https") {
+        true
+    } else if scheme.eq_ignore_ascii_case("http") {
+        false
+    } else {
+        return url_err(format!("URL scheme must be http or https (got {scheme:?})"));
     };
-    Some((scheme, authority, _path))
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return url_err("URL must include a host".to_owned());
+    }
+    let (host, port) = if let Some(after) = authority.strip_prefix('[') {
+        let close = after.find(']').ok_or_else(|| ConfigError::Invalid {
+            table: "[url]".to_owned(),
+            reason: "URL has an invalid IPv6 host".to_owned(),
+        })?;
+        let inside = &after[..close];
+        let tail = &after[close + 1..];
+        let port = if tail.is_empty() {
+            None
+        } else if let Some(port_s) = tail.strip_prefix(':') {
+            if port_s.is_empty() || port_s.len() > 5 || !port_s.bytes().all(|b| b.is_ascii_digit())
+            {
+                return url_err("URL has an invalid port".to_owned());
+            }
+            let port: u16 = port_s.parse().map_err(|_| ConfigError::Invalid {
+                table: "[url]".to_owned(),
+                reason: "URL has an invalid port".to_owned(),
+            })?;
+            Some(port)
+        } else {
+            return url_err("URL has an invalid IPv6 host".to_owned());
+        };
+        let ip: Ipv6Addr = inside.parse().map_err(|_| ConfigError::Invalid {
+            table: "[url]".to_owned(),
+            reason: "URL has an invalid IPv6 host".to_owned(),
+        })?;
+        (Host::Ip(IpAddr::V6(ip)), port)
+    } else {
+        let (host_s, port) = if let Some((h, p)) = authority.rsplit_once(':') {
+            if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) {
+                if p.len() > 5 {
+                    return url_err("URL has an invalid port".to_owned());
+                }
+                let port: u16 = p.parse().map_err(|_| ConfigError::Invalid {
+                    table: "[url]".to_owned(),
+                    reason: "URL has an invalid port".to_owned(),
+                })?;
+                (h, Some(port))
+            } else {
+                (authority, None)
+            }
+        } else {
+            (authority, None)
+        };
+        if host_s.is_empty() {
+            return url_err("URL must include a host".to_owned());
+        }
+        if host_s.len() > 253 {
+            return url_err("URL host is too long".to_owned());
+        }
+        if host_s.starts_with('.')
+            || host_s.ends_with('.')
+            || host_s.starts_with('-')
+            || host_s.ends_with('-')
+        {
+            return url_err("URL has an invalid host".to_owned());
+        }
+        if !host_s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        {
+            return url_err("URL has an invalid host".to_owned());
+        }
+        let host = if let Ok(ip) = host_s.parse::<IpAddr>() {
+            Host::Ip(ip)
+        } else {
+            Host::Name(host_s.to_owned())
+        };
+        (host, port)
+    };
+    Ok(ParsedUrl { https, host, port })
+}
+
+fn map_url_error(table: &str, field: &str, err: ConfigError, url: &str) -> ConfigError {
+    match err {
+        ConfigError::Invalid { reason, .. } => ConfigError::Invalid {
+            table: table.to_owned(),
+            reason: if let Some(stripped) = reason.strip_prefix("URL ") {
+                format!("{field} {stripped}")
+            } else {
+                format!("{field}: {reason} (got {url:?})")
+            },
+        },
+        other => other,
+    }
 }
 
 fn validate_controller_url(url: &str) -> Result<(), ConfigError> {
-    if url.contains('@') {
+    let parsed =
+        parse_http_url(url).map_err(|e| map_url_error("[agent]", "controller_url", e, url))?;
+    if !parsed.https && !host_is_loopback(&parsed.host) {
         return invalid(
             "[agent]",
-            "controller_url must not contain credentials".to_owned(),
+            "controller_url may use http only on a loopback address; use https for non-loopback hosts"
+                .to_owned(),
         );
     }
-    if url.contains('?') {
-        return invalid(
-            "[agent]",
-            "controller_url must not contain a query".to_owned(),
-        );
-    }
-    if url.contains('#') {
-        return invalid(
-            "[agent]",
-            "controller_url must not contain a fragment".to_owned(),
-        );
-    }
-    let (scheme, authority, _) = parse_url_parts(url).ok_or_else(|| ConfigError::Invalid {
-        table: "[agent]".to_owned(),
-        reason: format!("controller_url must be a valid URL (got {url:?})"),
-    })?;
-    if authority.is_empty() {
-        return invalid("[agent]", "controller_url must include a host".to_owned());
-    }
-    let host = if authority.starts_with('[') {
-        // [ipv6]:port or [ipv6]
-        match authority.rfind(']') {
-            Some(i) => &authority[..=i],
-            None => {
-                return invalid(
-                    "[agent]",
-                    "controller_url has an invalid IPv6 host".to_owned(),
-                )
-            }
-        }
-    } else {
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority)
-    };
-    match scheme {
-        "https" => Ok(()),
-        "http" => {
-            if is_loopback_host(host) {
-                Ok(())
-            } else {
-                invalid(
-                    "[agent]",
-                    "controller_url may use http only on a loopback address; use https for non-loopback hosts"
-                        .to_owned(),
-                )
-            }
-        }
-        _ => invalid(
-            "[agent]",
-            format!("controller_url must use https or http (got scheme {scheme:?})"),
-        ),
-    }
+    Ok(())
 }
 
 fn validate_loopback_http_url(table: &str, field: &str, url: &str) -> Result<(), ConfigError> {
-    if url.contains('@') || url.contains('?') || url.contains('#') {
-        return invalid(
-            table,
-            format!("{field} must not contain credentials, query, or fragment"),
-        );
-    }
-    let (scheme, authority, _) = parse_url_parts(url).ok_or_else(|| ConfigError::Invalid {
-        table: table.to_owned(),
-        reason: format!("{field} must be a valid URL (got {url:?})"),
-    })?;
-    if scheme != "http" && scheme != "https" {
-        return invalid(
-            table,
-            format!("{field} must use http or https (got scheme {scheme:?})"),
-        );
-    }
-    let host = if authority.starts_with('[') {
-        match authority.rfind(']') {
-            Some(i) => &authority[..=i],
-            None => return invalid(table, format!("{field} has an invalid IPv6 host")),
-        }
-    } else {
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority)
-    };
-    if !is_loopback_host(host) {
+    let parsed = parse_http_url(url).map_err(|e| map_url_error(table, field, e, url))?;
+    if !host_is_loopback(&parsed.host) {
         return invalid(
             table,
             format!("{field} must be a loopback address (got {url:?})"),
@@ -658,12 +700,16 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     }
     let config = Config::parse(&text)?;
     if let Some(tls) = &config.tls {
-        check_private_file("[tls] key", Path::new(&tls.key))?;
+        secret::read_private_file("[tls] key", Path::new(&tls.key), MAX_CONFIG_BYTES)?;
     }
     if let Some(agent) = &config.agent {
-        check_private_file("[agent] token_file", Path::new(&agent.token_file))?;
+        secret::read_private_file(
+            "[agent] token_file",
+            Path::new(&agent.token_file),
+            MAX_CONFIG_BYTES,
+        )?;
         if let Some(rt) = &agent.reiki_token_file {
-            check_private_file("[agent] reiki_token_file", Path::new(rt))?;
+            secret::read_private_file("[agent] reiki_token_file", Path::new(rt), MAX_CONFIG_BYTES)?;
         }
     }
     Ok(config)
@@ -910,6 +956,65 @@ heartbeat_secs = 15
         expect_table(&base("https://user:pw@example.net"), "[agent]");
         expect_table(&base("https://example.net?q=1"), "[agent]");
         expect_table(&base("https://example.net#f"), "[agent]");
+    }
+
+    #[test]
+    fn url_host_parsing_strict_cases() {
+        let agent = |url: &str| {
+            format!(
+            "[agent]\nname=\"a\"\ncontroller_url=\"{url}\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n"
+        )
+        };
+        let reiki = |url: &str| {
+            format!(
+            "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\nreiki_health_url=\"{url}\"\nreiki_token_file=\"/rt\"\n"
+        )
+        };
+        // refused
+        for url in [
+            "http://[::1].attacker.example:80",
+            "http://[::1]x",
+            "http://[::1]:80x",
+            "http://[::1]:99999",
+            "http://127.0.0.1.evil.example",
+            "http://localhost.evil.example",
+            "http://user@127.0.0.1",
+            "http://2130706433",
+        ] {
+            expect_table(&agent(url), "[agent]");
+            expect_table(&reiki(url), "[agent]");
+        }
+        // accepted
+        for url in [
+            "http://[::ffff:127.0.0.1]:8080",
+            "http://localhost:4100",
+            "http://127.0.0.1:4100",
+            "http://[::1]:4100",
+        ] {
+            assert!(Config::parse(&agent(url)).is_ok(), "agent accepted: {url}");
+            assert!(Config::parse(&reiki(url)).is_ok(), "reiki accepted: {url}");
+        }
+        assert!(
+            Config::parse(&agent("https://lu.example.net:7600")).is_ok(),
+            "https accepted"
+        );
+        assert!(
+            Config::parse(&agent("HTTPS://lu.example.net:7600")).is_ok(),
+            "uppercase scheme"
+        );
+        assert!(
+            Config::parse(&agent("HTTP://127.0.0.1:7600")).is_ok(),
+            "uppercase http loopback"
+        );
+        // empty host
+        expect_table(&agent("http:///path"), "[agent]");
+        expect_table(&agent("https://"), "[agent]");
+        // 300 byte host
+        let long_host = format!("https://{}.example.net", "a".repeat(300));
+        expect_table(&agent(&long_host), "[agent]");
+        // control character in URL
+        expect_table(&agent("http://127.0.0.1/\\u007f"), "[agent]");
+        expect_table(&agent("http://exa\\u0001mple.net"), "[agent]");
     }
 
     #[test]

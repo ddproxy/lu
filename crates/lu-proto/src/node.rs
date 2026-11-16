@@ -35,8 +35,7 @@ pub struct ProviderStatus {
 }
 
 /// A periodic message from an agent. `reiki` is the opaque health document, forwarded unchanged.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Heartbeat {
     pub node: NodeName,
     pub harness: HarnessState,
@@ -44,6 +43,41 @@ pub struct Heartbeat {
     pub providers: Vec<ProviderStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reiki: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHeartbeat {
+    pub node: NodeName,
+    pub harness: HarnessState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reiki: Option<serde_json::Value>,
+}
+
+impl TryFrom<RawHeartbeat> for Heartbeat {
+    type Error = HeartbeatError;
+    fn try_from(raw: RawHeartbeat) -> Result<Self, Self::Error> {
+        let hb = Heartbeat {
+            node: raw.node,
+            harness: raw.harness,
+            providers: raw.providers,
+            reiki: raw.reiki,
+        };
+        hb.validate()?;
+        Ok(hb)
+    }
+}
+
+impl<'de> Deserialize<'de> for Heartbeat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawHeartbeat::deserialize(deserializer)?;
+        Heartbeat::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Heartbeat {

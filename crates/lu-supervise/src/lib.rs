@@ -9,6 +9,10 @@
 //!
 //! The implementation is Unix-specific: it relies on process groups and signals.
 //! On other targets the crate is empty.
+//!
+//! A process group does not contain a child that calls `setsid` or `setpgid`;
+//! callers who need containment run the agent under a service manager that ends
+//! the whole control group on stop.
 #![cfg(unix)]
 
 mod command;

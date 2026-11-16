@@ -21,6 +21,7 @@ fn is_invisible(c: char) -> bool {
         || matches!(
             c,
             '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{2029}'
                 | '\u{202a}'..='\u{202e}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{206f}'
@@ -49,6 +50,13 @@ mod tests {
     fn bidi_overrides_are_neutralised() {
         assert_eq!(printable("ab\u{202e}cd"), "ab?cd");
         assert_eq!(printable("x\u{2066}y"), "x?y");
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_are_neutralised() {
+        assert_eq!(printable("a\u{2028}b"), "a?b");
+        assert_eq!(printable("a\u{2029}b"), "a?b");
+        assert_eq!(printable("\u{2028}\u{2029}"), "??");
     }
 
     #[test]

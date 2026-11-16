@@ -86,3 +86,63 @@ fn an_interior_dash_is_allowed() {
     let spec = opencode_command(Path::new("t"), None, None, "a-b c").expect("a valid command");
     assert_eq!(args(&spec), ["run", "--auto", "-f", "t", "a-b c"]);
 }
+
+#[test]
+fn a_server_is_accepted() {
+    let spec = opencode_command(Path::new("t"), None, Some("https://example.net"), "ok")
+        .expect("a valid command");
+    assert_eq!(
+        args(&spec),
+        [
+            "run",
+            "--server",
+            "https://example.net",
+            "--auto",
+            "-f",
+            "t",
+            "ok"
+        ]
+    );
+}
+
+#[test]
+fn a_server_starting_with_dash_is_refused() {
+    assert_eq!(
+        opencode_command(Path::new("t"), None, Some("-bad"), "ok").unwrap_err(),
+        InvalidArgument::Server
+    );
+}
+
+#[test]
+fn a_server_with_control_character_is_refused() {
+    assert_eq!(
+        opencode_command(Path::new("t"), None, Some("https://exa\nmple.net"), "ok").unwrap_err(),
+        InvalidArgument::Server
+    );
+}
+
+#[test]
+fn a_server_with_whitespace_is_refused() {
+    assert_eq!(
+        opencode_command(Path::new("t"), None, Some("https://example .net"), "ok").unwrap_err(),
+        InvalidArgument::Server
+    );
+}
+
+#[test]
+fn a_server_longer_than_2048_bytes_is_refused() {
+    let long = format!("https://{}", "a".repeat(2041));
+    assert_eq!(long.len(), 2049);
+    assert_eq!(
+        opencode_command(Path::new("t"), None, Some(&long), "ok").unwrap_err(),
+        InvalidArgument::Server
+    );
+}
+
+#[test]
+fn a_server_must_start_with_http_or_https() {
+    assert_eq!(
+        opencode_command(Path::new("t"), None, Some("ftp://example.net"), "ok").unwrap_err(),
+        InvalidArgument::Server
+    );
+}

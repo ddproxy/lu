@@ -10,6 +10,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
 /// Error returned by staging, diff export and cleanup operations.
 #[derive(Debug)]
 pub enum StageError {
@@ -151,8 +154,6 @@ pub enum Source {
     Url(String),
     /// An absolute path to a local repository.
     Path(PathBuf),
-    /// A git bundle file.
-    Bundle(PathBuf),
 }
 
 /// Request describing how to create a staged checkout.
@@ -266,24 +267,7 @@ impl Staging {
                     [
                         "clone",
                         "--no-checkout",
-                        "--",
-                        path_str(path)?,
-                        path_str(target)?,
-                    ],
-                )?;
-            }
-            Source::Bundle(path) => {
-                // A relative path could start with `-` and be read as an option.
-                if !path.is_absolute() {
-                    return Err(StageError::Git {
-                        message: "bundle path must be absolute".to_string(),
-                    });
-                }
-                run_git(
-                    None,
-                    [
-                        "clone",
-                        "--no-checkout",
+                        "--no-local",
                         "--",
                         path_str(path)?,
                         path_str(target)?,
@@ -304,69 +288,55 @@ impl Staging {
     }
 
     /// Export everything the job changed relative to the checked-out commit,
-    /// including new files, as a binary-safe patch.
+    /// including new untracked files that are not ignored, as a binary-safe patch.
     pub fn export_diff(staged: &StagedDir, cap_bytes: usize) -> Result<Vec<u8>, StageError> {
-        // Stage intent for untracked, non-ignored files so they appear in diff.
-        run_git(Some(staged.path()), ["add", "-N", "."])?;
-
-        let mut command = Command::new("git");
-        harden(&mut command);
-        let mut child = command
-            .args([
-                "diff",
-                "--binary",
-                "--no-ext-diff",
-                "--no-textconv",
-                "HEAD",
-                "--",
-            ])
-            .current_dir(staged.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        let mut stdout = child.stdout.take().ok_or_else(|| StageError::Git {
-            message: "failed to capture git diff stdout".to_string(),
+        let repo = git2::Repository::open(staged.path()).map_err(|e| StageError::Git {
+            message: format!("failed to open repository: {e}"),
         })?;
-        let stderr_handle = child.stderr.take();
+        let head = repo
+            .head()
+            .and_then(|h| h.peel_to_tree())
+            .map_err(|e| StageError::Git {
+                message: format!("failed to resolve HEAD tree: {e}"),
+            })?;
+        let mut opts = git2::DiffOptions::new();
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true)
+            .show_binary(true)
+            .ignore_submodules(true);
+        let diff = repo
+            .diff_tree_to_workdir_with_index(Some(&head), Some(&mut opts))
+            .map_err(|e| StageError::Git {
+                message: format!("failed to compute diff: {e}"),
+            })?;
 
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
+        let mut out: Vec<u8> = Vec::new();
         let mut too_large = false;
-        loop {
-            let n = stdout.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            if out.len().saturating_add(n) > cap_bytes {
+        let print_res = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            let content = line.content();
+            let prefix = match line.origin() {
+                '+' | '-' | ' ' => Some(line.origin() as u8),
+                'F' | 'H' | 'B' => None,
+                _ => None,
+            };
+            let need = content.len() + usize::from(prefix.is_some());
+            if out.len().saturating_add(need) > cap_bytes {
                 too_large = true;
-                // Stop reading early; do not buffer unbounded output.
-                let _ = child.kill();
-                break;
+                return false;
             }
-            out.extend_from_slice(&buf[..n]);
-        }
-        // Drain remaining pipe best-effort after kill to avoid blocking on wait in some cases.
-        if too_large {
-            let mut sink = [0u8; 4096];
-            while stdout.read(&mut sink).ok().unwrap_or(0) > 0 {}
-        }
-
-        let status = child.wait()?;
-        let mut stderr = String::new();
-        if let Some(mut s) = stderr_handle {
-            let _ = s.read_to_string(&mut stderr);
-        }
-
+            if let Some(p) = prefix {
+                out.push(p);
+            }
+            out.extend_from_slice(content);
+            true
+        });
         if too_large {
             return Err(StageError::TooLarge);
         }
-        if !status.success() {
-            return Err(StageError::Git {
-                message: format_git_failure("git diff --binary", status, &stderr),
-            });
-        }
+        print_res.map_err(|e| StageError::Git {
+            message: format!("failed to format diff: {e}"),
+        })?;
         Ok(out)
     }
 
@@ -549,7 +519,24 @@ fn validate_url_source(url: &str) -> Result<(), StageError> {
     if url.contains("::") {
         return refuse("remote helper syntax");
     }
-    if url.starts_with("https://") || url.starts_with("ssh://") || url.starts_with("file://") {
+    if url.starts_with("https://") || url.starts_with("file://") {
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        // ssh://[user@]host[:port]/path - host must exist and not start with '-'
+        let authority = rest.split('/').next().unwrap_or("");
+        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        let host = host.split(':').next().unwrap_or(host);
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if host.is_empty() {
+            return refuse("missing host");
+        }
+        if host.starts_with('-') {
+            return refuse("option-like host");
+        }
         return Ok(());
     }
     if is_scp_like(url) {
@@ -607,8 +594,9 @@ where
     }
 }
 
-/// Limits what git may do on our behalf: only these transports (no `ext::` command transport),
-/// never a terminal prompt, and no pager or external helper settings from the environment.
+/// Limits what git may do on our behalf when we invoke git: only these transports (no
+/// `ext::` command transport), never a terminal prompt, and no pager or external helper
+/// settings from the environment.
 fn harden(cmd: &mut Command) {
     cmd.env("GIT_ALLOW_PROTOCOL", "file:https:ssh")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -636,20 +624,6 @@ fn set_dir_mode_0700_io(path: &Path) -> Result<(), io::Error> {
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(0o700);
-        fs::set_permissions(path, perms)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
-}
-
-fn set_file_mode_0600(path: &Path) -> Result<(), io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
         fs::set_permissions(path, perms)?;
     }
     #[cfg(not(unix))]
@@ -771,8 +745,16 @@ impl ArtifactDir {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(ArtifactError::Io(e)),
         }
-        fs::create_dir(&dir)?;
-        set_dir_mode_0700_io(&dir)?;
+        #[cfg(unix)]
+        {
+            let mut b = fs::DirBuilder::new();
+            b.mode(0o700);
+            b.create(&dir)?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir(&dir)?;
+        }
         Ok(dir)
     }
 
@@ -802,12 +784,13 @@ impl ArtifactDir {
         let tmp_path = temp_path_in(&dir, file.file_name());
 
         let result = (|| -> Result<u64, ArtifactError> {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
-            // Best effort restrictive mode on create.
-            let _ = set_file_mode_0600(&tmp_path);
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp_path)?;
 
             let mut total: u64 = 0;
             let mut buf = [0u8; 8192];
@@ -823,9 +806,7 @@ impl ArtifactDir {
                 f.write_all(&buf[..n]).map_err(ArtifactError::Io)?;
             }
             f.sync_all().map_err(ArtifactError::Io)?;
-            set_file_mode_0600(&tmp_path).map_err(ArtifactError::Io)?;
             fs::rename(&tmp_path, &final_path).map_err(ArtifactError::Io)?;
-            set_file_mode_0600(&final_path).map_err(ArtifactError::Io)?;
             Ok(total)
         })();
 

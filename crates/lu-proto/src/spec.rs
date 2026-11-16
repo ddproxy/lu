@@ -41,26 +41,73 @@ impl fmt::Display for JobSpecError {
 impl std::error::Error for JobSpecError {}
 
 /// A job to run. `harness` defaults to `opencode` and `timeout_secs` to an hour.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobSpec {
     /// A git URL or an absolute local path.
     pub repo: String,
     pub git_ref: String,
     /// The prompt text. Control characters are allowed; they are sanitised for display.
     pub task: String,
-    #[serde(default = "default_harness")]
     pub harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawJobSpec {
+    repo: String,
+    git_ref: String,
+    task: String,
+    #[serde(default = "default_harness")]
+    harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default = "default_timeout_secs")]
+    timeout_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idle_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<String>,
+}
+
+impl TryFrom<RawJobSpec> for JobSpec {
+    type Error = JobSpecError;
+
+    fn try_from(raw: RawJobSpec) -> Result<Self, Self::Error> {
+        let spec = JobSpec {
+            repo: raw.repo,
+            git_ref: raw.git_ref,
+            task: raw.task,
+            harness: raw.harness,
+            provider: raw.provider,
+            model: raw.model,
+            timeout_secs: raw.timeout_secs,
+            idle_timeout_secs: raw.idle_timeout_secs,
+            idempotency_key: raw.idempotency_key,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+}
+
+impl<'de> Deserialize<'de> for JobSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawJobSpec::deserialize(deserializer)?;
+        JobSpec::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 impl JobSpec {
