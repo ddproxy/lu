@@ -9,6 +9,11 @@ publish.workspace = true
 
 [dependencies]
 lu-proto = { path = "../lu-proto" }
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
 
 [lints]
 workspace = true

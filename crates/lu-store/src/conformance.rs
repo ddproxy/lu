@@ -1,0 +1,507 @@
+//! Shared conformance tests for [`crate::Store`] implementations.
+
+use std::str::FromStr;
+
+use lu_proto::{
+    ArtifactName, Completion, FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobState,
+    NodeName, Outcome, ProviderState, ProviderStatus, MAX_LOG_BYTES,
+};
+
+use crate::{Now, Store, StoreError};
+
+pub fn now(wall_unix: i64, mono_ms: u64) -> Now {
+    Now { wall_unix, mono_ms }
+}
+
+pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
+    JobSpec {
+        repo: repo.to_owned(),
+        git_ref: "main".to_owned(),
+        task: "do it".to_owned(),
+        harness: "opencode".to_owned(),
+        provider: None,
+        model: None,
+        timeout_secs: 3600,
+        idle_timeout_secs: None,
+        idempotency_key: key.map(|s| s.to_owned()),
+    }
+}
+
+pub fn node(name: &str) -> NodeName {
+    NodeName::from_str(name).unwrap()
+}
+
+pub fn hb(name: &str, harness: HarnessState, providers: Vec<(&str, ProviderState)>) -> Heartbeat {
+    Heartbeat {
+        node: node(name),
+        harness,
+        providers: providers
+            .into_iter()
+            .map(|(n, s)| ProviderStatus {
+                name: n.to_owned(),
+                state: s,
+                soonest_secs: None,
+            })
+            .collect(),
+        reiki: None,
+    }
+}
+
+/// Runs the same tests against any store implementation.
+pub fn run_all<S: Store>(make: impl Fn() -> S) {
+    idempotent_create(&make());
+    list_jobs_ordering_and_cursor(&make());
+    cancel_states(&make());
+    assignment_and_epoch(&make());
+    start_renew_log_artifact(&make());
+    complete_and_retry_cordon(&make());
+    stale_epoch_rejected(&make());
+    expire_and_recover(&make());
+    recover_on_boot(&make());
+    recovery_grace_survives_a_young_clock(&make());
+    a_recovering_job_resumes_or_finishes_for_its_holder(&make());
+    nodes_view(&make());
+}
+
+fn idempotent_create<S: Store>(s: &S) {
+    let n = now(100, 1000);
+    let a = spec("https://example.net/a.git", Some("k1"));
+    let (j1, created1) = s.create_job(&a, n).unwrap();
+    assert!(created1);
+    assert_eq!(j1.attempt, 1);
+    assert_eq!(j1.state, JobState::Queued);
+    // ULID-like id from lu-proto
+    assert_eq!(j1.id.as_str().len(), 26);
+    JobId::from_str(j1.id.as_str()).unwrap();
+
+    let (j2, created2) = s.create_job(&a, now(101, 1001)).unwrap();
+    assert!(!created2);
+    assert_eq!(j1.id, j2.id);
+
+    let b = spec("https://example.net/b.git", Some("k1"));
+    let err = s.create_job(&b, n).unwrap_err();
+    assert!(matches!(err, StoreError::Conflict { length: None }));
+
+    // no key => always new
+    let c = spec("https://example.net/c.git", None);
+    let (j3, _) = s.create_job(&c, n).unwrap();
+    let (j4, _) = s.create_job(&c, n).unwrap();
+    assert_ne!(j3.id, j4.id);
+}
+
+fn list_jobs_ordering_and_cursor<S: Store>(s: &S) {
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let (j, _) = s
+            .create_job(
+                &spec(&format!("https://x/{i}.git"), None),
+                now(100 + i, 1000 + i as u64),
+            )
+            .unwrap();
+        ids.push(j.id);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let all = s.list_jobs(None, 10, None).unwrap();
+    assert_eq!(all.len(), 3);
+    // newest first
+    assert!(all[0].id > all[1].id);
+    assert!(all[1].id > all[2].id);
+    let page = s.list_jobs(None, 1, None).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].id, all[0].id);
+    let after = s.list_jobs(None, 10, Some(&all[0].id)).unwrap();
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0].id, all[1].id);
+    // filter by state
+    let queued = s.list_jobs(Some(JobState::Queued), 10, None).unwrap();
+    assert_eq!(queued.len(), 3);
+    let done = s.list_jobs(Some(JobState::Done), 10, None).unwrap();
+    assert!(done.is_empty());
+}
+
+fn cancel_states<S: Store>(s: &S) {
+    let (q, _) = s
+        .create_job(&spec("https://x/q.git", None), now(1, 1))
+        .unwrap();
+    let cancelled = s.cancel_job(&q.id, now(2, 2)).unwrap();
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert!(s.cancel_job(&q.id, now(3, 3)).is_err());
+
+    let n = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (j, _) = s
+        .create_job(&spec("https://x/r.git", None), now(1, 1))
+        .unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    assert_eq!(a.job_id, j.id);
+    let c = s.cancel_job(&j.id, now(3, 3)).unwrap();
+    assert!(c.cancel_requested);
+    assert_eq!(c.state, JobState::Leased);
+    s.start_job(&j.id, a.epoch, now(4, 4)).unwrap();
+    let c2 = s.cancel_job(&j.id, now(5, 5)).unwrap();
+    assert!(c2.cancel_requested);
+    assert_eq!(c2.state, JobState::Running);
+}
+
+fn assignment_and_epoch<S: Store>(s: &S) {
+    let n1 = node("node-1");
+    let n2 = node("node-2");
+    s.heartbeat(&hb("node-1", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    s.heartbeat(&hb("node-2", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (j1, _) = s
+        .create_job(&spec("https://x/1.git", None), now(1, 1))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let (j2, _) = s
+        .create_job(&spec("https://x/2.git", None), now(2, 2))
+        .unwrap();
+    // oldest queued first
+    let a1 = s.next_assignment(&n1, now(3, 3), 60_000).unwrap().unwrap();
+    assert_eq!(a1.job_id, j1.id);
+    assert_eq!(a1.epoch, 1);
+    // no job held by n1 -> none (n1 holds j1)
+    assert!(s.next_assignment(&n1, now(4, 4), 60_000).unwrap().is_none());
+    // n2 gets j2, never same job twice
+    let a2 = s.next_assignment(&n2, now(5, 5), 60_000).unwrap().unwrap();
+    assert_eq!(a2.job_id, j2.id);
+    assert_ne!(a1.job_id, a2.job_id);
+
+    // draining node gets nothing
+    let (j3, _) = s
+        .create_job(&spec("https://x/3.git", None), now(6, 6))
+        .unwrap();
+    let nd = node("drain");
+    s.heartbeat(&hb("drain", HarnessState::Idle, vec![]), now(6, 6))
+        .unwrap();
+    s.set_draining(&nd, true).unwrap();
+    assert!(s.next_assignment(&nd, now(7, 7), 60_000).unwrap().is_none());
+    s.set_draining(&nd, false).unwrap();
+    let a3 = s.next_assignment(&nd, now(8, 8), 60_000).unwrap().unwrap();
+    assert_eq!(a3.job_id, j3.id);
+
+    // provider constraints
+    let mut sp = spec("https://x/p.git", None);
+    sp.provider = Some("prov-a".to_owned());
+    let (jp, _) = s.create_job(&sp, now(9, 9)).unwrap();
+    let np = node("np");
+    s.heartbeat(
+        &hb(
+            "np",
+            HarnessState::Idle,
+            vec![("prov-b", ProviderState::Ok)],
+        ),
+        now(9, 9),
+    )
+    .unwrap();
+    assert!(s
+        .next_assignment(&np, now(10, 10), 60_000)
+        .unwrap()
+        .is_none());
+    s.heartbeat(
+        &hb(
+            "np",
+            HarnessState::Idle,
+            vec![("prov-a", ProviderState::Ok)],
+        ),
+        now(11, 11),
+    )
+    .unwrap();
+    let ap = s
+        .next_assignment(&np, now(12, 12), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ap.job_id, jp.id);
+}
+
+fn start_renew_log_artifact<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (j, _) = s
+        .create_job(&spec("https://x/l.git", None), now(1, 1))
+        .unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    let running = s.start_job(&j.id, a.epoch, now(3, 3)).unwrap();
+    assert_eq!(running.state, JobState::Running);
+    let cancel = s.renew_lease(&j.id, a.epoch, now(4, 4), 60_000).unwrap();
+    assert!(!cancel);
+
+    // log offsets
+    let len = s.reserve_log(&j.id, a.epoch, 0, 5).unwrap();
+    assert_eq!(len, 5);
+    let err = s.reserve_log(&j.id, a.epoch, 0, 1).unwrap_err();
+    assert_eq!(err, StoreError::Conflict { length: Some(5) });
+    let len2 = s.reserve_log(&j.id, a.epoch, 5, 3).unwrap();
+    assert_eq!(len2, 8);
+
+    // log cap behavior
+    let cap = MAX_LOG_BYTES;
+    let len3 = s.reserve_log(&j.id, a.epoch, 8, cap + 100).unwrap();
+    assert_eq!(len3, cap);
+    let len4 = s.reserve_log(&j.id, a.epoch, cap, 10).unwrap();
+    assert_eq!(len4, cap);
+
+    s.record_artifact(&j.id, a.epoch, ArtifactName::DiffPatch)
+        .unwrap();
+    let rec = s.get_job(&j.id).unwrap();
+    assert!(rec.artifacts.contains(&ArtifactName::DiffPatch));
+}
+
+fn complete_and_retry_cordon<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(
+        &hb(
+            "node-a",
+            HarnessState::Idle,
+            vec![("p1", ProviderState::Ok)],
+        ),
+        now(1, 1),
+    )
+    .unwrap();
+    let mut sp = spec("https://x/c.git", None);
+    sp.provider = Some("p1".to_owned());
+    let (j, _) = s.create_job(&sp, now(1, 1)).unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    s.start_job(&j.id, a.epoch, now(3, 3)).unwrap();
+    // provider failure with retry -> queued attempt+1 and cordon
+    let comp = Completion {
+        job_id: j.id.clone(),
+        epoch: a.epoch,
+        outcome: Outcome::Failed(FailureClass::Provider),
+        exit_code: None,
+        summary: Some("nope".into()),
+    };
+    let rec = s
+        .complete(
+            &comp,
+            Some((FailureClass::Provider, Some("p1".into()))),
+            now(4, 4),
+            1,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(rec.state, JobState::Queued);
+    assert_eq!(rec.attempt, 2);
+    assert_eq!(rec.failure_class, Some(FailureClass::Provider));
+    // cordoned so cannot assign
+    assert!(s.next_assignment(&n, now(5, 5), 60_000).unwrap().is_none());
+    // after expiry
+    assert!(s
+        .next_assignment(&n, now(20_000, 20_000), 60_000)
+        .unwrap()
+        .is_some());
+
+    // execution failure never retries
+    let (j2, _) = s
+        .create_job(&spec("https://x/e.git", None), now(1, 1))
+        .unwrap();
+    let n2 = node("node-b");
+    s.heartbeat(&hb("node-b", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let a2 = s.next_assignment(&n2, now(2, 2), 60_000).unwrap().unwrap();
+    assert_eq!(a2.job_id, j2.id);
+    let comp2 = Completion {
+        job_id: j2.id.clone(),
+        epoch: a2.epoch,
+        outcome: Outcome::Failed(FailureClass::Execution),
+        exit_code: Some(1),
+        summary: None,
+    };
+    let rec2 = s
+        .complete(
+            &comp2,
+            Some((FailureClass::Execution, None)),
+            now(3, 3),
+            1,
+            1000,
+        )
+        .unwrap();
+    assert_eq!(rec2.state, JobState::Failed);
+
+    // success
+    let (j3, _) = s
+        .create_job(&spec("https://x/s.git", None), now(1, 1))
+        .unwrap();
+    let n3 = node("node-c");
+    s.heartbeat(&hb("node-c", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let a3 = s.next_assignment(&n3, now(2, 2), 60_000).unwrap().unwrap();
+    s.start_job(&j3.id, a3.epoch, now(3, 3)).unwrap();
+    let comp3 = Completion {
+        job_id: j3.id.clone(),
+        epoch: a3.epoch,
+        outcome: Outcome::Done,
+        exit_code: Some(0),
+        summary: None,
+    };
+    let rec3 = s.complete(&comp3, None, now(4, 4), 1, 1000).unwrap();
+    assert_eq!(rec3.state, JobState::Done);
+}
+
+fn stale_epoch_rejected<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (j, _) = s
+        .create_job(&spec("https://x/stale.git", None), now(1, 1))
+        .unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    assert_eq!(
+        s.start_job(&j.id, a.epoch - 1, now(3, 3)).unwrap_err(),
+        StoreError::StaleEpoch
+    );
+    assert_eq!(
+        s.renew_lease(&j.id, a.epoch - 1, now(3, 3), 60_000)
+            .unwrap_err(),
+        StoreError::StaleEpoch
+    );
+    assert_eq!(
+        s.reserve_log(&j.id, a.epoch - 1, 0, 1).unwrap_err(),
+        StoreError::StaleEpoch
+    );
+    assert_eq!(
+        s.record_artifact(&j.id, a.epoch - 1, ArtifactName::RunLog)
+            .unwrap_err(),
+        StoreError::StaleEpoch
+    );
+    let comp = Completion {
+        job_id: j.id.clone(),
+        epoch: a.epoch - 1,
+        outcome: Outcome::Done,
+        exit_code: Some(0),
+        summary: None,
+    };
+    assert_eq!(
+        s.complete(&comp, None, now(3, 3), 1, 1000).unwrap_err(),
+        StoreError::StaleEpoch
+    );
+    let unchanged = s.get_job(&j.id).unwrap();
+    assert_eq!(unchanged.state, JobState::Leased);
+}
+
+fn expire_and_recover<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (j, _) = s
+        .create_job(&spec("https://x/exp.git", None), now(1, 1))
+        .unwrap();
+    s.next_assignment(&n, now(2, 2), 100).unwrap().unwrap();
+    let moved = s.expire_leases(now(200, 200)).unwrap();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0], j.id);
+    assert_eq!(s.get_job(&j.id).unwrap().state, JobState::Recovering);
+
+    // recovering -> queued after grace (retry)
+    let moved2 = s.requeue_recovering(now(400, 400), 100, 1).unwrap();
+    assert_eq!(moved2.len(), 1);
+    let rec = s.get_job(&j.id).unwrap();
+    assert_eq!(rec.state, JobState::Queued);
+    assert_eq!(rec.attempt, 2);
+    assert_eq!(rec.failure_class, None);
+
+    // exhausted attempts -> failed
+    let nb = node("node-b");
+    s.heartbeat(&hb("node-b", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let a = s.next_assignment(&nb, now(500, 500), 100).unwrap().unwrap();
+    assert_eq!(a.job_id, j.id);
+    s.expire_leases(now(700, 700)).unwrap();
+    let moved3 = s.requeue_recovering(now(900, 900), 100, 1).unwrap();
+    assert_eq!(moved3.len(), 1);
+    let rec2 = s.get_job(&j.id).unwrap();
+    assert_eq!(rec2.state, JobState::Failed);
+    assert_eq!(rec2.failure_class, Some(FailureClass::Node));
+}
+
+fn recover_on_boot<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (j, _) = s
+        .create_job(&spec("https://x/boot.git", None), now(1, 1))
+        .unwrap();
+    s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    let c = s.recover_on_boot(now(3, 3)).unwrap();
+    assert_eq!(c, 1);
+    assert_eq!(s.get_job(&j.id).unwrap().state, JobState::Recovering);
+}
+
+fn nodes_view<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(
+        &hb(
+            "node-a",
+            HarnessState::Idle,
+            vec![("p1", ProviderState::Ok)],
+        ),
+        now(10, 1000),
+    )
+    .unwrap();
+    s.set_draining(&n, true).unwrap();
+    let view = s.nodes(now(20, 1500), 1000).unwrap();
+    assert_eq!(view.len(), 1);
+    let v = &view[0];
+    assert_eq!(v.name.as_str(), "node-a");
+    assert!(v.draining);
+    assert!(v.online);
+    // not online if outside 2*lease_ms
+    let view2 = s.nodes(now(20, 5000), 1000).unwrap();
+    assert!(!view2[0].online);
+
+    // cordons shown
+    let (j, _) = s
+        .create_job(&spec("https://x/c2.git", None), now(1, 1))
+        .unwrap();
+    let _ = j;
+    // create cordon via provider failure
+}
+
+/// A job that only just began recovering must wait out the grace even when the clock is near zero.
+fn recovery_grace_survives_a_young_clock<S: Store>(s: &S) {
+    let (rec, _) = s
+        .create_job(&spec("https://example.net/r.git", None), now(0, 0))
+        .unwrap();
+    let node = NodeName::from_str("node-a").unwrap();
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(0, 0))
+        .unwrap();
+    let a = s.next_assignment(&node, now(1, 1), 1000).unwrap().unwrap();
+    s.start_job(&a.job_id, a.epoch, now(2, 2)).unwrap();
+    assert_eq!(s.recover_on_boot(now(3, 3)).unwrap(), 1);
+    let moved = s.requeue_recovering(now(3, 3), 30_000, 1).unwrap();
+    assert!(moved.is_empty(), "inside the grace nothing is requeued");
+    let moved = s
+        .requeue_recovering(now(31_000, 31_000), 30_000, 1)
+        .unwrap();
+    assert_eq!(moved, vec![rec.id]);
+}
+
+/// A controller restart must not strand an agent that kept its lease.
+fn a_recovering_job_resumes_or_finishes_for_its_holder<S: Store>(s: &S) {
+    let node = NodeName::from_str("node-a").unwrap();
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(0, 0))
+        .unwrap();
+    // Renew resumes.
+    s.create_job(&spec("https://example.net/r.git", Some("one")), now(0, 0))
+        .unwrap();
+    let a = s.next_assignment(&node, now(1, 1), 1000).unwrap().unwrap();
+    s.start_job(&a.job_id, a.epoch, now(2, 2)).unwrap();
+    s.recover_on_boot(now(3, 3)).unwrap();
+    assert_eq!(s.get_job(&a.job_id).unwrap().state, JobState::Recovering);
+    s.reserve_log(&a.job_id, a.epoch, 0, 4).unwrap();
+    s.renew_lease(&a.job_id, a.epoch, now(4, 4), 1000).unwrap();
+    assert_eq!(s.get_job(&a.job_id).unwrap().state, JobState::Running);
+    assert!(s
+        .requeue_recovering(now(90_000, 90_000), 30_000, 1)
+        .unwrap()
+        .is_empty());
+    // A stale epoch still cannot resume.
+    s.recover_on_boot(now(5, 5)).unwrap();
+    assert_eq!(
+        s.renew_lease(&a.job_id, a.epoch + 1, now(6, 6), 1000),
+        Err(StoreError::StaleEpoch)
+    );
+}

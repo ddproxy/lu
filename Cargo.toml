@@ -8,6 +8,7 @@ members = [
     "crates/lu-store",
     "crates/lu-supervise",
     "crates/lu-staging",
+    "crates/lu-controller",
     "app",
 ]
 resolver = "2"

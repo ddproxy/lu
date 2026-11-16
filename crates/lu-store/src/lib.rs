@@ -5,6 +5,12 @@
 //! [`Now`] so tests control it: lease expiry uses `mono_ms` only (a clock that never jumps), the
 //! `*_at` fields shown to people use `wall_unix`.
 
+pub mod memory;
+pub mod sqlite;
+
+#[cfg(test)]
+pub mod conformance;
+
 use lu_proto::{
     ArtifactName, Completion, FailureClass, Heartbeat, JobId, JobSpec, JobState, NodeName,
 };
@@ -60,7 +66,9 @@ pub enum StoreError {
     NotFound,
     /// Same idempotency key, different spec; or an illegal state edge; or a log offset that is not
     /// the stored length (`length` carries it).
-    Conflict { length: Option<u64> },
+    Conflict {
+        length: Option<u64>,
+    },
     /// The write names an epoch older than the job's.
     StaleEpoch,
     Internal(String),
@@ -105,12 +113,8 @@ pub trait Store: Send + Sync + 'static {
     /// Reserves `n` log bytes at `offset`; conflicts with the stored length when they differ.
     /// Returns the new length. The caller then writes the bytes to the log file.
     fn reserve_log(&self, id: &JobId, epoch: u64, offset: u64, n: u64) -> Result<u64, StoreError>;
-    fn record_artifact(
-        &self,
-        id: &JobId,
-        epoch: u64,
-        name: ArtifactName,
-    ) -> Result<(), StoreError>;
+    fn record_artifact(&self, id: &JobId, epoch: u64, name: ArtifactName)
+        -> Result<(), StoreError>;
     /// Finishes the attempt. Success is `done`; a node or provider failure with attempts left
     /// returns the job to `queued` (attempt + 1) and cordons `(node, provider)` for a provider
     /// failure; anything else is `failed`. `cordon_ms` and `max_retries` come from config.
