@@ -638,12 +638,29 @@ fn display_field(text: &str) -> String {
     printable(&truncate_chars(text, SUMMARY_CHARS))
 }
 
+/// Unix seconds as `YYYY-MM-DD HH:MM:SSZ`, computed by hand to avoid a date dependency.
 fn time(value: u64) -> String {
     if value == 0 {
-        "-".to_owned()
-    } else {
-        format!("{value}ms")
+        return "-".to_owned();
     }
+    let days = (value / 86_400) as i64;
+    let secs = value % 86_400;
+    // Civil-from-days (proleptic Gregorian), valid far beyond any real timestamp.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}Z",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    )
 }
 
 fn optional_time(value: Option<u64>) -> String {
@@ -721,5 +738,17 @@ fn finish(result: Result<ExitCode, String>) -> ExitCode {
             eprintln!("lu: {message}");
             ExitCode::from(EXIT_ERROR)
         }
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::time;
+
+    #[test]
+    fn unix_seconds_render_as_utc() {
+        assert_eq!(time(0), "-");
+        assert_eq!(time(1_794_818_368), "2026-11-16 08:39:28Z");
+        assert_eq!(time(951_782_400), "2000-02-29 00:00:00Z");
     }
 }
