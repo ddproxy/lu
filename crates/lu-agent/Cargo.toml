@@ -21,6 +21,9 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
+lu-proto = { path = "../lu-proto" }
+lu-staging = { path = "../lu-staging" }
+lu-supervise = { path = "../lu-supervise" }
 
 [lints]
 workspace = true

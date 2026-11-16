@@ -966,3 +966,6 @@ fn create_work_dir(path: &Path) -> Result<(), AgentError> {
             .map_err(|error| AgentError::Config(format!("cannot create work_dir: {error}")))
     }
 }
+
+#[cfg(test)]
+mod tests;
