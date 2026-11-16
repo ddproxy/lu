@@ -55,7 +55,7 @@ The `[agent]` table describes an agent host. The operator CLI also reads `contro
 | `controller_url` | yes | — | `http` or `https` URL with a host. No credentials, query or fragment. `http` is allowed only for `localhost` or a loopback IP. A path is allowed but must not contain `.` or `..` segments. |
 | `token_file` | yes | — | Non-empty path. On `load`, it must be a regular file, owned by the effective user, with no group or other permission bits, no symlink and no FIFO; at most 64 KiB. The CLI trims trailing CR/LF from the token text. |
 | `ca_file` | no | — | Non-empty path when set. The client reads up to 1 MiB of PEM certificates and adds them to the system trust roots; it does not replace the system roots. Not checked by `lu check` beyond the non-empty test. |
-| `work_dir` | yes | — | Absolute path; must not contain `..`. The staging layer additionally requires it to exist, be a real directory (not a symlink), and not be `/` or a bare top-level directory. |
+| `work_dir` | yes | — | Absolute path; must not contain `..`. Staging also requires it to exist, be a real directory (not a symlink), and not be `/` or a bare top-level directory. |
 | `harness` | yes | — | Non-empty. The configured harness name; jobs use the harness named in their spec, and 0.1.0 runs `opencode` only. |
 | `opencode_server` | no | — | Non-empty when set. Opaque endpoint passed to the harness launcher. |
 | `slots` | no | `1` | Exactly `1` in 0.1.0 (`1` to `1`). |
