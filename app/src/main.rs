@@ -31,7 +31,7 @@ enum Command {
     Check,
     /// Run the HTTP listener. This is the default.
     Serve,
-    /// Live terminal dashboard demo. Needs a build with the `tui` feature. Ignores --config.
+    /// Live terminal view of the nodes and recent jobs. Needs a build with the `tui` feature.
     #[cfg(feature = "tui")]
     Top,
     /// Run the node agent loop. Needs an `[agent]` config.
@@ -64,7 +64,7 @@ async fn main() -> ExitCode {
         Command::Check => check(&cli.config),
         Command::Serve => serve(&cli.config).await,
         #[cfg(feature = "tui")]
-        Command::Top => match top::run().await {
+        Command::Top => match top::run(&cli.config).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(&error),
         },

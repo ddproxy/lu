@@ -1,12 +1,13 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::model::Dashboard;
+use crate::model::{Dashboard, Snapshot};
 use crate::render;
 use crate::terminal::TerminalGuard;
 
@@ -34,21 +35,18 @@ pub fn action_for(event: KeyEvent) -> Option<Action> {
     }
 }
 
-/// Runs the demo dashboard until the user quits or `stop` is set. The caller sets `stop` from a
-/// signal handler; the guard restores the terminal on the way out either way.
-pub fn run_demo(stop: &AtomicBool, tick: Duration) -> io::Result<()> {
+/// Runs the dashboard until the user quits or `stop` is set, applying each refresh from `feed`.
+/// The caller sets `stop` from a signal handler; the guard restores the terminal either way.
+pub fn run_live(feed: &Receiver<Result<Snapshot, String>>, stop: &AtomicBool) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut dashboard = Dashboard::new(&["peer-a", "peer-b", "host-1"]);
-    let mut last_tick = Instant::now();
+    let mut dashboard = Dashboard::new();
     while !stop.load(Ordering::Relaxed) {
-        let now = Instant::now();
-        if now.duration_since(last_tick) >= tick {
-            dashboard.tick();
-            last_tick = now;
+        while let Ok(result) = feed.try_recv() {
+            dashboard.apply(result, Instant::now());
         }
-        terminal.draw(|frame| render::draw(frame, &dashboard.view(now)))?;
-        if event::poll(POLL.min(tick))? {
+        terminal.draw(|frame| render::draw(frame, &dashboard.view(Instant::now())))?;
+        if event::poll(POLL)? {
             if let Event::Key(key) = event::read()? {
                 match action_for(key) {
                     Some(Action::Quit) => break,

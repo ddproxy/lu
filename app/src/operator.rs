@@ -414,7 +414,7 @@ struct Settings {
     ca_file: Option<PathBuf>,
 }
 
-fn connect(config: &Path) -> Result<Client, String> {
+pub(crate) fn connect(config: &Path) -> Result<Client, String> {
     let settings = settings(config)?;
     let text = lu_config::read_private_file("operator token", &settings.token_file, TOKEN_LIMIT)
         .map_err(|error| error.to_string())?;
@@ -667,7 +667,7 @@ fn optional_time(value: Option<u64>) -> String {
     value.map(time).unwrap_or_else(|| "-".to_owned())
 }
 
-fn harness_name(value: Option<HarnessState>) -> String {
+pub(crate) fn harness_name(value: Option<HarnessState>) -> String {
     match value {
         Some(HarnessState::Idle) => "idle".to_owned(),
         Some(HarnessState::Busy) => "busy".to_owned(),
@@ -675,7 +675,7 @@ fn harness_name(value: Option<HarnessState>) -> String {
     }
 }
 
-fn failure_name(value: Option<FailureClass>) -> String {
+pub(crate) fn failure_name(value: Option<FailureClass>) -> String {
     match value {
         Some(FailureClass::Node) => "node".to_owned(),
         Some(FailureClass::Provider) => "provider".to_owned(),
@@ -684,7 +684,7 @@ fn failure_name(value: Option<FailureClass>) -> String {
     }
 }
 
-fn state_name(state: JobState) -> &'static str {
+pub(crate) fn state_name(state: JobState) -> &'static str {
     match state {
         JobState::Queued => "queued",
         JobState::Leased => "leased",

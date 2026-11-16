@@ -5,6 +5,12 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-16
+
+### Changed
+
+- `lu top` shows the real fleet: nodes with state, last heartbeat and provider health, and the recent jobs, refreshed every two seconds. It was a demo with fake counters.
+
 ## [0.1.4] - 2026-11-16
 
 ### Fixed
