@@ -12,7 +12,7 @@ operator --HTTPS--> controller <--HTTPS poll-- agent --process group--> harness
 
 The controller owns job state, leases, retry decisions and node cordons. An agent has one job slot in 0.1.0; it stages a fresh checkout, supervises the harness, and reports logs and artifacts back to the controller.
 
-**Status:** the controller and operator CLI are usable. The 0.1.0 tree does not contain an agent runtime or an `lu agent` subcommand, so a submitted job stays `queued` until an agent is available. See *Known gaps* below.
+**Status:** controller, agent and operator CLI work end to end. A submitted job is leased to an agent, run by a harness under supervision, and finishes with a diff, a log and a report. See *Known gaps* below.
 
 ## Install
 
@@ -87,16 +87,13 @@ These steps run a controller and the operator CLI on one machine. Run them as yo
 
    `lu submit` prints the new job id. With no agent running the job remains `queued`; `lu logs` is empty and `lu cancel` moves a queued job to `cancelled`.
 
-5. The intended single-machine agent flow, once the agent runtime is available, is:
+5. Run an agent on the same machine. Write `$HOME/lu-demo/agent.toml` with an `[agent]` table (`name = "node-a"`, `controller_url = "http://127.0.0.1:7600"`, `token_file` pointing at `agent.token`, a `work_dir` under `lu-demo`, `harness = "opencode"`), then:
 
    ```sh
    lu agent --config "$HOME/lu-demo/agent.toml"
-   lu submit --repo /path/to/repository --ref main --task "run the test suite" --wait
-   lu logs --follow <job-id>
-   lu fetch <job-id> --out results
    ```
 
-   `lu agent` is not implemented in this tree, so step 5 cannot run yet. The CLI also does not currently read the controller's `X-Lu-State` log header, so `logs --follow` may not notice a terminal job on its own; stop it with Ctrl-C if it keeps waiting. These are code/document mismatches, not configuration errors.
+   In the other shell, `lu submit ... --wait` returns when the job is done, `lu logs --follow <job-id>` streams its output, and `lu fetch <job-id> --out results` saves the diff, log and report.
 
 For a controller on a non-loopback address, add a `[tls]` table with `cert` and `key`; plain HTTP is accepted only on loopback. See [docs/config.md](docs/config.md).
 
@@ -134,14 +131,13 @@ Operator connection settings come from `LU_URL`, `LU_TOKEN_FILE` and optional `L
 
 - No web UI and no interactive attach to a running harness in 0.1.0.
 - No push channel: agents poll the controller.
-- No agent runtime in this tree yet, so the controller cannot dispatch work on its own.
 - One job per agent: `slots` is validated as exactly `1`.
 - No controller-side provider credentials; provider authentication stays on the leaf in 0.1.0.
 
 ## Known gaps
 
-- `lu agent` and the agent main loop are missing.
-- The typed client's agent calls do not match the controller's current wire shapes, and `lu nodes`/`drain` do not decode the controller's current responses. See the task report for the exact mismatches.
+- The agent runs the harness as its own user; see `docs/security.md`.
+- The agent sends no provider health, so the controller does not yet steer around a cooling provider.
 - `[service].shutdown_timeout_secs` is validated but not applied; the listener drains for a fixed 10 seconds.
 
 ## Crates

@@ -161,11 +161,11 @@ The units apply `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `Priva
 `PrivateDevices`, restricted address families, an empty capability set, a system-call filter
 and `LimitNOFILE`. They are `Type=simple`; there is no `sd_notify` support.
 
-**0.1.0 limitation:** there is no agent runtime, so nothing currently drops privileges to
-`lu-harness` or arranges access to a job's `0700` directory. The agent unit is a template and
-must not be enabled yet. A future runtime has to make only the job directory available to
-`lu-harness`, then exec the harness as that account without passing the token. Until then, the
-controller unit is the only one of the two that can run.
+**0.1.0 limitation:** the agent runs the harness as its own user. The harness gets a minimal
+environment and never receives the token as an argument or variable, but it can read any file
+the agent can, including the token file. Run the agent as a dedicated account that holds no other
+secrets, and treat a job's harness as able to act with that account's rights. Separating the
+harness into `lu-harness` is planned.
 
 ## Credentials stay on the leaf in 0.1.0
 

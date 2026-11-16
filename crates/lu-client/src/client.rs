@@ -476,10 +476,11 @@ impl Client {
             .send(Method::POST, &routes, Some(body), &[], &[], false)
             .await?;
         let reply = self.success(reply)?;
-        if reply.body.is_empty() {
-            return Ok(NodeView::placeholder(node.clone(), drain));
+        // The controller answers with an empty object; a full node record is accepted too.
+        match parse_node(&reply.body) {
+            Ok(view) if !reply.body.iter().all(u8::is_ascii_whitespace) => self.scrub(Ok(view)),
+            _ => Ok(NodeView::placeholder(node.clone(), drain)),
         }
-        self.scrub(parse_node(&reply.body))
     }
 
     pub async fn drain(&self, node: &NodeName) -> Result<NodeView> {
@@ -1185,18 +1186,19 @@ fn parse_log(reply: &HttpReply, requested_offset: u64) -> LogPage {
         return page;
     }
     let data = String::from_utf8_lossy(&reply.body).into_owned();
-    let offset = reply
+    // The controller answers with the log bytes from `offset`, and says where the job stands in
+    // `X-Lu-State`; a follower stops when that state is terminal.
+    let offset = requested_offset.saturating_add(reply.body.len() as u64);
+    let state = reply
         .headers
-        .get("x-lu-offset")
-        .or_else(|| reply.headers.get("x-next-offset"))
+        .get("x-lu-state")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| requested_offset.saturating_add(data.len() as u64));
+        .and_then(|value| serde_json::from_value::<JobState>(Value::String(value.to_owned())).ok());
     LogPage {
         data,
         offset,
-        state: None,
-        terminal: false,
+        state,
+        terminal: state.is_some_and(JobState::is_terminal),
     }
 }
 

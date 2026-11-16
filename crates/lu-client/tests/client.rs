@@ -643,3 +643,42 @@ async fn the_controller_trait_can_be_faked() {
     assert!(fake.poll(&PollRequest::default()).await.unwrap().is_empty());
     fake.start(&job_id(), 1).await.unwrap();
 }
+
+#[tokio::test]
+async fn a_text_log_page_reports_the_job_state_from_the_header() {
+    let server = start(|_| {
+        let mut reply = Reply::ok("tail\n");
+        reply.headers = vec![
+            ("content-type".to_owned(), "text/plain".to_owned()),
+            ("x-lu-log-length".to_owned(), "15".to_owned()),
+            ("x-lu-state".to_owned(), "done".to_owned()),
+        ];
+        reply
+    })
+    .await;
+    let page = client(&server).logs(&job_id(), 10, None).await.unwrap();
+    assert_eq!(page.data, "tail\n");
+    assert_eq!(
+        page.offset, 15,
+        "the next read starts after what was returned"
+    );
+    assert_eq!(page.state, Some(lu_proto::JobState::Done));
+    assert!(page.terminal);
+
+    let running = start(|_| {
+        let mut reply = Reply::ok("more");
+        reply.headers = vec![("x-lu-state".to_owned(), "running".to_owned())];
+        reply
+    })
+    .await;
+    let page = client(&running).logs(&job_id(), 0, None).await.unwrap();
+    assert!(!page.terminal);
+}
+
+#[tokio::test]
+async fn drain_accepts_the_controllers_empty_object_reply() {
+    let node = NodeName::parse("node-a").unwrap();
+    let server = start(|_| Reply::json(&json!({}))).await;
+    let view = client(&server).drain(&node).await.unwrap();
+    assert_eq!(view.name.as_str(), "node-a");
+}

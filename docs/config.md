@@ -56,7 +56,7 @@ The `[agent]` table describes an agent host. The operator CLI also reads `contro
 | `token_file` | yes | — | Non-empty path. On `load`, it must be a regular file, owned by the effective user, with no group or other permission bits, no symlink and no FIFO; at most 64 KiB. The CLI trims trailing CR/LF from the token text. |
 | `ca_file` | no | — | Non-empty path when set. The client reads up to 1 MiB of PEM certificates and adds them to the system trust roots; it does not replace the system roots. Not checked by `lu check` beyond the non-empty test. |
 | `work_dir` | yes | — | Absolute path; must not contain `..`. The staging layer additionally requires it to exist, be a real directory (not a symlink), and not be `/` or a bare top-level directory. |
-| `harness` | yes | — | Non-empty. The harness name is passed to the agent's harness launcher; 0.1.0 has no agent runtime to act on it. |
+| `harness` | yes | — | Non-empty. The configured harness name; jobs use the harness named in their spec, and 0.1.0 runs `opencode` only. |
 | `opencode_server` | no | — | Non-empty when set. Opaque endpoint passed to the harness launcher. |
 | `slots` | no | `1` | Exactly `1` in 0.1.0 (`1` to `1`). |
 | `heartbeat_secs` | no | `15` | Integer `2` to `300`. When a `[controller]` table is also present, `heartbeat_secs * 2` must be strictly less than `lease_secs`. |
@@ -136,4 +136,3 @@ harness = "opencode"
 
 - `[[controller.agents]].cordoned` is parsed but not applied to the store.
 - `[service].shutdown_timeout_secs` is validated but the fixed 10-second drain is used.
-- The `[agent]` table is validated, but the binary has no agent runtime and no `agent` subcommand yet.

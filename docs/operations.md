@@ -2,7 +2,7 @@
 
 This page covers a packaged controller deployment, upgrades, backup, restart behaviour, leases and retries, provider cordons, and how to read `lu nodes`.
 
-**0.1.0 status:** the controller and operator CLI exist. There is no agent runtime or `lu agent` subcommand in this tree, so the agent unit is a template and jobs stay `queued` unless an agent is supplied by other means. The controller-side instructions below are usable today.
+**0.1.0 status:** controller, agent (`lu agent`) and operator CLI work end to end. Read the agent limitation in `docs/security.md` before running an agent next to anything sensitive.
 
 ## Layout
 

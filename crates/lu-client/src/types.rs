@@ -78,7 +78,7 @@ pub struct NodeView {
     pub providers: Vec<ProviderStatus>,
     #[serde(default, alias = "heartbeat_at", alias = "last_seen_at")]
     pub last_seen: u64,
-    #[serde(default, alias = "drained")]
+    #[serde(default, alias = "drained", alias = "draining")]
     pub cordoned: bool,
 }
 
@@ -350,6 +350,13 @@ mod tests {
         let node: NodeView =
             serde_json::from_str(r#"{"name":"node-a","drained":true,"harness":"idle"}"#).unwrap();
         assert_eq!(node.name.as_str(), "node-a");
+        assert!(node.cordoned);
+    }
+
+    #[test]
+    fn node_views_accept_the_controllers_draining_field() {
+        let node: NodeView =
+            serde_json::from_str(r#"{"name":"node-a","draining":true,"harness":"idle"}"#).unwrap();
         assert!(node.cordoned);
     }
 }

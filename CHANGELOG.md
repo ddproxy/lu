@@ -30,13 +30,12 @@ First packaging release.
 
 ### Known gaps in 0.1.0
 
-- There is no agent runtime and no `lu agent` subcommand. `lu-agent.service` is a template and
-  must not be enabled; submitted jobs stay `queued` without an agent supplied by other means.
-- The typed client's agent calls do not match the controller's current wire shapes, and
-  `lu nodes` / `lu drain` do not decode the controller's current responses. Use `--json` where
-  documented.
-- `logs --follow` does not read the controller's `X-Lu-State` header, so it may not stop at a
-  terminal state on its own.
+- The agent runs the harness as its own user, so a harness can read the agent's token file.
+  Run the agent as a dedicated account that holds nothing else. Privilege separation is planned.
+- Leaf agents use their own credentials to check out private repositories; controller-side
+  fetch is planned.
+- The agent reports no provider health, so the controller does not yet steer around a cooling
+  provider.
 - `[service].shutdown_timeout_secs` is validated but the in-flight drain is fixed at 10 seconds.
 - `[[controller.agents]].cordoned` is parsed but does not seed the node's drain state.
 - Provider credentials stay on the agent/leaf host; there is no controller-side credential
