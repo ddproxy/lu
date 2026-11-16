@@ -1,0 +1,618 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::response::Response;
+use axum::Router;
+use lu_client::{ApiError, Client, ClientOptions, Controller, LogPage, PollRequest};
+use lu_proto::{
+    AgentEvent, ArtifactName, Completion, FailureClass, JobId, JobSpec, JobState, LogChunk,
+    NodeName, Outcome,
+};
+use serde_json::{json, Value};
+use tokio::net::TcpListener;
+
+const TOKEN: &str = "operator-token-do-not-print";
+
+#[derive(Debug, Clone)]
+struct Recorded {
+    method: String,
+    path: String,
+    query: Option<String>,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Recorded {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Reply {
+    fn ok(body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status: 200,
+            headers: Vec::new(),
+            body: body.into(),
+        }
+    }
+
+    fn json(value: &Value) -> Self {
+        Self {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: value.to_string().into_bytes(),
+        }
+    }
+
+    fn status(status: u16) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    fn with_header(mut self, key: &str, value: &str) -> Self {
+        self.headers.push((key.to_owned(), value.to_owned()));
+        self
+    }
+}
+
+type Responder = dyn Fn(&Recorded) -> Reply + Send + Sync;
+
+#[derive(Clone)]
+struct FakeState {
+    records: Arc<Mutex<Vec<Recorded>>>,
+    responder: Arc<Responder>,
+}
+
+struct TestServer {
+    url: String,
+    records: Arc<Mutex<Vec<Recorded>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn start<F>(responder: F) -> TestServer
+where
+    F: Fn(&Recorded) -> Reply + Send + Sync + 'static,
+{
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let state = FakeState {
+        records: Arc::clone(&records),
+        responder: Arc::new(responder),
+    };
+    let app = Router::new().fallback(fallback).with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    TestServer {
+        url: format!("http://{addr}"),
+        records,
+        handle,
+    }
+}
+
+async fn fallback(
+    State(state): State<FakeState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let recorded = Recorded {
+        method: method.to_string(),
+        path: uri.path().to_owned(),
+        query: uri.query().map(str::to_owned),
+        headers: headers
+            .iter()
+            .filter_map(|(key, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (key.as_str().to_owned(), value.to_owned()))
+            })
+            .collect(),
+        body: body.to_vec(),
+    };
+    state.records.lock().unwrap().push(recorded.clone());
+    let reply = (state.responder)(&recorded);
+    let mut response = Response::builder().status(StatusCode::from_u16(reply.status).unwrap());
+    for (key, value) in reply.headers {
+        response = response.header(key, value);
+    }
+    response.body(Body::from(reply.body)).unwrap()
+}
+
+fn client(server: &TestServer) -> Client {
+    Client::new(&server.url, TOKEN, None).unwrap()
+}
+
+fn fast_options() -> ClientOptions {
+    ClientOptions {
+        backoff: Duration::from_millis(1),
+        max_attempts: 3,
+        ..ClientOptions::default()
+    }
+}
+
+fn job_id() -> JobId {
+    JobId::new()
+}
+
+fn job_json(id: &JobId, state: JobState) -> Value {
+    json!({
+        "id": id,
+        "state": state,
+        "spec": {"repo": "/srv/repo", "git_ref": "main", "task": "go"},
+        "attempt": 1,
+        "created_at": 10,
+        "started_at": 11,
+        "failure_class": "execution",
+        "summary": "failed tests\n\u{1b}[31m"
+    })
+}
+
+fn spec() -> JobSpec {
+    JobSpec {
+        repo: "https://example.net/repo.git".to_owned(),
+        git_ref: "main".to_owned(),
+        task: "run the tests".to_owned(),
+        harness: "opencode".to_owned(),
+        provider: None,
+        model: None,
+        timeout_secs: 60,
+        idle_timeout_secs: None,
+        idempotency_key: Some("ticket:42".to_owned()),
+    }
+}
+
+fn completion(id: JobId) -> Completion {
+    Completion {
+        job_id: id,
+        epoch: 7,
+        outcome: Outcome::Failed(FailureClass::Execution),
+        exit_code: Some(2),
+        summary: Some("bad".to_owned()),
+    }
+}
+
+#[tokio::test]
+async fn submit_posts_the_spec_and_keeps_the_idempotency_key() {
+    let id = job_id();
+    let body = job_json(&id, JobState::Queued);
+    let server = start(move |_| Reply::json(&body)).await;
+    let client = client(&server);
+    let view = client.submit(&spec()).await.unwrap();
+    assert_eq!(view.id, id);
+    let records = server.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].method, "POST");
+    assert_eq!(records[0].path, "/v1/jobs");
+    assert_eq!(
+        records[0].header("authorization"),
+        Some("Bearer operator-token-do-not-print")
+    );
+    assert_eq!(records[0].header("idempotency-key"), Some("ticket:42"));
+    let sent: JobSpec = serde_json::from_slice(&records[0].body).unwrap();
+    assert_eq!(sent, spec());
+}
+
+#[tokio::test]
+async fn list_jobs_sends_the_filters_and_reads_a_page() {
+    let id = job_id();
+    let body = json!({"jobs": [job_json(&id, JobState::Running)]});
+    let server = start(move |_| Reply::json(&body)).await;
+    let client = client(&server);
+    let page = client
+        .list_jobs(Some(JobState::Running), Some(5))
+        .await
+        .unwrap();
+    assert_eq!(page.jobs.len(), 1);
+    assert_eq!(page.jobs[0].id, id);
+    let records = server.records.lock().unwrap();
+    assert_eq!(records[0].path, "/v1/jobs");
+    assert_eq!(records[0].query.as_deref(), Some("state=running&limit=5"));
+}
+
+#[tokio::test]
+async fn list_jobs_accepts_a_bare_array() {
+    let id = job_id();
+    let body = json!([job_json(&id, JobState::Done)]);
+    let server = start(move |_| Reply::json(&body)).await;
+    let page = client(&server).list_jobs(None, None).await.unwrap();
+    assert_eq!(page.jobs[0].id, id);
+}
+
+#[tokio::test]
+async fn get_job_uses_the_job_route() {
+    let id = job_id();
+    let body = job_json(&id, JobState::Running);
+    let server = start(move |_| Reply::json(&body)).await;
+    let view = client(&server).get_job(&id).await.unwrap();
+    assert_eq!(view.node, None);
+    assert_eq!(view.failure_class, Some(FailureClass::Execution));
+    let records = server.records.lock().unwrap();
+    assert_eq!(records[0].path, format!("/v1/jobs/{id}"));
+    assert_eq!(records[0].method, "GET");
+}
+
+#[tokio::test]
+async fn logs_sends_offset_and_wait_and_reads_the_next_offset() {
+    let id = job_id();
+    let body = json!({"data": "hello\n", "next": 12, "state": "running"});
+    let server = start(move |_| Reply::json(&body)).await;
+    let page: LogPage = client(&server).logs(&id, 3, Some(25)).await.unwrap();
+    assert_eq!(page.data, "hello\n");
+    assert_eq!(page.offset, 12);
+    assert_eq!(page.state, Some(JobState::Running));
+    assert!(!page.terminal);
+    let records = server.records.lock().unwrap();
+    assert_eq!(records[0].path, format!("/v1/jobs/{id}/logs"));
+    assert_eq!(records[0].query.as_deref(), Some("offset=3&wait=25"));
+}
+
+#[tokio::test]
+async fn logs_accept_plain_text_and_advance_by_the_body_length() {
+    let id = job_id();
+    let server = start(|_| Reply::ok("abc".as_bytes().to_vec())).await;
+    let page = client(&server).logs(&id, 10, None).await.unwrap();
+    assert_eq!(page.data, "abc");
+    assert_eq!(page.offset, 13);
+}
+
+#[tokio::test]
+async fn fetch_artifact_uses_the_fixed_name_and_returns_bytes() {
+    let id = job_id();
+    let server = start(|record| {
+        assert!(record.path.ends_with("/artifacts/diff.patch"));
+        Reply::ok(b"diff --git".to_vec())
+    })
+    .await;
+    let bytes = client(&server)
+        .fetch_artifact(&id, ArtifactName::DiffPatch)
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"diff --git");
+}
+
+#[tokio::test]
+async fn missing_artifacts_are_not_found() {
+    let id = job_id();
+    let server = start(|_| Reply::status(404)).await;
+    let error = client(&server)
+        .fetch_artifact(&id, ArtifactName::ReportJson)
+        .await
+        .unwrap_err();
+    assert_eq!(error, ApiError::NotFound);
+}
+
+#[tokio::test]
+async fn cancel_accepts_an_empty_reply() {
+    let id = job_id();
+    let server = start(|_| Reply::status(204)).await;
+    let view = client(&server).cancel(&id).await.unwrap();
+    assert_eq!(view.id, id);
+    assert_eq!(view.state, JobState::Cancelled);
+    let records = server.records.lock().unwrap();
+    assert_eq!(records[0].method, "POST");
+    assert_eq!(records[0].path, format!("/v1/jobs/{id}/cancel"));
+}
+
+#[tokio::test]
+async fn nodes_reads_wrapped_and_bare_lists() {
+    let wrapped = json!({"nodes": [{"name": "node-a", "harness": "idle", "cordoned": false}]});
+    let server = start(move |_| Reply::json(&wrapped)).await;
+    let nodes = client(&server).nodes().await.unwrap();
+    assert_eq!(nodes.nodes[0].name.as_str(), "node-a");
+    assert_eq!(nodes.nodes[0].harness, Some(lu_proto::HarnessState::Idle));
+}
+
+#[tokio::test]
+async fn drain_and_undrain_hit_the_node_actions() {
+    let node = NodeName::parse("node-a").unwrap();
+    let reply = json!({"name": "node-a", "cordoned": true});
+    let server = start(move |_| Reply::json(&reply)).await;
+    let client = client(&server);
+    let view = client.drain(&node).await.unwrap();
+    assert!(view.cordoned);
+    let _ = client.undrain(&node).await.unwrap();
+    let records = server.records.lock().unwrap();
+    assert_eq!(records[0].path, "/v1/nodes/node-a/drain");
+    assert_eq!(records[1].path, "/v1/nodes/node-a/undrain");
+}
+
+#[tokio::test]
+async fn every_agent_call_uses_the_documented_path_and_epoch() {
+    let id = job_id();
+    let poll_id = id.clone();
+    let server = start(move |record| match record.path.as_str() {
+        path if path.ends_with("/poll") => {
+            Reply::json(&json!({"kind":"cancel","job_id": poll_id, "epoch": 7}))
+        }
+        _ => Reply::status(204),
+    })
+    .await;
+    let client = client(&server);
+    let event = client
+        .poll(&PollRequest::for_node(NodeName::parse("node-a").unwrap()))
+        .await
+        .unwrap();
+    assert!(matches!(event, Some(AgentEvent::Cancel { epoch: 7, .. })));
+
+    client.start(&id, 7).await.unwrap();
+    client.renew(&id, 7).await.unwrap();
+    client
+        .append_log(&LogChunk {
+            job_id: id.clone(),
+            epoch: 7,
+            seq: 1,
+            data: "line\n".to_owned(),
+        })
+        .await
+        .unwrap();
+    client
+        .put_artifact(&id, 7, ArtifactName::RunLog, b"log")
+        .await
+        .unwrap();
+    client.complete(&completion(id.clone())).await.unwrap();
+
+    let records = server.records.lock().unwrap();
+    let paths: Vec<&str> = records.iter().map(|record| record.path.as_str()).collect();
+    assert_eq!(paths[0], "/v1/agent/poll");
+    assert_eq!(paths[1], format!("/v1/agent/jobs/{id}/start"));
+    assert_eq!(paths[2], format!("/v1/agent/jobs/{id}/renew"));
+    assert_eq!(paths[3], format!("/v1/agent/jobs/{id}/logs"));
+    assert_eq!(paths[4], format!("/v1/agent/jobs/{id}/artifacts/run.log"));
+    assert_eq!(paths[5], format!("/v1/agent/jobs/{id}/complete"));
+    assert_eq!(records[1].header("x-lu-epoch"), Some("7"));
+    assert_eq!(records[4].query.as_deref(), Some("epoch=7"));
+    assert_eq!(records[4].body, b"log");
+    let sent: Value = serde_json::from_slice(&records[5].body).unwrap();
+    assert_eq!(sent["job_id"], json!(id));
+    assert_eq!(sent["epoch"], json!(7));
+}
+
+#[tokio::test]
+async fn an_empty_poll_is_no_assignment() {
+    let server = start(|_| Reply::status(204)).await;
+    let event = client(&server).poll(&PollRequest::default()).await.unwrap();
+    assert!(event.is_none());
+}
+
+#[tokio::test]
+async fn stale_epoch_conflict_and_unauthorized_are_distinct() {
+    let id = job_id();
+    let gone = start(|_| Reply::status(410)).await;
+    assert_eq!(
+        client(&gone).get_job(&id).await.unwrap_err(),
+        ApiError::StaleEpoch
+    );
+
+    let conflict = start(|_| {
+        let mut reply = Reply::json(&json!({"error":"conflict","length":17}));
+        reply.status = 409;
+        reply
+    })
+    .await;
+    assert_eq!(
+        client(&conflict).get_job(&id).await.unwrap_err(),
+        ApiError::Conflict { length: 17 }
+    );
+
+    let denied = start(|_| Reply::status(401)).await;
+    assert_eq!(
+        client(&denied).get_job(&id).await.unwrap_err(),
+        ApiError::Unauthorized
+    );
+}
+
+#[tokio::test]
+async fn a_redirect_is_refused_and_not_followed() {
+    let id = job_id();
+    let location = format!("http://{}", "example.net");
+    let server =
+        start(move |_| Reply::status(302).with_header("location", &format!("{location}/steal")))
+            .await;
+    let error = client(&server).get_job(&id).await.unwrap_err();
+    assert!(
+        matches!(error, ApiError::Redirect { status: 302 }),
+        "{error:?}"
+    );
+    assert_eq!(server.records.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_json_body_has_a_hard_cap() {
+    let id = job_id();
+    let server = start(|_| Reply::ok(vec![b'x'; 256])).await;
+    let options = ClientOptions {
+        max_json_bytes: 64,
+        ..fast_options()
+    };
+    let client = Client::new_with_options(&server.url, TOKEN, options).unwrap();
+    let error = client.get_job(&id).await.unwrap_err();
+    assert_eq!(error, ApiError::TooLarge { limit: 64 });
+}
+
+#[tokio::test]
+async fn debug_and_errors_never_contain_the_token() {
+    let id = job_id();
+    let echo = format!("token was {TOKEN}");
+    let server = start(move |_| {
+        let mut reply = Reply::json(&json!({"error":"denied","echo": echo}));
+        reply.status = 403;
+        reply
+    })
+    .await;
+    let client = client(&server);
+    assert!(!format!("{client:?}").contains(TOKEN));
+    let error = client.get_job(&id).await.unwrap_err();
+    assert!(!format!("{error:?}").contains(TOKEN), "{error:?}");
+    assert!(!error.to_string().contains(TOKEN), "{error}");
+}
+
+#[tokio::test]
+async fn a_hostile_success_body_cannot_leak_the_token() {
+    let id = job_id();
+    let body = format!("this is not json and it mentions {TOKEN}");
+    let server = start(move |_| Reply::ok(body.clone().into_bytes())).await;
+    let error = client(&server).get_job(&id).await.unwrap_err();
+    assert!(matches!(error, ApiError::Decode { .. }), "{error:?}");
+    assert!(!format!("{error:?}").contains(TOKEN), "{error:?}");
+    assert!(!error.to_string().contains(TOKEN), "{error}");
+}
+
+#[tokio::test]
+async fn only_idempotent_gets_are_retried() {
+    let id = job_id();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let body = job_json(&id, JobState::Queued);
+    let server = start(move |_| {
+        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply::status(500)
+        } else {
+            Reply::json(&body)
+        }
+    })
+    .await;
+    let client = Client::new_with_options(&server.url, TOKEN, fast_options()).unwrap();
+    assert!(client.get_job(&id).await.is_ok());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let server = start(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Reply::status(500)
+    })
+    .await;
+    let client = Client::new_with_options(&server.url, TOKEN, fast_options()).unwrap();
+    assert!(client.submit(&spec()).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn server_errors_and_rate_limits_are_reported() {
+    let id = job_id();
+    let options = ClientOptions {
+        max_attempts: 1,
+        ..fast_options()
+    };
+    let server = start(|_| Reply::status(500)).await;
+    let client = Client::new_with_options(&server.url, TOKEN, options.clone()).unwrap();
+    assert!(matches!(
+        client.get_job(&id).await.unwrap_err(),
+        ApiError::Server { status: 500, .. }
+    ));
+
+    let server = start(|_| Reply::status(429).with_header("retry-after", "9")).await;
+    let client = Client::new_with_options(&server.url, TOKEN, options).unwrap();
+    assert_eq!(
+        client.get_job(&id).await.unwrap_err(),
+        ApiError::TooManyRequests {
+            retry_after: Some(9)
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_network_failure_is_a_network_error() {
+    let client = Client::new("http://127.0.0.1:1", TOKEN, None).unwrap();
+    let error = client.get_job(&job_id()).await.unwrap_err();
+    assert!(matches!(error, ApiError::Network { .. }), "{error:?}");
+}
+
+#[test]
+fn urls_are_checked_before_any_request() {
+    assert!(Client::new("http://example.net", TOKEN, None).is_err());
+    assert!(Client::new("http://127.0.0.1:7600", TOKEN, None).is_ok());
+    assert!(Client::new("https://example.net", TOKEN, None).is_ok());
+    assert!(Client::new("https://user@example.net", TOKEN, None).is_err());
+    assert!(Client::new("https://example.net?x=1", TOKEN, None).is_err());
+    assert!(Client::new("https://example.net#x", TOKEN, None).is_err());
+    assert!(Client::new("ftp://example.net", TOKEN, None).is_err());
+    assert!(Client::new("https://example.net", "bad\ntoken", None).is_err());
+}
+
+struct FakeController;
+
+impl Controller for FakeController {
+    fn poll<'a>(
+        &'a self,
+        _request: &'a PollRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentEvent>, ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn start<'a>(
+        &'a self,
+        _id: &'a JobId,
+        _epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn renew<'a>(
+        &'a self,
+        _id: &'a JobId,
+        _epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn append_log<'a>(
+        &'a self,
+        _chunk: &'a LogChunk,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn put_artifact<'a>(
+        &'a self,
+        _id: &'a JobId,
+        _epoch: u64,
+        _name: ArtifactName,
+        _bytes: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn complete<'a>(
+        &'a self,
+        _completion: &'a Completion,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn the_controller_trait_can_be_faked() {
+    let fake: Box<dyn Controller> = Box::new(FakeController);
+    assert!(fake.poll(&PollRequest::default()).await.unwrap().is_none());
+    fake.start(&job_id(), 1).await.unwrap();
+}

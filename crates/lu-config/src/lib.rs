@@ -653,7 +653,8 @@ fn map_url_error(table: &str, field: &str, err: ConfigError, url: &str) -> Confi
     }
 }
 
-fn validate_controller_url(url: &str) -> Result<(), ConfigError> {
+/// The rule for a controller base URL, shared with the client: http only on loopback.
+pub fn validate_controller_url(url: &str) -> Result<(), ConfigError> {
     let parsed =
         parse_http_url(url).map_err(|e| map_url_error("[agent]", "controller_url", e, url))?;
     if !parsed.https && !host_is_loopback(&parsed.host) {

@@ -9,6 +9,7 @@ members = [
     "crates/lu-supervise",
     "crates/lu-staging",
     "crates/lu-controller",
+    "crates/lu-client",
     "app",
 ]
 resolver = "2"
@@ -40,6 +41,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm",
 crossterm = "0.29"
 libc = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

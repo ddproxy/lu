@@ -1,0 +1,725 @@
+//! Operator subcommands. Every command talks to the controller through `lu-client`; this module
+//! only resolves the connection, formats untrusted values, and maps the outcome to an exit code.
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Duration;
+
+use lu_client::{ApiError, Client, JobView, LogPage, NodeView};
+use lu_proto::{
+    printable, truncate_chars, ArtifactName, FailureClass, HarnessState, JobId, JobSpec, JobState,
+    NodeName, MAX_TASK_BYTES,
+};
+
+const EXIT_ERROR: u8 = 1;
+const EXIT_UNSUCCESSFUL: u8 = 3;
+const TOKEN_LIMIT: u64 = 8 * 1024;
+const FOLLOW_WAIT_SECS: u64 = 25;
+const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const SUMMARY_CHARS: usize = 2000;
+
+#[derive(Debug, clap::Args)]
+pub struct SubmitArgs {
+    /// Repository URL or absolute local path.
+    #[arg(long)]
+    pub repo: String,
+    /// Git ref to check out.
+    #[arg(long = "ref")]
+    pub git_ref: String,
+    /// Harness name.
+    #[arg(long, default_value = "opencode")]
+    pub harness: String,
+    /// Provider name.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Model name.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Job timeout in seconds.
+    #[arg(long, default_value_t = lu_proto::DEFAULT_TIMEOUT_SECS)]
+    pub timeout: u64,
+    /// Idempotency key.
+    #[arg(long)]
+    pub key: Option<String>,
+    /// Task text. If neither this nor --task-file is given, the task is read from stdin.
+    #[arg(long, conflicts_with = "task_file")]
+    pub task: Option<String>,
+    /// Read the task from a file.
+    #[arg(long = "task-file", conflicts_with = "task")]
+    pub task_file: Option<PathBuf>,
+    /// Wait for the job to finish.
+    #[arg(long)]
+    pub wait: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct LsArgs {
+    /// Only show jobs in this state.
+    #[arg(long, value_parser = parse_state)]
+    pub state: Option<JobState>,
+    /// Maximum number of jobs to return.
+    #[arg(long, value_parser = parse_limit)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ShowArgs {
+    /// Job id.
+    #[arg(value_parser = parse_job_id)]
+    pub id: JobId,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct LogsArgs {
+    /// Job id.
+    #[arg(value_parser = parse_job_id)]
+    pub id: JobId,
+    /// Keep reading until the job reaches a terminal state.
+    #[arg(long)]
+    pub follow: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct FetchArgs {
+    /// Job id.
+    #[arg(value_parser = parse_job_id)]
+    pub id: JobId,
+    /// Directory to write the three fixed artifact names into.
+    #[arg(long, default_value = ".")]
+    pub out: PathBuf,
+    /// Replace files that already exist.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CancelArgs {
+    /// Job id.
+    #[arg(value_parser = parse_job_id)]
+    pub id: JobId,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct NodesArgs {}
+
+#[derive(Debug, clap::Args)]
+pub struct NodeArgs {
+    /// Node name.
+    #[arg(value_parser = parse_node)]
+    pub node: NodeName,
+}
+
+pub async fn submit(args: SubmitArgs, config: &Path, json: bool) -> ExitCode {
+    finish(submit_inner(args, config, json).await)
+}
+
+pub async fn ls(args: LsArgs, config: &Path, json: bool) -> ExitCode {
+    finish(ls_inner(args, config, json).await)
+}
+
+pub async fn show(args: ShowArgs, config: &Path, json: bool) -> ExitCode {
+    finish(show_inner(args, config, json).await)
+}
+
+pub async fn logs(args: LogsArgs, config: &Path, json: bool) -> ExitCode {
+    finish(logs_inner(args, config, json).await)
+}
+
+pub async fn fetch(args: FetchArgs, config: &Path, json: bool) -> ExitCode {
+    finish(fetch_inner(args, config, json).await)
+}
+
+pub async fn cancel(args: CancelArgs, config: &Path, json: bool) -> ExitCode {
+    finish(cancel_inner(args, config, json).await)
+}
+
+pub async fn nodes(args: NodesArgs, config: &Path, json: bool) -> ExitCode {
+    finish(nodes_inner(args, config, json).await)
+}
+
+pub async fn drain(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
+    finish(drain_inner(args, config, json, true).await)
+}
+
+pub async fn undrain(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
+    finish(drain_inner(args, config, json, false).await)
+}
+
+async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let task = read_task(&args)?;
+    let spec = JobSpec {
+        repo: args.repo,
+        git_ref: args.git_ref,
+        task,
+        harness: args.harness,
+        provider: args.provider,
+        model: args.model,
+        timeout_secs: args.timeout,
+        idle_timeout_secs: None,
+        idempotency_key: args.key,
+    };
+    spec.validate().map_err(|error| error.to_string())?;
+
+    let client = connect(config)?;
+    let (view, raw) = client
+        .submit_with_raw(&spec)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if json && !args.wait {
+        print_raw(&raw);
+    } else {
+        println!("{}", view.id);
+    }
+
+    if !args.wait {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let final_view = wait_for_job(&client, &view.id).await?;
+    eprintln!("state: {}", state_name(final_view.state));
+    if json {
+        let raw = client
+            .get_job_raw(&view.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        print_raw(&raw);
+    }
+    Ok(if final_view.state == JobState::Done {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_UNSUCCESSFUL)
+    })
+}
+
+async fn ls_inner(args: LsArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    if json {
+        let raw = client
+            .list_jobs_raw(args.state, args.limit)
+            .await
+            .map_err(|error| error.to_string())?;
+        print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let page = client
+        .list_jobs(args.state, args.limit)
+        .await
+        .map_err(|error| error.to_string())?;
+    let rows = page
+        .jobs
+        .iter()
+        .map(|job| {
+            vec![
+                job.id.to_string(),
+                state_name(job.state).to_owned(),
+                job.node
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "-".to_owned()),
+                job.attempt.to_string(),
+                time(job.created_at),
+            ]
+        })
+        .collect();
+    print_table(&["ID", "STATE", "NODE", "ATTEMPT", "CREATED"], rows);
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn show_inner(args: ShowArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    if json {
+        let raw = client
+            .get_job_raw(&args.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let view = client
+        .get_job(&args.id)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_job(&view);
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn logs_inner(args: LogsArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    if !args.follow {
+        if json {
+            let raw = client
+                .logs_raw(&args.id, 0, None)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_raw(&raw);
+        } else {
+            let page = client
+                .logs(&args.id, 0, None)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_log(&page.data);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut offset = 0u64;
+    loop {
+        let (page, raw) = client
+            .logs_with_raw(&args.id, offset, Some(FOLLOW_WAIT_SECS))
+            .await
+            .map_err(|error| error.to_string())?;
+        if json {
+            print_raw(&raw);
+        } else {
+            print_log(&page.data);
+        }
+        let previous = offset;
+        offset = offset.max(page.offset);
+        if page.terminal || page.state.is_some_and(JobState::is_terminal) {
+            return Ok(follow_exit(&page));
+        }
+        if page.data.is_empty() && offset == previous {
+            // A controller that answers an empty wait immediately must not make us spin.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+}
+
+fn follow_exit(page: &LogPage) -> ExitCode {
+    match page.state {
+        Some(JobState::Failed | JobState::Cancelled) => ExitCode::from(EXIT_UNSUCCESSFUL),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
+async fn fetch_inner(args: FetchArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    let mut saved = Vec::new();
+    let mut skipped = Vec::new();
+    for name in ArtifactName::ALL {
+        match client.fetch_artifact(&args.id, name).await {
+            Ok(bytes) => {
+                let path = write_artifact(&args.out, name, &bytes, args.force)?;
+                if !json {
+                    println!("saved {}", path.display());
+                }
+                saved.push(path.display().to_string());
+            }
+            Err(ApiError::NotFound) => {
+                if !json {
+                    eprintln!("skipped {}: not found", name.file_name());
+                }
+                skipped.push(name.file_name().to_owned());
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    if saved.is_empty() {
+        return Err("no artifacts were available".to_owned());
+    }
+    if json {
+        let summary = serde_json::json!({ "saved": saved, "skipped": skipped });
+        println!("{summary}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn cancel_inner(args: CancelArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    if json {
+        let raw = client
+            .cancel_raw(&args.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let view = client
+        .cancel(&args.id)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_job(&view);
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    if json {
+        let raw = client
+            .nodes_raw()
+            .await
+            .map_err(|error| error.to_string())?;
+        print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let list = client.nodes().await.map_err(|error| error.to_string())?;
+    let rows = list
+        .nodes
+        .iter()
+        .map(|node| {
+            vec![
+                node.name.to_string(),
+                harness_name(node.harness),
+                time(node.last_seen),
+                if node.cordoned { "yes" } else { "no" }.to_owned(),
+            ]
+        })
+        .collect();
+    print_table(&["NAME", "HARNESS", "LAST_SEEN", "DRAINED"], rows);
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn drain_inner(
+    args: NodeArgs,
+    config: &Path,
+    json: bool,
+    drain: bool,
+) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    if json {
+        let raw = client
+            .set_drain_raw(&args.node, drain)
+            .await
+            .map_err(|error| error.to_string())?;
+        print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let view = client
+        .set_drain(&args.node, drain)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_node(&view);
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn wait_for_job(client: &Client, id: &JobId) -> Result<JobView, String> {
+    loop {
+        let view = client
+            .get_job(id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if view.state.is_terminal() {
+            return Ok(view);
+        }
+        tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+    }
+}
+
+struct Settings {
+    url: String,
+    token_file: PathBuf,
+    ca_file: Option<PathBuf>,
+}
+
+fn connect(config: &Path) -> Result<Client, String> {
+    let settings = settings(config)?;
+    let text = lu_config::read_private_file("operator token", &settings.token_file, TOKEN_LIMIT)
+        .map_err(|error| error.to_string())?;
+    let token = text.trim_end_matches(['\r', '\n']);
+    if token.is_empty() {
+        return Err(format!(
+            "token file {} is empty",
+            settings.token_file.display()
+        ));
+    }
+    Client::new(&settings.url, token, settings.ca_file).map_err(|error| error.to_string())
+}
+
+fn settings(config: &Path) -> Result<Settings, String> {
+    if let Ok(url) = std::env::var("LU_URL") {
+        if !url.is_empty() {
+            let token_file = std::env::var("LU_TOKEN_FILE")
+                .ok()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| "LU_TOKEN_FILE must be set when LU_URL is set".to_owned())?;
+            let ca_file = std::env::var("LU_CA_FILE")
+                .ok()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from);
+            return Ok(Settings {
+                url,
+                token_file: PathBuf::from(token_file),
+                ca_file,
+            });
+        }
+    }
+
+    let loaded = lu_config::load(config).map_err(|error| error.to_string())?;
+    let agent = loaded.agent.ok_or_else(|| {
+        format!(
+            "no controller URL: set LU_URL and LU_TOKEN_FILE, or add an [agent] table to {}",
+            config.display()
+        )
+    })?;
+    Ok(Settings {
+        url: agent.controller_url,
+        token_file: PathBuf::from(agent.token_file),
+        ca_file: agent
+            .ca_file
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from),
+    })
+}
+
+fn read_task(args: &SubmitArgs) -> Result<String, String> {
+    if let Some(task) = &args.task {
+        return Ok(task.clone());
+    }
+    if let Some(path) = &args.task_file {
+        let file = std::fs::File::open(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        return read_bounded(file, MAX_TASK_BYTES)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()));
+    }
+    read_bounded(std::io::stdin().lock(), MAX_TASK_BYTES)
+        .map_err(|error| format!("cannot read the task from stdin: {error}"))
+}
+
+fn read_bounded(mut reader: impl Read, limit: usize) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > limit {
+        return Err(format!("task is larger than {limit} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|_| "task is not valid UTF-8".to_owned())
+}
+
+fn write_artifact(
+    dir: &Path,
+    name: ArtifactName,
+    bytes: &[u8],
+    force: bool,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    // Only the three fixed names can reach this join; the job id is never a path component.
+    let path = dir.join(name.file_name());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    if force {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    let mut file = options.open(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("{} already exists (use --force)", path.display())
+        } else {
+            format!("cannot write {}: {error}", path.display())
+        }
+    })?;
+    std::io::Write::write_all(&mut file, bytes)
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("cannot set the mode of {}: {error}", path.display()))?;
+    }
+    Ok(path)
+}
+
+fn print_job(view: &JobView) {
+    let rows = vec![
+        ("id", view.id.to_string()),
+        ("state", state_name(view.state).to_owned()),
+        (
+            "node",
+            view.node
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        ("attempt", view.attempt.to_string()),
+        ("epoch", view.epoch.to_string()),
+        ("created_at", time(view.created_at)),
+        ("started_at", optional_time(view.started_at)),
+        ("finished_at", optional_time(view.finished_at)),
+        ("failure", failure_name(view.failure_class)),
+        (
+            "summary",
+            view.summary
+                .as_deref()
+                .map(display_field)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+    ];
+    print_pairs(&rows);
+}
+
+fn print_node(node: &NodeView) {
+    let rows = vec![
+        ("name", node.name.to_string()),
+        ("harness", harness_name(node.harness)),
+        ("last_seen", time(node.last_seen)),
+        (
+            "cordoned",
+            if node.cordoned { "yes" } else { "no" }.to_owned(),
+        ),
+    ];
+    print_pairs(&rows);
+}
+
+fn print_pairs(rows: &[(&str, String)]) {
+    let width = rows.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
+    for (key, value) in rows {
+        println!("{key:<width$}  {value}");
+    }
+}
+
+fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
+    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    for row in &rows {
+        for (index, cell) in row.iter().enumerate() {
+            if let Some(width) = widths.get_mut(index) {
+                *width = (*width).max(cell.chars().count());
+            }
+        }
+    }
+    print_row(headers, &widths);
+    for row in &rows {
+        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        print_row(&cells, &widths);
+    }
+}
+
+fn print_row(cells: &[&str], widths: &[usize]) {
+    let mut line = String::new();
+    for (index, cell) in cells.iter().enumerate() {
+        if index > 0 {
+            line.push_str("  ");
+        }
+        let width = widths.get(index).copied().unwrap_or(0);
+        if index + 1 == cells.len() {
+            line.push_str(cell);
+        } else {
+            line.push_str(&format!("{cell:<width$}"));
+        }
+    }
+    println!("{line}");
+}
+
+fn print_log(data: &str) {
+    if data.is_empty() {
+        return;
+    }
+    // Keep line breaks (they are the shape of a log) but sanitise every character inside a line.
+    for piece in data.split_inclusive('\n') {
+        match piece.strip_suffix('\n') {
+            Some(line) => println!("{}", printable(line)),
+            None => print!("{}", printable(piece)),
+        }
+    }
+}
+
+fn print_raw(raw: &str) {
+    if raw.is_empty() {
+        return;
+    }
+    print!("{raw}");
+    if !raw.ends_with('\n') {
+        println!();
+    }
+}
+
+fn display_field(text: &str) -> String {
+    printable(&truncate_chars(text, SUMMARY_CHARS))
+}
+
+fn time(value: u64) -> String {
+    if value == 0 {
+        "-".to_owned()
+    } else {
+        format!("{value}ms")
+    }
+}
+
+fn optional_time(value: Option<u64>) -> String {
+    value.map(time).unwrap_or_else(|| "-".to_owned())
+}
+
+fn harness_name(value: Option<HarnessState>) -> String {
+    match value {
+        Some(HarnessState::Idle) => "idle".to_owned(),
+        Some(HarnessState::Busy) => "busy".to_owned(),
+        None => "-".to_owned(),
+    }
+}
+
+fn failure_name(value: Option<FailureClass>) -> String {
+    match value {
+        Some(FailureClass::Node) => "node".to_owned(),
+        Some(FailureClass::Provider) => "provider".to_owned(),
+        Some(FailureClass::Execution) => "execution".to_owned(),
+        None => "-".to_owned(),
+    }
+}
+
+fn state_name(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued => "queued",
+        JobState::Leased => "leased",
+        JobState::Running => "running",
+        JobState::Recovering => "recovering",
+        JobState::NeedsInput => "needs_input",
+        JobState::Done => "done",
+        JobState::Failed => "failed",
+        JobState::Cancelled => "cancelled",
+    }
+}
+
+fn parse_job_id(value: &str) -> Result<JobId, String> {
+    JobId::parse(value).map_err(|error| error.to_string())
+}
+
+fn parse_node(value: &str) -> Result<NodeName, String> {
+    NodeName::parse(value).map_err(|error| error.to_string())
+}
+
+fn parse_state(value: &str) -> Result<JobState, String> {
+    match value.to_ascii_lowercase().replace('-', "_").as_str() {
+        "queued" => Ok(JobState::Queued),
+        "leased" => Ok(JobState::Leased),
+        "running" => Ok(JobState::Running),
+        "recovering" => Ok(JobState::Recovering),
+        "needs_input" => Ok(JobState::NeedsInput),
+        "done" => Ok(JobState::Done),
+        "failed" => Ok(JobState::Failed),
+        "cancelled" | "canceled" => Ok(JobState::Cancelled),
+        other => Err(format!(
+            "unknown job state {other:?}; expected queued, leased, running, recovering, needs_input, done, failed, or cancelled"
+        )),
+    }
+}
+
+fn parse_limit(value: &str) -> Result<u32, String> {
+    let limit: u32 = value
+        .parse()
+        .map_err(|_| format!("limit must be a positive integer (got {value:?})"))?;
+    if limit == 0 {
+        return Err("limit must be at least 1".to_owned());
+    }
+    Ok(limit)
+}
+
+fn finish(result: Result<ExitCode, String>) -> ExitCode {
+    match result {
+        Ok(code) => code,
+        Err(message) => {
+            eprintln!("lu: {message}");
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
+}

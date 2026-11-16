@@ -17,6 +17,8 @@ lu-auth = { path = "../crates/lu-auth" }
 lu-serve = { path = "../crates/lu-serve" }
 lu-controller = { path = "../crates/lu-controller" }
 lu-store = { path = "../crates/lu-store" }
+lu-client = { path = "../crates/lu-client" }
+lu-proto = { path = "../crates/lu-proto" }
 lu-tui = { path = "../crates/lu-tui", optional = true }
 axum.workspace = true
 clap = { workspace = true }

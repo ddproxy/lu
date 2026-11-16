@@ -1,6 +1,7 @@
 //! lu: a job queue and dispatcher for dev peers.
 
 mod logging;
+mod operator;
 mod service;
 #[cfg(feature = "tui")]
 mod top;
@@ -16,6 +17,9 @@ struct Cli {
     /// Config file (TOML).
     #[arg(long, global = true, default_value = "lu.toml")]
     config: PathBuf,
+    /// Print the raw API JSON instead of aligned text.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -29,11 +33,30 @@ enum Command {
     /// Live terminal dashboard demo. Needs a build with the `tui` feature. Ignores --config.
     #[cfg(feature = "tui")]
     Top,
+    /// Submit a job.
+    Submit(operator::SubmitArgs),
+    /// List jobs.
+    Ls(operator::LsArgs),
+    /// Show one job.
+    Show(operator::ShowArgs),
+    /// Print a job's log.
+    Logs(operator::LogsArgs),
+    /// Fetch the three artifacts of a job.
+    Fetch(operator::FetchArgs),
+    /// Ask the controller to cancel a job.
+    Cancel(operator::CancelArgs),
+    /// List nodes.
+    Nodes(operator::NodesArgs),
+    /// Stop assigning new jobs to a node.
+    Drain(operator::NodeArgs),
+    /// Allow a drained node to take jobs again.
+    Undrain(operator::NodeArgs),
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let json = cli.json;
     match cli.command.unwrap_or(Command::Serve) {
         Command::Check => check(&cli.config),
         Command::Serve => serve(&cli.config).await,
@@ -42,6 +65,15 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(&error),
         },
+        Command::Submit(args) => operator::submit(args, &cli.config, json).await,
+        Command::Ls(args) => operator::ls(args, &cli.config, json).await,
+        Command::Show(args) => operator::show(args, &cli.config, json).await,
+        Command::Logs(args) => operator::logs(args, &cli.config, json).await,
+        Command::Fetch(args) => operator::fetch(args, &cli.config, json).await,
+        Command::Cancel(args) => operator::cancel(args, &cli.config, json).await,
+        Command::Nodes(args) => operator::nodes(args, &cli.config, json).await,
+        Command::Drain(args) => operator::drain(args, &cli.config, json).await,
+        Command::Undrain(args) => operator::undrain(args, &cli.config, json).await,
     }
 }
 
