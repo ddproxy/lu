@@ -163,6 +163,8 @@ impl std::error::Error for LogChunkError {}
 pub enum Outcome {
     Done,
     Failed(FailureClass),
+    /// The agent stopped the job because the controller asked it to.
+    Cancelled,
 }
 
 /// The agent's final report for a job.

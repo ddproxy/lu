@@ -357,6 +357,10 @@ impl Store for FakeStore {
                 row.rec.failure_class = None;
                 row.rec.finished_at = Some(now_wall(now));
             }
+            Outcome::Cancelled => {
+                row.rec.state = JobState::Cancelled;
+                row.rec.finished_at = Some(now_wall(now));
+            }
             Outcome::Failed(class) => {
                 row.rec.failure_class = Some(class);
                 let retryable = class.retryable(row.rec.attempt, max_retries);

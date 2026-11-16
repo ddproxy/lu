@@ -567,7 +567,25 @@ impl Agent {
         let uploaded = tokio::time::timeout(Duration::from_secs(5), uploader).await;
 
         match end {
-            JobEnd::Cancelled | JobEnd::Stale => return Ok(end),
+            JobEnd::Stale => return Ok(end),
+            JobEnd::Cancelled => {
+                let completion = Completion {
+                    job_id: job_id.clone(),
+                    epoch,
+                    outcome: Outcome::Cancelled,
+                    exit_code: None,
+                    summary: Some(summarise("cancelled by the controller")),
+                };
+                match self.controller.complete(&completion).await {
+                    Ok(()) | Err(ApiError::StaleEpoch) => {}
+                    Err(ApiError::Unauthorized) => return Err(AgentError::Unauthorized),
+                    Err(ApiError::Forbidden) => return Err(AgentError::Forbidden),
+                    Err(error) => {
+                        warn!(job = %job_id, %error, "could not report the cancelled job")
+                    }
+                }
+                return Ok(end);
+            }
             JobEnd::Shutdown => {
                 let _ = self
                     .complete_failure(

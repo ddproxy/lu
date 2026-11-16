@@ -1353,7 +1353,7 @@ async fn job_stale_log_append_stops_without_completing() {
 }
 
 #[tokio::test]
-async fn job_renew_true_stops_harness_without_completing() {
+async fn job_renew_true_stops_harness_and_reports_cancelled() {
     // The first renew fires after the 20 second renew period, so this test is slow.
     let f = fixture();
     let job_id = JobId::new();
@@ -1377,7 +1377,12 @@ async fn job_renew_true_stops_harness_without_completing() {
         calls.iter().any(|c| matches!(c, Call::Renew { .. })),
         "the lease was never renewed"
     );
-    assert!(completions(&calls).is_empty(), "{calls:?}");
+    assert!(
+        completions(&calls)
+            .iter()
+            .all(|c| c.outcome == Outcome::Cancelled),
+        "{calls:?}"
+    );
     assert!(
         !calls.iter().any(|c| matches!(c, Call::PutArtifact { .. })),
         "a cancelled job must not upload artifacts"
@@ -1467,7 +1472,12 @@ async fn job_workspace_removed_after_cancel() {
     })
     .await;
 
-    assert!(completions(&calls).is_empty(), "{calls:?}");
+    assert!(
+        completions(&calls)
+            .iter()
+            .all(|c| c.outcome == Outcome::Cancelled),
+        "{calls:?}"
+    );
     assert!(!workspace.exists());
 }
 

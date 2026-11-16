@@ -559,7 +559,7 @@ pub async fn complete_job(
         return with_version(ApiError::forbidden("forbidden").into_response());
     }
     let failure = match completion.outcome {
-        lu_proto::Outcome::Done => None,
+        lu_proto::Outcome::Done | lu_proto::Outcome::Cancelled => None,
         lu_proto::Outcome::Failed(class) => {
             // provider name? spec says provider failure class cordons (node, provider) if job names a provider.
             let provider = rec_check.spec.provider.clone();

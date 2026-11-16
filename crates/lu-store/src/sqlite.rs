@@ -971,6 +971,13 @@ impl Store for SqliteStore {
                 rec.failure_class = None;
                 update_job_tx(&tx, &rec, None, None)?;
             }
+            Outcome::Cancelled => {
+                check_transition(rec.state, JobState::Cancelled)?;
+                rec.state = JobState::Cancelled;
+                rec.finished_at = Some(now.wall_unix);
+                rec.updated_at = now.wall_unix;
+                update_job_tx(&tx, &rec, None, None)?;
+            }
             Outcome::Failed(out_class) => {
                 let (class, provider) = failure.unwrap_or((out_class, None));
                 rec.failure_class = Some(class);

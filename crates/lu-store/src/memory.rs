@@ -477,6 +477,14 @@ impl Store for MemoryStore {
                 e.lease_until_mono_ms = None;
                 e.recovering_since_mono_ms = None;
             }
+            Outcome::Cancelled => {
+                check_transition(e.rec.state, JobState::Cancelled)?;
+                e.rec.state = JobState::Cancelled;
+                e.rec.finished_at = Some(now.wall_unix);
+                e.rec.updated_at = now.wall_unix;
+                e.lease_until_mono_ms = None;
+                e.recovering_since_mono_ms = None;
+            }
             Outcome::Failed(_) => {
                 let (class, provider) = failure.unwrap_or((FailureClass::Execution, None));
                 e.rec.failure_class = Some(class);
