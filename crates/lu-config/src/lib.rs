@@ -743,6 +743,13 @@ pub fn operator_config_path() -> Option<std::path::PathBuf> {
     Some(base.join("lu").join("operator.toml"))
 }
 
+/// Operator files in lookup order: the user's, then the system-wide one.
+pub fn operator_config_paths() -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<_> = operator_config_path().into_iter().collect();
+    paths.push(std::path::PathBuf::from("/etc/lu/operator.toml"));
+    paths
+}
+
 /// Reads an operator file. A leading `~/` in a path means the home directory.
 pub fn load_operator(path: &Path) -> Result<OperatorConfig, ConfigError> {
     let shown = path.display().to_string();

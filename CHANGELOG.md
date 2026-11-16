@@ -5,6 +5,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `/etc/lu/operator.toml` is read after the per-user operator file, for a shared operator host.
+
 ## [0.1.6] - 2026-11-16
 
 ### Added

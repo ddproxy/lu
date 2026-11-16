@@ -448,7 +448,10 @@ fn settings(config: &Path) -> Result<Settings, String> {
     }
 
     if !config.exists() {
-        if let Some(path) = lu_config::operator_config_path().filter(|p| p.exists()) {
+        let found = lu_config::operator_config_paths()
+            .into_iter()
+            .find(|path| path.exists());
+        if let Some(path) = found {
             let file = lu_config::load_operator(&path).map_err(|error| error.to_string())?;
             return Ok(Settings {
                 url: file.url,
@@ -464,7 +467,7 @@ fn settings(config: &Path) -> Result<Settings, String> {
     let loaded = lu_config::load(config).map_err(|error| error.to_string())?;
     let agent = loaded.agent.ok_or_else(|| {
         format!(
-            "no controller URL: set LU_URL and LU_TOKEN_FILE, write ~/.config/lu/operator.toml, or add an [agent] table to {}",
+            "no controller URL: set LU_URL and LU_TOKEN_FILE, write ~/.config/lu/operator.toml or /etc/lu/operator.toml, or add an [agent] table to {}",
             config.display()
         )
     })?;
