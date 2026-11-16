@@ -134,6 +134,30 @@ If the controller is down for longer than a lease, agents cannot renew. When it 
 
 ## Leases and retries
 
+```mermaid
+stateDiagram-v2
+    [*] --> queued: submit
+    queued --> leased: an idle node polls
+    queued --> cancelled: cancel
+    leased --> running: agent starts the job
+    leased --> cancelled: cancel
+    leased --> recovering: lease expires
+    running --> done: success
+    running --> failed: failure with no retry left
+    running --> queued: node or provider failure, retry
+    running --> recovering: lease expires or the controller restarts
+    running --> cancelled: cancel
+    recovering --> running: the holder renews within the grace period
+    recovering --> done: the holder finishes while the controller was down
+    recovering --> queued: grace over, retry
+    recovering --> failed: grace over, no retry left
+    done --> [*]
+    failed --> [*]
+    cancelled --> [*]
+```
+
+A `needs_input` state is reserved for interactive harnesses and unreachable in 0.1.0.
+
 A job starts as `queued` with `attempt = 1` and `epoch = 0`. When an idle, non-draining node with no held job asks for work, the controller assigns the oldest queued job whose provider is available and not cordoned:
 
 - state becomes `leased`, `node` is set, `epoch` is incremented, and the lease runs for `lease_secs`.

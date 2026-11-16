@@ -4,10 +4,12 @@ Lu is a small job queue for coding-agent work: an operator submits a repository,
 
 ## Architecture
 
-```
-operator --HTTPS--> controller <--HTTPS poll-- agent --process group--> harness
-                       |
-                  SQLite + artifacts/
+```mermaid
+flowchart LR
+    operator["operator<br/>lu CLI"] -->|HTTPS| controller
+    agent -->|"HTTPS poll"| controller
+    controller --- store[("SQLite<br/>+ artifacts")]
+    agent -->|"process group"| harness
 ```
 
 The controller owns job state, leases, retry decisions and node cordons. An agent has one job slot in 0.1.0; it stages a fresh checkout, supervises the harness, and reports logs and artifacts back to the controller.
