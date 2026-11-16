@@ -335,9 +335,14 @@ impl Agent {
         F: Future<Output = ()> + Send,
     {
         let started = Instant::now();
+        // A harness in another account cannot read `.git`, so its task file sits beside the tree.
+        let shared_task = self
+            .workspace_gid
+            .map(|gid| (self.work_dir.join(format!("{job_id}.task.md")), gid));
         let _cleanup = Cleanup {
             staging: &self.staging,
             job_id: job_id.to_string(),
+            task_file: shared_task.as_ref().map(|(path, _)| path.clone()),
         };
         if let Err(error) = spec.validate() {
             let summary = format!("invalid job spec: {error}");
@@ -375,8 +380,19 @@ impl Agent {
             }
         }
 
-        let task_file = staged.path().join(".git").join("lu-task.md");
-        if let Err(error) = std::fs::write(&task_file, spec.task.as_bytes()) {
+        let task_file = match &shared_task {
+            Some((path, _)) => path.clone(),
+            None => staged.path().join(".git").join("lu-task.md"),
+        };
+        let written = std::fs::write(&task_file, spec.task.as_bytes()).and_then(|()| {
+            if let Some((_, gid)) = &shared_task {
+                use std::os::unix::fs::PermissionsExt;
+                std::os::unix::fs::chown(&task_file, None, Some(*gid))?;
+                std::fs::set_permissions(&task_file, std::fs::Permissions::from_mode(0o640))?;
+            }
+            Ok(())
+        });
+        if let Err(error) = written {
             let summary = format!("could not write the task file: {error}");
             self.complete_failure(&job_id, epoch, &summary, FailureClass::Execution)
                 .await?;
@@ -786,11 +802,15 @@ struct Finish<'a> {
 struct Cleanup<'a> {
     staging: &'a Staging,
     job_id: String,
+    task_file: Option<PathBuf>,
 }
 
 impl Drop for Cleanup<'_> {
     fn drop(&mut self) {
         let _ = self.staging.clean(&self.job_id);
+        if let Some(task_file) = &self.task_file {
+            let _ = std::fs::remove_file(task_file);
+        }
     }
 }
 

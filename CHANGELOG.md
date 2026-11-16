@@ -5,6 +5,12 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-16
+
+### Fixed
+
+- With `workspace_group` set, the task file is written beside the working tree instead of inside `.git`, so a harness in another account, such as one in a container, can read it.
+
 ## [0.1.3] - 2026-11-16
 
 ### Added
