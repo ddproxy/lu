@@ -1,0 +1,31 @@
+[package]
+name = "lu"
+description = "Lu: a job queue and dispatcher for dev peers (controller, agent and CLI in one binary)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# The `top` subcommand. Off by default: the default binary has no terminal dependencies.
+tui = ["dep:lu-tui", "lu-tui/tui"]
+
+[dependencies]
+lu-config = { path = "../crates/lu-config" }
+lu-auth = { path = "../crates/lu-auth" }
+lu-serve = { path = "../crates/lu-serve" }
+lu-tui = { path = "../crates/lu-tui", optional = true }
+axum.workspace = true
+clap = { workspace = true }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW for the log file; std has no constant for it.
+libc.workspace = true
+
+[lints]
+workspace = true
