@@ -1,0 +1,42 @@
+# Lu HTTP API, version 1 (0.1.0)
+
+Controller serves JSON over HTTPS (HTTP only on loopback). Every request carries `Authorization: Bearer <token>`. Tokens are scoped `operator` or `agent`; an agent token is bound to one node name. A wrong scope is 403, a missing or unknown token 401. Bodies are capped (1 MiB, log chunks 64 KiB plus framing). Errors are `{"error":"<code>","message":"<text>"}` with codes `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `stale_epoch`, `too_large`, `rate_limited`, `internal`. Times are RFC 3339 UTC. Ids are 26-character `JobId`s. Unknown JSON fields are rejected.
+
+Agents poll; there is no push channel in 0.1.0. Lease expiry is measured on the controller's monotonic clock.
+
+## Operator
+
+| Route | Meaning |
+|---|---|
+| `POST /v1/jobs` body `JobSpec` | Create a job. `201` with `JobView`. Same `idempotency_key` and same spec returns the existing job with `200`; same key and a different spec is `409 conflict`. |
+| `GET /v1/jobs?state=&limit=&after=` | List, newest first, `limit` at most 200, `after` is a `JobId` cursor. `{"jobs":[JobView],"next":"<id>|null"}` |
+| `GET /v1/jobs/{id}` | `JobView` |
+| `POST /v1/jobs/{id}/cancel` | Queued: becomes `cancelled` at once. Leased or running: the agent is told on its next poll. Terminal: `409`. Returns `JobView`. |
+| `GET /v1/jobs/{id}/logs?offset=N` | Bytes of the stored log from `offset`, `Content-Type: text/plain`, header `X-Lu-Log-Length` and `X-Lu-State`; `?wait=25` holds the request up to 25 seconds for new bytes or a state change. |
+| `GET /v1/jobs/{id}/artifacts/{name}` | `name` is `diff.patch`, `run.log` or `report.json`. `404` until stored. |
+| `GET /v1/nodes` | `[NodeView]` |
+| `POST /v1/nodes/{name}/drain` and `/undrain` | Stop or resume assigning new jobs to a node. |
+| `GET /v1/health` | `{"ok":true,"version":"…","db":"ok"}`, no auth. |
+
+`JobView`: `id`, `state`, `spec`, `attempt` (1 based), `node` (or null), `epoch`, `created_at`, `updated_at`, `started_at`, `finished_at`, `failure_class` (or null), `summary`, `exit_code`, `artifacts` (names present), `cancel_requested`.
+
+`NodeView`: `name`, `last_seen`, `online` (seen within two lease periods), `draining`, `harness` state, `providers` (list), `current_job` (id or null), `cordons` (provider names with an unexpired cordon), `reiki` (opaque JSON from the heartbeat or null).
+
+## Agent
+
+| Route | Meaning |
+|---|---|
+| `POST /v1/agent/poll` body `{"heartbeat": Heartbeat, "wait_secs": 0..30}` | Registers a heartbeat and asks for work. Returns `204` when there is nothing, or `200` `[AgentEvent]` with `Assign` (when the node is free, not draining, harness healthy, and a queued job matches), `Cancel`, or `Followup`. Holds up to `wait_secs` for work. Assigning creates a lease: `lease_secs` from now, epoch incremented. |
+| `POST /v1/agent/jobs/{id}/start` body `{"epoch":N}` | Leased to running. `409 stale_epoch` if the lease moved on. |
+| `POST /v1/agent/jobs/{id}/renew` body `{"epoch":N}` | Extends the lease by `lease_secs`. Also implied by `poll`, `log` and `start`. Returns `{"cancel":bool}`. |
+| `POST /v1/agent/jobs/{id}/log?epoch=N&offset=M` body raw bytes | Append a chunk at `offset`. `offset` must equal the stored length (`409 conflict` with `{"length":L}` otherwise so the agent can resume). At most 64 KiB. Logs beyond the cap are dropped with a marker line and still return 200. |
+| `PUT /v1/agent/jobs/{id}/artifacts/{name}?epoch=N` body raw bytes | Store `diff.patch` or `report.json` (caps from `limits`). Controller names the file; the agent never supplies a path. |
+| `POST /v1/agent/jobs/{id}/complete` body `Completion` | Finish. Outcomes and failure classes follow `lu-proto`. A stale epoch is `409 stale_epoch` and the result is discarded. |
+
+## Controller rules
+
+- A lease that is not renewed for `lease_secs` expires: the job becomes `recovering`, then after `recovery_grace_secs` returns to `queued` with a bumped attempt (class `node`) unless attempts are exhausted (`max_retries`), when it becomes `failed`.
+- `Completion` with a `provider` failure class cordons `(node, provider)` for `provider_cooldown_secs`; assignment skips cordoned pairs when the job names a provider.
+- Epoch fencing: every agent write names the epoch it was assigned; a write for an older epoch is `409 stale_epoch` and changes nothing.
+- On start the controller marks every `leased` or `running` job `recovering` (it was restarted mid-flight); agents that still hold the lease resume by renewing within the grace period.
+- Job logs and artifacts are stored under `artifacts_dir/<job id>/`, names fixed by the controller, files `0600`, directories `0700`.
