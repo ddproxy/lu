@@ -351,20 +351,23 @@ async fn every_agent_call_uses_the_documented_path_and_epoch() {
     let poll_id = id.clone();
     let server = start(move |record| match record.path.as_str() {
         path if path.ends_with("/poll") => {
-            Reply::json(&json!({"kind":"cancel","job_id": poll_id, "epoch": 7}))
+            Reply::json(&json!([{"kind":"cancel","job_id": poll_id, "epoch": 7}]))
         }
+        path if path.ends_with("/renew") => Reply::json(&json!({"cancel": true})),
         _ => Reply::status(204),
     })
     .await;
     let client = client(&server);
-    let event = client
-        .poll(&PollRequest::for_node(NodeName::parse("node-a").unwrap()))
-        .await
-        .unwrap();
-    assert!(matches!(event, Some(AgentEvent::Cancel { epoch: 7, .. })));
+    let mut request = PollRequest::for_node(NodeName::parse("node-a").unwrap());
+    request.harness = Some(lu_proto::HarnessState::Idle);
+    let events = client.poll(&request).await.unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::Cancel { epoch: 7, .. }]
+    ));
 
     client.start(&id, 7).await.unwrap();
-    client.renew(&id, 7).await.unwrap();
+    assert!(client.renew(&id, 7).await.unwrap());
     client
         .append_log(&LogChunk {
             job_id: id.clone(),
@@ -385,10 +388,21 @@ async fn every_agent_call_uses_the_documented_path_and_epoch() {
     assert_eq!(paths[0], "/v1/agent/poll");
     assert_eq!(paths[1], format!("/v1/agent/jobs/{id}/start"));
     assert_eq!(paths[2], format!("/v1/agent/jobs/{id}/renew"));
-    assert_eq!(paths[3], format!("/v1/agent/jobs/{id}/logs"));
+    assert_eq!(paths[3], format!("/v1/agent/jobs/{id}/log"));
     assert_eq!(paths[4], format!("/v1/agent/jobs/{id}/artifacts/run.log"));
     assert_eq!(paths[5], format!("/v1/agent/jobs/{id}/complete"));
-    assert_eq!(records[1].header("x-lu-epoch"), Some("7"));
+    let poll: Value = serde_json::from_slice(&records[0].body).unwrap();
+    assert_eq!(poll["heartbeat"]["node"], json!("node-a"));
+    assert_eq!(poll["heartbeat"]["harness"], json!("idle"));
+    assert_eq!(poll["wait_secs"], json!(0));
+    let start: Value = serde_json::from_slice(&records[1].body).unwrap();
+    assert_eq!(
+        start,
+        json!({"epoch": 7}),
+        "no field the controller would reject"
+    );
+    assert_eq!(records[3].query.as_deref(), Some("epoch=7&offset=1"));
+    assert_eq!(records[3].body, b"line\n", "the log goes as raw bytes");
     assert_eq!(records[4].query.as_deref(), Some("epoch=7"));
     assert_eq!(records[4].body, b"log");
     let sent: Value = serde_json::from_slice(&records[5].body).unwrap();
@@ -397,10 +411,23 @@ async fn every_agent_call_uses_the_documented_path_and_epoch() {
 }
 
 #[tokio::test]
+async fn a_poll_without_a_node_or_harness_is_refused_before_any_request() {
+    let server = start(|_| Reply::status(204)).await;
+    let error = client(&server)
+        .poll(&PollRequest::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ApiError::BadRequest { .. }), "{error:?}");
+    assert!(server.records.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn an_empty_poll_is_no_assignment() {
     let server = start(|_| Reply::status(204)).await;
-    let event = client(&server).poll(&PollRequest::default()).await.unwrap();
-    assert!(event.is_none());
+    let mut request = PollRequest::for_node(NodeName::parse("node-a").unwrap());
+    request.harness = Some(lu_proto::HarnessState::Idle);
+    let events = client(&server).poll(&request).await.unwrap();
+    assert!(events.is_empty());
 }
 
 #[tokio::test]
@@ -565,8 +592,8 @@ impl Controller for FakeController {
     fn poll<'a>(
         &'a self,
         _request: &'a PollRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentEvent>, ApiError>> + Send + 'a>> {
-        Box::pin(async { Ok(None) })
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AgentEvent>, ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     fn start<'a>(
@@ -581,8 +608,8 @@ impl Controller for FakeController {
         &'a self,
         _id: &'a JobId,
         _epoch: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
+    ) -> Pin<Box<dyn Future<Output = Result<bool, ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(false) })
     }
 
     fn append_log<'a>(
@@ -613,6 +640,6 @@ impl Controller for FakeController {
 #[tokio::test]
 async fn the_controller_trait_can_be_faked() {
     let fake: Box<dyn Controller> = Box::new(FakeController);
-    assert!(fake.poll(&PollRequest::default()).await.unwrap().is_none());
+    assert!(fake.poll(&PollRequest::default()).await.unwrap().is_empty());
     fake.start(&job_id(), 1).await.unwrap();
 }

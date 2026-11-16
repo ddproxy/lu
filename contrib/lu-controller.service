@@ -1,0 +1,50 @@
+[Unit]
+Description=Lu controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lu
+Group=lu
+WorkingDirectory=/var/lib/lu
+# Adjust the binary path if PREFIX was not /usr/local.
+ExecStart=/usr/local/bin/lu serve --config /etc/lu/lu.toml
+Restart=on-failure
+RestartSec=2s
+# Above [service].shutdown_timeout_secs (default 25). The binary currently drains
+# in-flight connections for a fixed 10 seconds.
+TimeoutStopSec=40s
+KillMode=mixed
+StateDirectory=lu
+StateDirectoryMode=0750
+UMask=0077
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+# The database, artifacts and an optional [log] file must stay under this path.
+ReadWritePaths=/var/lib/lu
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

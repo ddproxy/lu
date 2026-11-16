@@ -15,11 +15,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Self-hosted runner images may lack Rust; install it only when missing.
+      # The workspace requires Rust 1.99; install it even when the runner has an older cargo.
       - name: Install Rust
         run: |
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99 -c rustfmt -c clippy
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain 1.99 -c rustfmt -c clippy
+          else
+            rustup toolchain install 1.99 --profile minimal -c rustfmt -c clippy
+            rustup default 1.99
           fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: cargo fmt --all --check

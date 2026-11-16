@@ -1,0 +1,46 @@
+# Sample controller config. Copy to /etc/lu/lu.toml and replace every placeholder.
+#
+#   install -m 0644 contrib/lu-controller.toml /etc/lu/lu.toml
+#   chown root:lu /etc/lu/lu.toml
+#   chmod 0640 /etc/lu/lu.toml
+#
+# Put the real token hashes here, never the tokens. Generate a token and its hash with:
+#   printf '%s' "$(head -c 32 /dev/urandom | base64)" > /etc/lu/agent.token
+#   sha256sum /etc/lu/agent.token
+# The placeholder hashes below are not valid credentials; replace them before starting.
+
+[controller]
+listen = "0.0.0.0:7600"
+db = "/var/lib/lu/lu.db"
+artifacts_dir = "/var/lib/lu/artifacts"
+lease_secs = 60
+max_retries = 1
+provider_cooldown_secs = 1800
+recovery_grace_secs = 30
+max_connections = 256
+max_connections_per_addr = 64
+
+[[controller.agents]]
+name = "node-a"
+token_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[controller.operators]]
+name = "ops"
+token_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+# A non-loopback listen address requires TLS. Install the certificate and key first;
+# the key must be a regular file owned by lu with mode 0600 or tighter.
+[tls]
+cert = "/etc/lu/tls/cert.pem"
+key = "/etc/lu/tls/key.pem"
+
+[log]
+level = "info"
+format = "json"
+stderr = true
+# Keep any log file under /var/lib/lu so the unit's ProtectSystem/ReadWritePaths
+# sandbox can write it. Journald is the default when file is omitted.
+# file = "/var/lib/lu/lu.log"
+
+[service]
+shutdown_timeout_secs = 25

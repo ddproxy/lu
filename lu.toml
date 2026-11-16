@@ -1,8 +1,8 @@
 # Example controller config for lu. Check it with: lu check --config lu.toml
-# Replace placeholders (peer-a, paths, token hashes) before real use.
-# Demo token hashes below are sha256 of demo tokens:
-#   printf '%s' "demo-agent-token-change-me" | sha256sum
-#   printf '%s' "demo-operator-token-change-me" | sha256sum
+# Replace placeholders (node-a, paths, token hashes) before real use.
+# The hashes below are placeholders, not credentials. Generate real ones:
+#   printf '%s' "$(head -c 32 /dev/urandom | base64)" > token
+#   sha256sum token
 
 [controller]
 listen = "127.0.0.1:7600"
@@ -10,16 +10,16 @@ db = "/var/lib/lu/lu.db"
 artifacts_dir = "/var/lib/lu/artifacts"
 
 [[controller.agents]]
-name = "peer-a"
-token_sha256 = "f88d02352a7b6d7a28d4a50685b31d2c0c81c4ba2960733fdd445cc2740a6223"
+name = "node-a"
+token_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 [[controller.operators]]
 name = "ops"
-token_sha256 = "f7d9d3c374d151efb2cd62dff4c1f1b6cf0e5d1dbec6d1f48ea7e7d2d2d5f3e6"
+token_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 # For an agent host, add an [agent] table instead (or in addition). Example:
 # [agent]
-# name = "peer-a"
+# name = "node-a"
 # controller_url = "https://lu.example.net:7600"
 # token_file = "/etc/lu/agent.token"   # mode 0600 or tighter
 # work_dir = "/srv/work/lu"

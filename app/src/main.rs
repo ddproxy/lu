@@ -1,5 +1,6 @@
 //! lu: a job queue and dispatcher for dev peers.
 
+mod agent;
 mod logging;
 mod operator;
 mod service;
@@ -33,6 +34,8 @@ enum Command {
     /// Live terminal dashboard demo. Needs a build with the `tui` feature. Ignores --config.
     #[cfg(feature = "tui")]
     Top,
+    /// Run the node agent loop. Needs an `[agent]` config.
+    Agent,
     /// Submit a job.
     Submit(operator::SubmitArgs),
     /// List jobs.
@@ -62,6 +65,10 @@ async fn main() -> ExitCode {
         Command::Serve => serve(&cli.config).await,
         #[cfg(feature = "tui")]
         Command::Top => match top::run().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(&error),
+        },
+        Command::Agent => match agent::run(&cli.config).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(&error),
         },

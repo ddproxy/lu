@@ -1,9 +1,19 @@
-.PHONY: help build install uninstall du clean clean-debug clean-release clean-stale
+.PHONY: help build install uninstall install-units uninstall-units du clean clean-debug clean-release clean-stale
 
 # root installs to /usr/local, anyone else to ~/.local; override with PREFIX=
 PREFIX ?= $(if $(filter 0,$(shell id -u)),/usr/local,$(HOME)/.local)
 BINDIR ?= $(PREFIX)/bin
+SYSTEMD_UNIT_DIR ?= $(PREFIX)/lib/systemd/system
 TARGET_DIR ?= $(or $(CARGO_TARGET_DIR),target)
+
+# Units are only installed for a root install (or a root packaging run with DESTDIR).
+ifeq ($(shell id -u),0)
+INSTALL_UNITS = install-units
+UNINSTALL_UNITS = uninstall-units
+else
+INSTALL_UNITS =
+UNINSTALL_UNITS =
+endif
 
 
 help:  ## list targets
@@ -12,13 +22,23 @@ help:  ## list targets
 build:  ## release build of lu with the tui feature
 	cargo build --release --locked -p lu --features tui
 
-install: build  ## build and install lu into PREFIX/bin (~/.local, or /usr/local as root; PREFIX= and DESTDIR= override)
+install: build $(INSTALL_UNITS)  ## build and install lu into PREFIX/bin (~/.local, or /usr/local as root; PREFIX= and DESTDIR= override)
 	install -d '$(DESTDIR)$(BINDIR)'
 	install -m 0755 '$(TARGET_DIR)/release/lu' '$(DESTDIR)$(BINDIR)/lu'
 	@echo "installed $(DESTDIR)$(BINDIR)/lu"
 
-uninstall:  ## remove the installed binary
+install-units:  ## install systemd units into PREFIX/lib/systemd/system (root only)
+	install -d '$(DESTDIR)$(SYSTEMD_UNIT_DIR)'
+	install -m 0644 contrib/lu-controller.service contrib/lu-agent.service '$(DESTDIR)$(SYSTEMD_UNIT_DIR)/'
+	@echo "installed units in $(DESTDIR)$(SYSTEMD_UNIT_DIR)"
+
+uninstall: $(UNINSTALL_UNITS)  ## remove the installed binary and, as root, the units
 	rm -f '$(DESTDIR)$(BINDIR)/lu'
+
+uninstall-units:  ## remove the systemd units from PREFIX/lib/systemd/system (root only)
+	rm -f '$(DESTDIR)$(SYSTEMD_UNIT_DIR)/lu-controller.service' \
+	      '$(DESTDIR)$(SYSTEMD_UNIT_DIR)/lu-agent.service'
+	@echo "removed units from $(DESTDIR)$(SYSTEMD_UNIT_DIR)"
 
 du:  ## show target/ size breakdown (debug/release/musl), biggest first
 	@du -sh target/* 2>/dev/null | sort -rh || echo "no target/ yet"

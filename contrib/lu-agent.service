@@ -1,0 +1,53 @@
+[Unit]
+Description=Lu agent (template; the 0.1.0 tree has no `lu agent` subcommand)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lu
+Group=lu
+# The agent needs the shared staging group; the harness itself must run as
+# lu-harness, not as lu, so it cannot read /etc/lu/agent.token.
+SupplementaryGroups=lu-harness
+WorkingDirectory=/var/lib/lu/work
+# Adjust the binary path if PREFIX was not /usr/local.
+ExecStart=/usr/local/bin/lu agent --config /etc/lu/agent.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=40s
+KillMode=mixed
+StateDirectory=lu
+StateDirectoryMode=0750
+UMask=0077
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Do not add MemoryDenyWriteExecute here: a JavaScript/Bun/Node harness needs
+# executable mappings for its JIT. Set it only for a harness that does not.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Staging, checkouts and artifacts under /var/lib/lu; the harness home is writable
+# by the child process in the same sandbox.
+ReadWritePaths=/var/lib/lu /var/lib/lu-harness
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

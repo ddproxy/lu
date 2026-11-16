@@ -1,0 +1,10 @@
+# Service accounts for Lu. Install as /etc/sysusers.d/lu.conf and run
+# systemd-sysusers.
+#
+# lu         runs the controller or agent and owns the token and TLS key files.
+# lu-harness runs the coding-agent process without access to those files.
+
+g lu -
+u lu - "Lu controller and agent" /var/lib/lu /usr/sbin/nologin
+g lu-harness -
+u lu-harness - "Lu unprivileged harness" /var/lib/lu-harness /usr/sbin/nologin

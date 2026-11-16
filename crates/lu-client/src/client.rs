@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use crate::error::{body_excerpt, ApiError};
 use crate::types::{
-    CompletionBody, JobEnvelope, JobView, ListJobs, ListNodes, LogPage, NodeView, PollReply,
-    PollRequest, MAX_JSON_BYTES,
+    CompletionBody, JobEnvelope, JobView, ListJobs, ListNodes, LogPage, NodeView, PollRequest,
+    MAX_JSON_BYTES,
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -513,14 +513,33 @@ impl Client {
 
     // ---- agent ------------------------------------------------------------
 
-    pub async fn poll(&self, request: &PollRequest) -> Result<Option<AgentEvent>> {
-        let body = serde_json::to_vec(request).map_err(|error| ApiError::Decode {
+    /// Registers a heartbeat and asks for work. Returns every event the controller has for
+    /// this node (an assignment, cancels), empty when there is nothing.
+    pub async fn poll(&self, request: &PollRequest) -> Result<Vec<AgentEvent>> {
+        let (Some(node), Some(harness)) = (request.node.as_ref(), request.harness) else {
+            return Err(ApiError::BadRequest {
+                status: 0,
+                message: "a poll needs a node and a harness state".to_owned(),
+            });
+        };
+        let mut heartbeat = serde_json::json!({ "node": node, "harness": harness });
+        if !request.providers.is_empty() {
+            heartbeat["providers"] = serde_json::json!(request.providers);
+        }
+        if let Some(reiki) = &request.reiki {
+            heartbeat["reiki"] = reiki.clone();
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "heartbeat": heartbeat,
+            "wait_secs": request.wait_secs.unwrap_or(0),
+        }))
+        .map_err(|error| ApiError::Decode {
             message: format!("could not encode the poll request: {error}"),
         })?;
         let reply = self
             .send(
                 Method::POST,
-                &owned(&["v1/agent/poll", "v1/poll", "agent/poll"]),
+                &owned(&["v1/agent/poll"]),
                 Some(body),
                 &[],
                 &[],
@@ -528,63 +547,79 @@ impl Client {
             )
             .await?;
         if reply.status == StatusCode::NO_CONTENT {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let reply = self.success(reply)?;
         if reply.body.iter().all(u8::is_ascii_whitespace) {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        // A controller may wrap the event; accept both forms.
-        let event = serde_json::from_slice::<PollReply>(&reply.body)
-            .map(PollReply::into_event)
-            .or_else(|_| serde_json::from_slice::<AgentEvent>(&reply.body))
-            .map_err(|error| ApiError::Decode {
+        let events: Vec<AgentEvent> =
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
                 message: format!("could not decode the poll reply: {error}"),
-            });
-        Ok(Some(self.scrub(event)?))
+            })?;
+        events
+            .into_iter()
+            .map(|event| self.scrub(Ok(event)))
+            .collect()
     }
 
     pub async fn start(&self, id: &JobId, epoch: u64) -> Result<()> {
-        self.lease_ack("start", id, epoch).await
+        self.lease_ack("start", id, epoch).await.map(|_| ())
     }
 
-    pub async fn renew(&self, id: &JobId, epoch: u64) -> Result<()> {
-        self.lease_ack("renew", id, epoch).await
-    }
-
-    async fn lease_ack(&self, action: &str, id: &JobId, epoch: u64) -> Result<()> {
-        let body = serde_json::to_vec(&serde_json::json!({ "job_id": id, "epoch": epoch }))
-            .map_err(|error| ApiError::Decode {
-                message: format!("could not encode the {action} request: {error}"),
+    /// Extends the lease. Returns whether the controller wants the job cancelled.
+    pub async fn renew(&self, id: &JobId, epoch: u64) -> Result<bool> {
+        let reply = self.lease_ack("renew", id, epoch).await?;
+        #[derive(serde::Deserialize)]
+        struct Renewed {
+            #[serde(default)]
+            cancel: bool,
+        }
+        let renewed: Renewed =
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode the renew reply: {error}"),
             })?;
-        let routes = [
-            format!("v1/agent/jobs/{id}/{action}"),
-            format!("v1/jobs/{id}/{action}"),
-            format!("v1/agent/{action}/{id}"),
-        ];
-        let headers = [("X-Lu-Epoch".to_owned(), epoch.to_string())];
-        let reply = self
-            .send(Method::POST, &routes, Some(body), &[], &headers, false)
-            .await?;
-        self.success(reply).map(|_| ())
+        Ok(renewed.cancel)
     }
 
+    async fn lease_ack(&self, action: &str, id: &JobId, epoch: u64) -> Result<HttpReply> {
+        let body = serde_json::to_vec(&serde_json::json!({ "epoch": epoch })).map_err(|error| {
+            ApiError::Decode {
+                message: format!("could not encode the {action} request: {error}"),
+            }
+        })?;
+        let routes = [format!("v1/agent/jobs/{id}/{action}")];
+        let reply = self
+            .send(Method::POST, &routes, Some(body), &[], &[], false)
+            .await?;
+        self.success(reply)
+    }
+
+    /// Appends `chunk.data` at byte offset `chunk.seq` of the job's log. A wrong offset is a
+    /// [`ApiError::Conflict`] carrying the length the controller holds.
     pub async fn append_log(&self, chunk: &LogChunk) -> Result<()> {
         chunk.validate().map_err(|_| ApiError::TooLarge {
             limit: lu_proto::MAX_LOG_CHUNK_BYTES as u64,
         })?;
-        let body = serde_json::to_vec(chunk).map_err(|error| ApiError::Decode {
-            message: format!("could not encode the log chunk: {error}"),
-        })?;
         let id = &chunk.job_id;
-        let routes = [
-            format!("v1/agent/jobs/{id}/logs"),
-            format!("v1/agent/jobs/{id}/log"),
-            format!("v1/jobs/{id}/logs"),
+        let routes = [format!("v1/agent/jobs/{id}/log")];
+        let query = [
+            ("epoch".to_owned(), chunk.epoch.to_string()),
+            ("offset".to_owned(), chunk.seq.to_string()),
         ];
-        let headers = [("X-Lu-Epoch".to_owned(), chunk.epoch.to_string())];
+        let headers = [(
+            "Content-Type".to_owned(),
+            "application/octet-stream".to_owned(),
+        )];
         let reply = self
-            .send(Method::POST, &routes, Some(body), &[], &headers, false)
+            .send(
+                Method::POST,
+                &routes,
+                Some(chunk.data.clone().into_bytes()),
+                &query,
+                &headers,
+                false,
+            )
             .await?;
         self.success(reply).map(|_| ())
     }
@@ -602,18 +637,12 @@ impl Client {
             });
         }
         let file = name.file_name();
-        let routes = [
-            format!("v1/agent/jobs/{id}/artifacts/{file}"),
-            format!("v1/jobs/{id}/artifacts/{file}"),
-        ];
+        let routes = [format!("v1/agent/jobs/{id}/artifacts/{file}")];
         let query = [("epoch".to_owned(), epoch.to_string())];
-        let headers = [
-            ("X-Lu-Epoch".to_owned(), epoch.to_string()),
-            (
-                "Content-Type".to_owned(),
-                "application/octet-stream".to_owned(),
-            ),
-        ];
+        let headers = [(
+            "Content-Type".to_owned(),
+            "application/octet-stream".to_owned(),
+        )];
         let reply = self
             .send(
                 Method::PUT,
@@ -645,14 +674,9 @@ impl Client {
             message: format!("could not encode the completion: {error}"),
         })?;
         let id = &completion.job_id;
-        let routes = [
-            format!("v1/agent/jobs/{id}/complete"),
-            format!("v1/jobs/{id}/complete"),
-            "v1/agent/complete".to_owned(),
-        ];
-        let headers = [("X-Lu-Epoch".to_owned(), completion.epoch.to_string())];
+        let routes = [format!("v1/agent/jobs/{id}/complete")];
         let reply = self
-            .send(Method::POST, &routes, Some(body), &[], &headers, false)
+            .send(Method::POST, &routes, Some(body), &[], &[], false)
             .await?;
         self.success(reply).map(|_| ())
     }
@@ -836,7 +860,7 @@ pub trait Controller: Send + Sync {
     fn poll<'a>(
         &'a self,
         request: &'a PollRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentEvent>>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AgentEvent>>> + Send + 'a>>;
     fn start<'a>(
         &'a self,
         id: &'a JobId,
@@ -846,7 +870,7 @@ pub trait Controller: Send + Sync {
         &'a self,
         id: &'a JobId,
         epoch: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
     fn append_log<'a>(
         &'a self,
         chunk: &'a LogChunk,
@@ -868,7 +892,7 @@ impl Controller for Client {
     fn poll<'a>(
         &'a self,
         request: &'a PollRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentEvent>>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AgentEvent>>> + Send + 'a>> {
         Box::pin(async move { Client::poll(self, request).await })
     }
 
@@ -884,7 +908,7 @@ impl Controller for Client {
         &'a self,
         id: &'a JobId,
         epoch: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async move { Client::renew(self, id, epoch).await })
     }
 

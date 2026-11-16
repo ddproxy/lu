@@ -1,0 +1,10 @@
+# Directories for Lu. Install as /etc/tmpfiles.d/lu.conf and run
+# systemd-tmpfiles --create.
+#
+# Type Path                 Mode User       Group      Age Argument
+d /var/lib/lu              0750 lu         lu         -
+d /var/lib/lu/artifacts    0700 lu         lu         -
+d /var/lib/lu/work         0770 lu         lu-harness -
+d /var/lib/lu-harness      0700 lu-harness lu-harness -
+d /etc/lu                  0750 root       lu         -
+d /etc/lu/tls              0750 root       lu         -
