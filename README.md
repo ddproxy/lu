@@ -118,7 +118,7 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu drain <node>` | Stop assigning new jobs to a node. |
 | `lu undrain <node>` | Allow a drained node to take jobs again. |
 
-Operator connection settings come from `LU_URL`, `LU_TOKEN_FILE` and optional `LU_CA_FILE`, or from the `[agent]` table in `--config`. The token file must be private (mode `0600` or tighter).
+Operator connection settings come from `LU_URL`, `LU_TOKEN_FILE` and optional `LU_CA_FILE`, or from `~/.config/lu/operator.toml` (`url`, `token_file`, optional `ca_file`; a leading `~/` is expanded) when `--config` names no file, or from the `[agent]` table in `--config`. The token file must be private (mode `0600` or tighter).
 
 ### Exit codes
 

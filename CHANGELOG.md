@@ -5,6 +5,12 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-16
+
+### Added
+
+- Operator commands, including `lu top`, read `~/.config/lu/operator.toml` (`url`, `token_file`, optional `ca_file`) when no `LU_URL` is set and the `--config` file does not exist, so no shell setup is needed.
+
 ## [0.1.5] - 2026-11-16
 
 ### Changed

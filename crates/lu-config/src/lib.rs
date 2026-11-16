@@ -724,6 +724,59 @@ fn validate_loopback_http_url(table: &str, field: &str, url: &str) -> Result<(),
 
 /// Reads and validates a config file. Refuses files over [`MAX_CONFIG_BYTES`] and secret files
 /// that group or others can read.
+/// The operator's own connection settings, read from `~/.config/lu/operator.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorConfig {
+    pub url: String,
+    pub token_file: String,
+    pub ca_file: Option<String>,
+}
+
+/// Where the operator file lives: `$XDG_CONFIG_HOME/lu/operator.toml`, else `$HOME/.config/...`.
+pub fn operator_config_path() -> Option<std::path::PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(std::env::var_os("HOME").filter(|v| !v.is_empty())?)
+            .join(".config"),
+    };
+    Some(base.join("lu").join("operator.toml"))
+}
+
+/// Reads an operator file. A leading `~/` in a path means the home directory.
+pub fn load_operator(path: &Path) -> Result<OperatorConfig, ConfigError> {
+    let shown = path.display().to_string();
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: shown.clone(),
+        source,
+    })?;
+    if text.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: shown,
+            limit: MAX_CONFIG_BYTES,
+        });
+    }
+    let mut config: OperatorConfig =
+        toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let home = std::env::var("HOME").unwrap_or_default();
+    config.token_file = expand_home(&config.token_file, &home);
+    config.ca_file = config.ca_file.map(|file| expand_home(&file, &home));
+    parse_http_url(&config.url)?;
+    if config.token_file.is_empty() {
+        return Err(ConfigError::Parse(
+            "token_file must not be empty".to_owned(),
+        ));
+    }
+    Ok(config)
+}
+
+fn expand_home(value: &str, home: &str) -> String {
+    match value.strip_prefix("~/") {
+        Some(rest) if !home.is_empty() => format!("{home}/{rest}"),
+        _ => value.to_owned(),
+    }
+}
+
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let shown = path.display().to_string();
     let file = std::fs::File::open(path).map_err(|source| ConfigError::Io {
@@ -1209,5 +1262,35 @@ heartbeat_secs = 15
             "[controller]\nlisten=\"127.0.0.1:1\"\ndb=\"/db\"\nartifacts_dir=\"/a\"\n[tls]\ncert=\"/c\"\nkey=\"\"\n",
             "[tls]",
         );
+    }
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::*;
+
+    #[test]
+    fn an_operator_file_expands_home_and_checks_the_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operator.toml");
+        std::fs::write(
+            &path,
+            "url = \"https://127.0.0.1:7600\"\ntoken_file = \"~/t\"\nca_file = \"/ca\"\n",
+        )
+        .unwrap();
+        let config = load_operator(&path).unwrap();
+        assert!(
+            !config.token_file.starts_with('~')
+                || std::env::var("HOME").unwrap_or_default().is_empty()
+        );
+        assert_eq!(config.ca_file.as_deref(), Some("/ca"));
+        std::fs::write(&path, "url = \"ftp://x\"\ntoken_file = \"/t\"\n").unwrap();
+        assert!(load_operator(&path).is_err());
+        std::fs::write(
+            &path,
+            "url = \"https://x\"\ntoken_file = \"/t\"\nextra = 1\n",
+        )
+        .unwrap();
+        assert!(load_operator(&path).is_err());
     }
 }
