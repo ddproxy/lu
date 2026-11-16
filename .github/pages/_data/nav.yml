@@ -1,0 +1,11 @@
+- title: Start
+  items:
+    - { title: Overview, url: / }
+- title: Reference
+  items:
+    - { title: HTTP API, url: /docs/api.html }
+    - { title: Configuration, url: /docs/config.html }
+- title: Run it
+  items:
+    - { title: Operations, url: /docs/operations.html }
+    - { title: Security, url: /docs/security.html }
