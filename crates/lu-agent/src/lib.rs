@@ -5,6 +5,7 @@
 //! errors only when the agent cannot continue; a broken log stream is never allowed to kill a
 //! running job.
 
+mod health;
 mod logs;
 
 use std::future::Future;
@@ -101,6 +102,15 @@ enum UploadFault {
     Forbidden,
 }
 
+/// Aborts a task when dropped, so a background reader never outlives the agent loop.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The node agent. One instance runs one job at a time.
 pub struct Agent {
     node: NodeName,
@@ -113,6 +123,10 @@ pub struct Agent {
     workspace_gid: Option<u32>,
     /// The opencode server password, kept out of `Debug` and logs.
     opencode_password: Option<Arc<str>>,
+    /// The local Reiki's health URL and token, when configured.
+    reiki_probe: Option<(String, Arc<str>)>,
+    /// The last health read from it, sent with every heartbeat.
+    health: health::Shared,
     harness: String,
     builder: Arc<CommandBuilder>,
 }
@@ -153,6 +167,24 @@ impl Agent {
             }
             None => None,
         };
+        let reiki_probe = match (
+            config.reiki_health_url.as_deref(),
+            config.reiki_token_file.as_deref(),
+        ) {
+            (Some(url), Some(file)) => {
+                let text =
+                    lu_config::read_private_file("[agent] reiki_token_file", Path::new(file), 4096)
+                        .map_err(|error| AgentError::Config(error.to_string()))?;
+                let token = text.trim_end_matches(['\r', '\n']);
+                if token.is_empty() || token.chars().any(char::is_control) {
+                    return Err(AgentError::Config(
+                        "reiki_token_file must hold one line of text".to_owned(),
+                    ));
+                }
+                Some((url.to_owned(), Arc::from(token)))
+            }
+            _ => None,
+        };
         Ok(Self {
             node,
             controller,
@@ -162,6 +194,8 @@ impl Agent {
             opencode_server: config.opencode_server,
             workspace_gid,
             opencode_password,
+            reiki_probe,
+            health: health::Shared::default(),
             harness: config.harness,
             builder: Arc::new(|task_file, model, server, message| {
                 lu_supervise::opencode_command(task_file, model, server, message)
@@ -202,6 +236,14 @@ impl Agent {
     {
         let mut shutdown = Box::pin(shutdown);
         let mut backoff = Backoff::new();
+        // Ends with the agent: the guard aborts the task when `run` returns.
+        let _health_task = self.reiki_probe.as_ref().map(|(url, token)| {
+            AbortOnDrop(health::spawn_refresher(
+                url.clone(),
+                Arc::clone(token),
+                Arc::clone(&self.health),
+            ))
+        });
         info!(node = %self.node, work_dir = %self.work_dir.display(), "agent started");
         loop {
             let request = self.poll_request(HarnessState::Idle, POLL_WAIT_SECS);
@@ -268,11 +310,12 @@ impl Agent {
     }
 
     fn poll_request(&self, harness: HarnessState, wait_secs: u64) -> lu_client::PollRequest {
+        let current = health::snapshot(&self.health);
         let beat = Heartbeat {
             node: self.node.clone(),
             harness,
-            providers: Vec::new(),
-            reiki: None,
+            providers: current.providers,
+            reiki: current.reiki,
         };
         let mut request = lu_client::PollRequest::from(beat);
         request.wait_secs = Some(wait_secs);
@@ -443,6 +486,7 @@ impl Agent {
             epoch,
             self.heartbeat_secs,
             control_tx,
+            Arc::clone(&self.health),
         ));
 
         let mut tail = Tail::new(SUMMARY_TAIL_BYTES);
@@ -736,6 +780,7 @@ async fn control_loop(
     epoch: u64,
     heartbeat_secs: u64,
     tx: mpsc::Sender<Control>,
+    shared_health: health::Shared,
 ) {
     let mut renew = tokio::time::interval(RENEW_PERIOD);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -779,11 +824,12 @@ async fn control_loop(
                 }
             }
             _ = heartbeat.tick() => {
+                let current = health::snapshot(&shared_health);
                 let beat = Heartbeat {
                     node: node.clone(),
                     harness: HarnessState::Busy,
-                    providers: Vec::new(),
-                    reiki: None,
+                    providers: current.providers,
+                    reiki: current.reiki,
                 };
                 let mut request = lu_client::PollRequest::from(beat);
                 request.wait_secs = Some(0);

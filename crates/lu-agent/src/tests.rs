@@ -247,6 +247,8 @@ fn make_agent(
         opencode_server: None,
         workspace_gid: None,
         opencode_password: None,
+        reiki_probe: None,
+        health: Default::default(),
         harness: "opencode".to_owned(),
         builder: Arc::new(move |task_file, _model, _server, _message| {
             Ok(harness_script(task_file))
@@ -1193,6 +1195,64 @@ async fn job_harness_gets_the_opencode_password_only_when_one_is_configured() {
             .any(|line| line == "OPENCODE_SERVER_PASSWORD=test-password-value"),
         "the harness did not get the password: {log}"
     );
+}
+
+#[tokio::test]
+async fn heartbeats_carry_the_providers_the_local_reiki_reports() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let seen = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                let body = if seen.contains("authorization: bearer probe-token") {
+                    r#"{"instance":"node-a","upstreams":[{"name":"zen","healthy_keys":1,"cooling_keys":0,"disabled_keys":0},{"name":"openrouter","healthy_keys":0,"cooling_keys":1,"disabled_keys":0,"soonest_cooldown_seconds":60}]}"#
+                } else {
+                    "{}"
+                };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    let f = fixture();
+    let controller = Arc::new(FakeController::new());
+    for _ in 0..200 {
+        controller.push_poll(Ok(Vec::new()));
+    }
+    let mut agent = make_agent(&f.work_dir, controller.clone(), sh("true"));
+    agent.reiki_probe = Some((
+        format!("http://127.0.0.1:{port}/v1/health"),
+        Arc::from("probe-token"),
+    ));
+    let (stop, handle) = run_agent_with_shutdown(agent);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let carried = loop {
+        let found = controller.check(|calls| {
+            calls.iter().find_map(|call| match call {
+                Call::Poll(request) if !request.providers.is_empty() => Some(request.clone()),
+                _ => None,
+            })
+        });
+        if let Some(request) = found {
+            break request;
+        }
+        assert!(Instant::now() < deadline, "no heartbeat carried providers");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let names: Vec<&str> = carried.providers.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["zen", "openrouter"]);
+    assert_eq!(carried.providers[1].soonest_secs, Some(60));
+    assert!(carried.reiki.is_some(), "the document is forwarded too");
+    let _ = stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 }
 
 #[tokio::test]

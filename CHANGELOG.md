@@ -3,6 +3,12 @@
 All notable changes are recorded here. The format follows Keep a Changelog, and the project
 uses semantic versioning once it reaches 1.0.
 
+## [Unreleased]
+
+### Added
+
+- The agent sends its local Reiki's key health with each heartbeat when `reiki_health_url` and `reiki_token_file` are set, so the controller knows which providers a node can use.
+
 ## [0.1.2] - 2026-11-16
 
 ### Added

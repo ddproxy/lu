@@ -62,7 +62,7 @@ The `[agent]` table describes an agent host. The operator CLI also reads `contro
 | `workspace_group` | no | — | A group name or number, 1 to 32 letters, digits, `_`, `-` or `.`. When set, each job's working tree is given to this group with group read and write and the setgid bit; `.git` is left as git made it. For a harness that runs as another account, such as an opencode server in a container, while the agent runs as the account that can use git. Resolved from `/etc/group` at start; an unknown group stops the agent. |
 | `slots` | no | `1` | Exactly `1` in 0.1.0 (`1` to `1`). |
 | `heartbeat_secs` | no | `15` | Integer `2` to `300`. When a `[controller]` table is also present, `heartbeat_secs * 2` must be strictly less than `lease_secs`. |
-| `reiki_health_url` | no | — | Loopback `http` or `https` URL with no credentials, query or fragment. Requires `reiki_token_file`. |
+| `reiki_health_url` | no | — | Loopback `http` or `https` URL with no credentials, query or fragment. Requires `reiki_token_file`. The agent reads the local Reiki's peer health (`GET /v1/health`) every 10 seconds and sends each upstream as a provider (`ok`, `cooling` with seconds left, `disabled` or `unknown`) with every heartbeat, plus the document itself. A job that names a `provider` goes only to nodes that report it. After three failed reads the node reports no providers. |
 | `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set. Checked like `token_file` on `load`. |
 
 ## `[tls]`

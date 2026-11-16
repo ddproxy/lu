@@ -13,6 +13,7 @@ lu-config = { path = "../lu-config" }
 lu-proto = { path = "../lu-proto" }
 lu-staging = { path = "../lu-staging" }
 lu-supervise = { path = "../lu-supervise" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt", "sync", "time"] }

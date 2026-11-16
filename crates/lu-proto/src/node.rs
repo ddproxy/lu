@@ -141,7 +141,8 @@ impl std::fmt::Display for HeartbeatError {
 
 impl std::error::Error for HeartbeatError {}
 
-fn valid_provider_name(name: &str) -> bool {
+/// Whether `name` may appear as a provider in a heartbeat.
+pub fn valid_provider_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= MAX_NAME_BYTES && name.bytes().all(is_name_byte)
 }
 

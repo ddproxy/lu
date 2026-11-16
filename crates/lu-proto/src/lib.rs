@@ -23,7 +23,9 @@ pub use limits::{
     MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_PROVIDERS, MAX_REIKI_BYTES, MAX_REPORT_BYTES,
     MAX_REPO_BYTES, MAX_SUMMARY_BYTES, MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
 };
-pub use node::{HarnessState, Heartbeat, HeartbeatError, ProviderState, ProviderStatus};
+pub use node::{
+    valid_provider_name, HarnessState, Heartbeat, HeartbeatError, ProviderState, ProviderStatus,
+};
 pub use sanitize::{printable, truncate_chars};
 pub use spec::{JobSpec, JobSpecError};
 pub use state::JobState;

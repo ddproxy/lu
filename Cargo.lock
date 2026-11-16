@@ -1086,6 +1086,7 @@ dependencies = [
  "lu-proto",
  "lu-staging",
  "lu-supervise",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
