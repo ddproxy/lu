@@ -753,6 +753,7 @@ dependencies = [
 name = "lu-proto"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
  "serde",
  "serde_json",
 ]
@@ -787,6 +788,7 @@ dependencies = [
 name = "lu-supervise"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "tokio",
 ]
 

@@ -1,0 +1,91 @@
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::process::Stdio;
+
+use tokio::process::Command;
+
+/// Environment names a child always receives when the parent has them.
+const BASE_ENV: [&str; 3] = ["PATH", "HOME", "LANG"];
+
+/// A program to run without a shell, with an explicit environment.
+///
+/// The child never inherits the parent environment: it sees only [`BASE_ENV`]
+/// (when the parent has them) plus the entries in [`CommandSpec::env`].
+#[derive(Debug, Clone)]
+pub struct CommandSpec {
+    /// The program to execute. Resolved by the OS, never by a shell.
+    pub program: PathBuf,
+    /// Arguments passed verbatim, in order.
+    pub args: Vec<OsString>,
+    /// Working directory. `None` keeps the parent's.
+    pub cwd: Option<PathBuf>,
+    /// Extra environment entries added on top of [`BASE_ENV`].
+    pub env: Vec<(OsString, OsString)>,
+}
+
+impl CommandSpec {
+    /// A spec that runs `program` with no arguments.
+    pub fn new(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+        }
+    }
+
+    /// Appends one argument.
+    pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// Appends several arguments.
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Sets the working directory.
+    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Adds one environment entry, on top of [`BASE_ENV`].
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+}
+
+/// Builds the tokio command: direct exec, own process group, explicit environment.
+pub(crate) fn build(spec: &CommandSpec) -> Command {
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(&spec.args);
+    if let Some(cwd) = &spec.cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd.env_clear();
+    for name in BASE_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
+    for (key, value) in &spec.env {
+        cmd.env(key, value);
+    }
+    // No terminal input: a harness that waits on input hits the idle-output timeout.
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    // Own process group, so a signal reaches the whole tree.
+    cmd.process_group(0);
+    // A dropped child must not be left running.
+    cmd.kill_on_drop(true);
+    cmd
+}

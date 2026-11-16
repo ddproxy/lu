@@ -1,30 +1,34 @@
-# Demo config for lu. Check it with: lu check --config lu.toml
+# Example controller config for lu. Check it with: lu check --config lu.toml
+# Replace placeholders (peer-a, paths, token hashes) before real use.
+# Demo token hashes below are sha256 of demo tokens:
+#   printf '%s' "demo-agent-token-change-me" | sha256sum
+#   printf '%s' "demo-operator-token-change-me" | sha256sum
 
-[server]
-listen = "127.0.0.1:8080"
-max_connections = 256
-max_connections_per_addr = 16
-header_read_timeout_secs = 30
-request_timeout_secs = 60
+[controller]
+listen = "127.0.0.1:7600"
+db = "/var/lib/lu/lu.db"
+artifacts_dir = "/var/lib/lu/artifacts"
 
-# Uncomment to serve HTTPS. The key file must not be readable by group or others (chmod 600).
-# [tls]
-# cert = "/etc/lu/cert.pem"
-# key = "/etc/lu/key.pem"
+[[controller.agents]]
+name = "peer-a"
+token_sha256 = "f88d02352a7b6d7a28d4a50685b31d2c0c81c4ba2960733fdd445cc2740a6223"
+
+[[controller.operators]]
+name = "ops"
+token_sha256 = "f7d9d3c374d151efb2cd62dff4c1f1b6cf0e5d1dbec6d1f48ea7e7d2d2d5f3e6"
+
+# For an agent host, add an [agent] table instead (or in addition). Example:
+# [agent]
+# name = "peer-a"
+# controller_url = "https://lu.example.net:7600"
+# token_file = "/etc/lu/agent.token"   # mode 0600 or tighter
+# work_dir = "/srv/work/lu"
+# harness = "opencode"
 
 [log]
 level = "info"
 format = "text"
 stderr = true
-# file = "/var/log/lu.log"
 
-[auth]
-throttle = true
-max_failures = 10
-window_secs = 60
-
-# Demo only. The hash is sha256 of the token "demo-token-change-me". Replace the token and hash
-# before any real use: printf '%s' "$TOKEN" | sha256sum
-[[auth.tokens]]
-name = "peer-a"
-token_sha256 = "b5d56f2eacf505c2639b22468f3a8b1bcaf7d619cadbab47dc6ce515fc4c3612"
+[service]
+shutdown_timeout_secs = 25

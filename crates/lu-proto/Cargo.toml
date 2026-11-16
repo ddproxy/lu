@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# Random bytes for job ids. Already in the workspace lock (ring uses 0.2), so no duplicate.
+getrandom = "0.2"
 
 [lints]
 workspace = true

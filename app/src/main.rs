@@ -1,4 +1,4 @@
-//! lu: a reference service built from the lu-* crates. It is the thing you copy and rename.
+//! lu: a job queue and dispatcher for dev peers.
 
 mod logging;
 mod service;
@@ -11,11 +11,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(
-    name = "lu",
-    version,
-    about = "Reference service built from the lu-* crates"
-)]
+#[command(name = "lu", version, about = "Job queue and dispatcher for dev peers")]
 struct Cli {
     /// Config file (TOML).
     #[arg(long, global = true, default_value = "lu.toml")]
@@ -26,7 +22,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Parse and validate the config and the TLS files, print a one-line summary, and exit.
+    /// Parse and validate the config and the TLS files, print a summary, and exit.
     Check,
     /// Run the HTTP listener. This is the default.
     Serve,
@@ -62,13 +58,22 @@ fn check(path: &std::path::Path) -> ExitCode {
             return fail(&error);
         }
     }
-    println!(
-        "ok: listen {}, {} token(s), tls {}, log {}",
-        config.server.listen,
-        config.auth.tokens.len(),
-        if config.tls.is_some() { "on" } else { "off" },
-        config.log.level,
-    );
+    let tls_on = config.tls.is_some();
+    if let Some(c) = &config.controller {
+        println!(
+            "controller: listen {}, {} agent(s), {} operator(s), tls {}",
+            c.listen,
+            c.agents.len(),
+            c.operators.len(),
+            if tls_on { "on" } else { "off" }
+        );
+    }
+    if let Some(a) = &config.agent {
+        println!(
+            "agent: {} -> {}, work dir {}, slots {}",
+            a.name, a.controller_url, a.work_dir, a.slots
+        );
+    }
     ExitCode::SUCCESS
 }
 

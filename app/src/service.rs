@@ -19,26 +19,26 @@ use tokio::net::TcpListener;
 
 pub struct AppState {
     tokens: TokenSet,
-    /// `None` when `[auth] throttle = false`.
+    /// `None` when throttling is disabled.
     throttle: Option<LoginThrottle>,
 }
 
 impl AppState {
     pub fn from_config(config: &Config) -> Result<Self, String> {
-        let tokens = TokenSet::new(
-            config
-                .auth
-                .tokens
-                .iter()
-                .map(|t| (t.name.clone(), t.token_sha256.clone())),
-        )
-        .map_err(|e| e.to_string())?;
-        let throttle = config.auth.throttle.then(|| {
-            LoginThrottle::new(ThrottleSettings {
-                max_failures: config.auth.max_failures,
-                window: Duration::from_secs(config.auth.window_secs),
-            })
-        });
+        let mut pairs = Vec::new();
+        if let Some(controller) = &config.controller {
+            for t in &controller.agents {
+                pairs.push((t.name.clone(), t.token_sha256.clone()));
+            }
+            for t in &controller.operators {
+                pairs.push((t.name.clone(), t.token_sha256.clone()));
+            }
+        }
+        let tokens = TokenSet::new(pairs).map_err(|e| e.to_string())?;
+        let throttle = Some(LoginThrottle::new(ThrottleSettings {
+            max_failures: 10,
+            window: Duration::from_secs(60),
+        }));
         Ok(Self { tokens, throttle })
     }
 }
@@ -105,6 +105,10 @@ async fn whoami(
 
 /// Binds the listener and serves until a shutdown signal.
 pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
+    let controller = config
+        .controller
+        .as_ref()
+        .ok_or_else(|| "serve requires a [controller] config".to_owned())?;
     let state = Arc::new(AppState::from_config(config)?);
     let tls = match &config.tls {
         Some(tls) => Some(lu_serve::tls::load(
@@ -113,9 +117,9 @@ pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
         )?),
         None => None,
     };
-    let listener = TcpListener::bind(&config.server.listen)
+    let listener = TcpListener::bind(&controller.listen)
         .await
-        .map_err(|e| format!("cannot listen on {}: {e}", config.server.listen))?;
+        .map_err(|e| format!("cannot listen on {}: {e}", controller.listen))?;
     let addr: SocketAddr = listener.local_addr().map_err(|e| e.to_string())?;
     tracing::info!(
         %addr,
@@ -124,10 +128,10 @@ pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
         "listening"
     );
     let options = ServeOptions {
-        max_connections: config.server.max_connections,
-        max_connections_per_addr: config.server.max_connections_per_addr,
-        header_read_timeout: Duration::from_secs(config.server.header_read_timeout_secs),
-        request_timeout: Duration::from_secs(config.server.request_timeout_secs),
+        max_connections: controller.max_connections,
+        max_connections_per_addr: controller.max_connections_per_addr,
+        header_read_timeout: Duration::from_secs(30),
+        request_timeout: Duration::from_secs(60),
     };
     serve(listener, router(state), options, tls, shutdown_signal()).await;
     tracing::info!("stopped");
@@ -137,26 +141,42 @@ pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lu_config::{AuthConfig, TokenEntry};
+    use lu_config::{Config, ControllerAgent, ControllerConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     const TOKEN: &str = "a-long-demo-token-for-tests";
 
     async fn start(max_failures: u32) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
-        let config = Config {
-            auth: AuthConfig {
-                throttle: true,
-                max_failures,
-                window_secs: 60,
-                tokens: vec![TokenEntry {
-                    name: "peer-a".to_owned(),
-                    token_sha256: lu_auth::sha256_hex(TOKEN),
-                }],
-            },
+        let controller = ControllerConfig {
+            listen: "127.0.0.1:7600".to_owned(),
+            db: "/db".to_owned(),
+            artifacts_dir: "/a".to_owned(),
+            lease_secs: 60,
+            max_retries: 1,
+            provider_cooldown_secs: 1800,
+            recovery_grace_secs: 30,
+            max_connections: 256,
+            max_connections_per_addr: 64,
+            agents: vec![ControllerAgent {
+                name: "peer-a".to_owned(),
+                token_sha256: lu_auth::sha256_hex(TOKEN),
+                cordoned: false,
+            }],
+            operators: Vec::new(),
+        };
+        let _config = Config {
+            controller: Some(controller),
             ..Config::default()
         };
-        let state = Arc::new(AppState::from_config(&config).unwrap());
+        // override throttle for test
+        let state = Arc::new(AppState {
+            tokens: TokenSet::new(vec![("peer-a".to_owned(), lu_auth::sha256_hex(TOKEN))]).unwrap(),
+            throttle: Some(LoginThrottle::new(ThrottleSettings {
+                max_failures,
+                window: Duration::from_secs(60),
+            })),
+        });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -227,7 +247,6 @@ mod tests {
             "Authorization: Bearer t\u{e9}st\r\n",
         ];
         for header in hostile {
-            // hyper answers 400 to raw control bytes before the handler runs; either refusal is fine.
             let reply = send(addr, header).await;
             assert!(matches!(status(&reply), 400 | 401), "{header:?} -> {reply}");
         }
@@ -258,14 +277,25 @@ mod tests {
 
     #[test]
     fn a_hash_of_the_wrong_length_is_refused_at_startup() {
+        let controller = ControllerConfig {
+            listen: "127.0.0.1:7600".to_owned(),
+            db: "/db".to_owned(),
+            artifacts_dir: "/a".to_owned(),
+            lease_secs: 60,
+            max_retries: 1,
+            provider_cooldown_secs: 1800,
+            recovery_grace_secs: 30,
+            max_connections: 256,
+            max_connections_per_addr: 64,
+            agents: vec![ControllerAgent {
+                name: "bad".to_owned(),
+                token_sha256: "abc".to_owned(),
+                cordoned: false,
+            }],
+            operators: Vec::new(),
+        };
         let config = Config {
-            auth: AuthConfig {
-                tokens: vec![TokenEntry {
-                    name: "bad".to_owned(),
-                    token_sha256: "abc".to_owned(),
-                }],
-                ..AuthConfig::default()
-            },
+            controller: Some(controller),
             ..Config::default()
         };
         assert!(AppState::from_config(&config).is_err());
