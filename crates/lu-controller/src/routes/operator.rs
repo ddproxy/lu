@@ -1,7 +1,8 @@
 use crate::auth::authenticate_operator;
 use crate::error::ApiError;
 use crate::routes::{
-    json_ok, json_value_ok, parse_job_state, read_json, store_err, with_version, MAX_JSON_BODY,
+    json_ok, json_value_ok, parse_job_state, read_raw_limited, store_err, with_version,
+    MAX_JSON_BODY,
 };
 use crate::state::AppState;
 use crate::time::now;
@@ -22,10 +23,12 @@ pub fn job_view(r: &JobRecord) -> serde_json::Value {
         lu_proto::FailureClass::Node => "node",
         lu_proto::FailureClass::Provider => "provider",
         lu_proto::FailureClass::Execution => "execution",
+        lu_proto::FailureClass::Dependency => "dependency",
     });
     json!({
         "id": r.id.to_string(),
         "state": match r.state {
+            lu_proto::JobState::Blocked => "blocked",
             lu_proto::JobState::Queued => "queued",
             lu_proto::JobState::Leased => "leased",
             lu_proto::JobState::Running => "running",
@@ -48,6 +51,8 @@ pub fn job_view(r: &JobRecord) -> serde_json::Value {
         "exit_code": r.exit_code,
         "artifacts": artifacts,
         "cancel_requested": r.cancel_requested,
+        "after": r.spec.after.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "waiting_on": r.waiting_on.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
     })
 }
 
@@ -79,9 +84,19 @@ pub async fn create_job(
         Ok(o) => o,
         Err(e) => return with_version(e.into_response()),
     };
-    let spec: JobSpec = match read_json(req, MAX_JSON_BODY).await {
-        Ok(s) => s,
+    let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
+        Ok(b) => b,
         Err(e) => return with_version(e.into_response()),
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return with_version(ApiError::bad_request("invalid request body").into_response())
+        }
+    };
+    let spec: JobSpec = match serde_json::from_value(value) {
+        Ok(s) => s,
+        Err(e) => return with_version(ApiError::unprocessable(e.to_string()).into_response()),
     };
     let now = now();
     let res = tokio::task::spawn_blocking({
@@ -324,6 +339,7 @@ pub async fn get_logs(
             .unwrap_or(header::HeaderValue::from_static("0")),
     );
     let st = match rec.state {
+        lu_proto::JobState::Blocked => "blocked",
         lu_proto::JobState::Queued => "queued",
         lu_proto::JobState::Leased => "leased",
         lu_proto::JobState::Running => "running",

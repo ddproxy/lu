@@ -89,6 +89,16 @@ These steps run a controller and the operator CLI on one machine. Run them as yo
 
    `lu submit` prints the new job id. With no agent running the job remains `queued`; `lu logs` is empty and `lu cancel` moves a queued job to `cancelled`.
 
+   To chain jobs, repeat `--after` with the ids that must finish first:
+
+   ```sh
+   lu submit --repo /path/to/repository --ref main --task "run the linter" --after <job-id>
+   lu ls   # AFTER shows how many dependencies are still unfinished, or - for none
+   lu show <job-id>   # prints each dependency and its state
+   ```
+
+   The dependent job stays `blocked` until every dependency is `done`, then becomes `queued`. If a dependency ends `failed` or `cancelled`, the dependent fails with `failure_class: "dependency"`; dependency results are not applied to the dependent's workspace.
+
 5. Run an agent on the same machine. Write `$HOME/lu-demo/agent.toml` with an `[agent]` table (`name = "node-a"`, `controller_url = "http://127.0.0.1:7600"`, `token_file` pointing at `agent.token`, a `work_dir` under `lu-demo`, `harness = "opencode"`), then:
 
    ```sh
@@ -108,9 +118,9 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu check` | Parse and validate the config and TLS files, print a summary, exit. |
 | `lu serve` | Run the HTTP(S) controller. This is the default when no subcommand is given. |
 | `lu top` | Live view of the nodes (state, last heartbeat, provider health) and recent jobs, refreshed every two seconds. `↑`/`↓` or `j`/`k` select a row, `Tab` switches focus between nodes and jobs, `Enter` opens the last 20 lines of the selected job's log, `Esc` closes the log pane (or quits when it is closed), `d` twice within three seconds drains or undrains the selected node, `p` pauses and `q` quits. `--once` prints one snapshot's tables as plain text and exits; `--json` prints one `nodes`/`jobs` object instead, and cannot be combined with `--once`. Only in a build with `--features tui`; connects like the other operator commands. |
-| `lu submit` | Submit a job. `--repo` and `--ref` are required; the task comes from `--task`, `--task-file`, or stdin. `--wait` polls until terminal. |
-| `lu ls` | List jobs, newest first. Filters: `--state`, `--limit`. |
-| `lu show <id>` | Show one job. |
+| `lu submit` | Submit a job. `--repo` and `--ref` are required; the task comes from `--task`, `--task-file`, or stdin. `--after <job-id>` (repeatable, at most 16) makes the job wait for those dependencies. `--wait` polls until terminal. |
+| `lu ls` | List jobs, newest first. Filters: `--state`, `--limit`. `AFTER` counts dependencies still unfinished. |
+| `lu show <id>` | Show one job, including each dependency and its state. |
 | `lu logs <id>` | Print a job's stored log. `--follow` keeps reading until the job is terminal. |
 | `lu fetch <id>` | Save `diff.patch`, `run.log` and `report.json` into `--out` (default `.`). Missing artifacts are skipped; existing files need `--force`. |
 | `lu cancel <id>` | Ask the controller to cancel a job. |

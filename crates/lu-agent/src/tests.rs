@@ -227,6 +227,7 @@ fn test_spec(repo: &str) -> JobSpec {
         timeout_secs: 60,
         idle_timeout_secs: None,
         idempotency_key: None,
+        after: Vec::new(),
     }
 }
 

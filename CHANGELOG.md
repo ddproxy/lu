@@ -13,6 +13,7 @@ uses semantic versioning once it reaches 1.0.
   last 20 log lines under the tables and `Esc` closes them. Log fetches run on the feeder task.
 - `lu top` drains or undrains the highlighted node with `d`, confirmed by a second `d` within
   three seconds; `Tab` switches the selection between the node table and the job list.
+- Job dependencies: `JobSpec.after` names up to 16 jobs that must be `done` first. A waiting job is `blocked`, `JobView` exposes `after` and `waiting_on`, `done` dependencies promote dependents in the same transaction, and a `failed` or `cancelled` dependency fails its dependents with `failure_class: "dependency"`. `lu submit --after` sets them, `lu ls` has an `AFTER` column, and `lu show` prints each dependency's state.
 
 ## [0.1.7] - 2026-11-17
 

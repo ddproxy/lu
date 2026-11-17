@@ -367,6 +367,107 @@ harness = "opencode"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_passes_after_dependencies() {
+    let id = job_id();
+    let dep1 = job_id();
+    let dep2 = job_id();
+    let body = job_json(&id, "blocked");
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("submit-after");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--after",
+            &dep1,
+            "--after",
+            &dep2,
+        ],
+        &env_for(&server, &token),
+        Some("run after the others\n"),
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap()[0].body).unwrap();
+    assert_eq!(spec["after"], json!([dep1, dep2]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ls_shows_the_waiting_dependency_count() {
+    let waiting_id = job_id();
+    let free_id = job_id();
+    let dep = job_id();
+    let mut waiting = job_json(&waiting_id, "blocked");
+    waiting["after"] = json!([dep]);
+    waiting["waiting_on"] = json!([dep]);
+    let free = job_json(&free_id, "queued");
+    let body = json!({"jobs": [waiting, free]});
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("ls-after");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(&["ls"], &env_for(&server, &token), None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    let header = text.lines().next().unwrap();
+    let columns: Vec<&str> = header.split_whitespace().collect();
+    assert_eq!(columns[4], "AFTER", "{text}");
+    let waiting_line = text
+        .lines()
+        .find(|line| line.contains(&waiting_id))
+        .unwrap();
+    let cells: Vec<&str> = waiting_line.split_whitespace().collect();
+    assert_eq!(cells[1], "blocked");
+    assert_eq!(cells[4], "1");
+    let free_line = text.lines().find(|line| line.contains(&free_id)).unwrap();
+    let cells: Vec<&str> = free_line.split_whitespace().collect();
+    assert_eq!(cells[4], "-");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_lists_dependency_states() {
+    let id = job_id();
+    let dep = job_id();
+    let main_id = id.clone();
+    let dep_id = dep.clone();
+    let server = start(move |recorded| {
+        if recorded.path == format!("/v1/jobs/{dep_id}") {
+            Reply::json(&job_json(&dep_id, "blocked"))
+        } else {
+            let mut view = job_json(&main_id, "blocked");
+            view["after"] = json!([dep_id]);
+            view["waiting_on"] = json!([dep_id]);
+            Reply::json(&view)
+        }
+    })
+    .await;
+    let dir = scratch("show-after");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(&["show", &id], &env_for(&server, &token), None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains(&format!("after  {dep}  blocked (waiting)")),
+        "{text}"
+    );
+    assert!(
+        server
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|record| record.path == format!("/v1/jobs/{dep}")),
+        "the dependency should be fetched"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_reads_stdin_and_sends_every_flag() {
     let id = job_id();
     let body = job_json(&id, "queued");

@@ -150,7 +150,7 @@ impl Sample {
         };
         Self {
             running: count(&["running", "leased"]),
-            queued: count(&["queued", "recovering"]),
+            queued: count(&["queued", "blocked", "recovering"]),
             busy_nodes: snapshot
                 .nodes
                 .iter()
@@ -510,7 +510,7 @@ fn provider_text(cell: &ProviderCell) -> (String, Tone) {
 fn job_tone(state: &str) -> Tone {
     match state {
         "running" | "leased" => Tone::Good,
-        "queued" | "recovering" | "needs_input" => Tone::Warn,
+        "queued" | "blocked" | "recovering" | "needs_input" => Tone::Warn,
         "failed" => Tone::Bad,
         _ => Tone::Dim,
     }
@@ -737,7 +737,7 @@ mod tests {
                 node("ct-1", "busy", Some(3)),
                 node("ct-2", "idle", Some(90)),
             ],
-            jobs: vec![job("01ABC", "running")],
+            jobs: vec![job("01ABC", "running"), job("01BLK", "blocked")],
         }
     }
 
@@ -768,6 +768,12 @@ mod tests {
             .unwrap();
         assert_eq!(running.values, vec![1, 1]);
         assert_eq!(running.latest, 1);
+        let queued = view
+            .charts
+            .iter()
+            .find(|c| c.title == "queued jobs")
+            .unwrap();
+        assert_eq!(queued.latest, 1);
         dashboard.toggle_pause(t0);
         dashboard.apply(Ok(snapshot()), t0);
         let paused = dashboard.view(t0);

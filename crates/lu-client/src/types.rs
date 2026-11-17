@@ -35,6 +35,10 @@ pub struct JobView {
     pub failure_class: Option<FailureClass>,
     #[serde(default)]
     pub summary: Option<String>,
+    #[serde(default)]
+    pub after: Vec<JobId>,
+    #[serde(default)]
+    pub waiting_on: Vec<JobId>,
 }
 
 impl JobView {
@@ -52,6 +56,8 @@ impl JobView {
             finished_at: None,
             failure_class: None,
             summary: None,
+            after: Vec::new(),
+            waiting_on: Vec::new(),
         }
     }
 }
@@ -282,6 +288,7 @@ fn empty_spec() -> JobSpec {
         timeout_secs: lu_proto::DEFAULT_TIMEOUT_SECS,
         idle_timeout_secs: None,
         idempotency_key: None,
+        after: Vec::new(),
     }
 }
 
@@ -310,6 +317,19 @@ mod tests {
         assert_eq!(view.attempt, 2);
         assert_eq!(view.failure_class, Some(FailureClass::Execution));
         assert_eq!(view.spec.repo, "/srv/repo");
+    }
+
+    #[test]
+    fn job_views_carry_dependencies() {
+        let id = JobId::new();
+        let dep = JobId::new();
+        let json = format!(
+            r#"{{"id":"{id}","state":"blocked","after":["{dep}"],"waiting_on":["{dep}"]}}"#
+        );
+        let view: JobView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view.state, JobState::Blocked);
+        assert_eq!(view.after, vec![dep.clone()]);
+        assert_eq!(view.waiting_on, vec![dep]);
     }
 
     #[test]

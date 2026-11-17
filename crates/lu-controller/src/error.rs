@@ -9,6 +9,7 @@ pub enum ErrorCode {
     Unauthorized,
     Forbidden,
     NotFound,
+    Unprocessable,
     Conflict,
     StaleEpoch,
     TooLarge,
@@ -23,6 +24,7 @@ impl ErrorCode {
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
+            Self::Unprocessable => "unprocessable",
             Self::Conflict => "conflict",
             Self::StaleEpoch => "stale_epoch",
             Self::TooLarge => "too_large",
@@ -37,6 +39,7 @@ impl ErrorCode {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Unprocessable => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Conflict => StatusCode::CONFLICT,
             Self::StaleEpoch => StatusCode::CONFLICT,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -79,6 +82,9 @@ impl ApiError {
     }
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self::new(ErrorCode::NotFound, msg)
+    }
+    pub fn unprocessable(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Unprocessable, msg)
     }
     pub fn conflict(msg: impl Into<String>) -> Self {
         Self::new(ErrorCode::Conflict, msg)

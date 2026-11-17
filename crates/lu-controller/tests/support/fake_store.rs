@@ -44,6 +44,76 @@ fn now_wall(now: Now) -> i64 {
     now.wall_unix
 }
 
+fn waiting_for(inner: &Inner, after: &[JobId]) -> Vec<JobId> {
+    after
+        .iter()
+        .filter(|dep| {
+            inner
+                .jobs
+                .get(dep.as_str())
+                .is_none_or(|r| r.rec.state != JobState::Done)
+        })
+        .cloned()
+        .collect()
+}
+
+fn refresh_waiting(inner: &Inner, rec: &mut JobRecord) {
+    rec.waiting_on = waiting_for(inner, &rec.spec.after);
+}
+
+fn unblock_dependents(inner: &mut Inner, dep: &str, now: Now) {
+    let ids: Vec<String> = inner
+        .jobs
+        .iter()
+        .filter(|(_, r)| {
+            r.rec.state == JobState::Blocked
+                && r.rec.spec.after.iter().any(|d| d.as_str() == dep)
+                && r.rec.spec.after.iter().all(|d| {
+                    inner
+                        .jobs
+                        .get(d.as_str())
+                        .is_some_and(|j| j.rec.state == JobState::Done)
+                })
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ids {
+        let row = inner.jobs.get_mut(&id).unwrap();
+        row.rec.state = JobState::Queued;
+        row.rec.updated_at = now_wall(now);
+        row.rec.failure_class = None;
+        row.rec.summary = None;
+        row.rec.finished_at = None;
+    }
+}
+
+fn fail_dependents(inner: &mut Inner, dep: &str, dep_state: &str, now: Now) {
+    let mut queue = vec![(dep.to_owned(), dep_state.to_owned())];
+    while let Some((dep_id, dep_state)) = queue.pop() {
+        let ids: Vec<String> = inner
+            .jobs
+            .iter()
+            .filter(|(_, r)| {
+                r.rec.state == JobState::Blocked
+                    && r.rec.spec.after.iter().any(|d| d.as_str() == dep_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let row = inner.jobs.get_mut(&id).unwrap();
+            row.rec.state = JobState::Failed;
+            row.rec.failure_class = Some(FailureClass::Dependency);
+            row.rec.summary = Some(format!("dependency {dep_id} {dep_state}"));
+            row.rec.finished_at = Some(now_wall(now));
+            row.rec.updated_at = now_wall(now);
+            row.rec.node = None;
+            row.lease_deadline_ms = None;
+            row.recovering_since_ms = None;
+            queue.push((id, "failed".to_owned()));
+        }
+    }
+}
+
 impl Store for FakeStore {
     fn create_job(&self, spec: &JobSpec, now: Now) -> Result<(JobRecord, bool), StoreError> {
         let mut inner = self.inner.lock().unwrap();
@@ -63,9 +133,26 @@ impl Store for FakeStore {
             }
         }
         let id = JobId::new();
-        let rec = JobRecord {
+        let mut blocked = false;
+        for dep in &spec.after {
+            let row = inner
+                .jobs
+                .get(dep.as_str())
+                .ok_or_else(|| StoreError::InvalidDependency(dep.clone()))?;
+            if matches!(row.rec.state, JobState::Failed | JobState::Cancelled) {
+                return Err(StoreError::DeadDependency(dep.clone()));
+            }
+            if row.rec.state != JobState::Done {
+                blocked = true;
+            }
+        }
+        let mut rec = JobRecord {
             id: id.clone(),
-            state: JobState::Queued,
+            state: if blocked {
+                JobState::Blocked
+            } else {
+                JobState::Queued
+            },
             spec: spec.clone(),
             attempt: 1,
             node: None,
@@ -80,7 +167,9 @@ impl Store for FakeStore {
             artifacts: Vec::new(),
             cancel_requested: false,
             log_len: 0,
+            waiting_on: Vec::new(),
         };
+        refresh_waiting(&inner, &mut rec);
         let row = JobStateRow {
             rec: rec.clone(),
             lease_deadline_ms: None,
@@ -100,7 +189,11 @@ impl Store for FakeStore {
         inner
             .jobs
             .get(id.as_str())
-            .map(|r| r.rec.clone())
+            .map(|r| {
+                let mut rec = r.rec.clone();
+                refresh_waiting(&inner, &mut rec);
+                rec
+            })
             .ok_or(StoreError::NotFound)
     }
 
@@ -121,29 +214,42 @@ impl Store for FakeStore {
             rows.retain(|r| r.state == st);
         }
         rows.truncate(limit);
+        for rec in &mut rows {
+            refresh_waiting(&inner, rec);
+        }
         Ok(rows)
     }
 
     fn cancel_job(&self, id: &JobId, now: Now) -> Result<JobRecord, StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        let row = inner
-            .jobs
-            .get_mut(id.as_str())
-            .ok_or(StoreError::NotFound)?;
-        match row.rec.state {
-            JobState::Queued => {
-                row.rec.state = JobState::Cancelled;
-                row.rec.finished_at = Some(now_wall(now));
-            }
-            JobState::Leased | JobState::Running | JobState::Recovering => {
-                row.rec.cancel_requested = true;
-            }
-            JobState::Done | JobState::Failed | JobState::Cancelled | JobState::NeedsInput => {
-                return Err(StoreError::Conflict { length: None });
-            }
+        let terminal = {
+            let row = inner
+                .jobs
+                .get_mut(id.as_str())
+                .ok_or(StoreError::NotFound)?;
+            let is_terminal = match row.rec.state {
+                JobState::Blocked | JobState::Queued => {
+                    row.rec.state = JobState::Cancelled;
+                    row.rec.finished_at = Some(now_wall(now));
+                    true
+                }
+                JobState::Leased | JobState::Running | JobState::Recovering => {
+                    row.rec.cancel_requested = true;
+                    false
+                }
+                JobState::Done | JobState::Failed | JobState::Cancelled | JobState::NeedsInput => {
+                    return Err(StoreError::Conflict { length: None });
+                }
+            };
+            row.rec.updated_at = now_wall(now);
+            is_terminal
+        };
+        if terminal {
+            fail_dependents(&mut inner, id.as_str(), "cancelled", now);
         }
-        row.rec.updated_at = now_wall(now);
-        Ok(row.rec.clone())
+        let mut rec = inner.jobs.get(id.as_str()).unwrap().rec.clone();
+        refresh_waiting(&inner, &mut rec);
+        Ok(rec)
     }
 
     fn heartbeat(&self, hb: &Heartbeat, now: Now) -> Result<(), StoreError> {
@@ -397,18 +503,42 @@ impl Store for FakeStore {
                 }
             }
         }
-        let row = inner
-            .jobs
-            .get_mut(completion.job_id.as_str())
-            .ok_or(StoreError::NotFound)?;
-        if matches!(
-            row.rec.state,
-            JobState::Done | JobState::Failed | JobState::Queued | JobState::Cancelled
-        ) {
-            row.lease_deadline_ms = None;
+        let final_state = {
+            let row = inner
+                .jobs
+                .get_mut(completion.job_id.as_str())
+                .ok_or(StoreError::NotFound)?;
+            if matches!(
+                row.rec.state,
+                JobState::Done | JobState::Failed | JobState::Queued | JobState::Cancelled
+            ) {
+                row.lease_deadline_ms = None;
+            }
+            row.rec.updated_at = now_wall(now);
+            row.rec.state
+        };
+        if final_state == JobState::Done {
+            unblock_dependents(&mut inner, completion.job_id.as_str(), now);
+        } else if matches!(final_state, JobState::Failed | JobState::Cancelled) {
+            fail_dependents(
+                &mut inner,
+                completion.job_id.as_str(),
+                if final_state == JobState::Cancelled {
+                    "cancelled"
+                } else {
+                    "failed"
+                },
+                now,
+            );
         }
-        row.rec.updated_at = now_wall(now);
-        Ok(row.rec.clone())
+        let mut rec = inner
+            .jobs
+            .get(completion.job_id.as_str())
+            .unwrap()
+            .rec
+            .clone();
+        refresh_waiting(&inner, &mut rec);
+        Ok(rec)
     }
 
     fn expire_leases(&self, now: Now) -> Result<Vec<JobId>, StoreError> {

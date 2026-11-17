@@ -14,7 +14,7 @@ use lu_proto::{
 
 use crate::{Assignment, JobRecord, NodeRecord, Now, Store, StoreError};
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 fn internal<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Internal(e.to_string())
@@ -22,6 +22,7 @@ fn internal<E: std::fmt::Display>(e: E) -> StoreError {
 
 fn state_str(s: JobState) -> &'static str {
     match s {
+        JobState::Blocked => "blocked",
         JobState::Queued => "queued",
         JobState::Leased => "leased",
         JobState::Running => "running",
@@ -35,6 +36,7 @@ fn state_str(s: JobState) -> &'static str {
 
 fn parse_state(s: &str) -> Result<JobState, StoreError> {
     Ok(match s {
+        "blocked" => JobState::Blocked,
         "queued" => JobState::Queued,
         "leased" => JobState::Leased,
         "running" => JobState::Running,
@@ -52,6 +54,7 @@ fn failure_str(f: FailureClass) -> &'static str {
         FailureClass::Node => "node",
         FailureClass::Provider => "provider",
         FailureClass::Execution => "execution",
+        FailureClass::Dependency => "dependency",
     }
 }
 
@@ -60,6 +63,7 @@ fn parse_failure(s: &str) -> Result<FailureClass, StoreError> {
         "node" => FailureClass::Node,
         "provider" => FailureClass::Provider,
         "execution" => FailureClass::Execution,
+        "dependency" => FailureClass::Dependency,
         _ => return Err(internal(format!("unknown failure class {s}"))),
     })
 }
@@ -185,19 +189,28 @@ impl SqliteStore {
                 return Ok(());
             }
             Some(v) => {
-                // future migrations would run here; for now only v1 exists
                 if v < 1 {
                     apply_v1(&tx)?;
-                    tx.execute("DELETE FROM schema_version", [])
-                        .map_err(internal)?;
-                    tx.execute("INSERT INTO schema_version(version) VALUES (1)", [])
-                        .map_err(internal)?;
                 }
+                if v < 2 {
+                    apply_v2(&tx)?;
+                }
+                tx.execute("DELETE FROM schema_version", [])
+                    .map_err(internal)?;
+                tx.execute(
+                    "INSERT INTO schema_version(version) VALUES (?1)",
+                    params![CURRENT_SCHEMA_VERSION],
+                )
+                .map_err(internal)?;
             }
             None => {
                 apply_v1(&tx)?;
-                tx.execute("INSERT INTO schema_version(version) VALUES (1)", [])
-                    .map_err(internal)?;
+                apply_v2(&tx)?;
+                tx.execute(
+                    "INSERT INTO schema_version(version) VALUES (?1)",
+                    params![CURRENT_SCHEMA_VERSION],
+                )
+                .map_err(internal)?;
             }
         }
         tx.commit().map_err(internal)?;
@@ -247,6 +260,78 @@ fn apply_v1(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
         );",
     )
     .map_err(internal)?;
+    Ok(())
+}
+
+fn apply_v2(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS job_deps (
+            job TEXT NOT NULL,
+            dep TEXT NOT NULL,
+            ord INTEGER NOT NULL,
+            PRIMARY KEY(job, dep),
+            FOREIGN KEY(job) REFERENCES jobs(id),
+            FOREIGN KEY(dep) REFERENCES jobs(id)
+        );
+        CREATE INDEX IF NOT EXISTS job_deps_dep ON job_deps(dep);",
+    )
+    .map_err(internal)?;
+    Ok(())
+}
+
+fn load_waiting(conn: &Connection, id: &str) -> Result<Vec<JobId>, StoreError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT d.dep FROM job_deps d JOIN jobs j ON j.id=d.dep
+             WHERE d.job=?1 AND j.state!='done' ORDER BY d.ord",
+        )
+        .map_err(internal)?;
+    let rows = stmt
+        .query_map(params![id], |r| r.get::<_, String>(0))
+        .map_err(internal)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(JobId::parse(&row.map_err(internal)?).map_err(internal)?);
+    }
+    Ok(out)
+}
+
+fn fail_dependents(
+    tx: &rusqlite::Transaction<'_>,
+    dep: &str,
+    dep_state: &str,
+    now: Now,
+) -> Result<(), StoreError> {
+    let mut queue = vec![(dep.to_owned(), dep_state.to_owned())];
+    while let Some((dep_id, dep_state)) = queue.pop() {
+        let ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT j.id FROM jobs j JOIN job_deps d ON d.job=j.id
+                     WHERE d.dep=?1 AND j.state='blocked'",
+                )
+                .map_err(internal)?;
+            let rows = stmt
+                .query_map(params![dep_id], |r| r.get::<_, String>(0))
+                .map_err(internal)?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row.map_err(internal)?);
+            }
+            v
+        };
+        for id in ids {
+            let summary = format!("dependency {dep_id} {dep_state}");
+            tx.execute(
+                "UPDATE jobs SET state='failed',failure_class='dependency',summary=?2,
+                 finished_at=?3,updated_at=?3,node=NULL,lease_until_mono_ms=NULL,
+                 recovering_since_mono_ms=NULL,cancel_requested=0 WHERE id=?1",
+                params![id, summary, now.wall_unix],
+            )
+            .map_err(internal)?;
+            queue.push((id, "failed".to_owned()));
+        }
+    }
     Ok(())
 }
 
@@ -333,6 +418,7 @@ fn get_job_tx(
         artifacts,
         cancel_requested: cancel_i != 0,
         log_len: log_len_i as u64,
+        waiting_on: load_waiting(tx, &id_s)?,
     };
     Ok((
         rec,
@@ -381,6 +467,8 @@ fn node_offers_provider(hb: &Heartbeat, provider: &str) -> bool {
 
 impl Store for SqliteStore {
     fn create_job(&self, spec: &JobSpec, now: Now) -> Result<(JobRecord, bool), StoreError> {
+        spec.validate()
+            .map_err(|e| StoreError::InvalidSpec(e.to_string()))?;
         let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -406,9 +494,32 @@ impl Store for SqliteStore {
             }
         }
         let id = JobId::new();
-        let rec = JobRecord {
+        let mut blocked = false;
+        for dep in &spec.after {
+            let dep_state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM jobs WHERE id=?1",
+                    params![dep.as_str()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(internal)?;
+            match dep_state.as_deref() {
+                Some("done") => {}
+                Some("failed" | "cancelled") => {
+                    return Err(StoreError::DeadDependency(dep.clone()))
+                }
+                Some(_) => blocked = true,
+                None => return Err(StoreError::InvalidDependency(dep.clone())),
+            }
+        }
+        let mut rec = JobRecord {
             id: id.clone(),
-            state: JobState::Queued,
+            state: if blocked {
+                JobState::Blocked
+            } else {
+                JobState::Queued
+            },
             spec: spec.clone(),
             attempt: 1,
             node: None,
@@ -423,6 +534,7 @@ impl Store for SqliteStore {
             artifacts: Vec::new(),
             cancel_requested: false,
             log_len: 0,
+            waiting_on: Vec::new(),
         };
         tx.execute(
             "INSERT INTO jobs(id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,lease_until_mono_ms,recovering_since_mono_ms)
@@ -434,6 +546,14 @@ impl Store for SqliteStore {
                 encode_artifacts(&[]), 0i64, 0i64, Option::<i64>::None, Option::<i64>::None
             ],
         ).map_err(internal)?;
+        for (ord, dep) in spec.after.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO job_deps(job,dep,ord) VALUES (?1,?2,?3)",
+                params![rec.id.as_str(), dep.as_str(), ord as i64],
+            )
+            .map_err(internal)?;
+        }
+        rec.waiting_on = load_waiting(&tx, rec.id.as_str())?;
         if let Some(key) = &spec.idempotency_key {
             tx.execute(
                 "INSERT INTO idempotency(key,spec_hash,job_id) VALUES (?1,?2,?3)",
@@ -515,6 +635,7 @@ impl Store for SqliteStore {
             artifacts: decode_artifacts(&artifacts_json)?,
             cancel_requested: cancel_i != 0,
             log_len: log_len_i as u64,
+            waiting_on: load_waiting(&conn, &id_s)?,
         })
     }
 
@@ -558,7 +679,9 @@ impl Store for SqliteStore {
                     .map_err(internal)?;
                 for r in rows {
                     let t = r.map_err(internal)?;
-                    out.push(tuple_to_job(t)?);
+                    let mut rec = tuple_to_job(t)?;
+                    rec.waiting_on = load_waiting(&conn, rec.id.as_str())?;
+                    out.push(rec);
                 }
             }
             (Some(st), None) => {
@@ -588,7 +711,9 @@ impl Store for SqliteStore {
                     .map_err(internal)?;
                 for r in rows {
                     let t = r.map_err(internal)?;
-                    out.push(tuple_to_job(t)?);
+                    let mut rec = tuple_to_job(t)?;
+                    rec.waiting_on = load_waiting(&conn, rec.id.as_str())?;
+                    out.push(rec);
                 }
             }
             (None, Some(a)) => {
@@ -618,7 +743,9 @@ impl Store for SqliteStore {
                     .map_err(internal)?;
                 for r in rows {
                     let t = r.map_err(internal)?;
-                    out.push(tuple_to_job(t)?);
+                    let mut rec = tuple_to_job(t)?;
+                    rec.waiting_on = load_waiting(&conn, rec.id.as_str())?;
+                    out.push(rec);
                 }
             }
             (Some(st), Some(a)) => {
@@ -648,7 +775,9 @@ impl Store for SqliteStore {
                     .map_err(internal)?;
                 for r in rows {
                     let t = r.map_err(internal)?;
-                    out.push(tuple_to_job(t)?);
+                    let mut rec = tuple_to_job(t)?;
+                    rec.waiting_on = load_waiting(&conn, rec.id.as_str())?;
+                    out.push(rec);
                 }
             }
         }
@@ -662,12 +791,13 @@ impl Store for SqliteStore {
             .map_err(internal)?;
         let (mut rec, lease, recov) = get_job_tx(&tx, id.as_str())?;
         match rec.state {
-            JobState::Queued => {
+            JobState::Blocked | JobState::Queued => {
                 check_transition(rec.state, JobState::Cancelled)?;
                 rec.state = JobState::Cancelled;
                 rec.updated_at = now.wall_unix;
                 rec.finished_at = Some(now.wall_unix);
                 update_job_tx(&tx, &rec, None, None)?;
+                fail_dependents(&tx, rec.id.as_str(), "cancelled", now)?;
             }
             JobState::Leased | JobState::Running | JobState::Recovering | JobState::NeedsInput => {
                 rec.cancel_requested = true;
@@ -678,6 +808,7 @@ impl Store for SqliteStore {
                 return Err(StoreError::Conflict { length: None })
             }
         }
+        rec.waiting_on = load_waiting(&tx, rec.id.as_str())?;
         tx.commit().map_err(internal)?;
         Ok(rec)
     }
@@ -970,6 +1101,17 @@ impl Store for SqliteStore {
                 rec.updated_at = now.wall_unix;
                 rec.failure_class = None;
                 update_job_tx(&tx, &rec, None, None)?;
+                tx.execute(
+                    "UPDATE jobs SET state='queued',updated_at=?2,failure_class=NULL,
+                     summary=NULL,finished_at=NULL
+                     WHERE state='blocked' AND id IN
+                       (SELECT job FROM job_deps WHERE dep=?1)
+                       AND NOT EXISTS
+                       (SELECT 1 FROM job_deps d JOIN jobs j ON j.id=d.dep
+                        WHERE d.job=jobs.id AND j.state!='done')",
+                    params![rec.id.as_str(), now.wall_unix],
+                )
+                .map_err(internal)?;
             }
             Outcome::Cancelled => {
                 check_transition(rec.state, JobState::Cancelled)?;
@@ -977,6 +1119,7 @@ impl Store for SqliteStore {
                 rec.finished_at = Some(now.wall_unix);
                 rec.updated_at = now.wall_unix;
                 update_job_tx(&tx, &rec, None, None)?;
+                fail_dependents(&tx, rec.id.as_str(), "cancelled", now)?;
             }
             Outcome::Failed(out_class) => {
                 let (class, provider) = failure.unwrap_or((out_class, None));
@@ -1006,9 +1149,11 @@ impl Store for SqliteStore {
                     rec.finished_at = Some(now.wall_unix);
                     rec.updated_at = now.wall_unix;
                     update_job_tx(&tx, &rec, None, None)?;
+                    fail_dependents(&tx, rec.id.as_str(), "failed", now)?;
                 }
             }
         }
+        rec.waiting_on = load_waiting(&tx, rec.id.as_str())?;
         tx.commit().map_err(internal)?;
         Ok(rec)
     }
@@ -1089,6 +1234,7 @@ impl Store for SqliteStore {
                 rec.updated_at = now.wall_unix;
                 rec.finished_at = Some(now.wall_unix);
                 update_job_tx(&tx, &rec, None, None)?;
+                fail_dependents(&tx, rec.id.as_str(), "failed", now)?;
             }
             moved.push(rec.id);
         }
@@ -1285,6 +1431,7 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         artifacts: decode_artifacts(&artifacts_json)?,
         cancel_requested: cancel_i != 0,
         log_len: log_len_i as u64,
+        waiting_on: Vec::new(),
     })
 }
 
@@ -1330,6 +1477,7 @@ mod tests {
             timeout_secs: 3600,
             idle_timeout_secs: None,
             idempotency_key: Some("k".to_owned()),
+            after: Vec::new(),
         };
         let now = Now {
             wall_unix: 1,
@@ -1352,6 +1500,36 @@ mod tests {
             assert!(!created2);
             assert_eq!(rec2.id, id);
         }
+    }
+
+    #[test]
+    fn dependencies_survive_a_reopen() {
+        let p = temp_db("deps.sqlite");
+        let now = Now {
+            wall_unix: 1,
+            mono_ms: 1,
+        };
+        let (a, b) = {
+            let s = SqliteStore::open(&p).unwrap();
+            let (a, _) = s
+                .create_job(&crate::conformance::spec("https://x/a.git", None), now)
+                .unwrap();
+            let mut sp = crate::conformance::spec("https://x/b.git", None);
+            sp.after = vec![a.id.clone()];
+            let (b, _) = s.create_job(&sp, now).unwrap();
+            assert_eq!(b.state, lu_proto::JobState::Blocked);
+            (a, b)
+        };
+        let s = SqliteStore::open(&p).unwrap();
+        assert_eq!(s.recover_on_boot(now).unwrap(), 0);
+        let b2 = s.get_job(&b.id).unwrap();
+        assert_eq!(b2.state, lu_proto::JobState::Blocked);
+        assert_eq!(b2.waiting_on, vec![a.id.clone()]);
+        assert_eq!(
+            b2.spec.after,
+            vec![a.id],
+            "dependencies are stored, not only in the spec"
+        );
     }
 
     #[test]

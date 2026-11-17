@@ -187,6 +187,7 @@ fn spec() -> JobSpec {
         timeout_secs: 60,
         idle_timeout_secs: None,
         idempotency_key: Some("ticket:42".to_owned()),
+        after: Vec::new(),
     }
 }
 
@@ -219,6 +220,28 @@ async fn submit_posts_the_spec_and_keeps_the_idempotency_key() {
     assert_eq!(records[0].header("idempotency-key"), Some("ticket:42"));
     let sent: JobSpec = serde_json::from_slice(&records[0].body).unwrap();
     assert_eq!(sent, spec());
+}
+
+#[tokio::test]
+async fn submit_carries_dependencies_both_ways() {
+    let id = job_id();
+    let dep = job_id();
+    let body = json!({
+        "id": id,
+        "state": "blocked",
+        "after": [dep],
+        "waiting_on": [dep],
+    });
+    let server = start(move |_| Reply::json(&body)).await;
+    let mut spec = spec();
+    spec.after = vec![dep.clone()];
+    let view = client(&server).submit(&spec).await.unwrap();
+    assert_eq!(view.state, JobState::Blocked);
+    assert_eq!(view.after, vec![dep.clone()]);
+    assert_eq!(view.waiting_on, vec![dep.clone()]);
+    let records = server.records.lock().unwrap();
+    let sent: Value = serde_json::from_slice(&records[0].body).unwrap();
+    assert_eq!(sent["after"], json!([dep]));
 }
 
 #[tokio::test]

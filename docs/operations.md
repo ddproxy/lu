@@ -126,7 +126,7 @@ On startup the controller runs boot recovery before serving traffic:
 - Jobs already in `recovering` stay there, but their grace timer is restarted. Lease and recovery timestamps are based on a monotonic clock that begins again with the process, so the old values are not meaningful after a restart.
 - An agent that still holds the lease and renews the same epoch within `recovery_grace_secs` moves the job back to `running` and continues.
 - If the grace period expires first, a node-class failure is applied. If `attempt <= max_retries`, the job returns to `queued`, the attempt is incremented, the node is cleared, and `failure_class`, `cancel_requested` and `finished_at` are cleared. Otherwise it becomes `failed` with `failure_class: "node"`.
-- `queued`, `done`, `failed` and `cancelled` jobs are not changed by boot recovery.
+- `queued`, `blocked`, `done`, `failed` and `cancelled` jobs are not changed by boot recovery.
 
 The listener stops accepting new connections on `SIGTERM` or Ctrl-C and drains in-flight connections for up to 10 seconds. The contributed unit allows 40 seconds before systemd sends `SIGKILL`.
 
@@ -136,7 +136,11 @@ If the controller is down for longer than a lease, agents cannot renew. When it 
 
 ```mermaid
 stateDiagram-v2
+    [*] --> blocked: submit with unfinished dependencies
     [*] --> queued: submit
+    blocked --> queued: every dependency done
+    blocked --> failed: a dependency failed or was cancelled
+    blocked --> cancelled: cancel
     queued --> leased: an idle node polls
     queued --> cancelled: cancel
     leased --> running: agent starts the job
@@ -158,6 +162,8 @@ stateDiagram-v2
 
 A `needs_input` state is reserved for interactive harnesses and unreachable in 0.1.0.
 
+A job submitted with `after` dependencies starts as `blocked` when at least one dependency is not `done`; if all are already `done`, it starts as `queued`. When a dependency finishes `done`, all blocked dependents whose remaining dependencies are `done` move to `queued` and waiter polls wake. When a dependency finishes `failed` or `cancelled`, blocked dependents fail with `failure_class: "dependency"`, a summary naming the dependency and its state, and the failure cascades through their own dependents. Dependency failures never retry, and dependencies do not transfer results or artifacts to the dependent job.
+
 A job starts as `queued` with `attempt = 1` and `epoch = 0`. When an idle, non-draining node with no held job asks for work, the controller assigns the oldest queued job whose provider is available and not cordoned:
 
 - state becomes `leased`, `node` is set, `epoch` is incremented, and the lease runs for `lease_secs`.
@@ -168,15 +174,15 @@ Maintenance runs every `max(1, lease_secs / 3)` seconds. An expired lease moves 
 
 On completion:
 
-- `Done` moves the job to `done` and records `finished_at`.
+- `Done` moves the job to `done` and records `finished_at`; newly unblocked dependents move to `queued`.
 - `Failed(Execution)` moves it to `failed` immediately. Execution failures never retry.
-- `Failed(Node)` and `Failed(Provider)` retry while `attempt <= max_retries`: the job returns to `queued`, the attempt is incremented, and the node is cleared. Beyond the cap it becomes `failed` with that failure class.
+- `Failed(Node)` and `Failed(Provider)` retry while `attempt <= max_retries`: the job returns to `queued`, the attempt is incremented, and the node is cleared. Beyond the cap it becomes `failed` with that failure class. A terminal `failed` or `cancelled` job fails its blocked dependents.
 
 `max_retries` is the number of retries, not the total number of attempts. With the default `1`, an initial attempt plus one retry is allowed. A provider failure that is retried also cordons the `(node, provider)` pair for `provider_cooldown_secs`.
 
 Cancellation is different:
 
-- a `queued` job becomes `cancelled` immediately;
+- a `queued` or `blocked` job becomes `cancelled` immediately, and its blocked dependents fail with `failure_class: "dependency"`;
 - a `leased`, `running`, `recovering` or `needs_input` job gets `cancel_requested = true` and the agent is told on its next poll;
 - a terminal job returns `409 conflict`.
 

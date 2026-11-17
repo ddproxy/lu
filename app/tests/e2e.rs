@@ -134,6 +134,13 @@ async fn a_job_runs_from_submit_to_diff() {
         .await
         .unwrap();
 
+    let mut dependent_spec = spec(&repo, "append a second line");
+    dependent_spec.after = vec![created.id.clone()];
+    let dependent = operator.submit(&dependent_spec).await.unwrap();
+    assert_eq!(dependent.state, JobState::Blocked);
+    assert_eq!(dependent.after, vec![created.id.clone()]);
+    assert_eq!(dependent.waiting_on, vec![created.id.clone()]);
+
     // The agent, with a scripted harness standing in for opencode.
     let work = root.join("work");
     let token_file = root.join("agent.token");
@@ -171,6 +178,15 @@ async fn a_job_runs_from_submit_to_diff() {
     assert_eq!(job.attempt, 1);
     assert!(job.failure_class.is_none(), "{job:?}");
 
+    let dependent = wait_for(&operator, &dependent.id, JobState::Done).await;
+    assert_eq!(dependent.attempt, 1);
+    assert!(dependent.failure_class.is_none(), "{dependent:?}");
+    assert!(
+        dependent.started_at.unwrap() >= job.finished_at.unwrap(),
+        "dependent started before its dependency finished: {dependent:?} {job:?}"
+    );
+    assert!(dependent.waiting_on.is_empty(), "{dependent:?}");
+
     let diff = operator
         .fetch_artifact(&created.id, ArtifactName::DiffPatch)
         .await
@@ -186,6 +202,7 @@ async fn a_job_runs_from_submit_to_diff() {
 
     // The workspace is gone and the agent ends cleanly on shutdown.
     assert!(!work.join(created.id.as_str()).exists());
+    assert!(!work.join(dependent.id.as_str()).exists());
     let _ = stop_tx.send(());
     let ended = tokio::time::timeout(Duration::from_secs(30), handle).await;
     assert!(ended.is_ok(), "agent did not stop");

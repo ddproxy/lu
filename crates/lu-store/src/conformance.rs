@@ -24,6 +24,7 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         timeout_secs: 3600,
         idle_timeout_secs: None,
         idempotency_key: key.map(|s| s.to_owned()),
+        after: Vec::new(),
     }
 }
 
@@ -61,6 +62,281 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     recovery_grace_survives_a_young_clock(&make());
     a_recovering_job_resumes_or_finishes_for_its_holder(&make());
     nodes_view(&make());
+    blocked_on_submit_and_unblocked_on_done(&make());
+    dependencies_already_done_queue_immediately(&make());
+    failed_dependency_cascades_two_levels(&make());
+    cancelled_dependency_cascades_two_levels(&make());
+    diamond_dependency(&make());
+    unknown_and_invalid_dependencies_are_rejected(&make());
+}
+
+fn with_after(mut sp: JobSpec, after: &[JobId]) -> JobSpec {
+    sp.after = after.to_vec();
+    sp
+}
+
+fn finish_done<S: Store>(s: &S, id: &JobId, node_name: &str, wall: i64, mono: u64) {
+    s.heartbeat(&hb(node_name, HarnessState::Idle, vec![]), now(wall, mono))
+        .unwrap();
+    let n = node(node_name);
+    let a = s
+        .next_assignment(&n, now(wall, mono + 1), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.job_id, *id);
+    s.start_job(id, a.epoch, now(wall, mono + 2)).unwrap();
+    let comp = Completion {
+        job_id: id.clone(),
+        epoch: a.epoch,
+        outcome: Outcome::Done,
+        exit_code: Some(0),
+        summary: None,
+    };
+    s.complete(&comp, None, now(wall, mono + 3), 1, 1000)
+        .unwrap();
+}
+
+fn finish_failed<S: Store>(s: &S, id: &JobId, node_name: &str, wall: i64, mono: u64) {
+    s.heartbeat(&hb(node_name, HarnessState::Idle, vec![]), now(wall, mono))
+        .unwrap();
+    let n = node(node_name);
+    let a = s
+        .next_assignment(&n, now(wall, mono + 1), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.job_id, *id);
+    s.start_job(id, a.epoch, now(wall, mono + 2)).unwrap();
+    let comp = Completion {
+        job_id: id.clone(),
+        epoch: a.epoch,
+        outcome: Outcome::Failed(FailureClass::Execution),
+        exit_code: Some(1),
+        summary: Some("boom".into()),
+    };
+    s.complete(
+        &comp,
+        Some((FailureClass::Execution, None)),
+        now(wall, mono + 3),
+        1,
+        1000,
+    )
+    .unwrap();
+}
+
+fn blocked_on_submit_and_unblocked_on_done<S: Store>(s: &S) {
+    let (a, _) = s
+        .create_job(&spec("https://x/a.git", None), now(1, 1))
+        .unwrap();
+    let (b, _) = s
+        .create_job(
+            &with_after(spec("https://x/b.git", None), std::slice::from_ref(&a.id)),
+            now(2, 2),
+        )
+        .unwrap();
+    assert_eq!(b.state, JobState::Blocked);
+    assert_eq!(b.waiting_on, vec![a.id.clone()]);
+    assert_eq!(
+        s.list_jobs(Some(JobState::Blocked), 10, None).unwrap()[0].id,
+        b.id
+    );
+
+    finish_done(s, &a.id, "dep-node-a", 10, 10);
+    let b2 = s.get_job(&b.id).unwrap();
+    assert_eq!(b2.state, JobState::Queued);
+    assert!(b2.waiting_on.is_empty());
+
+    let (c, _) = s
+        .create_job(
+            &with_after(spec("https://x/c.git", None), std::slice::from_ref(&b.id)),
+            now(3, 3),
+        )
+        .unwrap();
+    let cancelled = s.cancel_job(&c.id, now(4, 4)).unwrap();
+    assert_eq!(cancelled.state, JobState::Cancelled);
+}
+
+fn dependencies_already_done_queue_immediately<S: Store>(s: &S) {
+    let (a, _) = s
+        .create_job(&spec("https://x/a.git", None), now(1, 1))
+        .unwrap();
+    finish_done(s, &a.id, "done-node-a", 10, 10);
+    let (b, _) = s
+        .create_job(
+            &with_after(spec("https://x/b.git", None), std::slice::from_ref(&a.id)),
+            now(2, 2),
+        )
+        .unwrap();
+    assert_eq!(b.state, JobState::Queued);
+    assert!(b.waiting_on.is_empty());
+}
+
+fn failed_dependency_cascades_two_levels<S: Store>(s: &S) {
+    let (a, _) = s
+        .create_job(&spec("https://x/a.git", None), now(1, 1))
+        .unwrap();
+    let (b, _) = s
+        .create_job(
+            &with_after(spec("https://x/b.git", None), std::slice::from_ref(&a.id)),
+            now(2, 2),
+        )
+        .unwrap();
+    let (c, _) = s
+        .create_job(
+            &with_after(spec("https://x/c.git", None), std::slice::from_ref(&b.id)),
+            now(3, 3),
+        )
+        .unwrap();
+    finish_failed(s, &a.id, "fail-node-a", 10, 10);
+
+    let b2 = s.get_job(&b.id).unwrap();
+    assert_eq!(b2.state, JobState::Failed);
+    assert_eq!(b2.failure_class, Some(FailureClass::Dependency));
+    assert_eq!(
+        b2.summary.as_deref(),
+        Some(format!("dependency {} failed", a.id).as_str())
+    );
+    let c2 = s.get_job(&c.id).unwrap();
+    assert_eq!(c2.state, JobState::Failed);
+    assert_eq!(c2.failure_class, Some(FailureClass::Dependency));
+    assert!(c2
+        .summary
+        .as_deref()
+        .is_some_and(|m| m.starts_with(&format!("dependency {} ", b.id))));
+}
+
+fn cancelled_dependency_cascades_two_levels<S: Store>(s: &S) {
+    let (a, _) = s
+        .create_job(&spec("https://x/a.git", None), now(1, 1))
+        .unwrap();
+    let (b, _) = s
+        .create_job(
+            &with_after(spec("https://x/b.git", None), std::slice::from_ref(&a.id)),
+            now(2, 2),
+        )
+        .unwrap();
+    let (c, _) = s
+        .create_job(
+            &with_after(spec("https://x/c.git", None), std::slice::from_ref(&b.id)),
+            now(3, 3),
+        )
+        .unwrap();
+    s.cancel_job(&a.id, now(4, 4)).unwrap();
+    let b2 = s.get_job(&b.id).unwrap();
+    assert_eq!(b2.state, JobState::Failed);
+    assert_eq!(b2.failure_class, Some(FailureClass::Dependency));
+    assert_eq!(
+        b2.summary.as_deref(),
+        Some(format!("dependency {} cancelled", a.id).as_str())
+    );
+    let c2 = s.get_job(&c.id).unwrap();
+    assert_eq!(c2.state, JobState::Failed);
+}
+
+fn diamond_dependency<S: Store>(s: &S) {
+    let (a, _) = s
+        .create_job(&spec("https://x/a.git", None), now(1, 1))
+        .unwrap();
+    let (b, _) = s
+        .create_job(
+            &with_after(spec("https://x/b.git", None), std::slice::from_ref(&a.id)),
+            now(2, 2),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let (c, _) = s
+        .create_job(
+            &with_after(spec("https://x/c.git", None), std::slice::from_ref(&a.id)),
+            now(3, 3),
+        )
+        .unwrap();
+    let (d, _) = s
+        .create_job(
+            &with_after(spec("https://x/d.git", None), &[b.id.clone(), c.id.clone()]),
+            now(4, 4),
+        )
+        .unwrap();
+    finish_done(s, &a.id, "diamond-a", 10, 10);
+    finish_done(s, &b.id, "diamond-b", 20, 20);
+    let d2 = s.get_job(&d.id).unwrap();
+    assert_eq!(d2.state, JobState::Blocked);
+    assert_eq!(d2.waiting_on, vec![c.id.clone()]);
+    finish_done(s, &c.id, "diamond-c", 30, 30);
+    let d3 = s.get_job(&d.id).unwrap();
+    assert_eq!(d3.state, JobState::Queued);
+    assert!(d3.waiting_on.is_empty());
+    finish_done(s, &d.id, "diamond-d", 35, 35);
+
+    let (e, _) = s
+        .create_job(&spec("https://x/e.git", None), now(5, 5))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let (f, _) = s
+        .create_job(&spec("https://x/f.git", None), now(6, 6))
+        .unwrap();
+    let (g, _) = s
+        .create_job(
+            &with_after(spec("https://x/g.git", None), &[e.id.clone(), f.id.clone()]),
+            now(7, 7),
+        )
+        .unwrap();
+    finish_failed(s, &e.id, "diamond-e", 40, 40);
+    let g2 = s.get_job(&g.id).unwrap();
+    assert_eq!(g2.state, JobState::Failed);
+    assert_eq!(g2.failure_class, Some(FailureClass::Dependency));
+    assert_eq!(
+        s.get_job(&f.id).unwrap().state,
+        JobState::Queued,
+        "an unrelated branch is untouched"
+    );
+}
+
+fn unknown_and_invalid_dependencies_are_rejected<S: Store>(s: &S) {
+    let missing = JobId::new();
+    let err = s
+        .create_job(
+            &with_after(
+                spec("https://x/u.git", None),
+                std::slice::from_ref(&missing),
+            ),
+            now(1, 1),
+        )
+        .unwrap_err();
+    assert_eq!(err, StoreError::InvalidDependency(missing));
+
+    let (dead, _) = s
+        .create_job(&spec("https://x/dead.git", None), now(1, 1))
+        .unwrap();
+    s.cancel_job(&dead.id, now(2, 2)).unwrap();
+    let err = s
+        .create_job(
+            &with_after(
+                spec("https://x/late.git", None),
+                std::slice::from_ref(&dead.id),
+            ),
+            now(3, 3),
+        )
+        .unwrap_err();
+    assert_eq!(err, StoreError::DeadDependency(dead.id));
+
+    let too_many: Vec<JobId> = (0..=lu_proto::MAX_AFTER_JOBS)
+        .map(|_| JobId::new())
+        .collect();
+    let err = s
+        .create_job(
+            &with_after(spec("https://x/m.git", None), &too_many),
+            now(2, 2),
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidSpec(_)));
+
+    let dup = JobId::new();
+    let err = s
+        .create_job(
+            &with_after(spec("https://x/d.git", None), &[dup.clone(), dup]),
+            now(3, 3),
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidSpec(_)));
 }
 
 fn idempotent_create<S: Store>(s: &S) {

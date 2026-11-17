@@ -13,6 +13,8 @@ pub enum FailureClass {
     Provider,
     /// The harness exited non-zero, timed out, or produced no output.
     Execution,
+    /// A dependency finished unsuccessfully; a dependent cannot retry into a different outcome.
+    Dependency,
 }
 
 impl FailureClass {
@@ -21,7 +23,7 @@ impl FailureClass {
     pub fn retryable(self, attempt: u32, max_retries: u32) -> bool {
         match self {
             Self::Node | Self::Provider => attempt <= max_retries,
-            Self::Execution => false,
+            Self::Execution | Self::Dependency => false,
         }
     }
 }
@@ -47,6 +49,7 @@ mod tests {
             assert!(!FailureClass::Execution.retryable(attempt, 5));
         }
         assert!(!FailureClass::Execution.retryable(1, 0));
+        assert!(!FailureClass::Dependency.retryable(5, 5));
     }
 
     #[test]
@@ -55,6 +58,7 @@ mod tests {
             FailureClass::Node,
             FailureClass::Provider,
             FailureClass::Execution,
+            FailureClass::Dependency,
         ] {
             let json = serde_json::to_string(&class).unwrap();
             assert_eq!(serde_json::from_str::<FailureClass>(&json).unwrap(), class);

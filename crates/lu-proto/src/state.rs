@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
+    /// Submitted, but at least one dependency is not finished.
+    Blocked,
     Queued,
     Leased,
     Running,
@@ -21,7 +23,8 @@ pub enum JobState {
 
 impl JobState {
     /// Every state, in declaration order.
-    pub const ALL: [JobState; 8] = [
+    pub const ALL: [JobState; 9] = [
+        Self::Blocked,
         Self::Queued,
         Self::Leased,
         Self::Running,
@@ -43,10 +46,15 @@ impl JobState {
     /// `Recovering -> Running` and `-> Done` are the agent that kept its lease through a
     /// controller restart, resuming or finishing.
     pub fn can_transition(from: Self, to: Self) -> bool {
-        use JobState::{Cancelled, Done, Failed, Leased, NeedsInput, Queued, Recovering, Running};
+        use JobState::{
+            Blocked, Cancelled, Done, Failed, Leased, NeedsInput, Queued, Recovering, Running,
+        };
         matches!(
             (from, to),
-            (Queued, Leased)
+            (Blocked, Queued)
+                | (Blocked, Cancelled)
+                | (Blocked, Failed)
+                | (Queued, Leased)
                 | (Queued, Cancelled)
                 | (Leased, Running)
                 | (Leased, Queued)
@@ -79,6 +87,9 @@ mod tests {
     #[test]
     fn the_transition_table_is_exactly_the_allowed_edges() {
         let allowed = [
+            (Blocked, Queued),
+            (Blocked, Cancelled),
+            (Blocked, Failed),
             (Queued, Leased),
             (Queued, Cancelled),
             (Leased, Running),

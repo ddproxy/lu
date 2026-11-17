@@ -88,12 +88,84 @@ fn node_offers_provider(hb: &Heartbeat, provider: &str) -> bool {
         .any(|p| p.name == provider && matches!(p.state, lu_proto::ProviderState::Ok))
 }
 
+fn waiting_for(inner: &Inner, after: &[JobId]) -> Vec<JobId> {
+    after
+        .iter()
+        .filter(|dep| {
+            inner
+                .jobs
+                .get(dep.as_str())
+                .is_none_or(|e| e.rec.state != JobState::Done)
+        })
+        .cloned()
+        .collect()
+}
+
+fn refresh_waiting(inner: &Inner, rec: &mut JobRecord) {
+    rec.waiting_on = waiting_for(inner, &rec.spec.after);
+}
+
+fn unblock_dependents(inner: &mut Inner, dep: &str, now: Now) {
+    let ids: Vec<String> = inner
+        .jobs
+        .iter()
+        .filter(|(_, e)| {
+            e.rec.state == JobState::Blocked
+                && e.rec.spec.after.iter().any(|d| d.as_str() == dep)
+                && e.rec.spec.after.iter().all(|d| {
+                    inner
+                        .jobs
+                        .get(d.as_str())
+                        .is_some_and(|j| j.rec.state == JobState::Done)
+                })
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ids {
+        let e = inner.jobs.get_mut(&id).unwrap();
+        e.rec.state = JobState::Queued;
+        e.rec.updated_at = now.wall_unix;
+        e.rec.failure_class = None;
+        e.rec.summary = None;
+        e.rec.finished_at = None;
+    }
+}
+
+fn fail_dependents(inner: &mut Inner, dep: &str, dep_state: &str, now: Now) {
+    let mut queue = vec![(dep.to_owned(), dep_state.to_owned())];
+    while let Some((dep_id, dep_state)) = queue.pop() {
+        let ids: Vec<String> = inner
+            .jobs
+            .iter()
+            .filter(|(_, e)| {
+                e.rec.state == JobState::Blocked
+                    && e.rec.spec.after.iter().any(|d| d.as_str() == dep_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let e = inner.jobs.get_mut(&id).unwrap();
+            e.rec.state = JobState::Failed;
+            e.rec.failure_class = Some(FailureClass::Dependency);
+            e.rec.summary = Some(format!("dependency {dep_id} {dep_state}"));
+            e.rec.finished_at = Some(now.wall_unix);
+            e.rec.updated_at = now.wall_unix;
+            e.rec.node = None;
+            e.lease_until_mono_ms = None;
+            e.recovering_since_mono_ms = None;
+            queue.push((id, "failed".to_owned()));
+        }
+    }
+}
+
 impl Store for MemoryStore {
     fn create_job(&self, spec: &JobSpec, now: Now) -> Result<(JobRecord, bool), StoreError> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| StoreError::Internal("mutex poisoned".into()))?;
+        spec.validate()
+            .map_err(|e| StoreError::InvalidSpec(e.to_string()))?;
         let canonical = spec.canonical_json();
         if let Some(key) = &spec.idempotency_key {
             if let Some((hash, job_id)) = inner.idempotency.get(key).cloned() {
@@ -109,9 +181,26 @@ impl Store for MemoryStore {
             }
         }
         let id = JobId::new();
-        let rec = JobRecord {
+        let mut blocked = false;
+        for dep in &spec.after {
+            let entry = inner
+                .jobs
+                .get(dep.as_str())
+                .ok_or_else(|| StoreError::InvalidDependency(dep.clone()))?;
+            if matches!(entry.rec.state, JobState::Failed | JobState::Cancelled) {
+                return Err(StoreError::DeadDependency(dep.clone()));
+            }
+            if entry.rec.state != JobState::Done {
+                blocked = true;
+            }
+        }
+        let mut rec = JobRecord {
             id: id.clone(),
-            state: JobState::Queued,
+            state: if blocked {
+                JobState::Blocked
+            } else {
+                JobState::Queued
+            },
             spec: spec.clone(),
             attempt: 1,
             node: None,
@@ -126,7 +215,9 @@ impl Store for MemoryStore {
             artifacts: Vec::new(),
             cancel_requested: false,
             log_len: 0,
+            waiting_on: Vec::new(),
         };
+        refresh_waiting(&inner, &mut rec);
         let entry = JobEntry {
             rec: rec.clone(),
             lease_until_mono_ms: None,
@@ -150,7 +241,11 @@ impl Store for MemoryStore {
         inner
             .jobs
             .get(id.as_str())
-            .map(|e| e.rec.clone())
+            .map(|e| {
+                let mut rec = e.rec.clone();
+                refresh_waiting(&inner, &mut rec);
+                rec
+            })
             .ok_or(StoreError::NotFound)
     }
 
@@ -170,6 +265,9 @@ impl Store for MemoryStore {
             .filter(|e| state.map(|s| e.rec.state == s).unwrap_or(true))
             .map(|e| e.rec.clone())
             .collect();
+        for rec in &mut out {
+            refresh_waiting(&inner, rec);
+        }
         // newest first => descending by id
         out.sort_by(|a, b| b.id.cmp(&a.id));
         if let Some(after) = after {
@@ -186,30 +284,41 @@ impl Store for MemoryStore {
             .inner
             .lock()
             .map_err(|_| StoreError::Internal("mutex poisoned".into()))?;
-        let entry = inner
-            .jobs
-            .get_mut(id.as_str())
-            .ok_or(StoreError::NotFound)?;
-        match entry.rec.state {
-            JobState::Queued => {
-                check_transition(entry.rec.state, JobState::Cancelled)?;
-                entry.rec.state = JobState::Cancelled;
-                entry.rec.updated_at = now.wall_unix;
-                entry.rec.finished_at = Some(now.wall_unix);
-                entry.lease_until_mono_ms = None;
-                entry.recovering_since_mono_ms = None;
-                Ok(entry.rec.clone())
+        let terminal = {
+            let entry = inner
+                .jobs
+                .get_mut(id.as_str())
+                .ok_or(StoreError::NotFound)?;
+            match entry.rec.state {
+                JobState::Blocked | JobState::Queued => {
+                    check_transition(entry.rec.state, JobState::Cancelled)?;
+                    entry.rec.state = JobState::Cancelled;
+                    entry.rec.updated_at = now.wall_unix;
+                    entry.rec.finished_at = Some(now.wall_unix);
+                    entry.lease_until_mono_ms = None;
+                    entry.recovering_since_mono_ms = None;
+                    true
+                }
+                JobState::Leased
+                | JobState::Running
+                | JobState::Recovering
+                | JobState::NeedsInput => {
+                    // Leased/running: request cancel. Recovering/needs_input: best-effort request.
+                    entry.rec.cancel_requested = true;
+                    entry.rec.updated_at = now.wall_unix;
+                    false
+                }
+                JobState::Done | JobState::Failed | JobState::Cancelled => {
+                    return Err(StoreError::Conflict { length: None })
+                }
             }
-            JobState::Leased | JobState::Running | JobState::Recovering | JobState::NeedsInput => {
-                // Leased/running: request cancel. Recovering/needs_input: best-effort request.
-                entry.rec.cancel_requested = true;
-                entry.rec.updated_at = now.wall_unix;
-                Ok(entry.rec.clone())
-            }
-            JobState::Done | JobState::Failed | JobState::Cancelled => {
-                Err(StoreError::Conflict { length: None })
-            }
+        };
+        if terminal {
+            fail_dependents(&mut inner, id.as_str(), "cancelled", now);
         }
+        let mut rec = inner.jobs.get(id.as_str()).unwrap().rec.clone();
+        refresh_waiting(&inner, &mut rec);
+        Ok(rec)
     }
 
     fn heartbeat(&self, hb: &Heartbeat, now: Now) -> Result<(), StoreError> {
@@ -333,7 +442,9 @@ impl Store for MemoryStore {
         if e.rec.started_at.is_none() {
             e.rec.started_at = Some(now.wall_unix);
         }
-        Ok(e.rec.clone())
+        let mut rec = e.rec.clone();
+        refresh_waiting(&inner, &mut rec);
+        Ok(rec)
     }
 
     fn renew_lease(
@@ -518,12 +629,34 @@ impl Store for MemoryStore {
                 }
             }
         }
-        Ok(inner
+        let final_state = inner
             .jobs
             .get(completion.job_id.as_str())
             .unwrap()
             .rec
-            .clone())
+            .state;
+        if final_state == JobState::Done {
+            unblock_dependents(&mut inner, completion.job_id.as_str(), now);
+        } else if matches!(final_state, JobState::Failed | JobState::Cancelled) {
+            fail_dependents(
+                &mut inner,
+                completion.job_id.as_str(),
+                if final_state == JobState::Cancelled {
+                    "cancelled"
+                } else {
+                    "failed"
+                },
+                now,
+            );
+        }
+        let mut rec = inner
+            .jobs
+            .get(completion.job_id.as_str())
+            .unwrap()
+            .rec
+            .clone();
+        refresh_waiting(&inner, &mut rec);
+        Ok(rec)
     }
 
     fn expire_leases(&self, now: Now) -> Result<Vec<JobId>, StoreError> {
@@ -561,6 +694,7 @@ impl Store for MemoryStore {
             .lock()
             .map_err(|_| StoreError::Internal("mutex poisoned".into()))?;
         let mut moved = Vec::new();
+        let mut failed = Vec::new();
         let ids: Vec<String> = inner.jobs.keys().cloned().collect();
         for id in ids {
             let e = inner.jobs.get_mut(&id).unwrap();
@@ -586,10 +720,14 @@ impl Store for MemoryStore {
                         e.rec.finished_at = Some(now.wall_unix);
                         e.lease_until_mono_ms = None;
                         e.recovering_since_mono_ms = None;
+                        failed.push(e.rec.id.clone());
                     }
                     moved.push(e.rec.id.clone());
                 }
             }
+        }
+        for id in failed {
+            fail_dependents(&mut inner, id.as_str(), "failed", now);
         }
         Ok(moved)
     }

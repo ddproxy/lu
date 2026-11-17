@@ -53,12 +53,20 @@ pub fn store_err(e: lu_store::StoreError) -> ApiError {
             err
         }
         StoreError::StaleEpoch => ApiError::stale_epoch(),
+        StoreError::InvalidDependency(id) => {
+            ApiError::unprocessable(format!("unknown dependency {id}"))
+        }
+        StoreError::DeadDependency(id) => {
+            ApiError::unprocessable(format!("dependency {id} already failed or was cancelled"))
+        }
+        StoreError::InvalidSpec(message) => ApiError::unprocessable(message),
         StoreError::Internal(_) => ApiError::internal(),
     }
 }
 
 pub fn job_state_str(s: lu_proto::JobState) -> &'static str {
     match s {
+        lu_proto::JobState::Blocked => "blocked",
         lu_proto::JobState::Queued => "queued",
         lu_proto::JobState::Leased => "leased",
         lu_proto::JobState::Running => "running",

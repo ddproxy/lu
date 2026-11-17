@@ -267,6 +267,7 @@ mod tests {
             timeout_secs: 3600,
             idle_timeout_secs: None,
             idempotency_key: None,
+            after: Vec::new(),
         }
     }
 

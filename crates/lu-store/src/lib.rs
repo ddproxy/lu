@@ -39,6 +39,8 @@ pub struct JobRecord {
     pub artifacts: Vec<ArtifactName>,
     pub cancel_requested: bool,
     pub log_len: u64,
+    /// Dependencies that are not yet `done`; empty once the job may run.
+    pub waiting_on: Vec<JobId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +73,12 @@ pub enum StoreError {
     },
     /// The write names an epoch older than the job's.
     StaleEpoch,
+    /// `after` names a job that does not exist.
+    InvalidDependency(JobId),
+    /// `after` names a job that already failed or was cancelled, so the new job could never run.
+    DeadDependency(JobId),
+    /// The spec itself is invalid; normally the API validates before reaching the store.
+    InvalidSpec(String),
     Internal(String),
 }
 
@@ -85,7 +93,8 @@ pub trait Store: Send + Sync + 'static {
         limit: usize,
         after: Option<&JobId>,
     ) -> Result<Vec<JobRecord>, StoreError>;
-    /// Queued becomes cancelled; leased or running sets `cancel_requested`; terminal conflicts.
+    /// Queued or blocked becomes cancelled; leased or running sets `cancel_requested`;
+    /// terminal conflicts.
     fn cancel_job(&self, id: &JobId, now: Now) -> Result<JobRecord, StoreError>;
 
     /// Records the heartbeat and the time it was seen.

@@ -25,6 +25,7 @@ fn spec() -> JobSpec {
         timeout_secs: 600,
         idle_timeout_secs: Some(60),
         idempotency_key: Some("ticket:42".to_owned()),
+        after: vec![JobId::new()],
     }
 }
 

@@ -5,7 +5,7 @@ use fake_store::FakeStore;
 use lu_auth::sha256_hex;
 use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator};
 use lu_controller::{build_router, run_background, AppState};
-use lu_proto::JobSpec;
+use lu_proto::{JobId, JobSpec, MAX_AFTER_JOBS};
 use lu_serve::{serve, ServeOptions};
 use serde_json::json;
 use std::net::SocketAddr;
@@ -163,6 +163,7 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         timeout_secs: 3600,
         idle_timeout_secs: None,
         idempotency_key: key.map(|s| s.to_owned()),
+        after: Vec::new(),
     }
 }
 
@@ -524,4 +525,95 @@ async fn graceful_shutdown_ends_waiting_polls() {
     // server may end connection or return 204/empty response depending on shutdown timing; key is no leak/hang.
     // If it returned a response, it should be valid HTTP status or empty due to connection close.
     let _ = resp;
+}
+
+async fn post_job(addr: SocketAddr, spec: &JobSpec) -> String {
+    let body = serde_json::to_string(spec).unwrap();
+    let req = format!(
+        "POST /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    );
+    raw_request(addr, &req).await
+}
+
+#[tokio::test]
+async fn dependency_views_and_validation() {
+    let srv = start_server().await;
+
+    let r = post_job(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let a: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let a_id = a["id"].as_str().unwrap().to_string();
+    assert_eq!(a["state"], "queued");
+    assert_eq!(a["after"], json!([]));
+    assert_eq!(a["waiting_on"], json!([]));
+    let dep = JobId::parse(&a_id).unwrap();
+
+    let mut spec_b = sample_spec(None);
+    spec_b.after = vec![dep.clone()];
+    let r = post_job(srv.addr, &spec_b).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let b: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let b_id = b["id"].as_str().unwrap().to_string();
+    assert_eq!(b["state"], "blocked");
+    assert_eq!(b["after"], json!([a_id]));
+    assert_eq!(b["waiting_on"], json!([a_id]));
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{b_id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let got: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(got["state"], "blocked");
+    assert_eq!(got["after"], json!([a_id]));
+    assert_eq!(got["waiting_on"], json!([a_id]));
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs?state=blocked HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let list: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let listed = list["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == b_id)
+        .expect("blocked job should be listed");
+    assert_eq!(listed["waiting_on"], json!([a_id]));
+    assert_eq!(listed["after"], json!([a_id]));
+
+    // Cancelling a blocked job is allowed, like a queued one.
+    let r = raw_request(srv.addr, &format!("POST /v1/jobs/{b_id}/cancel HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let cancelled: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(cancelled["state"], "cancelled");
+
+    // An unknown dependency is a 422 naming the id.
+    let missing = JobId::new();
+    let mut unknown = sample_spec(None);
+    unknown.after = vec![missing.clone()];
+    let r = post_job(srv.addr, &unknown).await;
+    assert_eq!(status(&r), 422, "{r}");
+    let err: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(err["error"], "unprocessable", "{r}");
+    assert!(
+        err["message"].as_str().unwrap().contains(missing.as_str()),
+        "{r}"
+    );
+
+    // Spec validation failures are also 422s.
+    let mut too_many = sample_spec(None);
+    too_many.after = (0..=MAX_AFTER_JOBS).map(|_| JobId::new()).collect();
+    let r = post_job(srv.addr, &too_many).await;
+    assert_eq!(status(&r), 422, "{r}");
+    let err: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert!(err["message"].as_str().unwrap().contains("after"), "{r}");
+
+    let mut duplicate = sample_spec(None);
+    duplicate.after = vec![dep.clone(), dep];
+    let r = post_job(srv.addr, &duplicate).await;
+    assert_eq!(status(&r), 422, "{r}");
+    let err: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert!(
+        err["message"].as_str().unwrap().contains("duplicate"),
+        "{r}"
+    );
+
+    let _ = srv.shutdown.send(());
 }

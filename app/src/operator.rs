@@ -39,6 +39,9 @@ pub struct SubmitArgs {
     /// Job timeout in seconds.
     #[arg(long, default_value_t = lu_proto::DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
+    /// Only run after this job is done (repeatable).
+    #[arg(long = "after", value_parser = parse_job_id)]
+    pub after: Vec<JobId>,
     /// Idempotency key.
     #[arg(long)]
     pub key: Option<String>,
@@ -158,6 +161,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         timeout_secs: args.timeout,
         idle_timeout_secs: None,
         idempotency_key: args.key,
+        after: args.after,
     };
     spec.validate().map_err(|error| error.to_string())?;
 
@@ -220,11 +224,19 @@ async fn ls_inner(args: LsArgs, config: &Path, json: bool) -> Result<ExitCode, S
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "-".to_owned()),
                 job.attempt.to_string(),
+                if job.waiting_on.is_empty() {
+                    "-".to_owned()
+                } else {
+                    job.waiting_on.len().to_string()
+                },
                 time(job.created_at),
             ]
         })
         .collect();
-    print_table(&["ID", "STATE", "NODE", "ATTEMPT", "CREATED"], rows);
+    print_table(
+        &["ID", "STATE", "NODE", "ATTEMPT", "AFTER", "CREATED"],
+        rows,
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -243,6 +255,18 @@ async fn show_inner(args: ShowArgs, config: &Path, json: bool) -> Result<ExitCod
         .await
         .map_err(|error| error.to_string())?;
     print_job(&view);
+    for id in &view.after {
+        let state = match client.get_job(id).await {
+            Ok(dep) => state_name(dep.state).to_owned(),
+            Err(_) => "unknown".to_owned(),
+        };
+        let waiting = if view.waiting_on.contains(id) {
+            " (waiting)"
+        } else {
+            ""
+        };
+        println!("after  {id}  {state}{waiting}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -703,12 +727,14 @@ pub(crate) fn failure_name(value: Option<FailureClass>) -> String {
         Some(FailureClass::Node) => "node".to_owned(),
         Some(FailureClass::Provider) => "provider".to_owned(),
         Some(FailureClass::Execution) => "execution".to_owned(),
+        Some(FailureClass::Dependency) => "dependency".to_owned(),
         None => "-".to_owned(),
     }
 }
 
 pub(crate) fn state_name(state: JobState) -> &'static str {
     match state {
+        JobState::Blocked => "blocked",
         JobState::Queued => "queued",
         JobState::Leased => "leased",
         JobState::Running => "running",
@@ -730,6 +756,7 @@ fn parse_node(value: &str) -> Result<NodeName, String> {
 
 fn parse_state(value: &str) -> Result<JobState, String> {
     match value.to_ascii_lowercase().replace('-', "_").as_str() {
+        "blocked" => Ok(JobState::Blocked),
         "queued" => Ok(JobState::Queued),
         "leased" => Ok(JobState::Leased),
         "running" => Ok(JobState::Running),
@@ -739,7 +766,7 @@ fn parse_state(value: &str) -> Result<JobState, String> {
         "failed" => Ok(JobState::Failed),
         "cancelled" | "canceled" => Ok(JobState::Cancelled),
         other => Err(format!(
-            "unknown job state {other:?}; expected queued, leased, running, recovering, needs_input, done, failed, or cancelled"
+            "unknown job state {other:?}; expected blocked, queued, leased, running, recovering, needs_input, done, failed, or cancelled"
         )),
     }
 }

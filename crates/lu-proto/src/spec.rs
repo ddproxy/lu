@@ -6,11 +6,11 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::is_name_byte;
+use crate::ids::{is_name_byte, JobId};
 use crate::limits::{
-    DEFAULT_TIMEOUT_SECS, MAX_GIT_REF_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS,
-    MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_REPO_BYTES, MAX_TASK_BYTES, MAX_TIMEOUT_SECS,
-    MIN_TIMEOUT_SECS,
+    DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_GIT_REF_BYTES, MAX_IDEMPOTENCY_KEY_BYTES,
+    MAX_IDLE_TIMEOUT_SECS, MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_REPO_BYTES, MAX_TASK_BYTES,
+    MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
 };
 
 /// A field of [`JobSpec`] that failed validation.
@@ -58,6 +58,9 @@ pub struct JobSpec {
     pub idle_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Jobs that must be `done` before this one may run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<JobId>,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +81,8 @@ struct RawJobSpec {
     idle_timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     idempotency_key: Option<String>,
+    #[serde(default)]
+    after: Vec<JobId>,
 }
 
 impl TryFrom<RawJobSpec> for JobSpec {
@@ -94,6 +99,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
             timeout_secs: raw.timeout_secs,
             idle_timeout_secs: raw.idle_timeout_secs,
             idempotency_key: raw.idempotency_key,
+            after: raw.after,
         };
         spec.validate()?;
         Ok(spec)
@@ -129,6 +135,20 @@ impl JobSpec {
         }
         if let Some(key) = &self.idempotency_key {
             check_idempotency_key(key)?;
+        }
+        if self.after.len() > MAX_AFTER_JOBS {
+            return Err(invalid(
+                "after",
+                format!(
+                    "must name at most {MAX_AFTER_JOBS} jobs (got {})",
+                    self.after.len()
+                ),
+            ));
+        }
+        for (i, id) in self.after.iter().enumerate() {
+            if self.after[..i].contains(id) {
+                return Err(invalid("after", format!("duplicate job {id}")));
+            }
         }
         Ok(())
     }
@@ -237,6 +257,7 @@ mod tests {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             idle_timeout_secs: None,
             idempotency_key: None,
+            after: Vec::new(),
         }
     }
 
@@ -329,6 +350,15 @@ mod tests {
         spec = sample();
         spec.idempotency_key = Some("k".repeat(MAX_IDEMPOTENCY_KEY_BYTES + 1));
         assert_eq!(error_field(&spec), "idempotency_key");
+
+        spec = sample();
+        spec.after = (0..=MAX_AFTER_JOBS).map(|_| JobId::new()).collect();
+        assert_eq!(error_field(&spec), "after");
+
+        spec = sample();
+        let id = JobId::new();
+        spec.after = vec![id.clone(), id];
+        assert_eq!(error_field(&spec), "after");
     }
 
     #[test]
@@ -347,6 +377,7 @@ mod tests {
         assert_eq!(spec.harness, "opencode");
         assert_eq!(spec.timeout_secs, DEFAULT_TIMEOUT_SECS);
         assert_eq!(spec.provider, None);
+        assert!(spec.after.is_empty());
         assert!(spec.validate().is_ok());
     }
 
@@ -392,6 +423,18 @@ mod tests {
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{json}");
         assert!(!json.contains("model"), "{json}");
         assert!(!json.contains("idempotency_key"), "{json}");
+    }
+
+    #[test]
+    fn dependencies_round_trip_and_are_omitted_when_empty() {
+        let mut spec = sample();
+        assert!(!spec.canonical_json().contains("after"));
+        spec.after = vec![JobId::new(), JobId::new()];
+        let json = spec.canonical_json();
+        assert!(json.contains("\"after\""));
+        let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, spec);
+        assert_eq!(parsed.canonical_json(), json);
     }
 
     #[test]
