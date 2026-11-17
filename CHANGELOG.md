@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-11-17
+
 ### Changed
 
 - A provider failure no longer uses the retry budget. The job goes back to the queue and waits until a node can serve its provider again, instead of failing after `max_retries` outages. Only 100 provider failures in a row fail a job. Submitting once and letting the queue wait is now the intended way to run through a quota outage.
