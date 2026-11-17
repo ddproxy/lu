@@ -5,6 +5,13 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Removed
+
+- The in-memory store (`lu_store::memory::MemoryStore`) was removed; it was never used by the
+  controller, which opens only the SQLite store. The store logic now exists once, in
+  `crates/lu-store/src/sqlite.rs`. The controller API tests' separate fake store was removed too;
+  they run against `SqliteStore` opened on a temporary file.
+
 ## [0.1.12] - 2026-11-17
 
 ### Changed

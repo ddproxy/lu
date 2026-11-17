@@ -1,12 +1,9 @@
-#[path = "support/fake_store.rs"]
-mod fake_store;
-
-use fake_store::FakeStore;
 use lu_auth::sha256_hex;
 use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator};
 use lu_controller::{build_router, run_background, AppState};
 use lu_proto::{JobId, JobSpec, MAX_AFTER_JOBS, MAX_LOG_BYTES};
 use lu_serve::{serve, ServeOptions};
+use lu_store::sqlite::SqliteStore;
 use lu_store::Store;
 use serde_json::json;
 use std::net::SocketAddr;
@@ -20,10 +17,10 @@ const OP_TOKEN: &str = "op-token-1234567890";
 const AGENT_A_TOKEN: &str = "agent-a-token-1234567890";
 const AGENT_B_TOKEN: &str = "agent-b-token-1234567890";
 
-fn controller_cfg(artifacts_dir: &str) -> ControllerConfig {
+fn controller_cfg(db: &str, artifacts_dir: &str) -> ControllerConfig {
     ControllerConfig {
         listen: "127.0.0.1:0".to_owned(),
-        db: "/tmp/lu-test.db".to_owned(),
+        db: db.to_owned(),
         artifacts_dir: artifacts_dir.to_owned(),
         lease_secs: 6,
         max_retries: 1,
@@ -53,18 +50,19 @@ fn controller_cfg(artifacts_dir: &str) -> ControllerConfig {
 struct TestServer {
     addr: SocketAddr,
     shutdown: broadcast::Sender<()>,
-    store: Arc<FakeStore>,
+    store: Arc<SqliteStore>,
     _handle: tokio::task::JoinHandle<()>,
     _bg: tokio::task::JoinHandle<()>,
     _artifacts_dir: std::path::PathBuf,
+    _tmp: tempfile::TempDir,
 }
 
 async fn start_server() -> TestServer {
-    let dir =
-        std::env::temp_dir().join(format!("lu-ctl-{}-{}", std::process::id(), fastrand_u64()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let cfg = controller_cfg(dir.to_str().unwrap());
-    let store = Arc::new(FakeStore::new());
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("lu.db");
+    let artifacts_dir = tmp.path().join("artifacts");
+    let cfg = controller_cfg(db.to_str().unwrap(), artifacts_dir.to_str().unwrap());
+    let store = Arc::new(SqliteStore::open(&db).unwrap());
     let state = Arc::new(AppState::from_config(&cfg, store.clone()).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -99,16 +97,9 @@ async fn start_server() -> TestServer {
         store,
         _handle: handle,
         _bg: bg,
-        _artifacts_dir: dir,
+        _artifacts_dir: artifacts_dir,
+        _tmp: tmp,
     }
-}
-
-fn fastrand_u64() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
 }
 
 async fn raw_request(addr: SocketAddr, req: &str) -> String {

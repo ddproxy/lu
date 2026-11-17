@@ -1,12 +1,11 @@
-//! The controller's store. [`Store`] is the contract the HTTP layer is written against; the
-//! SQLite implementation lives in `sqlite.rs` and an in-memory one in `memory.rs` for tests.
+//! The controller's store. [`Store`] is the contract the HTTP layer is written against; the SQLite
+//! implementation lives in `sqlite.rs`.
 //!
 //! Every method is synchronous and short; callers run it on a blocking thread. Time arrives as a
 //! [`Now`] so tests control it: lease expiry uses `mono_ms` only (a clock that never jumps), the
 //! `*_at` fields shown to people use `wall_unix`.
 
 pub mod backup;
-pub mod memory;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
