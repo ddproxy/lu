@@ -30,12 +30,29 @@ fn provider_state(state: ProviderState) -> &'static str {
     }
 }
 
+/// The job's title: the first non-empty line of its task, without heading marks or a `Task:` lead.
+fn job_title(task: &str) -> String {
+    let line = task
+        .lines()
+        .map(|line| line.trim().trim_start_matches('#').trim())
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let line = line
+        .strip_prefix("Task:")
+        .or_else(|| line.strip_prefix("task:"))
+        .unwrap_or(line)
+        .trim();
+    line.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Drops terminal escape sequences and keeps the last non-empty line, where a harness puts its result.
 fn plain_summary(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
+        // The controller stores a received ESC as '?', so "?[91m" is a colour code too.
+        let escaped = c == '\u{1b}' || (c == '?' && chars.peek() == Some(&'['));
+        if escaped {
             if chars.peek() == Some(&'[') {
                 chars.next();
                 for next in chars.by_ref() {
@@ -87,6 +104,7 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
             .iter()
             .map(|job| JobRow {
                 id: job.id.to_string(),
+                title: job_title(&job.spec.task),
                 state: operator::state_name(job.state).to_owned(),
                 node: job.node.as_ref().map(ToString::to_string),
                 attempt: job.attempt,
@@ -147,6 +165,15 @@ mod tests {
             plain_summary("\u{1b}[0m> build\n\u{1b}[91mok\u{1b}[0m\n"),
             "ok"
         );
+        assert_eq!(
+            plain_summary("?[91m?[1mError: ?[0mFile not found"),
+            "Error: File not found"
+        );
         assert_eq!(plain_summary(""), "");
+        assert_eq!(
+            super::job_title("# Task: implement `lu top`\n\nbody"),
+            "implement `lu top`"
+        );
+        assert_eq!(super::job_title("\n  plain words\nmore"), "plain words");
     }
 }

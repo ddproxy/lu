@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Paragraph, Sparkline};
 use ratatui::Frame;
 
 use crate::model::{Tone, ViewModel};
@@ -19,12 +19,33 @@ fn style_for(tone: Tone) -> Style {
 
 /// Lays out a view model; all text decisions were made in the model.
 pub fn draw(frame: &mut Frame, view: &ViewModel) {
-    let [body, status, footer] = Layout::vertical([
+    let area = frame.area();
+    let chart_height = if area.height >= 24 { 5 } else { 0 };
+    let [charts, body, status, footer] = Layout::vertical([
+        Constraint::Length(chart_height),
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
+    if chart_height > 0 && !view.charts.is_empty() {
+        let cells = Layout::horizontal(vec![
+            Constraint::Ratio(1, view.charts.len() as u32);
+            view.charts.len()
+        ])
+        .split(charts);
+        for (chart, cell) in view.charts.iter().zip(cells.iter()) {
+            let width = cell.width.saturating_sub(2) as usize;
+            let skip = chart.values.len().saturating_sub(width);
+            let data: Vec<u64> = chart.values[skip..].to_vec();
+            let title = format!("{} {}", chart.title, chart.latest);
+            let sparkline = Sparkline::default()
+                .block(Block::bordered().title(title))
+                .data(&data)
+                .style(Style::default().fg(Color::Cyan));
+            frame.render_widget(sparkline, *cell);
+        }
+    }
     let lines: Vec<Line> = view
         .lines
         .iter()
@@ -86,6 +107,7 @@ mod tests {
                 }],
                 jobs: vec![JobRow {
                     id: "01ABC".to_owned(),
+                    title: "do the thing".to_owned(),
                     state: "running".to_owned(),
                     node: Some("peer-a".to_owned()),
                     attempt: 1,
@@ -116,6 +138,13 @@ mod tests {
         dashboard.toggle_pause(t0);
         let text = screen(&dashboard.view(t0 + Duration::from_secs(7)), 90, 12);
         assert!(text.contains("paused: showing data from 7s ago"), "{text}");
+    }
+
+    #[test]
+    fn a_tall_screen_draws_the_charts() {
+        let text = screen(&dashboard().view(Instant::now()), 100, 30);
+        assert!(text.contains("running jobs 1"), "{text}");
+        assert!(text.contains("providers ok 0"), "{text}");
     }
 
     #[test]

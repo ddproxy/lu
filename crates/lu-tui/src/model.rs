@@ -28,6 +28,8 @@ pub struct NodeRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRow {
     pub id: String,
+    /// What the job is for, from its task's first line.
+    pub title: String,
     pub state: String,
     pub node: Option<String>,
     pub attempt: u32,
@@ -71,6 +73,53 @@ impl Line {
     }
 }
 
+/// One reading of the fleet, kept to draw the charts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sample {
+    pub running: u64,
+    pub queued: u64,
+    pub busy_nodes: u64,
+    pub providers_ok: u64,
+}
+
+impl Sample {
+    fn of(snapshot: &Snapshot) -> Self {
+        let count = |states: &[&str]| {
+            snapshot
+                .jobs
+                .iter()
+                .filter(|job| states.contains(&job.state.as_str()))
+                .count() as u64
+        };
+        Self {
+            running: count(&["running", "leased"]),
+            queued: count(&["queued", "recovering"]),
+            busy_nodes: snapshot
+                .nodes
+                .iter()
+                .filter(|n| n.harness == "busy")
+                .count() as u64,
+            providers_ok: snapshot
+                .nodes
+                .iter()
+                .flat_map(|n| &n.providers)
+                .filter(|p| p.state == "ok")
+                .count() as u64,
+        }
+    }
+}
+
+/// Samples kept for the charts: about five minutes at the refresh rate.
+const HISTORY: usize = 150;
+
+/// One chart: a title, its recent values and the latest one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chart {
+    pub title: String,
+    pub values: Vec<u64>,
+    pub latest: u64,
+}
+
 /// A node silent for longer than this is shown as stale.
 const STALE_SECS: u64 = 60;
 
@@ -80,7 +129,8 @@ pub struct Dashboard {
     live: Snapshot,
     updated: Option<Instant>,
     error: Option<String>,
-    frozen: Option<(Snapshot, Instant)>,
+    frozen: Option<(Snapshot, Vec<Sample>, Instant)>,
+    history: Vec<Sample>,
     updates: u64,
 }
 
@@ -93,6 +143,10 @@ impl Dashboard {
     pub fn apply(&mut self, result: Result<Snapshot, String>, now: Instant) {
         match result {
             Ok(snapshot) => {
+                self.history.push(Sample::of(&snapshot));
+                if self.history.len() > HISTORY {
+                    self.history.remove(0);
+                }
                 self.live = snapshot;
                 self.updated = Some(now);
                 self.error = None;
@@ -110,14 +164,15 @@ impl Dashboard {
     pub fn toggle_pause(&mut self, now: Instant) {
         self.frozen = match self.frozen.take() {
             Some(_) => None,
-            None => Some((self.live.clone(), now)),
+            None => Some((self.live.clone(), self.history.clone(), now)),
         };
     }
 
     pub fn view(&self, now: Instant) -> ViewModel {
         match &self.frozen {
-            Some((snapshot, taken)) => ViewModel::build(
+            Some((snapshot, history, taken)) => ViewModel::build(
                 snapshot,
+                history,
                 Status::Paused(now.saturating_duration_since(*taken)),
             ),
             None => {
@@ -129,7 +184,7 @@ impl Dashboard {
                     },
                     (None, None) => Status::Waiting,
                 };
-                ViewModel::build(&self.live, status)
+                ViewModel::build(&self.live, &self.history, status)
             }
         }
     }
@@ -146,6 +201,7 @@ enum Status {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewModel {
     pub title: String,
+    pub charts: Vec<Chart>,
     pub lines: Vec<Line>,
     pub status: Line,
     pub footer: String,
@@ -199,8 +255,25 @@ fn worst(tones: impl Iterator<Item = Tone>) -> Tone {
     })
 }
 
+fn charts(history: &[Sample]) -> Vec<Chart> {
+    let series = |title: &str, pick: fn(&Sample) -> u64| {
+        let values: Vec<u64> = history.iter().map(pick).collect();
+        Chart {
+            title: title.to_owned(),
+            latest: values.last().copied().unwrap_or(0),
+            values,
+        }
+    };
+    vec![
+        series("running jobs", |s| s.running),
+        series("queued jobs", |s| s.queued),
+        series("busy nodes", |s| s.busy_nodes),
+        series("providers ok", |s| s.providers_ok),
+    ]
+}
+
 impl ViewModel {
-    fn build(snapshot: &Snapshot, status: Status) -> Self {
+    fn build(snapshot: &Snapshot, history: &[Sample], status: Status) -> Self {
         let mut lines = vec![Line::new(
             format!("{:<12} {:<8} {:<8} PROVIDERS", "NODE", "STATE", "SEEN"),
             Tone::Heading,
@@ -239,8 +312,8 @@ impl ViewModel {
         lines.push(Line::new("", Tone::Plain));
         lines.push(Line::new(
             format!(
-                "{:<28} {:<11} {:<10} {:>4} {:<7} NOTE",
-                "JOB", "STATE", "NODE", "TRY", "AGE"
+                "{:<10} {:<11} {:<9} {:>3} {:<6} {:<38} NOTE",
+                "JOB", "STATE", "NODE", "TRY", "AGE", "TITLE"
             ),
             Tone::Heading,
         ));
@@ -248,19 +321,25 @@ impl ViewModel {
             lines.push(Line::new("no jobs", Tone::Dim));
         }
         for job in &snapshot.jobs {
-            let node = job.node.as_deref().map_or("-".to_owned(), |n| clip(n, 10));
+            let node = job.node.as_deref().map_or("-".to_owned(), |n| clip(n, 9));
+            let id = printable(&job.id);
+            let short_id: String = id
+                .chars()
+                .skip(id.chars().count().saturating_sub(10))
+                .collect();
             let note = match (&job.model, job.note.is_empty()) {
                 (Some(model), true) => model.as_str(),
                 _ => job.note.as_str(),
             };
             lines.push(Line::new(
                 format!(
-                    "{:<28} {:<11} {:<10} {:>4} {:<7} {}",
-                    clip(&job.id, 28),
+                    "{:<10} {:<11} {:<9} {:>3} {:<6} {:<38} {}",
+                    short_id,
                     clip(&job.state, 11),
                     node,
                     job.attempt,
                     short_age(job.age_secs),
+                    clip(&job.title, 38),
                     clip(note, 60)
                 ),
                 job_tone(&job.state),
@@ -296,6 +375,7 @@ impl ViewModel {
         };
         Self {
             title: "lu top".to_owned(),
+            charts: charts(history),
             lines,
             status,
             footer: "p pause/resume   q quit".to_owned(),
@@ -341,6 +421,7 @@ mod tests {
     fn job(id: &str, state: &str) -> JobRow {
         JobRow {
             id: id.to_owned(),
+            title: "do the thing".to_owned(),
             state: state.to_owned(),
             node: Some("ct-1".to_owned()),
             attempt: 1,
@@ -369,7 +450,43 @@ mod tests {
         assert!(text.contains("zen cooling 2h00m"), "{text}");
         assert!(text.contains("openrouter ok"), "{text}");
         assert!(text.contains("01ABC"), "{text}");
+        assert!(text.contains("do the thing"), "{text}");
         assert!(text.contains("2m"), "{text}");
+    }
+
+    #[test]
+    fn charts_track_the_recent_counts_and_freeze_on_pause() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        dashboard.apply(Ok(snapshot()), t0);
+        dashboard.apply(Ok(snapshot()), t0);
+        let view = dashboard.view(t0);
+        let running = view
+            .charts
+            .iter()
+            .find(|c| c.title == "running jobs")
+            .unwrap();
+        assert_eq!(running.values, vec![1, 1]);
+        assert_eq!(running.latest, 1);
+        dashboard.toggle_pause(t0);
+        dashboard.apply(Ok(snapshot()), t0);
+        let paused = dashboard.view(t0);
+        let running = paused
+            .charts
+            .iter()
+            .find(|c| c.title == "running jobs")
+            .unwrap();
+        assert_eq!(running.values.len(), 2);
+    }
+
+    #[test]
+    fn history_is_bounded() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        for _ in 0..(HISTORY + 20) {
+            dashboard.apply(Ok(snapshot()), t0);
+        }
+        assert_eq!(dashboard.view(t0).charts[0].values.len(), HISTORY);
     }
 
     #[test]
