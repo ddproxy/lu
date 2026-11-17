@@ -4,16 +4,25 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lu_client::Client;
-use lu_proto::ProviderState;
-use lu_tui::model::{JobRow, NodeRow, ProviderCell, Snapshot};
+use lu_proto::{JobId, NodeName, ProviderState};
+use lu_tui::model::{Dashboard, JobRow, NodeRow, ProviderCell, Request, Snapshot, Update};
+use lu_tui::sanitize::printable;
 
 use crate::operator;
 
 const REFRESH: Duration = Duration::from_secs(2);
 const JOBS_SHOWN: u32 = 20;
+const LOG_TAIL_LINES: usize = 20;
+
+#[derive(Debug, clap::Args)]
+pub struct TopArgs {
+    /// Fetch one snapshot, print the node and job tables, and exit.
+    #[arg(long)]
+    pub once: bool,
+}
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -45,8 +54,8 @@ fn job_title(task: &str) -> String {
     line.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// Drops terminal escape sequences and keeps the last non-empty line, where a harness puts its result.
-fn plain_summary(text: &str) -> String {
+/// Drops terminal escape sequences, leaving line breaks and the rest of the text.
+fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -65,11 +74,29 @@ fn plain_summary(text: &str) -> String {
         }
         out.push(c);
     }
-    out.lines()
+    out
+}
+
+/// Keeps the last non-empty line, where a harness puts its result.
+fn plain_summary(text: &str) -> String {
+    strip_ansi(text)
+        .lines()
         .map(str::trim)
         .rfind(|line| !line.is_empty())
         .unwrap_or_default()
         .to_owned()
+}
+
+/// The last lines of a job log, stripped of escapes and made printable for the pane.
+fn log_tail(text: &str) -> String {
+    let text = strip_ansi(text);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(LOG_TAIL_LINES);
+    lines[start..]
+        .iter()
+        .map(|line| printable(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn snapshot(client: &Client) -> Result<Snapshot, String> {
@@ -127,8 +154,48 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
     })
 }
 
-pub async fn run(config: &Path) -> Result<(), String> {
+async fn fetch_log(client: &Client, job_id: &str) -> Result<String, String> {
+    let id = JobId::parse(job_id).map_err(|error| error.to_string())?;
+    let page = client
+        .logs(&id, 0, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(log_tail(&page.data))
+}
+
+async fn print_once(client: &Client) -> Result<(), String> {
+    let snapshot = snapshot(client).await?;
+    let mut dashboard = Dashboard::new();
+    let now = Instant::now();
+    dashboard.apply(Ok(snapshot), now);
+    println!("{}", dashboard.view(now).table_text());
+    Ok(())
+}
+
+async fn print_json(client: &Client) -> Result<(), String> {
+    let nodes = client.nodes().await.map_err(|error| error.to_string())?;
+    let jobs = client
+        .list_jobs(None, Some(JOBS_SHOWN))
+        .await
+        .map_err(|error| error.to_string())?;
+    let body = serde_json::json!({ "nodes": nodes.nodes, "jobs": jobs.jobs });
+    let text = serde_json::to_string(&body).map_err(|error| error.to_string())?;
+    println!("{text}");
+    Ok(())
+}
+
+pub async fn run(config: &Path, args: TopArgs, json: bool) -> Result<(), String> {
+    if args.once && json {
+        return Err("--once and --json are mutually exclusive".to_owned());
+    }
     let client = operator::connect(config)?;
+    if json {
+        return print_json(&client).await;
+    }
+    if args.once {
+        return print_once(&client).await;
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     tokio::spawn(async move {
@@ -136,20 +203,58 @@ pub async fn run(config: &Path) -> Result<(), String> {
         flag.store(true, Ordering::Relaxed);
     });
     let (tx, rx) = mpsc::channel();
+    let (update_tx, update_rx) = mpsc::channel();
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
     let feeder_stop = Arc::clone(&stop);
+    let feeder_client = client.clone();
     let feeder = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(REFRESH);
         while !feeder_stop.load(Ordering::Relaxed) {
-            if tx.send(snapshot(&client).await).is_err() {
-                break;
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if tx.send(snapshot(&feeder_client).await).is_err() {
+                        break;
+                    }
+                }
+                request = request_rx.recv() => {
+                    match request {
+                        Some(Request::Log { job_id }) => {
+                            let result = fetch_log(&feeder_client, &job_id).await;
+                            if update_tx.send(Update::Log { job_id, result }).is_err() {
+                                break;
+                            }
+                        }
+                        Some(Request::Drain { node, drain }) => {
+                            let parsed = NodeName::parse(&node);
+                            let result = match parsed {
+                                Ok(name) => feeder_client
+                                    .set_drain(&name, drain)
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|error| error.to_string()),
+                                Err(error) => Err(error.to_string()),
+                            };
+                            let update = Update::Drain { node, drain, result };
+                            if update_tx.send(update).is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
             }
-            tokio::time::sleep(REFRESH).await;
         }
     });
     let ui_stop = Arc::clone(&stop);
-    let result = tokio::task::spawn_blocking(move || lu_tui::run::run_live(&rx, &ui_stop))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("terminal: {e}"));
+    let request = move |request: Request| {
+        let _ = request_tx.send(request);
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        lu_tui::run::run_live(&rx, &update_rx, &request, &ui_stop)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("terminal: {e}"));
     stop.store(true, Ordering::Relaxed);
     feeder.abort();
     result
@@ -157,7 +262,7 @@ pub async fn run(config: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::plain_summary;
+    use super::{log_tail, plain_summary};
 
     #[test]
     fn escapes_are_dropped_and_the_last_line_kept() {
@@ -175,5 +280,18 @@ mod tests {
             "implement `lu top`"
         );
         assert_eq!(super::job_title("\n  plain words\nmore"), "plain words");
+    }
+
+    #[test]
+    fn a_log_tail_is_stripped_printed_and_limited_to_twenty_lines() {
+        let lines = (1..=25)
+            .map(|n| format!("\u{1b}[0mline {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = log_tail(&lines);
+        assert_eq!(tail.lines().count(), 20);
+        assert!(tail.starts_with("line 6"), "{tail}");
+        assert!(tail.ends_with("line 25"), "{tail}");
+        assert!(!tail.contains('\u{1b}'));
     }
 }

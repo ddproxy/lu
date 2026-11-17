@@ -266,6 +266,56 @@ async fn ls_json_prints_the_raw_body_and_sends_the_filters() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "tui")]
+async fn top_once_prints_tables_and_top_json_prints_one_object() {
+    let id = job_id();
+    let node_body = json!({"nodes": [{
+        "name": "node-a",
+        "harness": "idle",
+        "providers": [],
+        "last_seen": 20,
+        "cordoned": false
+    }]});
+    let jobs_body = json!({"jobs": [job_json(&id, "running")]});
+    let server = start(move |record| {
+        if record.path.contains("nodes") {
+            Reply::json(&node_body)
+        } else {
+            Reply::json(&jobs_body)
+        }
+    })
+    .await;
+    let dir = scratch("top-once-json");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+
+    let output = run_with_env(&["top", "--once"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("NODE"), "{text}");
+    assert!(text.contains("node-a"), "{text}");
+    assert!(text.contains(&id[id.len() - 10..]), "{text}");
+    assert!(!text.contains("lu top"), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text}");
+
+    let output = run_with_env(&["top", "--json"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(value["nodes"][0]["name"], "node-a");
+    assert_eq!(value["jobs"][0]["id"], id);
+
+    let output = run_with_env(&["top", "--once", "--json"], &envs, None, &dir);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("mutually exclusive"),
+        "{}",
+        stderr(&output)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn show_uses_the_agent_table_and_sanitises_hostile_text() {
     let id = job_id();
     let mut job = job_json(&id, "failed");

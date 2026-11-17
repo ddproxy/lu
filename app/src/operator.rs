@@ -447,30 +447,36 @@ fn settings(config: &Path) -> Result<Settings, String> {
         }
     }
 
-    if !config.exists() {
-        let found = lu_config::operator_config_paths()
-            .into_iter()
-            .find(|path| path.exists());
-        if let Some(path) = found {
-            let file = lu_config::load_operator(&path).map_err(|error| error.to_string())?;
-            return Ok(Settings {
-                url: file.url,
-                token_file: PathBuf::from(file.token_file),
-                ca_file: file
-                    .ca_file
-                    .filter(|path| !path.is_empty())
-                    .map(PathBuf::from),
-            });
+    let agent = if config.exists() {
+        lu_config::load(config)
+            .map_err(|error| error.to_string())?
+            .agent
+    } else {
+        None
+    };
+    let agent = match agent {
+        Some(agent) => agent,
+        None => {
+            let found = lu_config::operator_config_paths()
+                .into_iter()
+                .find(|path| path.exists());
+            if let Some(path) = found {
+                let file = lu_config::load_operator(&path).map_err(|error| error.to_string())?;
+                return Ok(Settings {
+                    url: file.url,
+                    token_file: PathBuf::from(file.token_file),
+                    ca_file: file
+                        .ca_file
+                        .filter(|path| !path.is_empty())
+                        .map(PathBuf::from),
+                });
+            }
+            return Err(format!(
+                "no controller URL: set LU_URL and LU_TOKEN_FILE, write ~/.config/lu/operator.toml or /etc/lu/operator.toml, or add an [agent] table to {}",
+                config.display()
+            ));
         }
-    }
-
-    let loaded = lu_config::load(config).map_err(|error| error.to_string())?;
-    let agent = loaded.agent.ok_or_else(|| {
-        format!(
-            "no controller URL: set LU_URL and LU_TOKEN_FILE, write ~/.config/lu/operator.toml or /etc/lu/operator.toml, or add an [agent] table to {}",
-            config.display()
-        )
-    })?;
+    };
     Ok(Settings {
         url: agent.controller_url,
         token_file: PathBuf::from(agent.token_file),

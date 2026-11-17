@@ -46,13 +46,43 @@ pub fn draw(frame: &mut Frame, view: &ViewModel) {
             frame.render_widget(sparkline, *cell);
         }
     }
+    let log_height = view
+        .log
+        .as_ref()
+        .map_or(0, |log| log.lines.len() as u16 + 2)
+        .min(body.height.saturating_sub(1));
+    let [table_area, log_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(log_height)]).areas(body);
     let lines: Vec<Line> = view
         .lines
         .iter()
-        .map(|line| Line::from(line.text.as_str()).style(style_for(line.tone)))
+        .enumerate()
+        .map(|(index, line)| {
+            let mut style = style_for(line.tone);
+            if view.selected_line == Some(index) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            Line::from(line.text.as_str()).style(style)
+        })
         .collect();
     let block = Block::bordered().title(view.title.as_str());
-    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), body);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), table_area);
+    if let Some(log) = &view.log {
+        let title = if log.title.is_empty() {
+            format!("log {}", log.job_id)
+        } else {
+            format!("log {}: {}", log.job_id, log.title)
+        };
+        let lines: Vec<Line> = log
+            .lines
+            .iter()
+            .map(|line| Line::from(line.text.as_str()).style(style_for(line.tone)))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).block(Block::bordered().title(title)),
+            log_area,
+        );
+    }
     let status_style = style_for(view.status.tone).add_modifier(if view.paused {
         Modifier::BOLD
     } else {
@@ -74,7 +104,7 @@ mod tests {
     use ratatui::Terminal;
 
     use super::*;
-    use crate::model::{Dashboard, JobRow, NodeRow, Snapshot};
+    use crate::model::{Dashboard, JobRow, NodeRow, Snapshot, Update};
 
     fn screen(view: &ViewModel, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -153,5 +183,20 @@ mod tests {
         let _ = screen(&view, 1, 1);
         let _ = screen(&view, 0, 0);
         let _ = screen(&view, 12, 2);
+    }
+
+    #[test]
+    fn a_log_pane_is_drawn_under_the_tables() {
+        let mut dashboard = dashboard();
+        let t0 = Instant::now();
+        dashboard.toggle_focus();
+        let id = dashboard.open_selected_log().unwrap();
+        dashboard.apply_update(Update::Log {
+            job_id: id,
+            result: Ok("first\nlast".to_owned()),
+        });
+        let text = screen(&dashboard.view(t0), 90, 20);
+        assert!(text.contains("log 01ABC"), "{text}");
+        assert!(text.contains("last"), "{text}");
     }
 }

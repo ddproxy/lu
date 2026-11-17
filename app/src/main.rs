@@ -33,7 +33,7 @@ enum Command {
     Serve,
     /// Live terminal view of the nodes and recent jobs. Needs a build with the `tui` feature.
     #[cfg(feature = "tui")]
-    Top,
+    Top(top::TopArgs),
     /// Run the node agent loop. Needs an `[agent]` config.
     Agent,
     /// Submit a job.
@@ -64,7 +64,7 @@ async fn main() -> ExitCode {
         Command::Check => check(&cli.config),
         Command::Serve => serve(&cli.config).await,
         #[cfg(feature = "tui")]
-        Command::Top => match top::run(&cli.config).await {
+        Command::Top(args) => match top::run(&cli.config, args, json).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(&error),
         },

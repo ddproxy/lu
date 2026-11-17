@@ -107,7 +107,7 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | --- | --- |
 | `lu check` | Parse and validate the config and TLS files, print a summary, exit. |
 | `lu serve` | Run the HTTP(S) controller. This is the default when no subcommand is given. |
-| `lu top` | Live view of the nodes (state, last heartbeat, provider health) and recent jobs, refreshed every two seconds. `p` pauses, `q` quits. Only in a build with `--features tui`; connects like the other operator commands. |
+| `lu top` | Live view of the nodes (state, last heartbeat, provider health) and recent jobs, refreshed every two seconds. `↑`/`↓` or `j`/`k` select a row, `Tab` switches focus between nodes and jobs, `Enter` opens the last 20 lines of the selected job's log, `Esc` closes the log pane (or quits when it is closed), `d` twice within three seconds drains or undrains the selected node, `p` pauses and `q` quits. `--once` prints one snapshot's tables as plain text and exits; `--json` prints one `nodes`/`jobs` object instead, and cannot be combined with `--once`. Only in a build with `--features tui`; connects like the other operator commands. |
 | `lu submit` | Submit a job. `--repo` and `--ref` are required; the task comes from `--task`, `--task-file`, or stdin. `--wait` polls until terminal. |
 | `lu ls` | List jobs, newest first. Filters: `--state`, `--limit`. |
 | `lu show <id>` | Show one job. |

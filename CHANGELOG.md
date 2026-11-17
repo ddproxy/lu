@@ -5,6 +5,15 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `lu top --once` prints one snapshot's node and job tables as plain text and exits, without
+  needing a terminal; `lu top --json` prints one object with the controller's `nodes` and `jobs`.
+- `lu top` highlights a row selected with the arrows or `j`/`k`; `Enter` opens the selected job's
+  last 20 log lines under the tables and `Esc` closes them. Log fetches run on the feeder task.
+- `lu top` drains or undrains the highlighted node with `d`, confirmed by a second `d` within
+  three seconds; `Tab` switches the selection between the node table and the job list.
+
 ## [0.1.7] - 2026-11-17
 
 ### Added
