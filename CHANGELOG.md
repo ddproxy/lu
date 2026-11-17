@@ -5,6 +5,16 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-11-17
+
+### Added
+
+- `GET /metrics` on the controller: Prometheus text exposition of job states, node counts, provider states, and completed-job outcomes.
+- Agents report optional host stats (load, memory, swap, uptime) and per-job process-tree stats (PID, parent, state, CPU, RSS, age, redacted command line, open files) in each heartbeat. The combined payload is capped at 16 KiB by dropping processes and then jobs; older heartbeats without the fields are still accepted.
+- The controller keeps the latest stats per node in memory, exposes `GET /v1/nodes/{name}/stats`, adds `load1`, `mem_available_kb`, `mem_total_kb` and `stuck` to the node list, and clears a node's stats when its next heartbeat omits them.
+- `lu node <name>` prints the host numbers and each running job's process tree as an indented table; `--json` prints the raw stats response.
+- Job stats flag `stuck` when the harness has produced no output and the job tree has used no CPU for more than 300 seconds.
+
 ## [0.1.9] - 2026-11-17
 
 ### Added
@@ -19,12 +29,6 @@ uses semantic versioning once it reaches 1.0.
 - A harness that prints a provider-unavailable marker and then goes silent is stopped after 120
   seconds and completes as a `provider` failure, so the controller cordons that provider and
   retries the job elsewhere instead of waiting for the wall-clock timeout.
-### Added
-
-- Agents report optional host stats (load, memory, swap, uptime) and per-job process-tree stats (PID, parent, state, CPU, RSS, age, redacted command line, open files) in each heartbeat. The combined payload is capped at 16 KiB by dropping processes and then jobs; older heartbeats without the fields are still accepted.
-- The controller keeps the latest stats per node in memory, exposes `GET /v1/nodes/{name}/stats`, adds `load1`, `mem_available_kb`, `mem_total_kb` and `stuck` to the node list, and clears a node's stats when its next heartbeat omits them.
-- `lu node <name>` prints the host numbers and each running job's process tree as an indented table; `--json` prints the raw stats response.
-- Job stats flag `stuck` when the harness has produced no output and the job tree has used no CPU for more than 300 seconds.
 
 ## [0.1.8] - 2026-11-17
 
@@ -44,7 +48,6 @@ uses semantic versioning once it reaches 1.0.
 
 - `lu top` draws four sparklines over the last five minutes (running jobs, queued jobs, busy nodes, healthy providers) when the terminal is 24 rows or taller.
 - `lu top` shows a title for each job, taken from the first line of its task.
-- `GET /metrics` on the controller: Prometheus text exposition of job states, node counts, provider states, and completed-job outcomes.
 - `/etc/lu/operator.toml` is read after the per-user operator file, for a shared operator host.
 
 ## [0.1.6] - 2026-11-16

@@ -1054,7 +1054,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lu"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "clap",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "lu-agent"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "lu-client",
  "lu-config",
@@ -1096,14 +1096,14 @@ dependencies = [
 
 [[package]]
 name = "lu-auth"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "lu-client"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "lu-config",
@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "lu-config"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "libc",
  "rustix",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "lu-controller"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "lu-auth",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "lu-proto"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "getrandom 0.2.17",
  "serde",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "lu-serve"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "axum",
  "hyper",
@@ -1168,14 +1168,14 @@ dependencies = [
 
 [[package]]
 name = "lu-staging"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "git2",
 ]
 
 [[package]]
 name = "lu-store"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "lu-proto",
  "rusqlite",
@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "lu-supervise"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "rustix",
  "tokio",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "lu-tui"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "crossterm",
  "ratatui",
