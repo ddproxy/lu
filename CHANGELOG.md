@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-11-17
+
 ### Added
 
 - `lu backup --out <file>` takes a live SQLite snapshot with `VACUUM INTO`, writes it `0600`,
@@ -17,6 +19,8 @@ uses semantic versioning once it reaches 1.0.
 - `GET /v1/status` and `lu status` report the controller version, uptime, schema version,
   database bytes, jobs recovered at boot, job counts by state, oldest queued age, node counts
   and lease length. `lu status --json` prints the raw response.
+- `lu backup` never writes through a symlink or onto the database or its WAL, creates the copy with mode `0600` from the start and removes a partial file on failure. `lu restore` refuses an empty or foreign SQLite file, serialises concurrent restores, stages the copy beside the database with the old owner and renames it into place, and moves every WAL, SHM and journal file aside with the old database; a failed install puts the old files back.
+- The dashboard uses the protocol crate's text sanitiser, which also neutralises the Unicode line and paragraph separators.
 - New Prometheus series: `lu_build_info{version}`, `lu_uptime_seconds`, `lu_db_bytes`,
   `lu_schema_version`, `lu_recovered_on_boot`, `lu_queue_oldest_seconds` and
   `lu_node_last_seen_seconds{node}`. `docs/operations.md` includes alert examples.

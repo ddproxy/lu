@@ -164,11 +164,19 @@ lu restore --config /etc/lu/lu.toml /var/backups/lu/lu-YYYY-MM-DD.db
 systemctl start lu-controller.service
 ```
 
-`lu restore` verifies the snapshot, rejects a schema newer than the binary supports, and
-refuses when the database is still in use, so stop the controller first. It moves the current
-database to `<db>.pre-restore-<unix seconds>` (with its `-wal` and `-shm` sidecars) before
-installing the copy. Boot recovery then applies to jobs that were leased or running in the
-snapshot.
+`lu restore` verifies the snapshot, refuses a file that is not a Lu database (an empty or
+foreign SQLite file would replace your data with nothing), rejects a schema newer than the
+binary supports, and refuses when the database is still in use, so stop the controller first.
+Only one restore runs at a time. It stages the copy beside the database with the old file's
+owner and mode `0600`, moves the current database and every `-wal`, `-shm` and `-journal` file
+to `<db>.pre-restore-<unix seconds>` names, then renames the staged copy into place. Run it as
+root or as the controller's own account; either way the installed file keeps the old owner.
+Boot recovery then applies to jobs that were leased or running in the snapshot.
+
+If a restore is interrupted, the previous database is still under its `pre-restore` name:
+`mv <db>.pre-restore-<seconds> <db>`, and the same for each `-wal` or `-shm` file, puts it back.
+A failed install does this itself and says so. `lu backup` refuses an output path that is the
+database or one of its files, or a symlink, and removes a partial file if it fails.
 
 Artifacts are not part of the database snapshot. Restore them separately:
 

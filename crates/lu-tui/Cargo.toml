@@ -12,6 +12,7 @@ publish.workspace = true
 tui = ["dep:ratatui", "dep:crossterm"]
 
 [dependencies]
+lu-proto = { path = "../lu-proto" }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
 
