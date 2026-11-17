@@ -17,12 +17,18 @@ pub enum FailureClass {
     Dependency,
 }
 
+/// A provider outage is not the job's fault, so it does not use the retry budget: the job goes
+/// back to the queue and waits, and the provider cordon keeps it off nodes that cannot serve it.
+/// This only bounds a job that fails this way over and over for some other reason.
+pub const PROVIDER_ATTEMPT_LIMIT: u32 = 100;
+
 impl FailureClass {
-    /// Node and provider failures retry while the attempt count is within the cap; an execution
-    /// failure never does.
+    /// Node failures retry while the attempt count is within the cap, provider failures until
+    /// [`PROVIDER_ATTEMPT_LIMIT`]; an execution failure never does.
     pub fn retryable(self, attempt: u32, max_retries: u32) -> bool {
         match self {
-            Self::Node | Self::Provider => attempt <= max_retries,
+            Self::Node => attempt <= max_retries,
+            Self::Provider => attempt <= PROVIDER_ATTEMPT_LIMIT,
             Self::Execution | Self::Dependency => false,
         }
     }
@@ -33,14 +39,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn node_and_provider_failures_retry_within_the_cap() {
-        for class in [FailureClass::Node, FailureClass::Provider] {
-            assert!(class.retryable(1, 1));
-            assert!(!class.retryable(2, 1));
-            assert!(class.retryable(1, 2));
-            assert!(class.retryable(2, 2));
-            assert!(!class.retryable(3, 2));
-        }
+    fn node_failures_retry_within_the_cap() {
+        let class = FailureClass::Node;
+        assert!(class.retryable(1, 1));
+        assert!(!class.retryable(2, 1));
+        assert!(class.retryable(1, 2));
+        assert!(class.retryable(2, 2));
+        assert!(!class.retryable(3, 2));
+    }
+
+    #[test]
+    fn a_provider_outage_does_not_use_the_retry_budget() {
+        let class = FailureClass::Provider;
+        assert!(class.retryable(1, 0));
+        assert!(class.retryable(5, 1));
+        assert!(class.retryable(PROVIDER_ATTEMPT_LIMIT, 1));
+        assert!(!class.retryable(PROVIDER_ATTEMPT_LIMIT + 1, 1));
     }
 
     #[test]
