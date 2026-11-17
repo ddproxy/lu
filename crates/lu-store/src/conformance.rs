@@ -37,6 +37,7 @@ pub fn hb(name: &str, harness: HarnessState, providers: Vec<(&str, ProviderState
     Heartbeat {
         node: node(name),
         harness,
+        version: None,
         providers: providers
             .into_iter()
             .map(|(n, s)| ProviderStatus {

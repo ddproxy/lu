@@ -1,5 +1,6 @@
 //! lu: a job queue and dispatcher for dev peers.
 
+mod admin;
 mod agent;
 mod logging;
 mod operator;
@@ -29,6 +30,12 @@ struct Cli {
 enum Command {
     /// Parse and validate the config and the TLS files, print a summary, and exit.
     Check,
+    /// Copy the controller database to a file while the controller keeps running.
+    Backup(admin::BackupArgs),
+    /// Install a backup as the controller database after stopping the controller.
+    Restore(admin::RestoreArgs),
+    /// Show controller uptime, database size, queue and node counts.
+    Status(operator::StatusArgs),
     /// Run the HTTP listener. This is the default.
     Serve,
     /// Live terminal view of the nodes and recent jobs. Needs a build with the `tui` feature.
@@ -66,6 +73,15 @@ async fn main() -> ExitCode {
     let json = cli.json;
     match cli.command.unwrap_or(Command::Serve) {
         Command::Check => check(&cli.config),
+        Command::Backup(args) => match admin::backup(args, &cli.config) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(&error),
+        },
+        Command::Restore(args) => match admin::restore(args, &cli.config) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(&error),
+        },
+        Command::Status(args) => operator::status(args, &cli.config, json).await,
         Command::Serve => serve(&cli.config).await,
         #[cfg(feature = "tui")]
         Command::Top(args) => match top::run(&cli.config, args, json).await {
@@ -112,6 +128,14 @@ fn check(path: &std::path::Path) -> ExitCode {
             c.operators.len(),
             if tls_on { "on" } else { "off" }
         );
+        match admin::database_check(path) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            Err(error) => return fail(&error),
+        }
     }
     if let Some(a) = &config.agent {
         println!(

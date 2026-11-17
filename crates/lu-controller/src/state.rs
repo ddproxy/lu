@@ -7,11 +7,16 @@ use lu_staging::ArtifactDir;
 use lu_store::Store;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct AppState {
     pub store: Arc<dyn Store>,
+    /// The SQLite file, for size reporting and diagnostics.
+    pub db_path: PathBuf,
+    pub started: Instant,
+    pub recovered_on_boot: AtomicU64,
     pub auth: AuthConfig,
     pub throttle: LoginThrottle,
     pub waiters: Arc<Waiters>,
@@ -51,6 +56,9 @@ impl AppState {
         let lease_secs = cfg.lease_secs;
         Ok(Self {
             store,
+            db_path: PathBuf::from(&cfg.db),
+            started: Instant::now(),
+            recovered_on_boot: AtomicU64::new(0),
             auth,
             throttle,
             waiters: Arc::new(Waiters::new()),
@@ -68,5 +76,13 @@ impl AppState {
 
     pub fn artifact_dir(&self) -> Result<ArtifactDir, String> {
         ArtifactDir::new(&self.artifacts_dir).map_err(|e| e.to_string())
+    }
+
+    pub fn set_recovered_on_boot(&self, count: u64) {
+        self.recovered_on_boot.store(count, Ordering::Relaxed);
+    }
+
+    pub fn recovered_on_boot(&self) -> u64 {
+        self.recovered_on_boot.load(Ordering::Relaxed)
     }
 }

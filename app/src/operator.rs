@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use lu_client::{ApiError, Client, JobView, LogPage, NodeStats, NodeView};
+use lu_client::{ApiError, Client, JobView, LogPage, NodeStats, NodeView, StatusView};
 use lu_proto::{
     printable, truncate_chars, ArtifactName, FailureClass, HarnessState, JobId, JobSpec, JobState,
     NodeName, MAX_TASK_BYTES,
@@ -112,6 +112,9 @@ pub struct CancelArgs {
 pub struct NodesArgs {}
 
 #[derive(Debug, clap::Args)]
+pub struct StatusArgs {}
+
+#[derive(Debug, clap::Args)]
 pub struct GraphArgs {
     /// Show only the component containing this job.
     #[arg(value_parser = parse_job_id)]
@@ -151,6 +154,10 @@ pub async fn cancel(args: CancelArgs, config: &Path, json: bool) -> ExitCode {
 
 pub async fn nodes(args: NodesArgs, config: &Path, json: bool) -> ExitCode {
     finish(nodes_inner(args, config, json).await)
+}
+
+pub async fn status(args: StatusArgs, config: &Path, json: bool) -> ExitCode {
+    finish(status_inner(args, config, json).await)
 }
 
 pub async fn node(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
@@ -406,13 +413,35 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
         .map(|node| {
             vec![
                 node.name.to_string(),
+                node.version
+                    .as_deref()
+                    .map(display_field)
+                    .unwrap_or_else(|| "-".to_owned()),
                 harness_name(node.harness),
                 time(node.last_seen),
                 if node.cordoned { "yes" } else { "no" }.to_owned(),
             ]
         })
         .collect();
-    print_table(&["NAME", "HARNESS", "LAST_SEEN", "DRAINED"], rows);
+    print_table(
+        &["NAME", "VERSION", "HARNESS", "LAST_SEEN", "DRAINED"],
+        rows,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn status_inner(_args: StatusArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    if json {
+        let raw = client
+            .status_raw()
+            .await
+            .map_err(|error| error.to_string())?;
+        print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let status = client.status().await.map_err(|error| error.to_string())?;
+    print_status(&status);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -749,9 +778,46 @@ fn print_job(view: &JobView) {
     print_pairs(&rows);
 }
 
+fn print_status(status: &StatusView) {
+    print_pairs(&[
+        ("version", status.version.clone()),
+        ("uptime_secs", status.uptime_secs.to_string()),
+        ("schema_version", status.schema_version.to_string()),
+        ("db_bytes", status.db_bytes.to_string()),
+        ("recovered_on_boot", status.recovered_on_boot.to_string()),
+        ("oldest_queued_secs", status.oldest_queued_secs.to_string()),
+        ("nodes", status.nodes.to_string()),
+        ("nodes_online", status.nodes_online.to_string()),
+        ("lease_secs", status.lease_secs.to_string()),
+    ]);
+    println!();
+    let rows: Vec<Vec<String>> = JobState::ALL
+        .iter()
+        .map(|state| {
+            vec![
+                state_name(*state).to_owned(),
+                status
+                    .jobs
+                    .get(state_name(*state))
+                    .copied()
+                    .unwrap_or(0)
+                    .to_string(),
+            ]
+        })
+        .collect();
+    print_table(&["STATE", "COUNT"], rows);
+}
+
 fn print_node(node: &NodeView) {
     let rows = vec![
         ("name", node.name.to_string()),
+        (
+            "version",
+            node.version
+                .as_deref()
+                .map(display_field)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
         ("harness", harness_name(node.harness)),
         ("last_seen", time(node.last_seen)),
         (

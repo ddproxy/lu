@@ -8,6 +8,7 @@ use lu_proto::{
     ProviderStatus,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub use lu_proto::{HostStats, JobStats, NodeStats, ProcessStats};
 
@@ -81,6 +82,8 @@ pub struct NodeView {
     #[serde(alias = "node")]
     pub name: NodeName,
     #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
     pub harness: Option<HarnessState>,
     #[serde(default)]
     pub providers: Vec<ProviderStatus>,
@@ -103,6 +106,7 @@ impl NodeView {
     pub fn placeholder(name: NodeName, cordoned: bool) -> Self {
         Self {
             name,
+            version: None,
             harness: None,
             providers: Vec::new(),
             last_seen: 0,
@@ -122,6 +126,31 @@ pub struct ListNodes {
     pub nodes: Vec<NodeView>,
 }
 
+/// A controller status snapshot. The controller may add fields later; unknown ones are ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusView {
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub uptime_secs: u64,
+    #[serde(default)]
+    pub schema_version: i64,
+    #[serde(default)]
+    pub db_bytes: u64,
+    #[serde(default)]
+    pub recovered_on_boot: u64,
+    #[serde(default)]
+    pub jobs: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub oldest_queued_secs: u64,
+    #[serde(default)]
+    pub nodes: u64,
+    #[serde(default)]
+    pub nodes_online: u64,
+    #[serde(default)]
+    pub lease_secs: u64,
+}
+
 /// What an agent sends when it asks for work. The token already identifies the node, so `node`
 /// is optional; it is included when an agent wants the controller to verify it explicitly.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -131,6 +160,8 @@ pub struct PollRequest {
     pub node: Option<NodeName>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub harness: Option<HarnessState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,6 +179,7 @@ impl From<Heartbeat> for PollRequest {
         Self {
             node: Some(beat.node),
             harness: Some(beat.harness),
+            version: beat.version,
             providers: beat.providers,
             reiki: beat.reiki,
             host: beat.host,
@@ -391,6 +423,30 @@ mod tests {
             serde_json::from_str(r#"{"name":"node-a","drained":true,"harness":"idle"}"#).unwrap();
         assert_eq!(node.name.as_str(), "node-a");
         assert!(node.cordoned);
+    }
+
+    #[test]
+    fn node_views_carry_the_agent_version() {
+        let node: NodeView = serde_json::from_str(
+            r#"{"name":"node-a","version":"0.1.10","harness":"idle","draining":false}"#,
+        )
+        .unwrap();
+        assert_eq!(node.version.as_deref(), Some("0.1.10"));
+    }
+
+    #[test]
+    fn status_views_ignore_future_fields() {
+        let status: StatusView = serde_json::from_str(
+            r#"{"version":"0.1.10","uptime_secs":9,"schema_version":2,"db_bytes":4096,
+                "recovered_on_boot":1,"jobs":{"queued":2,"running":1},
+                "oldest_queued_secs":7,"nodes":3,"nodes_online":2,"lease_secs":60,
+                "future":true}"#,
+        )
+        .unwrap();
+        assert_eq!(status.version, "0.1.10");
+        assert_eq!(status.jobs.get("queued"), Some(&2));
+        assert_eq!(status.nodes_online, 2);
+        assert_eq!(status.lease_secs, 60);
     }
 
     #[test]

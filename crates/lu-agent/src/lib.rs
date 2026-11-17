@@ -346,6 +346,7 @@ impl Agent {
         let mut beat = Heartbeat {
             node: self.node.clone(),
             harness,
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             providers: current.providers,
             reiki: current.reiki,
             host: proc::host_stats(),
@@ -1038,6 +1039,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                 let mut beat = Heartbeat {
                     node: node.clone(),
                     harness: HarnessState::Busy,
+                    version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                     providers: current.providers,
                     reiki: current.reiki,
                     host,

@@ -10,6 +10,9 @@ pub const JOB_ID_LEN: usize = 26;
 /// Node, harness and provider names.
 pub const MAX_NAME_BYTES: usize = 64;
 
+/// An agent's reported version string.
+pub const MAX_VERSION_BYTES: usize = 32;
+
 pub const MAX_REPO_BYTES: usize = 2048;
 pub const MAX_GIT_REF_BYTES: usize = 256;
 pub const MAX_TASK_BYTES: usize = 256 * 1024;

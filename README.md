@@ -115,7 +115,10 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 
 | Command | What it does |
 | --- | --- |
-| `lu check` | Parse and validate the config and TLS files, print a summary, exit. |
+| `lu check` | Parse and validate the config and TLS files, print a summary, and report the controller database's `quick_check`, schema, size and consistency counts when it exists. |
+| `lu backup --out <file>` | Copy the live controller database to `<file>` with `VACUUM INTO`, verify it, and set mode `0600`. Existing files need `--force`. |
+| `lu restore <file>` | Install a backup as the controller database after stopping the controller; the previous file is moved to `<db>.pre-restore-<unix seconds>`. |
+| `lu status` | Show controller version, uptime, schema, database size, recovered jobs, job counts, oldest queued age and node counts. `--json` prints the raw response. |
 | `lu serve` | Run the HTTP(S) controller. This is the default when no subcommand is given. |
 | `lu top` | Live view of the nodes (state, last heartbeat, provider health) and recent jobs, refreshed every two seconds. `↑`/`↓` or `j`/`k` select a row, `Tab` switches focus between nodes and jobs, `Enter` opens the last 20 lines of the selected job's log, `Esc` closes the log pane (or quits when it is closed), `d` twice within three seconds drains or undrains the selected node, `g` toggles the dependency-graph panel, `p` pauses and `q` quits. `--once` prints one snapshot's tables as plain text and exits; `--json` prints one `nodes`/`jobs` object instead, and cannot be combined with `--once`. Only in a build with `--features tui`; connects like the other operator commands. |
 | `lu submit` | Submit a job. `--repo` and `--ref` are required; the task comes from `--task`, `--task-file`, or stdin. `--idle-timeout <secs>` (1 to 86400) stops a harness that has produced no output for that long. `--after <job-id>` (repeatable, at most 16) makes the job wait for those dependencies. `--wait` polls until terminal. |
@@ -125,7 +128,7 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu logs <id>` | Print a job's stored log. `--follow` keeps reading until the job is terminal. |
 | `lu fetch <id>` | Save `diff.patch`, `run.log` and `report.json` into `--out` (default `.`). Missing artifacts are skipped; existing files need `--force`. |
 | `lu cancel <id>` | Ask the controller to cancel a job. |
-| `lu nodes` | List known nodes. |
+| `lu nodes` | List known nodes, including the agent version each last reported. |
 | `lu drain <node>` | Stop assigning new jobs to a node. |
 | `lu undrain <node>` | Allow a drained node to take jobs again. |
 

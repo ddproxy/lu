@@ -4,7 +4,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{is_name_byte, JobId, NodeName};
-use crate::limits::{MAX_NAME_BYTES, MAX_PROVIDERS, MAX_REIKI_BYTES, MAX_STATS_BYTES};
+use crate::limits::{
+    MAX_NAME_BYTES, MAX_PROVIDERS, MAX_REIKI_BYTES, MAX_STATS_BYTES, MAX_VERSION_BYTES,
+};
 
 /// Whether the peer's harness is free to take a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -91,6 +93,8 @@ pub struct NodeStats {
 pub struct Heartbeat {
     pub node: NodeName,
     pub harness: HarnessState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,6 +110,8 @@ pub struct Heartbeat {
 struct RawHeartbeat {
     pub node: NodeName,
     pub harness: HarnessState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,6 +128,7 @@ impl TryFrom<RawHeartbeat> for Heartbeat {
         let mut hb = Heartbeat {
             node: raw.node,
             harness: raw.harness,
+            version: raw.version,
             providers: raw.providers,
             reiki: raw.reiki,
             host: raw.host,
@@ -177,6 +184,18 @@ impl Heartbeat {
 
     /// Checks the caps a single heartbeat must respect.
     pub fn validate(&self) -> Result<(), HeartbeatError> {
+        if let Some(version) = &self.version {
+            if version.is_empty()
+                || version.len() > MAX_VERSION_BYTES
+                || !version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+            {
+                return Err(HeartbeatError::Version {
+                    value: version.clone(),
+                });
+            }
+        }
         if self.providers.len() > MAX_PROVIDERS {
             return Err(HeartbeatError::TooManyProviders {
                 got: self.providers.len(),
@@ -205,6 +224,7 @@ impl Heartbeat {
 /// Why a heartbeat was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeartbeatError {
+    Version { value: String },
     TooManyProviders { got: usize },
     ProviderName { index: usize, name: String },
     ReikiTooLarge { got: usize },
@@ -214,6 +234,10 @@ pub enum HeartbeatError {
 impl std::fmt::Display for HeartbeatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Version { value } => write!(
+                f,
+                "the agent version {value:?} must be 1 to {MAX_VERSION_BYTES} printable ASCII characters"
+            ),
             Self::TooManyProviders { got } => write!(
                 f,
                 "a heartbeat may carry at most {MAX_PROVIDERS} providers (got {got})"
@@ -249,6 +273,7 @@ mod tests {
         Heartbeat {
             node: NodeName::from_str("peer-a").unwrap(),
             harness: HarnessState::Idle,
+            version: None,
             providers: vec![ProviderStatus {
                 name: "example-provider".to_owned(),
                 state: ProviderState::Ok,
@@ -316,6 +341,31 @@ mod tests {
         let out = serde_json::to_string(&beat).unwrap();
         assert!(!out.contains("providers"), "{out}");
         assert!(!out.contains("reiki"), "{out}");
+    }
+
+    #[test]
+    fn an_agent_version_is_optional_and_checked() {
+        let mut beat = heartbeat();
+        beat.version = Some("0.1.10".to_owned());
+        assert!(beat.validate().is_ok());
+        let json = serde_json::to_string(&beat).unwrap();
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version.as_deref(), Some("0.1.10"));
+
+        for version in [
+            String::new(),
+            "has\nnewline".to_owned(),
+            "café".to_owned(),
+            "a".repeat(MAX_VERSION_BYTES + 1),
+        ] {
+            beat.version = Some(version);
+            assert!(matches!(
+                beat.validate().unwrap_err(),
+                HeartbeatError::Version { .. }
+            ));
+        }
+        beat.version = Some("a".repeat(MAX_VERSION_BYTES));
+        assert!(beat.validate().is_ok());
     }
 
     #[test]

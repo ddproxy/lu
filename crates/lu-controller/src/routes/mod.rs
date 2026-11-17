@@ -2,6 +2,7 @@ pub mod agent;
 pub mod health;
 pub mod metrics;
 pub mod operator;
+pub mod status;
 
 use crate::error::{ApiError, ApiResult};
 use axum::body::to_bytes;

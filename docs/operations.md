@@ -1,6 +1,6 @@
 # Operations
 
-This page covers a packaged controller deployment, upgrades, backup, restart behaviour, leases and retries, provider cordons, how to read `lu nodes` and `lu node`, and the dependency-graph display.
+This page covers a packaged controller deployment, upgrades, backup and restore, restart behaviour, leases and retries, provider cordons, how to read `lu status` and `lu nodes`, monitoring, and the dependency-graph display.
 
 **0.1.0 status:** controller, agent (`lu agent`) and operator CLI work end to end. Read the agent limitation in `docs/security.md` before running an agent next to anything sensitive.
 
@@ -79,7 +79,7 @@ It returns `{"ok":true,"version":"…","db":"ok"}`. A non-loopback listener requ
 4. Replace `/usr/local/bin/lu` and any changed unit files, then `systemctl daemon-reload`.
 5. Start the controller and check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`.
 
-The store has schema version 1. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
+The store has schema version 2. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes.
 
@@ -87,14 +87,66 @@ There is no online config reload. `SIGHUP` is not handled; restart the controlle
 
 The database uses SQLite WAL mode. A plain copy of `lu.db` while the controller is running can miss committed transactions held in `lu.db-wal`.
 
-Online database backup, without stopping the controller:
+Take an online snapshot without stopping the controller:
 
 ```sh
 install -d -m 0700 /var/backups/lu
-sqlite3 /var/lib/lu/lu.db ".backup '/var/backups/lu/lu-$(date +%F).db'"
+lu backup --config /etc/lu/lu.toml --out "/var/backups/lu/lu-$(date +%F).db"
 ```
 
-If `sqlite3` is not available, stop the controller and copy `lu.db`, `lu.db-wal` and `lu.db-shm` together. Do not copy only `lu.db` from a live controller.
+`lu backup` uses SQLite's `VACUUM INTO`, writes the copy with mode `0600`, runs
+`PRAGMA integrity_check`, and prints the size, schema version and job count. It refuses to
+replace an existing file unless `--force` is given.
+
+For a daily snapshot, install a small wrapper, a service and a timer as root:
+
+```sh
+# /usr/local/bin/lu-backup
+#!/bin/sh
+set -eu
+/usr/local/bin/lu backup --config /etc/lu/lu.toml \
+    --out "/var/backups/lu/lu-$(date +%F).db" --force
+find /var/backups/lu -name 'lu-*.db' -mtime +30 -delete
+```
+
+```sh
+chmod 0755 /usr/local/bin/lu-backup
+```
+
+```ini
+# /etc/systemd/system/lu-backup.service
+[Unit]
+Description=Lu database backup
+After=lu-controller.service
+
+[Service]
+Type=oneshot
+User=lu
+Group=lu
+ExecStart=/usr/local/bin/lu-backup
+ReadWritePaths=/var/backups/lu
+```
+
+```ini
+# /etc/systemd/system/lu-backup.timer
+[Unit]
+Description=Daily Lu database backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```sh
+install -d -m 0700 -o lu -g lu /var/backups/lu
+systemctl daemon-reload
+systemctl enable --now lu-backup.timer
+```
+
+Keep the backup directory private because the database holds job tasks and summaries.
 
 Artifacts are ordinary files under `/var/lib/lu/artifacts/<job id>/`. Back them up with modes preserved:
 
@@ -104,18 +156,27 @@ tar -C /var/lib/lu -czf "/var/backups/lu/artifacts-$(date +%F).tar.gz" artifacts
 
 The database and artifacts are not updated in one transaction. For a consistent pair, stop the controller before taking both; otherwise accept that a job may reference an artifact that is missing from, or newer than, the snapshot. Backups contain job tasks, diffs, reports and logs, which may include source code and secrets that were present in a checked-out repository: store them with the same care as the live artifact directory.
 
-Restore:
+Restore the database:
 
 ```sh
 systemctl stop lu-controller.service
-install -d -m 0750 -o lu -g lu /var/lib/lu
-install -m 0600 -o lu -g lu /var/backups/lu/lu-YYYY-MM-DD.db /var/lib/lu/lu.db
-rm -f /var/lib/lu/lu.db-wal /var/lib/lu/lu.db-shm
+lu restore --config /etc/lu/lu.toml /var/backups/lu/lu-YYYY-MM-DD.db
+systemctl start lu-controller.service
+```
+
+`lu restore` verifies the snapshot, rejects a schema newer than the binary supports, and
+refuses when the database is still in use, so stop the controller first. It moves the current
+database to `<db>.pre-restore-<unix seconds>` (with its `-wal` and `-shm` sidecars) before
+installing the copy. Boot recovery then applies to jobs that were leased or running in the
+snapshot.
+
+Artifacts are not part of the database snapshot. Restore them separately:
+
+```sh
 rm -rf /var/lib/lu/artifacts
 tar -C /var/lib/lu -xzf /var/backups/lu/artifacts-YYYY-MM-DD.tar.gz
 chown -R lu:lu /var/lib/lu/artifacts
 chmod 0700 /var/lib/lu/artifacts
-systemctl start lu-controller.service
 ```
 
 ## What a controller restart does
@@ -200,26 +261,49 @@ These are separate mechanisms:
 
 Cordon deadlines are stored as monotonic milliseconds. The controller does not rebase them on restart, so a surviving cordon's remaining time is approximate and may last longer than the configured cooldown if the previous process ran for a long time. `lu nodes --json` shows the currently unexpired cordons; there is no CLI command to clear one. Waiting out the cooldown or editing the database while the controller is stopped are the available options.
 
-## Reading `lu nodes`
+## Reading `lu status`
 
-Human output has four columns:
+`lu status` is a one-shot operator summary of the controller:
 
 ```text
-NAME    HARNESS  LAST_SEEN            DRAINED
-node-a  idle     2026-11-16 09:12:00Z no
+version             0.1.10
+uptime_secs         3600
+schema_version      2
+db_bytes            81920
+recovered_on_boot   2
+oldest_queued_secs  0
+nodes               3
+nodes_online        2
+lease_secs          60
+
+STATE     COUNT
+blocked   0
+queued    0
+leased    1
+running   2
+...
+```
+
+`recovered_on_boot` is the number of jobs moved to `recovering` by the current process's boot
+recovery. `oldest_queued_secs` is `0` when no job is queued or blocked. `lu status --json`
+prints the raw `GET /v1/status` response.
+
+## Reading `lu nodes`
+
+Human output has five columns:
+
+```text
+NAME    VERSION  HARNESS  LAST_SEEN            DRAINED
+node-a  0.1.10   idle     2026-11-16 09:12:00Z no
 ```
 
 - `NAME` is the node name bound to the agent token.
+- `VERSION` is the agent version from its latest heartbeat, or `-` for an older agent.
 - `HARNESS` is the last reported harness state (`idle`, `busy`, or `-` if unknown).
 - `LAST_SEEN` is the last heartbeat time in UTC.
 - `DRAINED` is intended to show the drain flag.
 
-There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `current_job`, `cordons` and the opaque `reiki` document.
-
-Two client/controller mismatches affect this view in 0.1.0:
-
-- The controller sends `draining`, but the client looks for `drained`, so the human `DRAINED` column prints `no` even for a drained node.
-- `drain` and `undrain` return `{}`; non-JSON mode tries to decode that as a node and fails. `lu drain --json node-a` and `lu undrain --json node-a` send the request successfully and print `{}`. Use those forms until the client is fixed.
+There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `current_job`, `cordons`, `version` and the opaque `reiki` document.
 
 A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, or has a matching provider cordon will not be assigned one.
 
@@ -294,6 +378,13 @@ Series:
 | `lu_node_providers{node,provider,state}` | gauge | 1 per provider as reported by that node's latest heartbeat, `state` is `ok`, `cooling`, `disabled` or `unknown`. |
 | `lu_controller_up` | gauge | Always 1. |
 | `lu_jobs_completed_total{outcome="done\|failed\|cancelled"}` | counter | Jobs in a terminal state, by outcome, derived from the stored jobs table; survives a restart. |
+| `lu_build_info{version="…"}` | gauge | Always 1; the controller build version. |
+| `lu_uptime_seconds` | gauge | Seconds since the controller process started. |
+| `lu_db_bytes` | gauge | Size of the SQLite database file, excluding `-wal` and `-shm`. |
+| `lu_schema_version` | gauge | Schema version the binary expects, currently `2`. |
+| `lu_recovered_on_boot` | gauge | Jobs moved to `recovering` by this process's boot recovery. |
+| `lu_queue_oldest_seconds` | gauge | Age of the oldest `queued` or `blocked` job, or `0` when there is none. |
+| `lu_node_last_seen_seconds{node}` | gauge | Seconds since that node's last heartbeat. |
 
 Example scrape config (operator token read from the file, never from the config itself):
 
@@ -312,6 +403,39 @@ scrape_configs:
 
 If your Prometheus only supports inline `credentials`, put the token inline there and protect the config the same way you protect `lu.toml`. The operator token grants full operator scope, so treat the scrape config as a secret.
 
+Example alert rules:
+
+```yaml
+groups:
+  - name: lu
+    rules:
+      - alert: LuControllerDown
+        expr: up{job="lu"} == 0
+        for: 2m
+      - alert: LuQueueIsStale
+        expr: lu_queue_oldest_seconds > 900
+        for: 10m
+      - alert: LuNoOnlineNodes
+        expr: lu_nodes_online == 0 and lu_jobs{state="queued"} > 0
+        for: 5m
+      - alert: LuNodeMissingHeartbeat
+        expr: lu_node_last_seen_seconds > 180
+        for: 2m
+      - alert: LuDatabaseGrowing
+        expr: lu_db_bytes > 2e9
+        for: 1h
+      - alert: LuRecoveredAfterRestart
+        expr: lu_recovered_on_boot > 0
+        for: 5m
+```
+
+Adjust the heartbeat and queue thresholds to the configured `lease_secs` and expected backlog.
+`LuRecoveredAfterRestart` fires after a controller restart that interrupted jobs; check
+`lu status` and `lu ls --state recovering` to see whether they resume or retry.
+
+`lu check` reports the same database-level health without Prometheus: `quick_check`, schema
+version, size, `leased`/`running` jobs without a lease, and orphan `job_deps` rows.
+
 ## Common failures
 
 | Symptom | Check |
@@ -323,8 +447,6 @@ If your Prometheus only supports inline `credentials`, put the token inline ther
 | `401 unauthorized` | Wrong token, wrong scope, a hash mismatch, or a token file with the wrong contents. Operator commands need an operator token; agent routes need an agent token. |
 | `403 forbidden` | The token is valid but the job or heartbeat belongs to a different node. |
 | Job stays `queued` | No agent is polling, the node is busy or draining, provider missing, or provider cordon. Inspect `lu nodes --json`. |
-| `lu nodes` shows `DRAINED no` after a drain | Known client mismatch; use `lu nodes --json`. |
-| `lu drain <node>` fails to decode | Use `lu drain --json <node>`; the request itself succeeds. |
 | `logs --follow` never stops | Known client mismatch; `Ctrl-C` and use `lu show`/`lu logs`. |
 | `lu fetch` exits `1` | No artifacts yet, or the job has not uploaded any; check the job state. |
 

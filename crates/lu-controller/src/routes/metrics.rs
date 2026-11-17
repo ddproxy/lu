@@ -68,6 +68,56 @@ pub async fn metrics(
 
     let mut out = String::new();
 
+    let version = escape_label(env!("CARGO_PKG_VERSION"));
+    out.push_str("# HELP lu_build_info Controller build version\n");
+    out.push_str("# TYPE lu_build_info gauge\n");
+    out.push_str(&gauge("lu_build_info", &[("version", &version)], 1));
+    out.push('\n');
+
+    out.push_str("# HELP lu_uptime_seconds Seconds since the controller started\n");
+    out.push_str("# TYPE lu_uptime_seconds gauge\n");
+    out.push_str(&gauge(
+        "lu_uptime_seconds",
+        &[],
+        state.started.elapsed().as_secs(),
+    ));
+    out.push('\n');
+
+    out.push_str("# HELP lu_db_bytes Size of the SQLite database file\n");
+    out.push_str("# TYPE lu_db_bytes gauge\n");
+    let db_bytes = std::fs::metadata(&state.db_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    out.push_str(&gauge("lu_db_bytes", &[], db_bytes));
+    out.push('\n');
+
+    out.push_str("# HELP lu_schema_version Database schema version\n");
+    out.push_str("# TYPE lu_schema_version gauge\n");
+    out.push_str(&gauge(
+        "lu_schema_version",
+        &[],
+        lu_store::SCHEMA_VERSION as u64,
+    ));
+    out.push('\n');
+
+    out.push_str("# HELP lu_recovered_on_boot Jobs moved to recovery at startup\n");
+    out.push_str("# TYPE lu_recovered_on_boot gauge\n");
+    out.push_str(&gauge(
+        "lu_recovered_on_boot",
+        &[],
+        state.recovered_on_boot(),
+    ));
+    out.push('\n');
+
+    out.push_str("# HELP lu_queue_oldest_seconds Age of the oldest queued or blocked job\n");
+    out.push_str("# TYPE lu_queue_oldest_seconds gauge\n");
+    let oldest = counts
+        .oldest_pending_at
+        .map(|created| n.wall_unix.saturating_sub(created).max(0) as u64)
+        .unwrap_or(0);
+    out.push_str(&gauge("lu_queue_oldest_seconds", &[], oldest));
+    out.push('\n');
+
     // HELP and TYPE comments for gauges
     out.push_str("# HELP lu_jobs Number of jobs per state\n");
     out.push_str("# TYPE lu_jobs gauge\n");
@@ -140,6 +190,19 @@ pub async fn metrics(
         Ok(Ok(n)) => n,
         _ => return with_version(ApiError::internal().into_response()),
     };
+
+    out.push_str("# HELP lu_node_last_seen_seconds Seconds since each node last reported\n");
+    out.push_str("# TYPE lu_node_last_seen_seconds gauge\n");
+    for node_rec in &nodes {
+        let node_name = escape_label(node_rec.name.as_str());
+        let age = n.wall_unix.saturating_sub(node_rec.last_seen).max(0) as u64;
+        out.push_str(&gauge(
+            "lu_node_last_seen_seconds",
+            &[("node", &node_name)],
+            age,
+        ));
+        out.push('\n');
+    }
 
     out.push_str("# HELP lu_node_providers Provider state per node (1 if reported, 0 otherwise)\n");
     out.push_str("# TYPE lu_node_providers gauge\n");

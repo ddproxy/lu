@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::error::{body_excerpt, ApiError};
 use crate::types::{
     CompletionBody, JobEnvelope, JobView, ListJobs, ListNodes, LogPage, NodeStats, NodeView,
-    PollRequest, MAX_JSON_BYTES,
+    PollRequest, StatusView, MAX_JSON_BYTES,
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -459,6 +459,42 @@ impl Client {
         Ok(raw_body(&reply))
     }
 
+    /// The controller's version, uptime, database size and queue summary.
+    pub async fn status(&self) -> Result<StatusView> {
+        let reply = self
+            .send(
+                Method::GET,
+                &owned(&["v1/status", "status"]),
+                None,
+                &[],
+                &[],
+                true,
+            )
+            .await?;
+        let reply = self.success(reply)?;
+        self.scrub(
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode the controller status: {error}"),
+            }),
+        )
+    }
+
+    /// The raw status response, so `lu status --json` can print exactly what was sent.
+    pub async fn status_raw(&self) -> Result<String> {
+        let reply = self
+            .send(
+                Method::GET,
+                &owned(&["v1/status", "status"]),
+                None,
+                &[],
+                &[],
+                true,
+            )
+            .await?;
+        let reply = self.success(reply)?;
+        Ok(raw_body(&reply))
+    }
+
     /// The latest host and job stats the controller holds for a node. Unknown nodes are
     /// [`ApiError::NotFound`]; a known node that has not reported stats yields an empty value.
     pub async fn node_stats(&self, node: &NodeName) -> Result<NodeStats> {
@@ -552,6 +588,9 @@ impl Client {
             });
         };
         let mut heartbeat = serde_json::json!({ "node": node, "harness": harness });
+        if let Some(version) = &request.version {
+            heartbeat["version"] = serde_json::json!(version);
+        }
         if !request.providers.is_empty() {
             heartbeat["providers"] = serde_json::json!(request.providers);
         }

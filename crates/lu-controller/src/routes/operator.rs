@@ -67,6 +67,7 @@ fn node_view(n: &NodeRecord, stats: Option<&lu_proto::NodeStats>) -> serde_json:
         .unwrap_or(0);
     json!({
         "name": n.name.to_string(),
+        "version": n.heartbeat.version.as_deref(),
         "last_seen": n.last_seen,
         "online": n.online,
         "draining": n.draining,

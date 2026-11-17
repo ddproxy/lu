@@ -5,6 +5,25 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `lu backup --out <file>` takes a live SQLite snapshot with `VACUUM INTO`, writes it `0600`,
+  verifies it with `PRAGMA integrity_check`, and refuses to overwrite unless `--force` is set.
+  `lu restore <file>` checks the snapshot and schema, refuses while the controller holds the
+  database, moves the current file to `<db>.pre-restore-<unix seconds>`, and installs the copy.
+- `lu check` now also reports the controller database's `quick_check` result, schema version,
+  size, `leased`/`running` jobs without a lease, and orphan `job_deps` rows when the database
+  exists.
+- `GET /v1/status` and `lu status` report the controller version, uptime, schema version,
+  database bytes, jobs recovered at boot, job counts by state, oldest queued age, node counts
+  and lease length. `lu status --json` prints the raw response.
+- New Prometheus series: `lu_build_info{version}`, `lu_uptime_seconds`, `lu_db_bytes`,
+  `lu_schema_version`, `lu_recovered_on_boot`, `lu_queue_oldest_seconds` and
+  `lu_node_last_seen_seconds{node}`. `docs/operations.md` includes alert examples.
+- Agent heartbeats carry an optional `version` (the crate version, at most 32 printable ASCII
+  characters). The node view exposes it and `lu nodes` adds a `VERSION` column.
+- `docs/operations.md` includes a systemd timer example for scheduled backups.
+
 ### Fixed
 
 - Uploading an artifact with a stale epoch returns `409 stale_epoch` and leaves the newer attempt's artifact file untouched.

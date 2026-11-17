@@ -9,13 +9,13 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use lu_proto::{
-    ArtifactName, Completion, FailureClass, Heartbeat, JobId, JobSpec, JobState, NodeName, Outcome,
-    MAX_LOG_BYTES,
+    ArtifactName, CancelEffect, Completion, FailureClass, Heartbeat, JobId, JobSpec, JobState,
+    NodeName, Outcome, MAX_LOG_BYTES,
 };
 
 use crate::{Assignment, JobCounts, JobRecord, NodeRecord, Now, Store, StoreError};
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = crate::SCHEMA_VERSION;
 
 fn internal<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Internal(e.to_string())
@@ -117,6 +117,8 @@ fn check_transition(from: JobState, to: JobState) -> Result<(), StoreError> {
 pub struct SqliteStore {
     conn: Mutex<Connection>,
     _path: PathBuf,
+    /// Shared advisory lock held for the store's lifetime so `lu restore` can refuse a live database.
+    _lock: std::fs::File,
 }
 
 impl SqliteStore {
@@ -145,6 +147,13 @@ impl SqliteStore {
             // best effort enforce 0600 on existing? "creates the file 0600" - ensure perms reasonable
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(internal)?;
+        lock.try_lock_shared()
+            .map_err(|error| internal(format!("database {} is in use: {error}", path.display())))?;
         let conn = Connection::open(path).map_err(internal)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(internal)?;
@@ -157,6 +166,7 @@ impl SqliteStore {
         let store = Self {
             conn: Mutex::new(conn),
             _path: path.to_path_buf(),
+            _lock: lock,
         };
         store.migrate()?;
         Ok(store)
@@ -791,8 +801,8 @@ impl Store for SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
         let (mut rec, lease, recov) = get_job_tx(&tx, id.as_str())?;
-        match rec.state {
-            JobState::Blocked | JobState::Queued | JobState::Recovering => {
+        match rec.state.cancel_effect() {
+            CancelEffect::Now => {
                 check_transition(rec.state, JobState::Cancelled)?;
                 rec.state = JobState::Cancelled;
                 rec.updated_at = now.wall_unix;
@@ -800,14 +810,12 @@ impl Store for SqliteStore {
                 update_job_tx(&tx, &rec, None, None)?;
                 fail_dependents(&tx, rec.id.as_str(), "cancelled", now)?;
             }
-            JobState::Leased | JobState::Running | JobState::NeedsInput => {
+            CancelEffect::Request => {
                 rec.cancel_requested = true;
                 rec.updated_at = now.wall_unix;
                 update_job_tx(&tx, &rec, lease, recov)?;
             }
-            JobState::Done | JobState::Failed | JobState::Cancelled => {
-                return Err(StoreError::Conflict { length: None })
-            }
+            CancelEffect::Refuse => return Err(StoreError::Conflict { length: None }),
         }
         rec.waiting_on = load_waiting(&tx, rec.id.as_str())?;
         tx.commit().map_err(internal)?;
@@ -1393,6 +1401,7 @@ impl Store for SqliteStore {
             completed_done: 0,
             completed_failed: 0,
             completed_cancelled: 0,
+            oldest_pending_at: None,
         };
         let nodes = conn
             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))
@@ -1438,6 +1447,13 @@ impl Store for SqliteStore {
         job_counts.completed_done = done.max(0) as u64;
         job_counts.completed_failed = failed.max(0) as u64;
         job_counts.completed_cancelled = cancelled.max(0) as u64;
+        job_counts.oldest_pending_at = conn
+            .query_row(
+                "SELECT MIN(created_at) FROM jobs WHERE state IN ('queued','blocked')",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .map_err(internal)?;
         Ok(job_counts)
     }
 }

@@ -1,4 +1,4 @@
-use crate::routes::{agent, health, metrics, operator};
+use crate::routes::{agent, health, metrics, operator, status};
 use crate::state::AppState;
 use crate::time::{background_interval_secs, now};
 use axum::extract::DefaultBodyLimit;
@@ -60,6 +60,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/jobs/{id}/artifacts/{name}",
             get(operator::get_artifact),
         )
+        .route("/v1/status", get(status::status))
         .route("/v1/nodes", get(operator::list_nodes))
         .route("/v1/nodes/{name}/stats", get(operator::get_node_stats))
         .route(
@@ -120,11 +121,13 @@ pub async fn recover_on_boot(state: &Arc<AppState>) {
     })
     .await;
     match res {
-        Ok(Ok(count)) if count > 0 => {
-            tracing::info!(count, "recovered jobs on boot");
-            state.waiters.notify_work();
+        Ok(Ok(count)) => {
+            state.set_recovered_on_boot(count);
+            if count > 0 {
+                tracing::info!(count, "recovered jobs on boot");
+                state.waiters.notify_work();
+            }
         }
-        Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(?e, "recover_on_boot failed"),
         Err(e) => tracing::warn!(%e, "recover_on_boot task failed"),
     }

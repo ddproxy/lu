@@ -16,7 +16,7 @@ pub use client::{Client, ClientOptions, Controller};
 pub use error::ApiError;
 pub use types::{
     CompletionBody, HostStats, JobEnvelope, JobStats, JobView, ListJobs, ListNodes, LogPage,
-    NodeStats, NodeView, PollReply, PollRequest, ProcessStats, MAX_JSON_BYTES,
+    NodeStats, NodeView, PollReply, PollRequest, ProcessStats, StatusView, MAX_JSON_BYTES,
 };
 
 /// Canonical paths. The client also tries a small set of legacy spellings when a route answers
@@ -27,6 +27,7 @@ pub mod routes {
     pub const LOGS: &str = "/v1/jobs/{id}/logs";
     pub const ARTIFACT: &str = "/v1/jobs/{id}/artifacts/{name}";
     pub const CANCEL: &str = "/v1/jobs/{id}/cancel";
+    pub const STATUS: &str = "/v1/status";
     pub const NODES: &str = "/v1/nodes";
     pub const NODE_STATS: &str = "/v1/nodes/{node}/stats";
     pub const DRAIN: &str = "/v1/nodes/{node}/{action}";

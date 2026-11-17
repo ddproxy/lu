@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use lu_proto::{
-    ArtifactName, Completion, FailureClass, Heartbeat, JobId, JobSpec, JobState, NodeName, Outcome,
-    MAX_LOG_BYTES,
+    ArtifactName, CancelEffect, Completion, FailureClass, Heartbeat, JobId, JobSpec, JobState,
+    NodeName, Outcome, MAX_LOG_BYTES,
 };
 
 use crate::{Assignment, JobCounts, JobRecord, NodeRecord, Now, Store, StoreError};
@@ -289,8 +289,8 @@ impl Store for MemoryStore {
                 .jobs
                 .get_mut(id.as_str())
                 .ok_or(StoreError::NotFound)?;
-            match entry.rec.state {
-                JobState::Blocked | JobState::Queued | JobState::Recovering => {
+            match entry.rec.state.cancel_effect() {
+                CancelEffect::Now => {
                     check_transition(entry.rec.state, JobState::Cancelled)?;
                     entry.rec.state = JobState::Cancelled;
                     entry.rec.updated_at = now.wall_unix;
@@ -299,15 +299,12 @@ impl Store for MemoryStore {
                     entry.recovering_since_mono_ms = None;
                     true
                 }
-                JobState::Leased | JobState::Running | JobState::NeedsInput => {
-                    // Leased/running: request cancel. NeedsInput: best-effort request.
+                CancelEffect::Request => {
                     entry.rec.cancel_requested = true;
                     entry.rec.updated_at = now.wall_unix;
                     false
                 }
-                JobState::Done | JobState::Failed | JobState::Cancelled => {
-                    return Err(StoreError::Conflict { length: None })
-                }
+                CancelEffect::Refuse => return Err(StoreError::Conflict { length: None }),
             }
         };
         if terminal {
@@ -812,6 +809,12 @@ impl Store for MemoryStore {
         let mut nodes_online = 0u64;
         let mut nodes_drained = 0u64;
         let mut total = 0u64;
+        let oldest_pending_at = inner
+            .jobs
+            .values()
+            .filter(|e| matches!(e.rec.state, JobState::Queued | JobState::Blocked))
+            .map(|e| e.rec.created_at)
+            .min();
         for e in inner.nodes.values() {
             // match nodes(): only nodes that have sent a heartbeat exist
             if e.heartbeat.is_none() {
@@ -836,6 +839,7 @@ impl Store for MemoryStore {
             completed_done: jobs.get(&JobState::Done).copied().unwrap_or(0),
             completed_failed: jobs.get(&JobState::Failed).copied().unwrap_or(0),
             completed_cancelled: jobs.get(&JobState::Cancelled).copied().unwrap_or(0),
+            oldest_pending_at,
         })
     }
 }

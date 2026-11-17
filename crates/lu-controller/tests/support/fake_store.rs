@@ -1,5 +1,6 @@
 use lu_proto::{
-    ArtifactName, Completion, FailureClass, Heartbeat, JobId, JobSpec, JobState, NodeName, Outcome,
+    ArtifactName, CancelEffect, Completion, FailureClass, Heartbeat, JobId, JobSpec, JobState,
+    NodeName, Outcome,
 };
 use lu_store::{Assignment, JobCounts, JobRecord, NodeRecord, Now, Store, StoreError};
 use std::collections::{BTreeMap, HashMap};
@@ -227,21 +228,19 @@ impl Store for FakeStore {
                 .jobs
                 .get_mut(id.as_str())
                 .ok_or(StoreError::NotFound)?;
-            let is_terminal = match row.rec.state {
-                JobState::Blocked | JobState::Queued | JobState::Recovering => {
+            let is_terminal = match row.rec.state.cancel_effect() {
+                CancelEffect::Now => {
                     row.rec.state = JobState::Cancelled;
                     row.rec.finished_at = Some(now_wall(now));
                     row.lease_deadline_ms = None;
                     row.recovering_since_ms = None;
                     true
                 }
-                JobState::Leased | JobState::Running => {
+                CancelEffect::Request => {
                     row.rec.cancel_requested = true;
                     false
                 }
-                JobState::Done | JobState::Failed | JobState::Cancelled | JobState::NeedsInput => {
-                    return Err(StoreError::Conflict { length: None });
-                }
+                CancelEffect::Refuse => return Err(StoreError::Conflict { length: None }),
             };
             row.rec.updated_at = now_wall(now);
             is_terminal
@@ -675,6 +674,12 @@ impl Store for FakeStore {
         }
         let mut nodes_online = 0u64;
         let mut nodes_drained = 0u64;
+        let oldest_pending_at = inner
+            .jobs
+            .values()
+            .filter(|row| matches!(row.rec.state, JobState::Queued | JobState::Blocked))
+            .map(|row| row.rec.created_at)
+            .min();
         for nr in inner.nodes.values() {
             let online = nr.last_seen > 0
                 && (now.wall_unix - nr.last_seen)
@@ -697,6 +702,7 @@ impl Store for FakeStore {
             completed_done: jobs.get(&JobState::Done).copied().unwrap_or(0),
             completed_failed: jobs.get(&JobState::Failed).copied().unwrap_or(0),
             completed_cancelled: jobs.get(&JobState::Cancelled).copied().unwrap_or(0),
+            oldest_pending_at,
         })
     }
 }

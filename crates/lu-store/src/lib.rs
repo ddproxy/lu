@@ -5,8 +5,12 @@
 //! [`Now`] so tests control it: lease expiry uses `mono_ms` only (a clock that never jumps), the
 //! `*_at` fields shown to people use `wall_unix`.
 
+pub mod backup;
 pub mod memory;
 pub mod sqlite;
+
+/// Schema version this binary creates and supports.
+pub const SCHEMA_VERSION: i64 = 2;
 
 #[cfg(test)]
 pub mod conformance;
@@ -52,6 +56,8 @@ pub struct JobCounts {
     pub completed_done: u64,
     pub completed_failed: u64,
     pub completed_cancelled: u64,
+    /// Creation time of the oldest `queued` or `blocked` job, if any.
+    pub oldest_pending_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

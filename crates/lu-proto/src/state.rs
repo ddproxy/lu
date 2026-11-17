@@ -21,7 +21,27 @@ pub enum JobState {
     Cancelled,
 }
 
+/// What cancelling a job in a given state does. One rule for every store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelEffect {
+    /// No agent holds the job: it ends `cancelled` now.
+    Now,
+    /// An agent holds it: record the request and let the agent stop it.
+    Request,
+    /// The job already ended.
+    Refuse,
+}
+
 impl JobState {
+    /// What a cancel does in this state.
+    pub fn cancel_effect(self) -> CancelEffect {
+        match self {
+            Self::Blocked | Self::Queued | Self::Recovering => CancelEffect::Now,
+            Self::Leased | Self::Running | Self::NeedsInput => CancelEffect::Request,
+            Self::Done | Self::Failed | Self::Cancelled => CancelEffect::Refuse,
+        }
+    }
+
     /// Every state, in declaration order.
     pub const ALL: [JobState; 9] = [
         Self::Blocked,

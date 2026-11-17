@@ -348,24 +348,19 @@ pub async fn append_log(
         Err(e) => return with_version(e.into_response()),
     };
     let nbytes = bytes.len() as u64;
-    // Logs beyond the cap are dropped with a marker line and still return 200. The marker is
-    // reserved whenever a chunk is cut to fit, so the room it takes is not counted twice.
+    // Data may fill the log up to the cap minus the marker, so any log that is cut ends with the
+    // marker and never exceeds the cap; once the marker is in, later chunks are dropped with 200.
     const MARKER: &[u8] = b"\n[log truncated]\n";
     let cap = lu_proto::MAX_LOG_BYTES;
+    let limit = cap - MARKER.len() as u64;
     let current_len = rec_check.log_len;
     let (to_write, marker_only) = if current_len >= cap {
         (Vec::new(), true)
-    } else if current_len + nbytes > cap {
-        let remaining = (cap - current_len) as usize;
-        if remaining >= MARKER.len() {
-            let allowed = remaining - MARKER.len();
-            let mut v = bytes[..allowed].to_vec();
-            v.extend_from_slice(MARKER);
-            (v, true)
-        } else {
-            // Less room than the marker takes; the cap holds.
-            (Vec::new(), true)
-        }
+    } else if current_len + nbytes > limit {
+        let allowed = limit.saturating_sub(current_len) as usize;
+        let mut v = bytes[..allowed.min(bytes.len())].to_vec();
+        v.extend_from_slice(MARKER);
+        (v, true)
     } else {
         (bytes.to_vec(), false)
     };
@@ -487,6 +482,20 @@ async fn put_artifact_impl(
         Ok(b) => b,
         Err(e) => return with_version(e.into_response()),
     };
+    // Record first: the store checks the epoch inside its transaction, so a holder that lost its
+    // lease writes nothing. A failed write after this leaves the record without a file, which a
+    // fetch treats as missing and the agent's retry replaces.
+    let rec_res = tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        let jid = job_id.clone();
+        move || store.record_artifact(&jid, epoch, art)
+    })
+    .await;
+    match rec_res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    }
     // write via ArtifactDir (enforces cap, atomic rename, modes). ensure job dir exists.
     let ad = match state.artifact_dir() {
         Ok(a) => a,
@@ -524,21 +533,8 @@ async fn put_artifact_impl(
         Ok(Err(_)) => return with_version(ApiError::internal().into_response()),
         Err(_) => return with_version(ApiError::internal().into_response()),
     }
-    // record artifact in store (epoch fenced)
-    let rec_res = tokio::task::spawn_blocking({
-        let store = Arc::clone(&state.store);
-        let jid = job_id.clone();
-        move || store.record_artifact(&jid, epoch, art)
-    })
-    .await;
-    match rec_res {
-        Ok(Ok(())) => {
-            state.waiters.notify_job(job_id.as_ref());
-            with_version(StatusCode::OK.into_response())
-        }
-        Ok(Err(e)) => with_version(store_err(e).into_response()),
-        Err(_) => with_version(ApiError::internal().into_response()),
-    }
+    state.waiters.notify_job(job_id.as_ref());
+    with_version(StatusCode::OK.into_response())
 }
 
 pub async fn complete_job(

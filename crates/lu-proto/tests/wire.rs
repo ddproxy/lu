@@ -76,6 +76,7 @@ fn a_heartbeat_carries_a_capped_forwarded_document() {
     let beat = Heartbeat {
         node: NodeName::from_str("peer-a").unwrap(),
         harness: HarnessState::Idle,
+        version: Some("0.1.10".to_owned()),
         providers: vec![ProviderStatus {
             name: "peer-a".to_owned(),
             state: ProviderState::Cooling,

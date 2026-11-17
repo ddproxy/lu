@@ -30,4 +30,4 @@ pub use node::{
 };
 pub use sanitize::{printable, truncate_chars};
 pub use spec::{JobSpec, JobSpecError};
-pub use state::JobState;
+pub use state::{CancelEffect, JobState};

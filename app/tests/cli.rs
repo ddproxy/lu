@@ -786,7 +786,7 @@ async fn fetch_writes_the_fixed_private_names_and_needs_force_to_replace() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nodes_and_drain_render_aligned_text() {
     let list = json!({"nodes": [
-        {"name": "node-a", "harness": "idle", "last_seen": 10, "cordoned": true},
+        {"name": "node-a", "version": "0.1.10", "harness": "idle", "last_seen": 10, "cordoned": true},
         {"name": "node-b", "harness": "busy", "last_seen": 12, "cordoned": false}
     ]});
     let server = start(move |record| {
@@ -808,8 +808,10 @@ async fn nodes_and_drain_render_aligned_text() {
     let text = stdout(&output);
     let header = text.lines().next().unwrap();
     assert!(header.starts_with("NAME"), "{text}");
+    assert!(header.contains("VERSION"), "{text}");
     assert!(header.contains("HARNESS"), "{text}");
     assert!(text.contains("node-a"), "{text}");
+    assert!(text.contains("0.1.10"), "{text}");
     assert!(text.contains("node-b"), "{text}");
     assert!(text.contains("yes"), "{text}");
 
@@ -836,6 +838,64 @@ async fn nodes_and_drain_render_aligned_text() {
     assert_eq!(paths[0], "/v1/nodes");
     assert_eq!(paths[1], "/v1/nodes/node-a/drain");
     assert_eq!(paths[2], "/v1/nodes/node-a/undrain");
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_prints_a_summary_and_json_prints_the_raw_body() {
+    let body = json!({
+        "version": "0.1.10",
+        "uptime_secs": 42,
+        "schema_version": 2,
+        "db_bytes": 4096,
+        "recovered_on_boot": 1,
+        "jobs": {"queued": 2, "running": 1},
+        "oldest_queued_secs": 7,
+        "nodes": 3,
+        "nodes_online": 2,
+        "lease_secs": 60,
+        "future": true
+    });
+    let expected = body.to_string();
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("status");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+
+    let output = run_with_env(&["status"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    for (key, value) in [
+        ("version", "0.1.10"),
+        ("uptime_secs", "42"),
+        ("schema_version", "2"),
+        ("db_bytes", "4096"),
+        ("recovered_on_boot", "1"),
+        ("oldest_queued_secs", "7"),
+        ("nodes", "3"),
+        ("nodes_online", "2"),
+        ("lease_secs", "60"),
+    ] {
+        assert!(
+            text.lines()
+                .any(|line| line.split_whitespace().collect::<Vec<_>>() == [key, value]),
+            "{key}: {text}"
+        );
+    }
+    let queued = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("queued"))
+        .unwrap();
+    assert!(queued.trim_end().ends_with('2'), "{queued:?}");
+    assert!(text.contains("STATE"), "{text}");
+
+    let output = run_with_env(&["--json", "status"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{expected}\n"));
+    let records = server.records.lock().unwrap();
+    let paths: Vec<&str> = records.iter().map(|record| record.path.as_str()).collect();
+    assert_eq!(paths, vec!["/v1/status", "/v1/status"]);
     drop(records);
     let _ = std::fs::remove_dir_all(&dir);
 }
