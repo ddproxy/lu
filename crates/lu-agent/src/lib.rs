@@ -398,7 +398,8 @@ impl Agent {
             Ok(staged) => staged,
             Err(error) => {
                 let summary = format!("staging failed: {error}");
-                self.complete_failure(&job_id, epoch, &summary, FailureClass::Execution)
+                let class = pre_verdict_class(PreVerdict::Stage(&summary));
+                self.complete_failure(&job_id, epoch, &summary, class)
                     .await?;
                 return Ok(JobEnd::Finished);
             }
@@ -408,8 +409,13 @@ impl Agent {
             if let Err(error) = self.staging.share_with_group(&staged, gid) {
                 let summary = format!("could not share the workspace with its group: {error}");
                 let _ = self.staging.clean(staged.job_id());
-                self.complete_failure(&job_id, epoch, &summary, FailureClass::Execution)
-                    .await?;
+                self.complete_failure(
+                    &job_id,
+                    epoch,
+                    &summary,
+                    pre_verdict_class(PreVerdict::Prepare),
+                )
+                .await?;
                 return Ok(JobEnd::Finished);
             }
         }
@@ -428,8 +434,13 @@ impl Agent {
         });
         if let Err(error) = written {
             let summary = format!("could not write the task file: {error}");
-            self.complete_failure(&job_id, epoch, &summary, FailureClass::Execution)
-                .await?;
+            self.complete_failure(
+                &job_id,
+                epoch,
+                &summary,
+                pre_verdict_class(PreVerdict::Prepare),
+            )
+            .await?;
             return Ok(JobEnd::Finished);
         }
 
@@ -1186,7 +1197,7 @@ fn classify(outcome: SuperviseOutcome, tail: &str) -> (Outcome, Option<i32>, Str
             "harness was stopped".to_owned(),
         ),
         SuperviseOutcome::SpawnFailed(message) => (
-            Outcome::Failed(FailureClass::Execution),
+            Outcome::Failed(pre_verdict_class(PreVerdict::Spawn)),
             None,
             format!(
                 "harness could not be started: {}",
@@ -1194,6 +1205,61 @@ fn classify(outcome: SuperviseOutcome, tail: &str) -> (Outcome, Option<i32>, Str
             ),
         ),
     }
+}
+
+/// Why a job stopped before the harness produced a verdict, for one retry-class table.
+enum PreVerdict<'a> {
+    /// The supervisor could not start the harness process at all.
+    Spawn,
+    /// Staging the checkout failed, with this message (a prefix the caller adds is harmless).
+    Stage(&'a str),
+    /// The staged tree could not be prepared for the harness (share with the group, task file).
+    Prepare,
+}
+
+/// The class for a job that stopped before the harness ran. A node failure is retried on
+/// another node within the retry cap; an execution failure never is.
+///
+/// | Case | Class |
+/// | --- | --- |
+/// | The harness process could not be started | `Node` |
+/// | Staging, or preparing the tree, failed in a way the node controls | `Node` |
+/// | A staging error that names a missing ref, an authentication failure or an unknown repository | `Execution` |
+fn pre_verdict_class(fault: PreVerdict<'_>) -> FailureClass {
+    match fault {
+        PreVerdict::Spawn | PreVerdict::Prepare => FailureClass::Node,
+        PreVerdict::Stage(message) if stage_names_task_fault(message) => FailureClass::Execution,
+        PreVerdict::Stage(_) => FailureClass::Node,
+    }
+}
+
+/// Whether a staging error blames the task rather than the machine: it names a missing ref,
+/// an authentication failure, or an unknown repository.
+fn stage_names_task_fault(message: &str) -> bool {
+    // The error text is the only signal the agent has. Git spells these faults differently
+    // across versions and remotes, so the whole message is matched lowercased, not parsed.
+    // Bare "permission denied" is omitted: an I/O error (read-only filesystem, mode bits)
+    // carries it too and is the machine's fault.
+    const TASK_FAULT: &[&str] = &[
+        "pathspec",
+        "did not match any file",
+        "is not a commit",
+        "unknown revision",
+        "invalid reference",
+        "not a valid object name",
+        "invalid git ref",
+        "authentication failed",
+        "could not read username",
+        "could not read password",
+        "could not read from remote repository",
+        "terminal prompts disabled",
+        "permission denied (publickey",
+        "not appear to be a git repository",
+        "does not exist",
+    ];
+    let lower = message.to_ascii_lowercase();
+    TASK_FAULT.iter().any(|marker| lower.contains(marker))
+        || (lower.contains("repository") && lower.contains("not found"))
 }
 
 fn provider_marker(text: &str) -> bool {
@@ -1351,5 +1417,58 @@ mod wrap_tests {
             Path::new("/w"),
         );
         assert_eq!(wrapped.program, Path::new("opencode"));
+    }
+}
+
+#[cfg(test)]
+mod pre_verdict_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_and_prepare_rows_pick_node() {
+        assert_eq!(pre_verdict_class(PreVerdict::Spawn), FailureClass::Node);
+        assert_eq!(pre_verdict_class(PreVerdict::Prepare), FailureClass::Node);
+    }
+
+    #[test]
+    fn staging_rows_that_name_the_task_pick_execution() {
+        let rows = [
+            "staging failed: git error: error: pathspec 'develop' did not match any file(s) known to git",
+            "staging failed: git error: fatal: 'develop' is not a commit and a branch cannot be created",
+            "staging failed: git error: ambiguous argument 'develop': unknown revision or path not in the working tree",
+            "staging failed: invalid git ref: git ref must not start with '-'",
+            "staging failed: git error: fatal: Authentication failed for 'https://example.invalid/r.git/'",
+            "staging failed: git error: Permission denied (publickey).",
+            "staging failed: git error: fatal: could not read Username for 'https://example.invalid': terminal prompts disabled",
+            "staging failed: git error: fatal: Could not read from remote repository.",
+            "staging failed: git error: fatal: repository 'https://example.invalid/r.git/' not found",
+            "staging failed: git error: fatal: repository '/no/such/repo' does not exist",
+            "staging failed: git error: '/tmp/plaindir' does not appear to be a git repository",
+        ];
+        for message in rows {
+            assert_eq!(
+                pre_verdict_class(PreVerdict::Stage(message)),
+                FailureClass::Execution,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn staging_rows_that_are_the_machines_pick_node() {
+        let rows = [
+            "staging failed: io error: No space left on device (os error 28)",
+            "staging failed: io error: Permission denied (os error 13)",
+            "staging failed: git error: could not write pack file: read-only file system",
+            "staging failed: git error: unsupported source url: scheme",
+            "staging failed: directory already exists: /work/01JANJD",
+        ];
+        for message in rows {
+            assert_eq!(
+                pre_verdict_class(PreVerdict::Stage(message)),
+                FailureClass::Node,
+                "{message}"
+            );
+        }
     }
 }

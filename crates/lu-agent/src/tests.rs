@@ -1298,6 +1298,78 @@ async fn job_unsupported_harness_completes_execution_failure() {
 }
 
 #[tokio::test]
+async fn job_whose_harness_cannot_start_completes_node_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let agent = fast_agent(&f.work_dir, controller.clone(), |_task_file| {
+        CommandSpec::new("no-such-harness-binary-for-lu-tests")
+    });
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Node));
+    let summary = done[0].summary.clone().unwrap_or_default();
+    assert!(
+        summary.starts_with("harness could not be started"),
+        "{summary}"
+    );
+}
+
+#[tokio::test]
+async fn job_whose_ref_does_not_exist_completes_execution_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.git_ref = "no-such-ref".to_owned();
+    let controller = assigned_controller(&job_id, spec);
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo should not run"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Execution));
+    let summary = done[0].summary.clone().unwrap_or_default();
+    assert!(summary.starts_with("staging failed"), "{summary}");
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Start { .. })),
+        "a job that cannot be staged must not be started"
+    );
+}
+
+#[tokio::test]
+async fn job_whose_stage_directory_already_exists_completes_node_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    // A leftover directory from an attempt the controller re-leased.
+    std::fs::create_dir(f.work_dir.join(job_id.as_str())).unwrap();
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo should not run"));
+    let calls = run_job(&controller, agent, has_complete).await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Node));
+    let summary = done[0].summary.clone().unwrap_or_default();
+    assert!(summary.starts_with("staging failed"), "{summary}");
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Start { .. })),
+        "a job that cannot be staged must not be started"
+    );
+}
+
+#[tokio::test]
 async fn job_missing_repository_completes_execution_failure() {
     let f = fixture();
     let job_id = JobId::new();

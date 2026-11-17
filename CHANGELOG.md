@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-11-17
+
 ### Added
 
 - `lu retry <job-id>` resubmits a finished job's spec as a new job. `--provider <name>` and
@@ -42,6 +44,13 @@ uses semantic versioning once it reaches 1.0.
 - Cancelling a `recovering` job ends it `cancelled` immediately instead of ignoring the request until requeue: its lease is released and its blocked dependents fail as a cancelled dependency.
 - Appending a log chunk that must be cut to fit the log cap now reserves room for the `[log truncated]` marker, so the stored log always ends with the marker and never exceeds the cap.
 - `lu drain` and `lu undrain` on a node that has never heartbeated fail with `404 not_found` in both stores instead of silently discarding the request; the CLI says which node was refused.
+
+### Changed
+
+- A harness that could not be started, and a staging or workspace-preparation failure that does
+  not name the task's repository or ref, now end as a `node` failure and are retried on another
+  node within `max_retries`. A staging error naming a missing ref, an authentication failure or
+  an unknown repository stays `execution`.
 
 ## [0.1.10] - 2026-11-17
 

@@ -248,6 +248,14 @@ On completion:
 - `Failed(Execution)` moves it to `failed` immediately. Execution failures never retry. `lu retry <id>` resubmits a finished job's spec as a new job (`--provider`, `--model` and `--after` replace those fields); the new job is independent of the old one.
 - `Failed(Node)` and `Failed(Provider)` retry while `attempt <= max_retries`: the job returns to `queued`, the attempt is incremented, and the node is cleared. Beyond the cap it becomes `failed` with that failure class. A terminal `failed` or `cancelled` job fails its blocked dependents.
 
+A failure before the harness produced a verdict is classified by the agent, one row per case:
+
+| Cause | Class | Retried |
+| --- | --- | --- |
+| The harness process could not be started (command not found, exec refused, no pid) | `node` | within `max_retries` |
+| Staging or preparing the tree failed in a way the node controls (disk, filesystem, clone transport, permissions, leftover directory) | `node` | within `max_retries` |
+| A staging error that names a missing ref, an authentication failure or an unknown repository | `execution` | never |
+
 `max_retries` is the number of retries, not the total number of attempts. With the default `1`, an initial attempt plus one retry is allowed. A provider failure that is retried also cordons the `(node, provider)` pair for `provider_cooldown_secs`.
 
 When a job names a `provider`, the agent also checks it against its node's Reiki reading every five seconds. Reiki is the authority on keys, so this works for any harness: when two fresh readings in a row show the provider cooling or disabled (no usable key), the agent stops the job like a cancel and completes it as `Failed(Provider)`, with a summary that names the provider and the soonest return time Reiki reported. The completion carries that time plus a 60-second buffer as `retry_after_secs`, and the controller cordons the provider on the node for that long instead of the configured cordon length. The controller then cordons that provider on the node and requeues the job on another node.

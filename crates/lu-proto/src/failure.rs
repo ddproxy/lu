@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureClass {
-    /// The agent was lost or the lease expired.
+    /// The agent was lost, the lease expired, or the node could not stage or start the job.
     Node,
     /// Every key was unavailable, a model limit was hit, or a 429.
     Provider,
