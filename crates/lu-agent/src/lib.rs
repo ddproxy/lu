@@ -41,6 +41,10 @@ const MAX_HARNESS_OUTPUT: u64 = lu_proto::MAX_LOG_BYTES;
 /// Time between the terminate signal and the forced stop signal.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a provider-unavailable marker may stand without further output before the harness
+/// is stopped and the job is failed as a provider failure.
+pub const PROVIDER_MARKER_GRACE: Duration = Duration::from_secs(120);
+
 /// Output quoted on a completion summary. Kept small and independent of the log cap.
 const SUMMARY_TAIL_BYTES: usize = 16 * 1024;
 
@@ -83,6 +87,8 @@ enum JobEnd {
     Cancelled,
     /// The lease moved on; nothing was completed.
     Stale,
+    /// The harness went silent after a provider-unavailable marker.
+    Provider,
     /// Shutdown arrived while the job was running.
     Shutdown,
 }
@@ -118,6 +124,8 @@ pub struct Agent {
     staging: Staging,
     work_dir: PathBuf,
     heartbeat_secs: u64,
+    /// How long the harness may stay silent after a provider marker before it is stopped.
+    provider_marker_grace: Duration,
     opencode_server: Option<String>,
     /// The group that may write each job's working tree, resolved once at start.
     workspace_gid: Option<u32>,
@@ -192,6 +200,7 @@ impl Agent {
             staging,
             work_dir,
             heartbeat_secs: config.heartbeat_secs,
+            provider_marker_grace: PROVIDER_MARKER_GRACE,
             opencode_server: config.opencode_server,
             workspace_gid,
             opencode_password,
@@ -273,7 +282,10 @@ impl Agent {
                                 info!(job = %job_id, epoch, "assigned");
                                 match self.run_job(job_id, epoch, spec, shutdown.as_mut()).await? {
                                     JobEnd::Shutdown => return Ok(()),
-                                    JobEnd::Finished | JobEnd::Cancelled | JobEnd::Stale => {}
+                                    JobEnd::Finished
+                                    | JobEnd::Cancelled
+                                    | JobEnd::Stale
+                                    | JobEnd::Provider => {}
                                 }
                             }
                             AgentEvent::Cancel { job_id, .. } => {
@@ -511,6 +523,8 @@ impl Agent {
         let mut tail = Tail::new(SUMMARY_TAIL_BYTES);
         let mut dropped = 0u64;
         let mut end = JobEnd::Finished;
+        let mut marker_line: Option<String> = None;
+        let mut marker_deadline: Option<Instant> = None;
 
         loop {
             tokio::select! {
@@ -567,6 +581,18 @@ impl Agent {
                     match chunk {
                         Some(chunk) => {
                             tail.push(&chunk.bytes);
+                            // Armed only while the newest output line is the marker: any other
+                            // output means the harness recovered.
+                            let text = tail.text();
+                            let newest = text.lines().rev().find(|line| !line.trim().is_empty());
+                            match newest.filter(|line| provider_marker(line)) {
+                                Some(line) => {
+                                    marker_line = Some(truncate_chars(&printable(line), 300));
+                                    marker_deadline =
+                                        Some(Instant::now() + self.provider_marker_grace);
+                                }
+                                None => marker_deadline = None,
+                            }
                             for piece in logs::split_lossy(&chunk.bytes) {
                                 if log_tx.try_send(piece.into_bytes()).is_err() {
                                     dropped = dropped.saturating_add(1);
@@ -575,6 +601,13 @@ impl Agent {
                         }
                         None => break,
                     }
+                }
+                () = marker_deadline_wait(marker_deadline), if marker_deadline.is_some() => {
+                    let line = marker_line.as_deref().unwrap_or("provider unavailable");
+                    info!(job = %job_id, marker = %line, "harness silent after a provider marker");
+                    running.stop();
+                    end = JobEnd::Provider;
+                    break;
                 }
             }
         }
@@ -616,7 +649,7 @@ impl Agent {
                     .await;
                 return Ok(JobEnd::Shutdown);
             }
-            JobEnd::Finished => {}
+            JobEnd::Finished | JobEnd::Provider => {}
         }
 
         if let Ok(Ok(LogUpload {
@@ -631,6 +664,24 @@ impl Agent {
         }
         if dropped > 0 {
             warn!(job = %job_id, chunks = dropped, "dropped log chunks because the upload queue was full");
+        }
+
+        if end == JobEnd::Provider {
+            let line = marker_line.as_deref().unwrap_or("provider unavailable");
+            let summary = format!("harness went silent after a provider failure marker: {line}");
+            self.finish(&Finish {
+                job_id: &job_id,
+                epoch,
+                spec: &spec,
+                staged: &staged,
+                started,
+                outcome: Outcome::Failed(FailureClass::Provider),
+                exit_code: None,
+                summary,
+                cancelled: false,
+            })
+            .await?;
+            return Ok(JobEnd::Finished);
         }
 
         let (outcome, exit_code, reason) = classify(outcome, &tail.text());
@@ -1029,6 +1080,14 @@ fn provider_marker(text: &str) -> bool {
         || lower.contains("http 429")
         || lower.contains("429 too many requests")
         || lower.contains("rate limit")
+}
+
+/// Waits until `deadline`, or forever when the marker watch is not armed.
+async fn marker_deadline_wait(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Caps and neutralises the completion summary. Whole lines are preferred, but the last bytes

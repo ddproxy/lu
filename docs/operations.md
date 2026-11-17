@@ -180,6 +180,8 @@ On completion:
 
 `max_retries` is the number of retries, not the total number of attempts. With the default `1`, an initial attempt plus one retry is allowed. A provider failure that is retried also cordons the `(node, provider)` pair for `provider_cooldown_secs`.
 
+The agent also watches a running harness's output. If a line matches a provider-unavailable marker (the opencode message about every key in the stream's chain, a quota message, a 429, or a rate limit) and the harness then produces no output for 120 seconds, the agent stops it like a cancel and completes the job as `Failed(Provider)`, with a summary naming the marker. Any output after the marker restarts the 120-second watch.
+
 Cancellation is different:
 
 - a `queued` or `blocked` job becomes `cancelled` immediately, and its blocked dependents fail with `failure_class: "dependency"`;

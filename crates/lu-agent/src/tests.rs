@@ -245,6 +245,7 @@ fn make_agent(
         staging,
         work_dir: work_dir.to_path_buf(),
         heartbeat_secs: TEST_HEARTBEAT_SECS,
+        provider_marker_grace: super::PROVIDER_MARKER_GRACE,
         opencode_server: None,
         workspace_gid: None,
         opencode_password: None,
@@ -1100,6 +1101,84 @@ async fn job_provider_marker_completes_provider_failure() {
     assert_eq!(done.len(), 1, "{done:?}");
     assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Provider));
     assert_eq!(done[0].exit_code, Some(1));
+}
+
+#[tokio::test]
+async fn job_provider_marker_then_silence_fails_as_provider() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let mut agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo \"every key in this stream's chain is unavailable\"; sleep 30"),
+    );
+    agent.provider_marker_grace = Duration::from_millis(300);
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Provider));
+    assert_eq!(done[0].exit_code, None);
+    let summary = done[0].summary.clone().unwrap_or_default();
+    assert!(
+        summary.contains("every key in this stream's chain is unavailable"),
+        "{summary}"
+    );
+}
+
+#[tokio::test]
+async fn job_provider_marker_then_output_keeps_running() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let mut agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo \"every key in this stream's chain is unavailable\"; \
+            sleep 0.15; echo more; sleep 0.15; echo more; sleep 0.15; echo more; exit 0"),
+    );
+    agent.provider_marker_grace = Duration::from_millis(300);
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Done);
+    assert_eq!(done[0].exit_code, Some(0));
+}
+
+#[tokio::test]
+async fn job_that_recovers_after_a_marker_is_not_killed_when_it_goes_quiet() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let mut agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo \"every key in this stream's chain is unavailable\"; \
+            sleep 0.1; echo recovered; sleep 0.9; exit 0"),
+    );
+    agent.provider_marker_grace = Duration::from_millis(300);
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Done);
 }
 
 #[tokio::test]

@@ -5,6 +5,17 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `lu submit --idle-timeout <secs>` sets the job's idle-output timeout, so a silent harness is
+  stopped after `1` to `86400` seconds; `0` is a usage error.
+
+### Fixed
+
+- A harness that prints a provider-unavailable marker and then goes silent is stopped after 120
+  seconds and completes as a `provider` failure, so the controller cordons that provider and
+  retries the job elsewhere instead of waiting for the wall-clock timeout.
+
 ## [0.1.8] - 2026-11-17
 
 ### Added

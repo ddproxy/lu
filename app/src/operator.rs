@@ -39,6 +39,9 @@ pub struct SubmitArgs {
     /// Job timeout in seconds.
     #[arg(long, default_value_t = lu_proto::DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
+    /// Stop the harness after this many seconds with no output.
+    #[arg(long, value_parser = parse_idle_timeout)]
+    pub idle_timeout: Option<u64>,
     /// Only run after this job is done (repeatable).
     #[arg(long = "after", value_parser = parse_job_id)]
     pub after: Vec<JobId>,
@@ -159,7 +162,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         provider: args.provider,
         model: args.model,
         timeout_secs: args.timeout,
-        idle_timeout_secs: None,
+        idle_timeout_secs: args.idle_timeout,
         idempotency_key: args.key,
         after: args.after,
     };
@@ -769,6 +772,20 @@ fn parse_state(value: &str) -> Result<JobState, String> {
             "unknown job state {other:?}; expected blocked, queued, leased, running, recovering, needs_input, done, failed, or cancelled"
         )),
     }
+}
+
+fn parse_idle_timeout(value: &str) -> Result<u64, String> {
+    let secs: u64 = value
+        .parse()
+        .map_err(|_| format!("idle timeout must be a whole number of seconds (got {value:?})"))?;
+    let max = lu_proto::MAX_IDLE_TIMEOUT_SECS;
+    if !(lu_proto::MIN_TIMEOUT_SECS..=max).contains(&secs) {
+        return Err(format!(
+            "idle timeout must be {} to {max} seconds (got {secs})",
+            lu_proto::MIN_TIMEOUT_SECS
+        ));
+    }
+    Ok(secs)
 }
 
 fn parse_limit(value: &str) -> Result<u32, String> {

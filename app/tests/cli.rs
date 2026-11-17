@@ -514,6 +514,58 @@ async fn submit_reads_stdin_and_sends_every_flag() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_sends_idle_timeout_and_rejects_zero() {
+    let id = job_id();
+    let body = job_json(&id, "queued");
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("submit-idle");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--idle-timeout",
+            "45",
+        ],
+        &env_for(&server, &token),
+        Some("run the tests\n"),
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    {
+        let records = server.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let spec: Value = serde_json::from_slice(&records[0].body).unwrap();
+        assert_eq!(spec["idle_timeout_secs"], 45);
+    }
+
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--idle-timeout",
+            "0",
+        ],
+        &env_for(&server, &token),
+        Some("run the tests\n"),
+        &dir,
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(
+        server.records.lock().unwrap().len(),
+        1,
+        "a usage error must not reach the controller"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_reads_a_task_file() {
     let id = job_id();
     let body = job_json(&id, "queued");
