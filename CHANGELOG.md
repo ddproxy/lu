@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-17
+
 ### Added
 
 - `lu top --once` prints one snapshot's node and job tables as plain text and exits, without
