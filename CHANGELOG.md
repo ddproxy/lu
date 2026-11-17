@@ -7,6 +7,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [0.1.12] - 2026-11-17
 
+### Changed
+
+- A harness that cannot start, or a staging failure the node controls (a full or read-only disk, a container runtime error), now ends as a `node` failure and is retried on another node within the retry cap. A missing ref, bad credentials or an unknown repository stay `execution` failures. The table is in `docs/operations.md`.
+
 ### Added
 
 - `lu retry <job-id>` resubmits a finished job's spec as a new job. `--provider <name>` and
