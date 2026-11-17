@@ -32,12 +32,10 @@ fn controller_cfg(db: &str, artifacts_dir: &str) -> ControllerConfig {
             ControllerAgent {
                 name: "node-a".to_owned(),
                 token_sha256: sha256_hex(AGENT_A_TOKEN),
-                cordoned: false,
             },
             ControllerAgent {
                 name: "node-b".to_owned(),
                 token_sha256: sha256_hex(AGENT_B_TOKEN),
-                cordoned: false,
             },
         ],
         operators: vec![ControllerOperator {

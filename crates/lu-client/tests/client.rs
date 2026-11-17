@@ -263,9 +263,9 @@ async fn list_jobs_sends_the_filters_and_reads_a_page() {
 }
 
 #[tokio::test]
-async fn list_jobs_accepts_a_bare_array() {
+async fn list_jobs_reads_the_documented_envelope() {
     let id = job_id();
-    let body = json!([job_json(&id, JobState::Done)]);
+    let body = json!({"jobs": [job_json(&id, JobState::Done)], "next": null});
     let server = start(move |_| Reply::json(&body)).await;
     let page = client(&server).list_jobs(None, None).await.unwrap();
     assert_eq!(page.jobs[0].id, id);
@@ -324,6 +324,18 @@ async fn fetch_artifact_uses_the_fixed_name_and_returns_bytes() {
 }
 
 #[tokio::test]
+async fn an_unknown_job_makes_exactly_one_request() {
+    let id = job_id();
+    let server = start(|_| Reply::status(404)).await;
+    let error = client(&server).get_job(&id).await.unwrap_err();
+    assert_eq!(error, ApiError::NotFound);
+    let records = server.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].method, "GET");
+    assert_eq!(records[0].path, format!("/v1/jobs/{id}"));
+}
+
+#[tokio::test]
 async fn missing_artifacts_are_not_found() {
     let id = job_id();
     let server = start(|_| Reply::status(404)).await;
@@ -347,9 +359,9 @@ async fn cancel_accepts_an_empty_reply() {
 }
 
 #[tokio::test]
-async fn nodes_reads_wrapped_and_bare_lists() {
-    let wrapped = json!({"nodes": [{"name": "node-a", "harness": "idle", "cordoned": false}]});
-    let server = start(move |_| Reply::json(&wrapped)).await;
+async fn nodes_reads_a_bare_list() {
+    let bare = json!([{"name": "node-a", "harness": "idle", "draining": false}]);
+    let server = start(move |_| Reply::json(&bare)).await;
     let nodes = client(&server).nodes().await.unwrap();
     assert_eq!(nodes.nodes[0].name.as_str(), "node-a");
     assert_eq!(nodes.nodes[0].harness, Some(lu_proto::HarnessState::Idle));
@@ -358,11 +370,11 @@ async fn nodes_reads_wrapped_and_bare_lists() {
 #[tokio::test]
 async fn drain_and_undrain_hit_the_node_actions() {
     let node = NodeName::parse("node-a").unwrap();
-    let reply = json!({"name": "node-a", "cordoned": true});
+    let reply = json!({"name": "node-a", "draining": true});
     let server = start(move |_| Reply::json(&reply)).await;
     let client = client(&server);
     let view = client.drain(&node).await.unwrap();
-    assert!(view.cordoned);
+    assert!(view.draining);
     let _ = client.undrain(&node).await.unwrap();
     let records = server.records.lock().unwrap();
     assert_eq!(records[0].path, "/v1/nodes/node-a/drain");

@@ -39,8 +39,6 @@ pub struct Config {
     pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub log: LogConfig,
-    #[serde(default)]
-    pub service: ServiceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -91,8 +89,6 @@ fn default_max_connections_per_addr() -> usize {
 pub struct ControllerAgent {
     pub name: String,
     pub token_sha256: String,
-    #[serde(default)]
-    pub cordoned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -124,17 +120,12 @@ pub struct AgentConfig {
     /// `{cwd}` becomes the job's working tree. Empty runs the harness directly.
     #[serde(default)]
     pub harness_wrapper: Vec<String>,
-    #[serde(default = "default_slots")]
-    pub slots: u32,
     #[serde(default = "default_heartbeat_secs")]
     pub heartbeat_secs: u64,
     pub reiki_health_url: Option<String>,
     pub reiki_token_file: Option<String>,
 }
 
-fn default_slots() -> u32 {
-    1
-}
 fn default_heartbeat_secs() -> u64 {
     15
 }
@@ -175,25 +166,6 @@ impl Default for LogConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct ServiceConfig {
-    #[serde(default = "default_shutdown_timeout_secs")]
-    pub shutdown_timeout_secs: u64,
-}
-
-fn default_shutdown_timeout_secs() -> u64 {
-    25
-}
-
-impl Default for ServiceConfig {
-    fn default() -> Self {
-        Self {
-            shutdown_timeout_secs: default_shutdown_timeout_secs(),
-        }
-    }
-}
-
 impl Config {
     /// Parses and validates config text. Does not touch the filesystem.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
@@ -210,7 +182,6 @@ impl Config {
             );
         }
         self.validate_log()?;
-        self.validate_service()?;
         self.validate_tls()?;
         if let Some(c) = &self.controller {
             c.validate(self.tls.is_some())?;
@@ -237,19 +208,6 @@ impl Config {
             return invalid(
                 "[log]",
                 "file must not be empty; leave it out to log without a file".to_owned(),
-            );
-        }
-        Ok(())
-    }
-
-    fn validate_service(&self) -> Result<(), ConfigError> {
-        if !(1..=300).contains(&self.service.shutdown_timeout_secs) {
-            return invalid(
-                "[service]",
-                format!(
-                    "shutdown_timeout_secs must be 1 to 300 (got {})",
-                    self.service.shutdown_timeout_secs
-                ),
             );
         }
         Ok(())
@@ -469,12 +427,6 @@ impl AgentConfig {
                     "workspace_group must be 1 to 32 letters, digits, '_', '-' or '.'".to_owned(),
                 );
             }
-        }
-        if !(1..=1).contains(&self.slots) {
-            return invalid(
-                "[agent]",
-                format!("slots must be 1 to 1 (got {})", self.slots),
-            );
         }
         if !(2..=300).contains(&self.heartbeat_secs) {
             return invalid(
@@ -902,12 +854,9 @@ heartbeat_secs = 15
         assert_eq!(c.recovery_grace_secs, 30);
         assert_eq!(c.max_connections, 256);
         assert_eq!(c.max_connections_per_addr, 64);
-        assert!(!c.agents[0].cordoned);
         let a = Config::parse(&agent_only()).unwrap().agent.unwrap();
-        assert_eq!(a.slots, 1);
         assert_eq!(a.heartbeat_secs, 15);
         let cfg = Config::parse(&combined()).unwrap();
-        assert_eq!(cfg.service.shutdown_timeout_secs, 25);
         assert_eq!(cfg.log.level, "info");
     }
 
@@ -971,13 +920,9 @@ heartbeat_secs = 15
             "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n{field}={val}\n"
         )
         };
-        for v in ["0", "2"] {
-            expect_table(&base("slots", v), "[agent]");
-        }
         for v in ["1", "301"] {
             expect_table(&base("heartbeat_secs", v), "[agent]");
         }
-        assert!(Config::parse(&base("slots", "1")).is_ok());
         assert!(Config::parse(&base("heartbeat_secs", "2")).is_ok());
         assert!(Config::parse(&base("heartbeat_secs", "300")).is_ok());
     }
@@ -1013,12 +958,6 @@ heartbeat_secs = 15
         ] {
             expect_table(&base(bad), "[agent]");
         }
-    }
-
-    #[test]
-    fn service_range_names_table() {
-        expect_table("[controller]\nlisten=\"127.0.0.1:1\"\ndb=\"/db\"\nartifacts_dir=\"/a\"\n[service]\nshutdown_timeout_secs=0\n", "[service]");
-        expect_table("[controller]\nlisten=\"127.0.0.1:1\"\ndb=\"/db\"\nartifacts_dir=\"/a\"\n[service]\nshutdown_timeout_secs=301\n", "[service]");
     }
 
     #[test]

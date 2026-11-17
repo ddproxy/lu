@@ -98,7 +98,7 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
             .map(|node| NodeRow {
                 name: node.name.to_string(),
                 harness: operator::harness_name(node.harness),
-                drained: node.cordoned,
+                drained: node.draining,
                 seen_secs_ago: (node.last_seen > 0).then(|| now.saturating_sub(node.last_seen)),
                 providers: node
                     .providers

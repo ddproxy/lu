@@ -34,7 +34,6 @@ At least one of `[controller]` and `[agent]` must be present. A file may contain
 | --- | --- | --- | --- |
 | `name` | yes | — | 1 to 64 characters from `A-Z a-z 0-9 . _ -`; unique among agents. It must also be a valid node name, and the agent token is bound to it. |
 | `token_sha256` | yes | — | Exactly 64 lowercase hexadecimal characters. Unique across all agents and operators. |
-| `cordoned` | no | `false` | Boolean. Parsed and accepted, but 0.1.0 does not seed the node's drain state from it; use `lu drain` (or the HTTP API) after the node has registered. |
 
 ### `[[controller.operators]]`
 
@@ -61,7 +60,6 @@ The `[agent]` table describes an agent host. The operator CLI also reads `contro
 | `harness_wrapper` | no | `[]` | A command that wraps the harness, for example `["podman", "exec", "-i", "--workdir", "{cwd}", "--env", "OPENCODE_SERVER_PASSWORD", "opencode-agent"]`, so it runs inside a container. `{cwd}` becomes the job's working tree. The wrapper runs directly, never through a shell. |
 | `opencode_password_file` | no | — | A private file (a regular file owned by the agent's account, no group or other access) whose single line is the opencode server's password. The agent reads it at start and passes it to the harness as `OPENCODE_SERVER_PASSWORD`, the only variable beyond `PATH`, `HOME` and `LANG` the harness gets. |
 | `workspace_group` | no | — | A group name or number, 1 to 32 letters, digits, `_`, `-` or `.`. When set, each job's working tree is given to this group with group read and write and the setgid bit; `.git` is left as git made it. For a harness that runs as another account, such as an opencode server in a container, while the agent runs as the account that can use git. Resolved from `/etc/group` at start; an unknown group stops the agent. |
-| `slots` | no | `1` | Exactly `1` in 0.1.0 (`1` to `1`). |
 | `heartbeat_secs` | no | `15` | Integer `2` to `300`. When a `[controller]` table is also present, `heartbeat_secs * 2` must be strictly less than `lease_secs`. |
 | `reiki_health_url` | no | — | Loopback `http` or `https` URL with no credentials, query or fragment. Requires `reiki_token_file`. The agent reads the local Reiki's peer health (`GET /v1/health`) every 10 seconds and sends each upstream as a provider (`ok`, `cooling` with seconds left, `disabled` or `unknown`) with every heartbeat, plus the document itself. A job that names a `provider` goes only to nodes that report it. After three failed reads the node reports no providers. |
 | `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set. Checked like `token_file` on `load`. |
@@ -83,12 +81,6 @@ A `[tls]` table makes the controller serve HTTPS. It is required when `listen` i
 | `format` | no | `text` | `text` or `json`. |
 | `stderr` | no | `true` | Boolean. Logging also goes to stderr when `file` is unset, even if this is `false`. |
 | `file` | no | — | Non-empty path when set. Opened append-only with mode `0640`; a symlink at the path is refused. |
-
-## `[service]`
-
-| Key | Required | Default | Validation |
-| --- | --- | --- | --- |
-| `shutdown_timeout_secs` | no | `25` | Integer `1` to `300`. Accepted and validated, but 0.1.0 does not currently use it: the listener drains in-flight connections for a fixed 10 seconds. The contributed unit uses `TimeoutStopSec=40` so the service manager does not kill the process during that drain. |
 
 ## Cross-table rules
 
@@ -134,8 +126,3 @@ token_file = "/etc/lu/agent.token"
 work_dir = "/var/lib/lu/work"
 harness = "opencode"
 ```
-
-## Known config/code mismatches
-
-- `[[controller.agents]].cordoned` is parsed but not applied to the store.
-- `[service].shutdown_timeout_secs` is validated but the fixed 10-second drain is used.

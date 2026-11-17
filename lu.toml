@@ -29,6 +29,3 @@ token_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 level = "info"
 format = "text"
 stderr = true
-
-[service]
-shutdown_timeout_secs = 25

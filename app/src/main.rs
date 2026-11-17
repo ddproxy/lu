@@ -142,8 +142,8 @@ fn check(path: &std::path::Path) -> ExitCode {
     }
     if let Some(a) = &config.agent {
         println!(
-            "agent: {} -> {}, work dir {}, slots {}",
-            a.name, a.controller_url, a.work_dir, a.slots
+            "agent: {} -> {}, work dir {}",
+            a.name, a.controller_url, a.work_dir
         );
     }
     ExitCode::SUCCESS

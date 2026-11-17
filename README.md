@@ -62,9 +62,6 @@ These steps run a controller and the operator CLI on one machine. Run them as yo
    level = "info"
    format = "text"
    stderr = true
-
-   [service]
-   shutdown_timeout_secs = 25
    ```
 
 3. Check the config, then start the controller in the foreground:
@@ -149,14 +146,12 @@ Operator connection settings come from `LU_URL`, `LU_TOKEN_FILE` and optional `L
 
 - No web UI and no interactive attach to a running harness in 0.1.0.
 - No push channel: agents poll the controller.
-- One job per agent: `slots` is validated as exactly `1`.
 - No controller-side provider credentials; provider authentication stays on the leaf in 0.1.0.
 
 ## Known gaps
 
 - The agent runs the harness as its own user; see `docs/security.md`.
 - The agent sends no provider health, so the controller does not yet steer around a cooling provider.
-- `[service].shutdown_timeout_secs` is validated but not applied; the listener drains for a fixed 10 seconds.
 
 ## Crates
 

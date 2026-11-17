@@ -269,13 +269,13 @@ async fn ls_json_prints_the_raw_body_and_sends_the_filters() {
 #[cfg(feature = "tui")]
 async fn top_once_prints_tables_and_top_json_prints_one_object() {
     let id = job_id();
-    let node_body = json!({"nodes": [{
+    let node_body = json!([{
         "name": "node-a",
         "harness": "idle",
         "providers": [],
         "last_seen": 20,
-        "cordoned": false
-    }]});
+        "draining": false
+    }]);
     let jobs_body = json!({"jobs": [job_json(&id, "running")]});
     let server = start(move |record| {
         if record.path.contains("nodes") {
@@ -785,17 +785,17 @@ async fn fetch_writes_the_fixed_private_names_and_needs_force_to_replace() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nodes_and_drain_render_aligned_text() {
-    let list = json!({"nodes": [
-        {"name": "node-a", "version": "0.1.10", "harness": "idle", "last_seen": 10, "cordoned": true},
-        {"name": "node-b", "harness": "busy", "last_seen": 12, "cordoned": false}
-    ]});
+    let list = json!([
+        {"name": "node-a", "version": "0.1.10", "harness": "idle", "last_seen": 10, "draining": true},
+        {"name": "node-b", "harness": "busy", "last_seen": 12, "draining": false}
+    ]);
     let server = start(move |record| {
         if record.path == "/v1/nodes" {
             Reply::json(&list)
         } else if record.path.ends_with("/drain") {
             Reply::status(204)
         } else {
-            Reply::json(&json!({"name": "node-a", "cordoned": false}))
+            Reply::json(&json!({"name": "node-a", "draining": false}))
         }
     })
     .await;
@@ -819,7 +819,7 @@ async fn nodes_and_drain_render_aligned_text() {
     assert!(output.status.success(), "{}", stderr(&output));
     let drain_line = stdout(&output)
         .lines()
-        .find(|line| line.starts_with("cordoned"))
+        .find(|line| line.starts_with("draining"))
         .unwrap()
         .to_owned();
     assert!(drain_line.ends_with("yes"), "{drain_line:?}");
@@ -828,7 +828,7 @@ async fn nodes_and_drain_render_aligned_text() {
     assert!(output.status.success(), "{}", stderr(&output));
     let undrain_line = stdout(&output)
         .lines()
-        .find(|line| line.starts_with("cordoned"))
+        .find(|line| line.starts_with("draining"))
         .unwrap()
         .to_owned();
     assert!(undrain_line.ends_with("no"), "{undrain_line:?}");

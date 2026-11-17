@@ -42,5 +42,3 @@ stderr = true
 # sandbox can write it. Journald is the default when file is omitted.
 # file = "/var/lib/lu/lu.log"
 
-[service]
-shutdown_timeout_secs = 25

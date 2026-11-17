@@ -12,8 +12,7 @@ WorkingDirectory=/var/lib/lu
 ExecStart=/usr/local/bin/lu serve --config /etc/lu/lu.toml
 Restart=on-failure
 RestartSec=2s
-# Above [service].shutdown_timeout_secs (default 25). The binary currently drains
-# in-flight connections for a fixed 10 seconds.
+# The binary drains in-flight connections for a fixed 10 seconds on shutdown.
 TimeoutStopSec=40s
 KillMode=mixed
 StateDirectory=lu

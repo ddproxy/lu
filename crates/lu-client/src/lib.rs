@@ -15,12 +15,12 @@ mod types;
 pub use client::{Client, ClientOptions, Controller};
 pub use error::ApiError;
 pub use types::{
-    CompletionBody, HostStats, JobEnvelope, JobStats, JobView, ListJobs, ListNodes, LogPage,
-    NodeStats, NodeView, PollReply, PollRequest, ProcessStats, StatusView, MAX_JSON_BYTES,
+    CompletionBody, HostStats, JobStats, JobView, ListJobs, ListNodes, LogPage, NodeStats,
+    NodeView, PollReply, PollRequest, ProcessStats, StatusView, MAX_JSON_BYTES,
 };
 
-/// Canonical paths. The client also tries a small set of legacy spellings when a route answers
-/// 404 or 405, so a controller deployed during a rename keeps working.
+/// Canonical paths, exactly as documented in docs/api.md; the client sends each of these and
+/// nothing else.
 pub mod routes {
     pub const JOBS: &str = "/v1/jobs";
     pub const JOB: &str = "/v1/jobs/{id}";
@@ -34,7 +34,7 @@ pub mod routes {
     pub const POLL: &str = "/v1/agent/poll";
     pub const START: &str = "/v1/agent/jobs/{id}/start";
     pub const RENEW: &str = "/v1/agent/jobs/{id}/renew";
-    pub const APPEND_LOG: &str = "/v1/agent/jobs/{id}/logs";
+    pub const APPEND_LOG: &str = "/v1/agent/jobs/{id}/log";
     pub const PUT_ARTIFACT: &str = "/v1/agent/jobs/{id}/artifacts/{name}";
     pub const COMPLETE: &str = "/v1/agent/jobs/{id}/complete";
 }

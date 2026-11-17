@@ -17,7 +17,6 @@ controller_url = "https://lu.example.net:7600"
 token_file = "/etc/lu/agent.token"
 work_dir = "/var/lib/lu/work"
 harness = "opencode"
-slots = 1
 heartbeat_secs = 15
 
 # Optional: a private CA to add to the system trust roots. Do not use this to
@@ -34,6 +33,3 @@ heartbeat_secs = 15
 level = "info"
 format = "text"
 stderr = true
-
-[service]
-shutdown_timeout_secs = 25

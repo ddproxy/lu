@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use crate::error::{body_excerpt, ApiError};
 use crate::types::{
-    CompletionBody, JobEnvelope, JobView, ListJobs, ListNodes, LogPage, NodeStats, NodeView,
-    PollRequest, StatusView, MAX_JSON_BYTES,
+    CompletionBody, JobView, ListJobs, ListNodes, LogPage, NodeStats, NodeView, PollRequest,
+    StatusView, MAX_JSON_BYTES,
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -170,22 +170,11 @@ impl Client {
         })
     }
 
-    /// The base URL with the token removed, for display.
-    pub fn base_url(&self) -> String {
-        self.base.as_string()
-    }
-
     // ---- operator ---------------------------------------------------------
 
     pub async fn submit(&self, spec: &JobSpec) -> Result<JobView> {
         let reply = self.submit_reply(spec).await?;
         self.scrub(parse_job(&reply.body))
-    }
-
-    /// The raw submit response, so the CLI can implement `--json` without re-encoding.
-    pub async fn submit_raw(&self, spec: &JobSpec) -> Result<String> {
-        let reply = self.submit_reply(spec).await?;
-        Ok(raw_body(&reply))
     }
 
     /// Both the parsed view and the exact response body, from one request.
@@ -204,14 +193,7 @@ impl Client {
             headers.push(("Idempotency-Key".to_owned(), key.clone()));
         }
         let reply = self
-            .send(
-                Method::POST,
-                &owned(&["v1/jobs", "v1/job", "jobs"]),
-                Some(body),
-                &[],
-                &headers,
-                false,
-            )
+            .send(Method::POST, "v1/jobs", Some(body), &[], &headers, false)
             .await?;
         self.success(reply)
     }
@@ -229,14 +211,7 @@ impl Client {
             query.push(("limit".to_owned(), limit.to_string()));
         }
         let reply = self
-            .send(
-                Method::GET,
-                &owned(&["v1/jobs", "jobs"]),
-                None,
-                &query,
-                &[],
-                true,
-            )
+            .send(Method::GET, "v1/jobs", None, &query, &[], true)
             .await?;
         let reply = self.success(reply)?;
         self.scrub(parse_job_list(&reply.body))
@@ -260,41 +235,25 @@ impl Client {
             query.push(("limit".to_owned(), limit.to_string()));
         }
         let reply = self
-            .send(
-                Method::GET,
-                &owned(&["v1/jobs", "jobs"]),
-                None,
-                &query,
-                &[],
-                true,
-            )
+            .send(Method::GET, "v1/jobs", None, &query, &[], true)
             .await?;
         let reply = self.success(reply)?;
         Ok(raw_body(&reply))
     }
 
     pub async fn get_job(&self, id: &JobId) -> Result<JobView> {
-        let routes = [format!("v1/jobs/{id}"), format!("jobs/{id}")];
-        let reply = self
-            .send(Method::GET, &routes, None, &[], &[], true)
-            .await?;
+        let route = format!("v1/jobs/{id}");
+        let reply = self.send(Method::GET, &route, None, &[], &[], true).await?;
         let reply = self.success(reply)?;
         self.scrub(parse_job(&reply.body))
     }
 
     /// The raw job response, so the operator CLI can print what the controller sent.
     pub async fn get_job_raw(&self, id: &JobId) -> Result<String> {
-        let routes = [format!("v1/jobs/{id}"), format!("jobs/{id}")];
-        let reply = self
-            .send(Method::GET, &routes, None, &[], &[], true)
-            .await?;
+        let route = format!("v1/jobs/{id}");
+        let reply = self.send(Method::GET, &route, None, &[], &[], true).await?;
         let reply = self.success(reply)?;
         Ok(raw_body(&reply))
-    }
-
-    /// Alias for [`Client::get_job`].
-    pub async fn show_job(&self, id: &JobId) -> Result<JobView> {
-        self.get_job(id).await
     }
 
     pub async fn logs(&self, id: &JobId, offset: u64, wait: Option<u64>) -> Result<LogPage> {
@@ -320,13 +279,9 @@ impl Client {
         if let Some(wait) = wait {
             query.push(("wait".to_owned(), wait.to_string()));
         }
-        let routes = [
-            format!("v1/jobs/{id}/logs"),
-            format!("v1/jobs/{id}/log"),
-            format!("jobs/{id}/logs"),
-        ];
+        let route = format!("v1/jobs/{id}/logs");
         let reply = self
-            .send(Method::GET, &routes, None, &query, &[], true)
+            .send(Method::GET, &route, None, &query, &[], true)
             .await?;
         self.success(reply)
     }
@@ -339,15 +294,11 @@ impl Client {
 
     pub async fn fetch_artifact(&self, id: &JobId, name: ArtifactName) -> Result<Vec<u8>> {
         let file = name.file_name();
-        let routes = [
-            format!("v1/jobs/{id}/artifacts/{file}"),
-            format!("v1/jobs/{id}/{file}"),
-            format!("jobs/{id}/{file}"),
-        ];
+        let route = format!("v1/jobs/{id}/artifacts/{file}");
         let reply = self
             .send_capped(
                 Method::GET,
-                &routes,
+                &route,
                 SendParts {
                     body: None,
                     query: &[],
@@ -366,26 +317,10 @@ impl Client {
     }
 
     pub async fn cancel(&self, id: &JobId) -> Result<JobView> {
-        let body = serde_json::to_vec(&serde_json::json!({ "job_id": id })).map_err(|error| {
-            ApiError::Decode {
-                message: format!("could not encode the cancel request: {error}"),
-            }
-        })?;
-        let routes = [format!("v1/jobs/{id}/cancel"), format!("jobs/{id}/cancel")];
+        let route = format!("v1/jobs/{id}/cancel");
         let reply = self
-            .send(Method::POST, &routes, Some(body), &[], &[], false)
+            .send(Method::POST, &route, None, &[], &[], false)
             .await?;
-        if matches!(
-            reply.status,
-            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
-        ) {
-            // Some controllers expose cancellation as DELETE on the job itself.
-            let routes = [format!("v1/jobs/{id}"), format!("jobs/{id}")];
-            let reply = self
-                .send(Method::DELETE, &routes, None, &[], &[], false)
-                .await?;
-            return self.cancel_reply(reply, id);
-        }
         self.cancel_reply(reply, id)
     }
 
@@ -399,61 +334,26 @@ impl Client {
 
     /// The raw cancel response. An empty body means the controller cancelled without a view.
     pub async fn cancel_raw(&self, id: &JobId) -> Result<String> {
-        let body = serde_json::to_vec(&serde_json::json!({ "job_id": id })).map_err(|error| {
-            ApiError::Decode {
-                message: format!("could not encode the cancel request: {error}"),
-            }
-        })?;
-        let routes = [format!("v1/jobs/{id}/cancel"), format!("jobs/{id}/cancel")];
+        let route = format!("v1/jobs/{id}/cancel");
         let reply = self
-            .send(Method::POST, &routes, Some(body), &[], &[], false)
+            .send(Method::POST, &route, None, &[], &[], false)
             .await?;
-        if matches!(
-            reply.status,
-            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
-        ) {
-            let routes = [format!("v1/jobs/{id}"), format!("jobs/{id}")];
-            let reply = self
-                .send(Method::DELETE, &routes, None, &[], &[], false)
-                .await?;
-            let reply = self.success(reply)?;
-            return Ok(raw_body(&reply));
-        }
         let reply = self.success(reply)?;
         Ok(raw_body(&reply))
     }
 
     pub async fn nodes(&self) -> Result<ListNodes> {
         let reply = self
-            .send(
-                Method::GET,
-                &owned(&["v1/nodes", "nodes"]),
-                None,
-                &[],
-                &[],
-                true,
-            )
+            .send(Method::GET, "v1/nodes", None, &[], &[], true)
             .await?;
         let reply = self.success(reply)?;
         self.scrub(parse_nodes(&reply.body))
     }
 
-    /// Alias for [`Client::nodes`].
-    pub async fn list_nodes(&self) -> Result<ListNodes> {
-        self.nodes().await
-    }
-
     /// The raw node-list response.
     pub async fn nodes_raw(&self) -> Result<String> {
         let reply = self
-            .send(
-                Method::GET,
-                &owned(&["v1/nodes", "nodes"]),
-                None,
-                &[],
-                &[],
-                true,
-            )
+            .send(Method::GET, "v1/nodes", None, &[], &[], true)
             .await?;
         let reply = self.success(reply)?;
         Ok(raw_body(&reply))
@@ -462,14 +362,7 @@ impl Client {
     /// The controller's version, uptime, database size and queue summary.
     pub async fn status(&self) -> Result<StatusView> {
         let reply = self
-            .send(
-                Method::GET,
-                &owned(&["v1/status", "status"]),
-                None,
-                &[],
-                &[],
-                true,
-            )
+            .send(Method::GET, "v1/status", None, &[], &[], true)
             .await?;
         let reply = self.success(reply)?;
         self.scrub(
@@ -482,14 +375,7 @@ impl Client {
     /// The raw status response, so `lu status --json` can print exactly what was sent.
     pub async fn status_raw(&self) -> Result<String> {
         let reply = self
-            .send(
-                Method::GET,
-                &owned(&["v1/status", "status"]),
-                None,
-                &[],
-                &[],
-                true,
-            )
+            .send(Method::GET, "v1/status", None, &[], &[], true)
             .await?;
         let reply = self.success(reply)?;
         Ok(raw_body(&reply))
@@ -513,31 +399,16 @@ impl Client {
     }
 
     async fn node_stats_reply(&self, node: &NodeName) -> Result<HttpReply> {
-        let routes = [
-            format!("v1/nodes/{node}/stats"),
-            format!("nodes/{node}/stats"),
-        ];
-        let reply = self
-            .send(Method::GET, &routes, None, &[], &[], true)
-            .await?;
+        let route = format!("v1/nodes/{node}/stats");
+        let reply = self.send(Method::GET, &route, None, &[], &[], true).await?;
         self.success(reply)
     }
 
     pub async fn set_drain(&self, node: &NodeName, drain: bool) -> Result<NodeView> {
         let action = if drain { "drain" } else { "undrain" };
-        let routes = [
-            format!("v1/nodes/{node}/{action}"),
-            format!("v1/nodes/{node}/cordon"),
-            format!("nodes/{node}/{action}"),
-        ];
-        let body =
-            serde_json::to_vec(&serde_json::json!({ "cordoned": drain })).map_err(|error| {
-                ApiError::Decode {
-                    message: format!("could not encode the node request: {error}"),
-                }
-            })?;
+        let route = format!("v1/nodes/{node}/{action}");
         let reply = self
-            .send(Method::POST, &routes, Some(body), &[], &[], false)
+            .send(Method::POST, &route, None, &[], &[], false)
             .await?;
         let reply = self.success(reply)?;
         // The controller answers with an empty object; a full node record is accepted too.
@@ -554,19 +425,9 @@ impl Client {
     /// The raw drain/undrain response.
     pub async fn set_drain_raw(&self, node: &NodeName, drain: bool) -> Result<String> {
         let action = if drain { "drain" } else { "undrain" };
-        let routes = [
-            format!("v1/nodes/{node}/{action}"),
-            format!("v1/nodes/{node}/cordon"),
-            format!("nodes/{node}/{action}"),
-        ];
-        let body =
-            serde_json::to_vec(&serde_json::json!({ "cordoned": drain })).map_err(|error| {
-                ApiError::Decode {
-                    message: format!("could not encode the node request: {error}"),
-                }
-            })?;
+        let route = format!("v1/nodes/{node}/{action}");
         let reply = self
-            .send(Method::POST, &routes, Some(body), &[], &[], false)
+            .send(Method::POST, &route, None, &[], &[], false)
             .await?;
         let reply = self.success(reply)?;
         Ok(raw_body(&reply))
@@ -611,14 +472,7 @@ impl Client {
             message: format!("could not encode the poll request: {error}"),
         })?;
         let reply = self
-            .send(
-                Method::POST,
-                &owned(&["v1/agent/poll"]),
-                Some(body),
-                &[],
-                &[],
-                false,
-            )
+            .send(Method::POST, "v1/agent/poll", Some(body), &[], &[], false)
             .await?;
         if reply.status == StatusCode::NO_CONTENT {
             return Ok(Vec::new());
@@ -662,9 +516,9 @@ impl Client {
                 message: format!("could not encode the {action} request: {error}"),
             }
         })?;
-        let routes = [format!("v1/agent/jobs/{id}/{action}")];
+        let route = format!("v1/agent/jobs/{id}/{action}");
         let reply = self
-            .send(Method::POST, &routes, Some(body), &[], &[], false)
+            .send(Method::POST, &route, Some(body), &[], &[], false)
             .await?;
         self.success(reply)
     }
@@ -676,7 +530,7 @@ impl Client {
             limit: lu_proto::MAX_LOG_CHUNK_BYTES as u64,
         })?;
         let id = &chunk.job_id;
-        let routes = [format!("v1/agent/jobs/{id}/log")];
+        let route = format!("v1/agent/jobs/{id}/log");
         let query = [
             ("epoch".to_owned(), chunk.epoch.to_string()),
             ("offset".to_owned(), chunk.seq.to_string()),
@@ -688,7 +542,7 @@ impl Client {
         let reply = self
             .send(
                 Method::POST,
-                &routes,
+                &route,
                 Some(chunk.data.clone().into_bytes()),
                 &query,
                 &headers,
@@ -711,7 +565,7 @@ impl Client {
             });
         }
         let file = name.file_name();
-        let routes = [format!("v1/agent/jobs/{id}/artifacts/{file}")];
+        let route = format!("v1/agent/jobs/{id}/artifacts/{file}");
         let query = [("epoch".to_owned(), epoch.to_string())];
         let headers = [(
             "Content-Type".to_owned(),
@@ -720,7 +574,7 @@ impl Client {
         let reply = self
             .send(
                 Method::PUT,
-                &routes,
+                &route,
                 Some(bytes.to_vec()),
                 &query,
                 &headers,
@@ -748,9 +602,9 @@ impl Client {
             message: format!("could not encode the completion: {error}"),
         })?;
         let id = &completion.job_id;
-        let routes = [format!("v1/agent/jobs/{id}/complete")];
+        let route = format!("v1/agent/jobs/{id}/complete");
         let reply = self
-            .send(Method::POST, &routes, Some(body), &[], &[], false)
+            .send(Method::POST, &route, Some(body), &[], &[], false)
             .await?;
         self.success(reply).map(|_| ())
     }
@@ -760,7 +614,7 @@ impl Client {
     async fn send(
         &self,
         method: Method,
-        routes: &[String],
+        route: &str,
         body: Option<Vec<u8>>,
         query: &[(String, String)],
         headers: &[(String, String)],
@@ -768,7 +622,7 @@ impl Client {
     ) -> Result<HttpReply> {
         self.send_capped(
             method,
-            routes,
+            route,
             SendParts {
                 body,
                 query,
@@ -783,53 +637,35 @@ impl Client {
     async fn send_capped(
         &self,
         method: Method,
-        routes: &[String],
+        route: &str,
         parts: SendParts<'_>,
         retry: bool,
         max_body: u64,
     ) -> Result<HttpReply> {
-        let mut last_not_found = None;
-        for (index, route) in routes.iter().enumerate() {
-            let url = self.build_url(route, parts.query);
-            let mut attempt = 0u32;
-            loop {
-                match self
-                    .send_once(&method, &url, parts.body.clone(), parts.headers, max_body)
-                    .await
-                {
-                    Ok(reply) => {
-                        let transient = retry
-                            && (reply.status == StatusCode::TOO_MANY_REQUESTS
-                                || reply.status.is_server_error());
-                        if transient && attempt + 1 < self.max_attempts {
-                            attempt += 1;
-                            tokio::time::sleep(self.backoff_for(attempt)).await;
-                            continue;
-                        }
-                        if index + 1 < routes.len()
-                            && matches!(
-                                reply.status,
-                                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
-                            )
-                        {
-                            last_not_found = Some(reply);
-                            break;
-                        }
-                        return Ok(reply);
-                    }
-                    Err(error)
-                        if retry && error.is_transient() && attempt + 1 < self.max_attempts =>
-                    {
+        let url = self.build_url(route, parts.query);
+        let mut attempt = 0u32;
+        loop {
+            match self
+                .send_once(&method, &url, parts.body.clone(), parts.headers, max_body)
+                .await
+            {
+                Ok(reply) => {
+                    let transient = retry
+                        && (reply.status == StatusCode::TOO_MANY_REQUESTS
+                            || reply.status.is_server_error());
+                    if transient && attempt + 1 < self.max_attempts {
                         attempt += 1;
                         tokio::time::sleep(self.backoff_for(attempt)).await;
+                        continue;
                     }
-                    Err(error) => return Err(error),
+                    return Ok(reply);
                 }
+                Err(error) if retry && error.is_transient() && attempt + 1 < self.max_attempts => {
+                    attempt += 1;
+                    tokio::time::sleep(self.backoff_for(attempt)).await;
+                }
+                Err(error) => return Err(error),
             }
-        }
-        match last_not_found {
-            Some(reply) => Ok(reply),
-            None => Err(ApiError::NotFound),
         }
     }
 
@@ -1126,110 +962,22 @@ fn retry_after(reply: &HttpReply) -> Option<u64> {
 }
 
 fn parse_job(body: &[u8]) -> Result<JobView> {
-    if let Ok(view) = serde_json::from_slice::<JobView>(body) {
-        return Ok(view);
-    }
-    if let Ok(envelope) = serde_json::from_slice::<JobEnvelope>(body) {
-        return Ok(envelope.job);
-    }
-    if let Ok(id) = serde_json::from_slice::<JobId>(body) {
-        return Ok(JobView::placeholder(id, JobState::Queued));
-    }
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        if let Some(job) = value.get("job") {
-            if let Ok(view) = serde_json::from_value::<JobView>(job.clone()) {
-                return Ok(view);
-            }
-        }
-        // A submit route may answer with only the new id, optionally with its state.
-        let id = ["job_id", "id"]
-            .iter()
-            .find_map(|key| value.get(*key).and_then(Value::as_str))
-            .and_then(|text| JobId::parse(text).ok());
-        if let Some(id) = id {
-            let state = value
-                .get("state")
-                .and_then(|state| serde_json::from_value::<JobState>(state.clone()).ok())
-                .unwrap_or(JobState::Queued);
-            return Ok(JobView::placeholder(id, state));
-        }
-    }
-    Err(ApiError::Decode {
-        message: format!("could not decode a job: {}", body_excerpt(body, 200)),
+    serde_json::from_slice(body).map_err(|error| ApiError::Decode {
+        message: format!("could not decode a job: {error}"),
     })
 }
 
 fn parse_job_list(body: &[u8]) -> Result<ListJobs> {
-    if let Ok(list) = serde_json::from_slice::<ListJobs>(body) {
-        return Ok(list);
-    }
-    if let Ok(jobs) = serde_json::from_slice::<Vec<JobView>>(body) {
-        return Ok(ListJobs {
-            jobs,
-            total: None,
-            next: None,
-        });
-    }
-    // A controller may use `items` for the bit that matters and add other fields.
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        if let Some(items) = value
-            .get("items")
-            .or_else(|| value.get("jobs"))
-            .and_then(Value::as_array)
-        {
-            let mut jobs = Vec::with_capacity(items.len());
-            for item in items {
-                let view = serde_json::from_value::<JobView>(item.clone()).map_err(|error| {
-                    ApiError::Decode {
-                        message: format!("could not decode a job: {error}"),
-                    }
-                })?;
-                jobs.push(view);
-            }
-            return Ok(ListJobs {
-                jobs,
-                total: value.get("total").and_then(Value::as_u64),
-                next: value.get("next").and_then(Value::as_str).map(str::to_owned),
-            });
-        }
-    }
-    Err(ApiError::Decode {
-        message: format!("could not decode the job list: {}", body_excerpt(body, 200)),
+    serde_json::from_slice(body).map_err(|error| ApiError::Decode {
+        message: format!("could not decode the job list: {error}"),
     })
 }
 
 fn parse_nodes(body: &[u8]) -> Result<ListNodes> {
-    if let Ok(list) = serde_json::from_slice::<ListNodes>(body) {
-        return Ok(list);
-    }
-    if let Ok(nodes) = serde_json::from_slice::<Vec<NodeView>>(body) {
-        return Ok(ListNodes { nodes });
-    }
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        if let Some(items) = value
-            .get("items")
-            .or_else(|| value.get("nodes"))
-            .and_then(Value::as_array)
-        {
-            let mut nodes = Vec::with_capacity(items.len());
-            for item in items {
-                nodes.push(
-                    serde_json::from_value::<NodeView>(item.clone()).map_err(|error| {
-                        ApiError::Decode {
-                            message: format!("could not decode a node: {error}"),
-                        }
-                    })?,
-                );
-            }
-            return Ok(ListNodes { nodes });
-        }
-    }
-    Err(ApiError::Decode {
-        message: format!(
-            "could not decode the node list: {}",
-            body_excerpt(body, 200)
-        ),
-    })
+    let nodes: Vec<NodeView> = serde_json::from_slice(body).map_err(|error| ApiError::Decode {
+        message: format!("could not decode the node list: {error}"),
+    })?;
+    Ok(ListNodes { nodes })
 }
 
 fn parse_node(body: &[u8]) -> Result<NodeView> {
@@ -1273,10 +1021,6 @@ fn parse_log(reply: &HttpReply, requested_offset: u64) -> LogPage {
         state,
         terminal: state.is_some_and(JobState::is_terminal),
     }
-}
-
-fn owned(routes: &[&str]) -> Vec<String> {
-    routes.iter().map(|route| (*route).to_owned()).collect()
 }
 
 fn raw_body(reply: &HttpReply) -> String {

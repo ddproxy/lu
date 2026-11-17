@@ -26,15 +26,15 @@ pub struct JobView {
     pub node: Option<NodeName>,
     #[serde(default)]
     pub attempt: u32,
-    #[serde(default, alias = "lease_epoch", alias = "fencing_epoch")]
+    #[serde(default)]
     pub epoch: u64,
-    #[serde(default, alias = "created", alias = "created_at_ms")]
+    #[serde(default)]
     pub created_at: u64,
-    #[serde(default, alias = "started", alias = "started_at_ms")]
+    #[serde(default)]
     pub started_at: Option<u64>,
-    #[serde(default, alias = "finished", alias = "finished_at_ms")]
+    #[serde(default)]
     pub finished_at: Option<u64>,
-    #[serde(default, alias = "failure")]
+    #[serde(default)]
     pub failure_class: Option<FailureClass>,
     #[serde(default)]
     pub summary: Option<String>,
@@ -71,15 +71,12 @@ pub struct ListJobs {
     #[serde(default)]
     pub jobs: Vec<JobView>,
     #[serde(default)]
-    pub total: Option<u64>,
-    #[serde(default)]
     pub next: Option<String>,
 }
 
-/// One node's heartbeat and cordon state.
+/// One node's heartbeat and drain state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeView {
-    #[serde(alias = "node")]
     pub name: NodeName,
     #[serde(default)]
     pub version: Option<String>,
@@ -87,10 +84,10 @@ pub struct NodeView {
     pub harness: Option<HarnessState>,
     #[serde(default)]
     pub providers: Vec<ProviderStatus>,
-    #[serde(default, alias = "heartbeat_at", alias = "last_seen_at")]
+    #[serde(default)]
     pub last_seen: u64,
-    #[serde(default, alias = "drained", alias = "draining")]
-    pub cordoned: bool,
+    #[serde(default)]
+    pub draining: bool,
     #[serde(default)]
     pub load1: Option<f64>,
     #[serde(default)]
@@ -103,14 +100,14 @@ pub struct NodeView {
 
 impl NodeView {
     /// A view for a drain route that answered 204.
-    pub fn placeholder(name: NodeName, cordoned: bool) -> Self {
+    pub fn placeholder(name: NodeName, draining: bool) -> Self {
         Self {
             name,
             version: None,
             harness: None,
             providers: Vec::new(),
             last_seen: 0,
-            cordoned,
+            draining,
             load1: None,
             mem_available_kb: None,
             mem_total_kb: None,
@@ -323,12 +320,6 @@ pub struct CompletionBody {
     pub summary: Option<String>,
 }
 
-/// A small envelope used by some controllers for single-object replies.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobEnvelope {
-    pub job: JobView,
-}
-
 fn empty_spec() -> JobSpec {
     JobSpec {
         repo: String::new(),
@@ -418,14 +409,6 @@ mod tests {
     }
 
     #[test]
-    fn node_views_accept_drained_as_an_alias() {
-        let node: NodeView =
-            serde_json::from_str(r#"{"name":"node-a","drained":true,"harness":"idle"}"#).unwrap();
-        assert_eq!(node.name.as_str(), "node-a");
-        assert!(node.cordoned);
-    }
-
-    #[test]
     fn node_views_carry_the_agent_version() {
         let node: NodeView = serde_json::from_str(
             r#"{"name":"node-a","version":"0.1.10","harness":"idle","draining":false}"#,
@@ -450,9 +433,9 @@ mod tests {
     }
 
     #[test]
-    fn node_views_accept_the_controllers_draining_field() {
+    fn node_views_read_the_draining_field() {
         let node: NodeView =
             serde_json::from_str(r#"{"name":"node-a","draining":true,"harness":"idle"}"#).unwrap();
-        assert!(node.cordoned);
+        assert!(node.draining);
     }
 }

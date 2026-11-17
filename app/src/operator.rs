@@ -487,7 +487,7 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
                     .unwrap_or_else(|| "-".to_owned()),
                 harness_name(node.harness),
                 time(node.last_seen),
-                if node.cordoned { "yes" } else { "no" }.to_owned(),
+                if node.draining { "yes" } else { "no" }.to_owned(),
             ]
         })
         .collect();
@@ -889,8 +889,8 @@ fn print_node(node: &NodeView) {
         ("harness", harness_name(node.harness)),
         ("last_seen", time(node.last_seen)),
         (
-            "cordoned",
-            if node.cordoned { "yes" } else { "no" }.to_owned(),
+            "draining",
+            if node.draining { "yes" } else { "no" }.to_owned(),
         ),
     ];
     print_pairs(&rows);

@@ -81,7 +81,6 @@ controller_url = "https://lu.example.net:7600"
 token_file = "{token}"
 work_dir = "/srv/work/lu"
 harness = "opencode"
-slots = 1
 heartbeat_secs = 15
 "#
         ),
@@ -99,7 +98,7 @@ heartbeat_secs = 15
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(
         stdout.trim(),
-        "agent: peer-a -> https://lu.example.net:7600, work dir /srv/work/lu, slots 1"
+        "agent: peer-a -> https://lu.example.net:7600, work dir /srv/work/lu"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -131,7 +130,6 @@ controller_url = "https://lu.example.net:7600"
 token_file = "{token}"
 work_dir = "/srv/work/lu"
 harness = "opencode"
-slots = 1
 heartbeat_secs = 15
 "#
         ),
@@ -152,7 +150,7 @@ heartbeat_secs = 15
         lines,
         vec![
             "controller: listen 127.0.0.1:7600, 1 agent(s), 1 operator(s), tls off",
-            "agent: peer-a -> https://lu.example.net:7600, work dir /srv/work/lu, slots 1",
+            "agent: peer-a -> https://lu.example.net:7600, work dir /srv/work/lu",
         ]
     );
     let _ = std::fs::remove_dir_all(&dir);

@@ -12,6 +12,8 @@ uses semantic versioning once it reaches 1.0.
   `crates/lu-store/src/sqlite.rs`. The controller API tests' separate fake store was removed too;
   they run against `SqliteStore` opened on a temporary file.
 
+- `[agent].slots`, `[service].shutdown_timeout_secs` and `[[controller.agents]].cordoned` were parsed and validated but never applied, and are now removed; a config still setting them fails to load with an unknown-field error because keys are rejected rather than ignored. Fix: delete those keys (and the `[service]` table) from your config.
+
 ## [0.1.12] - 2026-11-17
 
 ### Changed

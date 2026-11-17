@@ -59,7 +59,7 @@ systemctl enable --now lu-controller.service
 systemctl status lu-controller.service
 ```
 
-`lu-controller.service` is `Type=simple`; `lu` does not implement `sd_notify`, so `Type=notify` is not available. It runs as `lu`, uses `StateDirectory=lu`, and applies `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, restricted address families, an empty capability set and `LimitNOFILE=65536`. `ReadWritePaths=/var/lib/lu` is the only writable system path. `TimeoutStopSec=40` is above the default `[service].shutdown_timeout_secs=25`, although the binary's actual in-flight drain is currently fixed at 10 seconds.
+`lu-controller.service` is `Type=simple`; `lu` does not implement `sd_notify`, so `Type=notify` is not available. It runs as `lu`, uses `StateDirectory=lu`, and applies `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, restricted address families, an empty capability set and `LimitNOFILE=65536`. `ReadWritePaths=/var/lib/lu` is the only writable system path. `TimeoutStopSec=40` is above the fixed 10-second in-flight drain the binary performs on shutdown.
 
 `lu-agent.service` is present for the intended agent layout, but it runs `lu agent`, which this tree does not implement. Do not enable it in 0.1.0; it will fail with a command-line usage error.
 
