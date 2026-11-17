@@ -541,20 +541,25 @@ async fn drain_inner(
     drain: bool,
 ) -> Result<ExitCode, String> {
     let client = connect(config)?;
-    if json {
-        let raw = client
+    let result = if json {
+        client
             .set_drain_raw(&args.node, drain)
             .await
-            .map_err(|error| error.to_string())?;
-        print_raw(&raw);
-        return Ok(ExitCode::SUCCESS);
+            .map(|raw| print_raw(&raw))
+    } else {
+        client
+            .set_drain(&args.node, drain)
+            .await
+            .map(|view| print_node(&view))
+    };
+    match result {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(ApiError::NotFound) => Err(format!(
+            "node '{}' not found: a node must heartbeat at least once before it can be drained or undrained",
+            args.node.as_str()
+        )),
+        Err(error) => Err(error.to_string()),
     }
-    let view = client
-        .set_drain(&args.node, drain)
-        .await
-        .map_err(|error| error.to_string())?;
-    print_node(&view);
-    Ok(ExitCode::SUCCESS)
 }
 
 async fn wait_for_job(client: &Client, id: &JobId) -> Result<JobView, String> {

@@ -5,6 +5,13 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- Uploading an artifact with a stale epoch returns `409 stale_epoch` and leaves the newer attempt's artifact file untouched.
+- Cancelling a `recovering` job ends it `cancelled` immediately instead of ignoring the request until requeue: its lease is released and its blocked dependents fail as a cancelled dependency.
+- Appending a log chunk that must be cut to fit the log cap now reserves room for the `[log truncated]` marker, so the stored log always ends with the marker and never exceeds the cap.
+- `lu drain` and `lu undrain` on a node that has never heartbeated fail with `404 not_found` in both stores instead of silently discarding the request; the CLI says which node was refused.
+
 ## [0.1.10] - 2026-11-17
 
 ### Added

@@ -54,9 +54,9 @@ enum Command {
     Nodes(operator::NodesArgs),
     /// Show the host and job stats a node last reported.
     Node(operator::NodeArgs),
-    /// Stop assigning new jobs to a node.
+    /// Stop assigning new jobs to a node. The node must have heartbeated at least once.
     Drain(operator::NodeArgs),
-    /// Allow a drained node to take jobs again.
+    /// Allow a drained node to take jobs again. The node must have heartbeated at least once.
     Undrain(operator::NodeArgs),
 }
 

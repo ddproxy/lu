@@ -348,26 +348,27 @@ pub async fn append_log(
         Err(e) => return with_version(e.into_response()),
     };
     let nbytes = bytes.len() as u64;
-    // Logs beyond the cap are dropped with a marker line and still return 200.
+    // Logs beyond the cap are dropped with a marker line and still return 200. The marker is
+    // reserved whenever a chunk is cut to fit, so the room it takes is not counted twice.
+    const MARKER: &[u8] = b"\n[log truncated]\n";
     let cap = lu_proto::MAX_LOG_BYTES;
     let current_len = rec_check.log_len;
-    let (to_write, _reserve_n, marker_only) = if current_len >= cap {
-        (Vec::new(), 0u64, true)
+    let (to_write, marker_only) = if current_len >= cap {
+        (Vec::new(), true)
     } else if current_len + nbytes > cap {
-        let allowed = (cap - current_len) as usize;
-        let mut v = bytes[..allowed].to_vec();
-        let marker = b"\n[log truncated]\n";
-        // marker appended if fits? spec says "dropped with a marker line..." - best effort append marker.
-        if v.len() + marker.len() <= cap as usize {
-            v.extend_from_slice(marker);
+        let remaining = (cap - current_len) as usize;
+        if remaining >= MARKER.len() {
+            let allowed = remaining - MARKER.len();
+            let mut v = bytes[..allowed].to_vec();
+            v.extend_from_slice(MARKER);
+            (v, true)
+        } else {
+            // Less room than the marker takes; the cap holds.
+            (Vec::new(), true)
         }
-        (v, 0u64 /* special handling below */, true)
     } else {
-        (bytes.to_vec(), nbytes, false)
+        (bytes.to_vec(), false)
     };
-
-    // reserve_log requires offset == stored length. For truncation case where we add marker without exceeding in a weird way,
-    // we need to reserve the actual bytes we will append.
     let actual_append = to_write.len() as u64;
     if actual_append > 0 {
         let res = tokio::task::spawn_blocking({
@@ -477,6 +478,11 @@ async fn put_artifact_impl(
     let Some(epoch) = q.get("epoch").and_then(|s| s.parse::<u64>().ok()) else {
         return with_version(ApiError::bad_request("missing or invalid epoch").into_response());
     };
+    // A stale holder must not reach the filesystem: record_artifact would reject the epoch,
+    // but only after the newer attempt's file had been replaced.
+    if rec_check.epoch != epoch {
+        return with_version(ApiError::stale_epoch().into_response());
+    }
     let bytes = match read_raw_limited(req, body_limit).await {
         Ok(b) => b,
         Err(e) => return with_version(e.into_response()),

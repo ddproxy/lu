@@ -155,6 +155,7 @@ stateDiagram-v2
     recovering --> done: the holder finishes while the controller was down
     recovering --> queued: grace over, retry
     recovering --> failed: grace over, no retry left
+    recovering --> cancelled: cancel
     done --> [*]
     failed --> [*]
     cancelled --> [*]
@@ -186,15 +187,15 @@ As a fallback for a job that names no provider, or a node without a Reiki feed, 
 
 Cancellation is different:
 
-- a `queued` or `blocked` job becomes `cancelled` immediately, and its blocked dependents fail with `failure_class: "dependency"`;
-- a `leased`, `running`, `recovering` or `needs_input` job gets `cancel_requested = true` and the agent is told on its next poll;
+- a `queued`, `blocked` or `recovering` job becomes `cancelled` immediately, and its blocked dependents fail with `failure_class: "dependency"`;
+- a `leased`, `running` or `needs_input` job gets `cancel_requested = true` and the agent is told on its next poll;
 - a terminal job returns `409 conflict`.
 
 ## Provider cordons and node drains
 
 These are separate mechanisms:
 
-- **Drain** stops a node taking any new job. It is set by `POST /v1/nodes/{name}/drain` and cleared by `/undrain`, and is stored in the `nodes` table. It survives a controller restart. A node must have sent a heartbeat at least once to exist; draining an unknown node returns success but does not create it.
+- **Drain** stops a node taking any new job. It is set by `POST /v1/nodes/{name}/drain` and cleared by `/undrain`, and is stored in the `nodes` table. It survives a controller restart. A node must have sent a heartbeat at least once to exist; draining an unknown node returns `404 not_found`.
 - **Cordon** stops a node taking jobs that name a particular provider. It is created when a retryable provider failure completes and the job names a provider, and it expires after `provider_cooldown_secs`. A job with no provider is not blocked by a cordon.
 
 Cordon deadlines are stored as monotonic milliseconds. The controller does not rebase them on restart, so a surviving cordon's remaining time is approximate and may last longer than the configured cooldown if the previous process ran for a long time. `lu nodes --json` shows the currently unexpired cordons; there is no CLI command to clear one. Waiting out the cooldown or editing the database while the controller is stopped are the available options.

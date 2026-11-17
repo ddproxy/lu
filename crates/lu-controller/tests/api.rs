@@ -5,8 +5,9 @@ use fake_store::FakeStore;
 use lu_auth::sha256_hex;
 use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator};
 use lu_controller::{build_router, run_background, AppState};
-use lu_proto::{JobId, JobSpec, MAX_AFTER_JOBS};
+use lu_proto::{JobId, JobSpec, MAX_AFTER_JOBS, MAX_LOG_BYTES};
 use lu_serve::{serve, ServeOptions};
+use lu_store::Store;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -52,6 +53,7 @@ fn controller_cfg(artifacts_dir: &str) -> ControllerConfig {
 struct TestServer {
     addr: SocketAddr,
     shutdown: broadcast::Sender<()>,
+    store: Arc<FakeStore>,
     _handle: tokio::task::JoinHandle<()>,
     _bg: tokio::task::JoinHandle<()>,
     _artifacts_dir: std::path::PathBuf,
@@ -63,7 +65,7 @@ async fn start_server() -> TestServer {
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = controller_cfg(dir.to_str().unwrap());
     let store = Arc::new(FakeStore::new());
-    let state = Arc::new(AppState::from_config(&cfg, store).unwrap());
+    let state = Arc::new(AppState::from_config(&cfg, store.clone()).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, _) = broadcast::channel::<()>(4);
@@ -94,6 +96,7 @@ async fn start_server() -> TestServer {
     TestServer {
         addr,
         shutdown: tx,
+        store,
         _handle: handle,
         _bg: bg,
         _artifacts_dir: dir,
@@ -728,6 +731,46 @@ async fn dependency_views_and_validation() {
 }
 
 #[tokio::test]
+async fn drain_and_undrain_an_unknown_node_is_not_found() {
+    let srv = start_server().await;
+    for action in ["drain", "undrain"] {
+        let r = raw_request(
+            srv.addr,
+            &format!("POST /v1/nodes/ghost/{action} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status(&r), 404, "{r} {action}");
+        let jb: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+        assert_eq!(jb["error"], "not_found", "{r}");
+    }
+    // nothing was persisted for the unknown node
+    let r = raw_request(
+        srv.addr,
+        &format!("GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"),
+    )
+    .await;
+    let list: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert!(list.as_array().unwrap().is_empty(), "{r}");
+
+    // the same node becomes drainable once it has heartbeated
+    let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    // no jobs are queued, so the poll heartbeats and reports nothing to do
+    assert_eq!(status(&r), 204, "{r}");
+    let r = raw_request(
+        srv.addr,
+        &format!("POST /v1/nodes/node-a/drain HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
 async fn metrics_requires_operator_token() {
     let srv = start_server().await;
     // no token -> 401
@@ -896,5 +939,132 @@ async fn metrics_text_format_parses() {
             "non-numeric value in: {line:?}"
         );
     }
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn stale_epoch_artifact_upload_leaves_the_file_alone() {
+    let srv = start_server().await;
+    let spec = sample_spec(None);
+    let body = serde_json::to_string(&spec).unwrap();
+    let req = format!(
+        "POST /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let j: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = j["id"].as_str().unwrap().to_string();
+
+    let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let events = events.as_array().unwrap().clone();
+    let assign = events
+        .iter()
+        .find(|e| e["kind"] == "assign")
+        .unwrap()
+        .clone();
+    let epoch = assign["epoch"].as_u64().unwrap();
+
+    let rep = b"original-report";
+    let req = format!("PUT /v1/agent/jobs/{id}/artifacts/report.json?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n", rep.len());
+    let mut packet = req.into_bytes();
+    packet.extend_from_slice(rep);
+    let r = raw_request_bytes(srv.addr, &packet).await;
+    let rs = String::from_utf8_lossy(&r).into_owned();
+    assert_eq!(status(&rs), 200, "{rs}");
+
+    let path = srv._artifacts_dir.join(&id).join("report.json");
+    assert_eq!(std::fs::read(&path).unwrap(), rep);
+
+    // an agent at an old epoch uploads; the stored artifact must survive
+    let stale = epoch.saturating_sub(1);
+    let new = b"clobbered-by-stale-agent";
+    let req = format!("PUT /v1/agent/jobs/{id}/artifacts/report.json?epoch={stale} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n", new.len());
+    let mut packet = req.into_bytes();
+    packet.extend_from_slice(new);
+    let r = raw_request_bytes(srv.addr, &packet).await;
+    let rs = String::from_utf8_lossy(&r).into_owned();
+    assert_eq!(status(&rs), 409, "{rs}");
+    let jb: serde_json::Value = serde_json::from_str(body_str(&rs)).unwrap();
+    assert_eq!(jb["error"], "stale_epoch", "{rs}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        rep,
+        "stale epoch must not overwrite the file"
+    );
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn log_append_100_bytes_below_the_cap_keeps_the_marker() {
+    let srv = start_server().await;
+    let spec = sample_spec(None);
+    let body = serde_json::to_string(&spec).unwrap();
+    let req = format!(
+        "POST /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let j: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = j["id"].as_str().unwrap().to_string();
+    let job_id = JobId::parse(&id).unwrap();
+
+    let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let events = events.as_array().unwrap().clone();
+    let assign = events
+        .iter()
+        .find(|e| e["kind"] == "assign")
+        .unwrap()
+        .clone();
+    let epoch = assign["epoch"].as_u64().unwrap();
+    let b = json!({"epoch": epoch}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", b.len(), b);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    // seed the stored log length to 100 bytes under the cap, with the same bytes on disk
+    let seeded = MAX_LOG_BYTES - 100;
+    let job_dir = srv._artifacts_dir.join(&id);
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(job_dir.join("run.log"), vec![b'l'; seeded as usize]).unwrap();
+    srv.store.reserve_log(&job_id, epoch, 0, seeded).unwrap();
+
+    // a chunk larger than the 100 bytes that remain
+    let chunk = vec![b'a'; 4096];
+    let req = format!("POST /v1/agent/jobs/{id}/log?epoch={epoch}&offset={seeded} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n", chunk.len());
+    let mut packet = req.into_bytes();
+    packet.extend_from_slice(&chunk);
+    let r = raw_request_bytes(srv.addr, &packet).await;
+    let rs = String::from_utf8_lossy(&r).into_owned();
+    assert_eq!(status(&rs), 200, "{rs}");
+
+    // the stored log ends with the marker and never exceeds the cap
+    let stored = std::fs::read(job_dir.join("run.log")).unwrap();
+    assert!(
+        stored.ends_with(b"\n[log truncated]\n"),
+        "stored log lacks the truncation marker, tail: {:?}",
+        &stored[stored.len().saturating_sub(32)..]
+    );
+    assert!(
+        stored.len() as u64 <= MAX_LOG_BYTES,
+        "stored log exceeds the cap"
+    );
+    let rec = srv.store.get_job(&job_id).unwrap();
+    assert_eq!(rec.log_len, MAX_LOG_BYTES);
     let _ = srv.shutdown.send(());
 }

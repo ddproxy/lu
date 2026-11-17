@@ -290,7 +290,7 @@ impl Store for MemoryStore {
                 .get_mut(id.as_str())
                 .ok_or(StoreError::NotFound)?;
             match entry.rec.state {
-                JobState::Blocked | JobState::Queued => {
+                JobState::Blocked | JobState::Queued | JobState::Recovering => {
                     check_transition(entry.rec.state, JobState::Cancelled)?;
                     entry.rec.state = JobState::Cancelled;
                     entry.rec.updated_at = now.wall_unix;
@@ -299,11 +299,8 @@ impl Store for MemoryStore {
                     entry.recovering_since_mono_ms = None;
                     true
                 }
-                JobState::Leased
-                | JobState::Running
-                | JobState::Recovering
-                | JobState::NeedsInput => {
-                    // Leased/running: request cancel. Recovering/needs_input: best-effort request.
+                JobState::Leased | JobState::Running | JobState::NeedsInput => {
+                    // Leased/running: request cancel. NeedsInput: best-effort request.
                     entry.rec.cancel_requested = true;
                     entry.rec.updated_at = now.wall_unix;
                     false
@@ -755,9 +752,15 @@ impl Store for MemoryStore {
             .inner
             .lock()
             .map_err(|_| StoreError::Internal("mutex poisoned".into()))?;
-        let e = inner.nodes.entry(node.as_str().to_owned()).or_default();
-        e.draining = draining;
-        Ok(())
+        // Only a node that has heartbeated is known; draining a name that has not appeared yet
+        // would persist nothing and be lost when the node first shows up.
+        match inner.nodes.get_mut(node.as_str()) {
+            Some(e) if e.heartbeat.is_some() => {
+                e.draining = draining;
+                Ok(())
+            }
+            _ => Err(StoreError::NotFound),
+        }
     }
 
     fn nodes(&self, now: Now, lease_ms: u64) -> Result<Vec<NodeRecord>, StoreError> {

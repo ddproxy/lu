@@ -792,7 +792,7 @@ impl Store for SqliteStore {
             .map_err(internal)?;
         let (mut rec, lease, recov) = get_job_tx(&tx, id.as_str())?;
         match rec.state {
-            JobState::Blocked | JobState::Queued => {
+            JobState::Blocked | JobState::Queued | JobState::Recovering => {
                 check_transition(rec.state, JobState::Cancelled)?;
                 rec.state = JobState::Cancelled;
                 rec.updated_at = now.wall_unix;
@@ -800,7 +800,7 @@ impl Store for SqliteStore {
                 update_job_tx(&tx, &rec, None, None)?;
                 fail_dependents(&tx, rec.id.as_str(), "cancelled", now)?;
             }
-            JobState::Leased | JobState::Running | JobState::Recovering | JobState::NeedsInput => {
+            JobState::Leased | JobState::Running | JobState::NeedsInput => {
                 rec.cancel_requested = true;
                 rec.updated_at = now.wall_unix;
                 update_job_tx(&tx, &rec, lease, recov)?;
@@ -1295,18 +1295,16 @@ impl Store for SqliteStore {
             )
             .optional()
             .map_err(internal)?;
-        if exists.is_some() {
-            tx.execute(
-                "UPDATE nodes SET draining=?2 WHERE name=?1",
-                params![node.as_str(), if draining { 1i64 } else { 0i64 }],
-            )
-            .map_err(internal)?;
-        } else {
-            // create placeholder node with empty heartbeat json? not possible to have valid heartbeat easily; but we can store a minimal one is risky.
-            // Better to insert only when heartbeat known; but set_draining should work. Store draining separately? schema says nodes table has draining.
-            // We'll insert with a dummy heartbeat if missing is not clean. Instead, keep draining in a way nodes() can show if heartbeat arrives later: insert row with heartbeat_json '{}' is invalid. Alternative: ignore if no node yet.
-            // However trait returns Ok.
+        if exists.is_none() {
+            // The operator can only drain a node that has sent a heartbeat; anything else would
+            // be a drain for a name that has not appeared yet.
+            return Err(StoreError::NotFound);
         }
+        tx.execute(
+            "UPDATE nodes SET draining=?2 WHERE name=?1",
+            params![node.as_str(), if draining { 1i64 } else { 0i64 }],
+        )
+        .map_err(internal)?;
         tx.commit().map_err(internal)?;
         Ok(())
     }

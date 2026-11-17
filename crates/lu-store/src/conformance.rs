@@ -56,6 +56,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     idempotent_create(&make());
     list_jobs_ordering_and_cursor(&make());
     cancel_states(&make());
+    cancel_recovering_ends_it_cancelled_immediately(&make());
     assignment_and_epoch(&make());
     start_renew_log_artifact(&make());
     complete_and_retry_cordon(&make());
@@ -65,6 +66,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     recovery_grace_survives_a_young_clock(&make());
     a_recovering_job_resumes_or_finishes_for_its_holder(&make());
     nodes_view(&make());
+    drain_unknown_node_is_rejected(&make());
     blocked_on_submit_and_unblocked_on_done(&make());
     dependencies_already_done_queue_immediately(&make());
     failed_dependency_cascades_two_levels(&make());
@@ -426,6 +428,52 @@ fn cancel_states<S: Store>(s: &S) {
     assert_eq!(c2.state, JobState::Running);
 }
 
+fn cancel_recovering_ends_it_cancelled_immediately<S: Store>(s: &S) {
+    let (dep, _) = s
+        .create_job(&spec("https://x/dep.git", None), now(1, 1))
+        .unwrap();
+    let dependent = {
+        let mut sp = spec("https://x/dependent.git", None);
+        sp.after = vec![dep.id.clone()];
+        s.create_job(&sp, now(1, 1)).unwrap().0
+    };
+    let node = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let a = s
+        .next_assignment(&node, now(2, 2), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.job_id, dep.id);
+    s.start_job(&dep.id, a.epoch, now(3, 3)).unwrap();
+    assert_eq!(s.recover_on_boot(now(4, 4)).unwrap(), 1);
+    assert_eq!(s.get_job(&dep.id).unwrap().state, JobState::Recovering);
+
+    let cancelled = s.cancel_job(&dep.id, now(5, 5)).unwrap();
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert_eq!(cancelled.finished_at, Some(5));
+    assert_eq!(cancelled.updated_at, 5);
+    // the lease and the recovering marker are released: nothing requeues or renews it
+    assert!(s
+        .requeue_recovering(now(60_000, 60_000), 1, 10)
+        .unwrap()
+        .is_empty());
+    assert!(s.renew_lease(&dep.id, a.epoch, now(6, 6), 60_000).is_err());
+    // its blocked dependent fails the way a cancelled dependency does
+    let failed = s.get_job(&dependent.id).unwrap();
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.failure_class, Some(FailureClass::Dependency));
+    assert_eq!(
+        failed.summary.as_deref(),
+        Some(format!("dependency {} cancelled", dep.id).as_str())
+    );
+    // terminal: a second cancel conflicts
+    assert_eq!(
+        s.cancel_job(&dep.id, now(6, 6)).unwrap_err(),
+        StoreError::Conflict { length: None }
+    );
+}
+
 fn assignment_and_epoch<S: Store>(s: &S) {
     let n1 = node("node-1");
     let n2 = node("node-2");
@@ -714,6 +762,40 @@ fn recover_on_boot<S: Store>(s: &S) {
     let c = s.recover_on_boot(now(3, 3)).unwrap();
     assert_eq!(c, 1);
     assert_eq!(s.get_job(&j.id).unwrap().state, JobState::Recovering);
+}
+
+fn drain_unknown_node_is_rejected<S: Store>(s: &S) {
+    let ghost = node("ghost");
+    // A node that has never sent a heartbeat is unknown; draining it must not persist anything.
+    assert_eq!(
+        s.set_draining(&ghost, true).unwrap_err(),
+        StoreError::NotFound
+    );
+    assert_eq!(
+        s.set_draining(&ghost, false).unwrap_err(),
+        StoreError::NotFound
+    );
+    s.heartbeat(&hb("ghost", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    s.set_draining(&ghost, true).unwrap();
+    let view = s.nodes(now(2, 2), 1000).unwrap();
+    assert!(
+        view.iter()
+            .find(|n| n.name.as_str() == "ghost")
+            .unwrap()
+            .draining,
+        "a known node drains"
+    );
+    s.set_draining(&ghost, false).unwrap();
+    let view = s.nodes(now(3, 3), 1000).unwrap();
+    assert!(
+        !view
+            .iter()
+            .find(|n| n.name.as_str() == "ghost")
+            .unwrap()
+            .draining,
+        "a known node undrains"
+    );
 }
 
 fn nodes_view<S: Store>(s: &S) {

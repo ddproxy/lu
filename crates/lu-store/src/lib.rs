@@ -160,6 +160,8 @@ pub trait Store: Send + Sync + 'static {
     /// At controller start: every `leased` or `running` job becomes `recovering`.
     fn recover_on_boot(&self, now: Now) -> Result<u64, StoreError>;
 
+    /// Drains or undrains a node. `Err(StoreError::NotFound)` for a node that has never
+    /// heartbeated.
     fn set_draining(&self, node: &NodeName, draining: bool) -> Result<(), StoreError>;
     fn nodes(&self, now: Now, lease_ms: u64) -> Result<Vec<NodeRecord>, StoreError>;
 

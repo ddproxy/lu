@@ -228,12 +228,14 @@ impl Store for FakeStore {
                 .get_mut(id.as_str())
                 .ok_or(StoreError::NotFound)?;
             let is_terminal = match row.rec.state {
-                JobState::Blocked | JobState::Queued => {
+                JobState::Blocked | JobState::Queued | JobState::Recovering => {
                     row.rec.state = JobState::Cancelled;
                     row.rec.finished_at = Some(now_wall(now));
+                    row.lease_deadline_ms = None;
+                    row.recovering_since_ms = None;
                     true
                 }
-                JobState::Leased | JobState::Running | JobState::Recovering => {
+                JobState::Leased | JobState::Running => {
                     row.rec.cancel_requested = true;
                     false
                 }
@@ -627,25 +629,12 @@ impl Store for FakeStore {
 
     fn set_draining(&self, node: &NodeName, draining: bool) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
+        // Only a node that has heartbeated is known; a drain for anyone else is refused, not stored.
         let nr = inner
             .nodes
-            .entry(node.to_string())
-            .or_insert_with(|| NodeRow {
-                name: node.clone(),
-                last_seen: 0,
-                draining,
-                heartbeat: Heartbeat {
-                    node: node.clone(),
-                    harness: lu_proto::HarnessState::Idle,
-                    providers: vec![],
-                    reiki: None,
-                    host: None,
-                    jobs: Vec::new(),
-                },
-                current_job: None,
-            });
+            .get_mut(node.as_str())
+            .ok_or(StoreError::NotFound)?;
         nr.draining = draining;
-        // if node didn't exist before, we need a heartbeat baseline - but tests may drain before heartbeat; acceptable.
         Ok(())
     }
 

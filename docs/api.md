@@ -11,12 +11,12 @@ Agents poll; there is no push channel in 0.1.0. Lease expiry is measured on the 
 | `POST /v1/jobs` body `JobSpec` | Create a job. `201` with `JobView`. `spec.after` lists up to 16 job ids that must be `done` first; the new job starts `blocked` while any are unfinished, otherwise `queued`. An unknown dependency, one that already failed or was cancelled, more than 16, a duplicate, or any other invalid spec gets `422 unprocessable` naming the fault. Same `idempotency_key` and same spec returns the existing job with `200`; same key and a different spec is `409 conflict`. |
 | `GET /v1/jobs?state=&limit=&after=` | List, newest first, `limit` at most 200, `after` is a `JobId` cursor. `{"jobs":[JobView],"next":"<id>|null"}` |
 | `GET /v1/jobs/{id}` | `JobView` |
-| `POST /v1/jobs/{id}/cancel` | Queued or blocked: becomes `cancelled` at once. Leased or running: the agent is told on its next poll. Terminal: `409`. Returns `JobView`. |
+| `POST /v1/jobs/{id}/cancel` | Queued, blocked or recovering: becomes `cancelled` at once. Leased or running: the agent is told on its next poll. Terminal: `409`. Returns `JobView`. |
 | `GET /v1/jobs/{id}/logs?offset=N` | Bytes of the stored log from `offset`, `Content-Type: text/plain`, header `X-Lu-Log-Length` and `X-Lu-State`; `?wait=25` holds the request up to 25 seconds for new bytes or a state change. |
 | `GET /v1/jobs/{id}/artifacts/{name}` | `name` is `diff.patch`, `run.log` or `report.json`. `404` until stored. |
 | `GET /v1/nodes` | `[NodeView]` |
 | `GET /v1/nodes/{name}/stats` | The latest `NodeStats` the node reported in its heartbeat. `404` for an unknown node; a known node that has not reported stats is `{}`. In-memory only, so it is lost on controller restart. |
-| `POST /v1/nodes/{name}/drain` and `/undrain` | Stop or resume assigning new jobs to a node. |
+| `POST /v1/nodes/{name}/drain` and `/undrain` | Stop or resume assigning new jobs to a node. `404` for a node that has never heartbeated. |
 | `GET /v1/health` | `{"ok":true,"version":"…","db":"ok"}`, no auth. |
 | `GET /metrics` | Prometheus text (`text/plain; version=0.0.4`): `lu_jobs` by state, `lu_nodes`/`lu_nodes_online`/`lu_nodes_drained`, `lu_node_providers{node,provider,state}`, `lu_controller_up`, `lu_jobs_completed_total` by outcome. See docs/operations.md. |
 
@@ -37,7 +37,7 @@ Agents poll; there is no push channel in 0.1.0. Lease expiry is measured on the 
 | `POST /v1/agent/poll` body `{"heartbeat": Heartbeat, "wait_secs": 0..30}` | Registers a heartbeat and asks for work. Returns `204` when there is nothing, or `200` `[AgentEvent]` with `Assign` (when the node is free, not draining, harness healthy, and a queued job matches), `Cancel`, or `Followup`. Holds up to `wait_secs` for work. Assigning creates a lease: `lease_secs` from now, epoch incremented. |
 | `POST /v1/agent/jobs/{id}/start` body `{"epoch":N}` | Leased to running. `409 stale_epoch` if the lease moved on. |
 | `POST /v1/agent/jobs/{id}/renew` body `{"epoch":N}` | Extends the lease by `lease_secs`. Also implied by `poll`, `log` and `start`. Returns `{"cancel":bool}`. |
-| `POST /v1/agent/jobs/{id}/log?epoch=N&offset=M` body raw bytes | Append a chunk at `offset`. `offset` must equal the stored length (`409 conflict` with `{"length":L}` otherwise so the agent can resume). At most 64 KiB. Logs beyond the cap are dropped with a marker line and still return 200. |
+| `POST /v1/agent/jobs/{id}/log?epoch=N&offset=M` body raw bytes | Append a chunk at `offset`. `offset` must equal the stored length (`409 conflict` with `{"length":L}` otherwise so the agent can resume). At most 64 KiB. When a chunk must be cut to fit the cap, room for the `[log truncated]` marker line is reserved first, so the stored log ends with the marker and never exceeds the cap; the append still returns 200. |
 | `PUT /v1/agent/jobs/{id}/artifacts/{name}?epoch=N` body raw bytes | Store `diff.patch` or `report.json` (caps from `limits`). Controller names the file; the agent never supplies a path. |
 | `POST /v1/agent/jobs/{id}/complete` body `Completion` | Finish. Outcomes and failure classes follow `lu-proto`. A stale epoch is `409 stale_epoch` and the result is discarded. For a provider failure, optional `retry_after_secs` is when the provider is expected back; the controller cordons the provider on the node for that long (at least 5 seconds, at most 24 hours) instead of the configured length. |
 
