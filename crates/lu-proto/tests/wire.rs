@@ -60,6 +60,7 @@ fn a_submission_travels_as_an_assignment_and_comes_back_as_a_completion() {
         outcome: Outcome::Failed(FailureClass::Execution),
         exit_code: Some(101),
         summary: Some("harness exited non-zero".to_owned()),
+        retry_after_secs: None,
     };
     completion.validate().unwrap();
     assert_eq!(

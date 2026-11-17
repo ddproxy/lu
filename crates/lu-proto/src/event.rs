@@ -177,6 +177,10 @@ pub struct Completion {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// For a provider failure: when the provider is expected back, in seconds. The controller
+    /// cordons the provider on the node for this long.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +193,8 @@ struct RawCompletion {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
 }
 
 impl TryFrom<RawCompletion> for Completion {
@@ -200,6 +206,7 @@ impl TryFrom<RawCompletion> for Completion {
             outcome: raw.outcome,
             exit_code: raw.exit_code,
             summary: raw.summary,
+            retry_after_secs: raw.retry_after_secs,
         };
         c.validate()?;
         Ok(c)
@@ -355,6 +362,7 @@ mod tests {
             outcome: Outcome::Done,
             exit_code: Some(0),
             summary: Some("all green".to_owned()),
+            retry_after_secs: None,
         };
         assert!(done.validate().is_ok());
         let json = serde_json::to_string(&done).unwrap();
@@ -366,6 +374,7 @@ mod tests {
             outcome: Outcome::Failed(FailureClass::Execution),
             exit_code: Some(2),
             summary: None,
+            retry_after_secs: Some(150),
         };
         assert!(failed.validate().is_ok());
         let json = serde_json::to_string(&failed).unwrap();
@@ -380,6 +389,7 @@ mod tests {
             outcome: Outcome::Done,
             exit_code: None,
             summary: Some("s".repeat(MAX_SUMMARY_BYTES + 1)),
+            retry_after_secs: None,
         };
         assert_eq!(
             completion.validate().unwrap_err(),

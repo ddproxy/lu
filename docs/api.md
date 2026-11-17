@@ -31,7 +31,7 @@ Agents poll; there is no push channel in 0.1.0. Lease expiry is measured on the 
 | `POST /v1/agent/jobs/{id}/renew` body `{"epoch":N}` | Extends the lease by `lease_secs`. Also implied by `poll`, `log` and `start`. Returns `{"cancel":bool}`. |
 | `POST /v1/agent/jobs/{id}/log?epoch=N&offset=M` body raw bytes | Append a chunk at `offset`. `offset` must equal the stored length (`409 conflict` with `{"length":L}` otherwise so the agent can resume). At most 64 KiB. Logs beyond the cap are dropped with a marker line and still return 200. |
 | `PUT /v1/agent/jobs/{id}/artifacts/{name}?epoch=N` body raw bytes | Store `diff.patch` or `report.json` (caps from `limits`). Controller names the file; the agent never supplies a path. |
-| `POST /v1/agent/jobs/{id}/complete` body `Completion` | Finish. Outcomes and failure classes follow `lu-proto`. A stale epoch is `409 stale_epoch` and the result is discarded. |
+| `POST /v1/agent/jobs/{id}/complete` body `Completion` | Finish. Outcomes and failure classes follow `lu-proto`. A stale epoch is `409 stale_epoch` and the result is discarded. For a provider failure, optional `retry_after_secs` is when the provider is expected back; the controller cordons the provider on the node for that long (at least 5 seconds, at most 24 hours) instead of the configured length. |
 
 ## Controller rules
 

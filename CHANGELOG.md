@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-17
+
 ### Added
 
 - `lu submit --idle-timeout <secs>` sets the job's idle-output timeout, so a silent harness is
@@ -12,6 +14,7 @@ uses semantic versioning once it reaches 1.0.
 
 ### Fixed
 
+- A provider failure reports when the provider returns (`Completion.retry_after_secs`, Reiki's estimate plus 60 seconds); the controller cordons the provider on the node for that long, within 5 seconds and 24 hours. An older controller refuses completions that carry the field, so roll controllers first.
 - A job that names a provider fails as a provider failure, and moves to another node, as soon as the node's Reiki reports no usable key for that provider on two readings in a row. The signal comes from Reiki, not from harness output.
 - A harness that prints a provider-unavailable marker and then goes silent is stopped after 120
   seconds and completes as a `provider` failure, so the controller cordons that provider and

@@ -47,6 +47,9 @@ pub const PROVIDER_MARKER_GRACE: Duration = Duration::from_secs(120);
 
 /// How often a running job's provider is checked against the node's Reiki reading.
 const REIKI_WATCH_PERIOD: Duration = Duration::from_secs(5);
+/// Added to Reiki's cooldown estimate before the controller cordons the provider, since the
+/// reading may be several seconds old and keys sometimes fail again right after a cooldown.
+const COOLDOWN_BUFFER_SECS: u64 = 60;
 /// Fresh readings in a row that must show the provider unusable before the job is stopped.
 const REIKI_UNAVAILABLE_READS: u32 = 2;
 
@@ -456,6 +459,7 @@ impl Agent {
                 exit_code: None,
                 summary,
                 cancelled: false,
+                retry_after_secs: None,
             })
             .await?;
             return Ok(JobEnd::Finished);
@@ -493,6 +497,7 @@ impl Agent {
                     exit_code: None,
                     summary,
                     cancelled: false,
+                    retry_after_secs: None,
                 })
                 .await?;
                 return Ok(JobEnd::Finished);
@@ -546,6 +551,7 @@ impl Agent {
         let mut seen_seq = health::snapshot(&self.health).seq;
         let mut unavailable_reads = 0u32;
         let mut reiki_reason: Option<String> = None;
+        let mut reiki_retry_after: Option<u64> = None;
 
         loop {
             tokio::select! {
@@ -633,6 +639,9 @@ impl Agent {
                             Some(p) if matches!(p.state, ProviderState::Cooling | ProviderState::Disabled) => {
                                 unavailable_reads += 1;
                                 if unavailable_reads >= REIKI_UNAVAILABLE_READS {
+                                    reiki_retry_after = p
+                                        .soonest_secs
+                                        .map(|secs| secs.saturating_add(COOLDOWN_BUFFER_SECS));
                                     reiki_reason = Some(match p.soonest_secs {
                                         Some(secs) => format!(
                                             "Reiki reports provider {wanted} has no usable key; the soonest returns in {secs}s"
@@ -674,6 +683,7 @@ impl Agent {
                     outcome: Outcome::Cancelled,
                     exit_code: None,
                     summary: Some(summarise("cancelled by the controller")),
+                    retry_after_secs: None,
                 };
                 match self.controller.complete(&completion).await {
                     Ok(()) | Err(ApiError::StaleEpoch) => {}
@@ -731,6 +741,7 @@ impl Agent {
                 exit_code: None,
                 summary,
                 cancelled: false,
+                retry_after_secs: reiki_retry_after,
             })
             .await?;
             return Ok(JobEnd::Finished);
@@ -751,6 +762,7 @@ impl Agent {
             exit_code,
             summary,
             cancelled: false,
+            retry_after_secs: None,
         })
         .await?;
         Ok(JobEnd::Finished)
@@ -769,6 +781,7 @@ impl Agent {
             outcome: Outcome::Failed(class),
             exit_code: None,
             summary: Some(summarise(summary)),
+            retry_after_secs: None,
         };
         match self.controller.complete(&completion).await {
             Ok(()) => Ok(()),
@@ -850,6 +863,7 @@ impl Agent {
             outcome: finish.outcome,
             exit_code: finish.exit_code,
             summary: Some(summarise(&finish.summary)),
+            retry_after_secs: finish.retry_after_secs,
         };
         match self.controller.complete(&completion).await {
             Ok(()) => Ok(JobEnd::Finished),
@@ -899,6 +913,7 @@ struct Finish<'a> {
     exit_code: Option<i32>,
     summary: String,
     cancelled: bool,
+    retry_after_secs: Option<u64>,
 }
 
 /// Removes the checkout even when the job is cancelled, the future is aborted, or it panics.

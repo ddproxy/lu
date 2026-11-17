@@ -1224,6 +1224,11 @@ async fn job_whose_provider_goes_unusable_in_reiki_fails_as_provider() {
         summary.contains("zen") && summary.contains("90s"),
         "{summary}"
     );
+    assert_eq!(
+        done[0].retry_after_secs,
+        Some(150),
+        "90s from Reiki plus the buffer"
+    );
 }
 
 #[tokio::test]

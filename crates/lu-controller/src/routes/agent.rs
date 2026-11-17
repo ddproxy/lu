@@ -570,7 +570,7 @@ pub async fn complete_job(
     let res = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         let max_retries = state.max_retries;
-        let cordon_ms = state.cordon_ms;
+        let cordon_ms = cordon_ms_for(&completion, state.cordon_ms);
         move || store.complete(&completion, failure, n, max_retries, cordon_ms)
     })
     .await;
@@ -608,4 +608,50 @@ pub async fn put_report_artifact(
     req: axum::extract::Request,
 ) -> Response {
     put_artifact_impl(state, peer, headers, id, "report.json", uri, req).await
+}
+
+/// The agent's estimate of when the provider returns, kept within sane bounds, replaces the
+/// configured cordon length for a provider failure.
+fn cordon_ms_for(completion: &lu_proto::Completion, default_ms: u64) -> u64 {
+    const MIN_MS: u64 = 5_000;
+    const MAX_MS: u64 = 24 * 60 * 60 * 1_000;
+    match (completion.outcome, completion.retry_after_secs) {
+        (lu_proto::Outcome::Failed(lu_proto::FailureClass::Provider), Some(secs)) => {
+            secs.saturating_mul(1_000).clamp(MIN_MS, MAX_MS)
+        }
+        _ => default_ms,
+    }
+}
+
+#[cfg(test)]
+mod cordon_tests {
+    use super::*;
+    use lu_proto::{Completion, FailureClass, JobId, Outcome};
+
+    fn completion(outcome: Outcome, retry: Option<u64>) -> Completion {
+        Completion {
+            job_id: JobId::new(),
+            epoch: 1,
+            outcome,
+            exit_code: None,
+            summary: None,
+            retry_after_secs: retry,
+        }
+    }
+
+    #[test]
+    fn a_provider_failure_cordons_for_the_reported_time_within_bounds() {
+        let p = Outcome::Failed(FailureClass::Provider);
+        assert_eq!(cordon_ms_for(&completion(p, Some(150)), 1), 150_000);
+        assert_eq!(cordon_ms_for(&completion(p, Some(0)), 1), 5_000);
+        assert_eq!(cordon_ms_for(&completion(p, Some(u64::MAX)), 1), 86_400_000);
+        assert_eq!(cordon_ms_for(&completion(p, None), 42), 42);
+    }
+
+    #[test]
+    fn other_outcomes_keep_the_configured_length() {
+        let e = Outcome::Failed(FailureClass::Execution);
+        assert_eq!(cordon_ms_for(&completion(e, Some(150)), 42), 42);
+        assert_eq!(cordon_ms_for(&completion(Outcome::Done, Some(150)), 42), 42);
+    }
 }

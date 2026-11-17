@@ -91,6 +91,7 @@ fn finish_done<S: Store>(s: &S, id: &JobId, node_name: &str, wall: i64, mono: u6
         outcome: Outcome::Done,
         exit_code: Some(0),
         summary: None,
+        retry_after_secs: None,
     };
     s.complete(&comp, None, now(wall, mono + 3), 1, 1000)
         .unwrap();
@@ -112,6 +113,7 @@ fn finish_failed<S: Store>(s: &S, id: &JobId, node_name: &str, wall: i64, mono: 
         outcome: Outcome::Failed(FailureClass::Execution),
         exit_code: Some(1),
         summary: Some("boom".into()),
+        retry_after_secs: None,
     };
     s.complete(
         &comp,
@@ -549,6 +551,7 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
         outcome: Outcome::Failed(FailureClass::Provider),
         exit_code: None,
         summary: Some("nope".into()),
+        retry_after_secs: None,
     };
     let rec = s
         .complete(
@@ -585,6 +588,7 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
         outcome: Outcome::Failed(FailureClass::Execution),
         exit_code: Some(1),
         summary: None,
+        retry_after_secs: None,
     };
     let rec2 = s
         .complete(
@@ -612,6 +616,7 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
         outcome: Outcome::Done,
         exit_code: Some(0),
         summary: None,
+        retry_after_secs: None,
     };
     let rec3 = s.complete(&comp3, None, now(4, 4), 1, 1000).unwrap();
     assert_eq!(rec3.state, JobState::Done);
@@ -649,6 +654,7 @@ fn stale_epoch_rejected<S: Store>(s: &S) {
         outcome: Outcome::Done,
         exit_code: Some(0),
         summary: None,
+        retry_after_secs: None,
     };
     assert_eq!(
         s.complete(&comp, None, now(3, 3), 1, 1000).unwrap_err(),
