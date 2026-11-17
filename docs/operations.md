@@ -260,6 +260,39 @@ Logs are stored at `<artifacts_dir>/<job id>/run.log`; artifacts are `diff.patch
 - `lu logs <id>` prints the stored text. `lu logs --follow` is intended to stop at a terminal state, but the client currently ignores the controller's `X-Lu-State` header, so it may keep waiting. Use `lu show <id>` to check the state if follow does not stop.
 - `lu fetch <id> --out DIR` writes the fixed names into `DIR`, mode `0600`, and refuses to overwrite existing files unless `--force` is given. Missing artifacts are skipped; if none are available the command exits `1`.
 
+## Metrics
+
+`GET /metrics` serves Prometheus text (exposition `0.0.4`, `Content-Type: text/plain; version=0.0.4; charset=utf-8`). It needs an operator token, like every other operator route. It is safe to scrape from any host that holds the operator token; keep that host tight.
+
+Series:
+
+| Series | Type | Meaning |
+| --- | --- | --- |
+| `lu_jobs{state="…"}` | gauge | Jobs in each of the eight states (`queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`); all eight are zero-filled. |
+| `lu_nodes` | gauge | Registered nodes that have sent at least one heartbeat. |
+| `lu_nodes_online` | gauge | … and seen within two lease periods. |
+| `lu_nodes_drained` | gauge | … with the drain flag set. |
+| `lu_node_providers{node,provider,state}` | gauge | 1 per provider as reported by that node's latest heartbeat, `state` is `ok`, `cooling`, `disabled` or `unknown`. |
+| `lu_controller_up` | gauge | Always 1. |
+| `lu_jobs_completed_total{outcome="done\|failed\|cancelled"}` | counter | Jobs in a terminal state, by outcome, derived from the stored jobs table; survives a restart. |
+
+Example scrape config (operator token read from the file, never from the config itself):
+
+```yaml
+scrape_configs:
+  - job_name: lu
+    scheme: https
+    metrics_path: /metrics
+    authorization:
+      credentials_file: /etc/lu/operator.token
+    tls_config:
+      ca_file: /etc/lu/ca.pem                    # if the controller cert is internal
+    static_configs:
+      - targets: ["controller.internal:8443"]
+```
+
+If your Prometheus only supports inline `credentials`, put the token inline there and protect the config the same way you protect `lu.toml`. The operator token grants full operator scope, so treat the scrape config as a secret.
+
 ## Common failures
 
 | Symptom | Check |

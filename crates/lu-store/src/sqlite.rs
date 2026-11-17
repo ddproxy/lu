@@ -1,5 +1,6 @@
 //! SQLite-backed [`crate::Store`].
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use lu_proto::{
     MAX_LOG_BYTES,
 };
 
-use crate::{Assignment, JobRecord, NodeRecord, Now, Store, StoreError};
+use crate::{Assignment, JobCounts, JobRecord, NodeRecord, Now, Store, StoreError};
 
 const CURRENT_SCHEMA_VERSION: i64 = 2;
 
@@ -1368,6 +1369,78 @@ impl Store for SqliteStore {
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
+    }
+
+    fn job_counts(&self, now: Now, lease_ms: u64) -> Result<JobCounts, StoreError> {
+        let conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let mut stmt = conn
+            .prepare("SELECT state, COUNT(*) FROM jobs GROUP BY state")
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(internal)?;
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for r in rows {
+            let (s, c) = r.map_err(internal)?;
+            counts.insert(s, c.max(0) as u64);
+        }
+        let mut job_counts = JobCounts {
+            jobs: JobState::ALL
+                .into_iter()
+                .map(|s| (s, counts.get(state_str(s)).copied().unwrap_or(0)))
+                .collect(),
+            nodes: 0,
+            nodes_online: 0,
+            nodes_drained: 0,
+            completed_done: 0,
+            completed_failed: 0,
+            completed_cancelled: 0,
+        };
+        let nodes = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))
+            .map_err(internal)?;
+        job_counts.nodes = nodes.max(0) as u64;
+        let online = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE last_seen_mono_ms + (?1 * 2) >= ?2",
+                params![lease_ms as i64, now.mono_ms as i64],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(internal)?;
+        job_counts.nodes_online = online.max(0) as u64;
+        let drained = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE draining=1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map_err(internal)?;
+        job_counts.nodes_drained = drained.max(0) as u64;
+        // terminal outcome counters: done/failed/cancelled. A retried job that finished is counted
+        // per job state, not per attempt; a `failed` state means the final attempt failed, etc.
+        let done: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state=?1",
+                params![state_str(JobState::Done)],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(internal)?;
+        let failed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state=?1",
+                params![state_str(JobState::Failed)],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(internal)?;
+        let cancelled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state=?1",
+                params![state_str(JobState::Cancelled)],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(internal)?;
+        job_counts.completed_done = done.max(0) as u64;
+        job_counts.completed_failed = failed.max(0) as u64;
+        job_counts.completed_cancelled = cancelled.max(0) as u64;
+        Ok(job_counts)
     }
 }
 

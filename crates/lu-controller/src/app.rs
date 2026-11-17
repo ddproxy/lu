@@ -1,4 +1,4 @@
-use crate::routes::{agent, health, operator};
+use crate::routes::{agent, health, metrics, operator};
 use crate::state::AppState;
 use crate::time::{background_interval_secs, now};
 use axum::extract::DefaultBodyLimit;
@@ -69,7 +69,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/v1/nodes/{name}/undrain",
             post(operator::undrain_node).layer(op_json),
-        );
+        )
+        .route("/metrics", get(metrics::metrics));
 
     // agent routes with specific body limits
     let agent = Router::new()

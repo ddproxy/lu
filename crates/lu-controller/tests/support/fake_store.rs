@@ -1,7 +1,7 @@
 use lu_proto::{
     ArtifactName, Completion, FailureClass, Heartbeat, JobId, JobSpec, JobState, NodeName, Outcome,
 };
-use lu_store::{Assignment, JobRecord, NodeRecord, Now, Store, StoreError};
+use lu_store::{Assignment, JobCounts, JobRecord, NodeRecord, Now, Store, StoreError};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
@@ -676,5 +676,38 @@ impl Store for FakeStore {
             });
         }
         Ok(out)
+    }
+
+    fn job_counts(&self, now: Now, lease_ms: u64) -> Result<JobCounts, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut jobs: HashMap<JobState, u64> = HashMap::new();
+        for row in inner.jobs.values() {
+            *jobs.entry(row.rec.state).or_insert(0) += 1;
+        }
+        let mut nodes_online = 0u64;
+        let mut nodes_drained = 0u64;
+        for nr in inner.nodes.values() {
+            let online = nr.last_seen > 0
+                && (now.wall_unix - nr.last_seen)
+                    <= ((lease_ms.saturating_mul(2) / 1000) as i64).max(1);
+            if online {
+                nodes_online += 1;
+            }
+            if nr.draining {
+                nodes_drained += 1;
+            }
+        }
+        Ok(JobCounts {
+            jobs: JobState::ALL
+                .into_iter()
+                .map(|s| (s, jobs.get(&s).copied().unwrap_or(0)))
+                .collect(),
+            nodes: inner.nodes.len() as u64,
+            nodes_online,
+            nodes_drained,
+            completed_done: jobs.get(&JobState::Done).copied().unwrap_or(0),
+            completed_failed: jobs.get(&JobState::Failed).copied().unwrap_or(0),
+            completed_cancelled: jobs.get(&JobState::Cancelled).copied().unwrap_or(0),
+        })
     }
 }

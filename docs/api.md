@@ -18,6 +18,7 @@ Agents poll; there is no push channel in 0.1.0. Lease expiry is measured on the 
 | `GET /v1/nodes/{name}/stats` | The latest `NodeStats` the node reported in its heartbeat. `404` for an unknown node; a known node that has not reported stats is `{}`. In-memory only, so it is lost on controller restart. |
 | `POST /v1/nodes/{name}/drain` and `/undrain` | Stop or resume assigning new jobs to a node. |
 | `GET /v1/health` | `{"ok":true,"version":"…","db":"ok"}`, no auth. |
+| `GET /metrics` | Prometheus text (`text/plain; version=0.0.4`): `lu_jobs` by state, `lu_nodes`/`lu_nodes_online`/`lu_nodes_drained`, `lu_node_providers{node,provider,state}`, `lu_controller_up`, `lu_jobs_completed_total` by outcome. See docs/operations.md. |
 
 `JobView`: `id`, `state`, `spec`, `attempt` (1 based), `node` (or null), `epoch`, `created_at`, `updated_at`, `started_at`, `finished_at`, `failure_class` (or null), `summary`, `exit_code`, `artifacts` (names present), `cancel_requested`, `after` (dependency ids), `waiting_on` (the subset not yet `done`).
 

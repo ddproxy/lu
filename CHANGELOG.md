@@ -44,6 +44,7 @@ uses semantic versioning once it reaches 1.0.
 
 - `lu top` draws four sparklines over the last five minutes (running jobs, queued jobs, busy nodes, healthy providers) when the terminal is 24 rows or taller.
 - `lu top` shows a title for each job, taken from the first line of its task.
+- `GET /metrics` on the controller: Prometheus text exposition of job states, node counts, provider states, and completed-job outcomes.
 - `/etc/lu/operator.toml` is read after the per-user operator file, for a shared operator host.
 
 ## [0.1.6] - 2026-11-16

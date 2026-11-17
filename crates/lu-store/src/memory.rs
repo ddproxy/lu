@@ -8,7 +8,7 @@ use lu_proto::{
     MAX_LOG_BYTES,
 };
 
-use crate::{Assignment, JobRecord, NodeRecord, Now, Store, StoreError};
+use crate::{Assignment, JobCounts, JobRecord, NodeRecord, Now, Store, StoreError};
 
 #[derive(Debug, Clone)]
 struct JobEntry {
@@ -795,6 +795,45 @@ impl Store for MemoryStore {
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
+    }
+
+    fn job_counts(&self, now: Now, lease_ms: u64) -> Result<JobCounts, StoreError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| StoreError::Internal("mutex poisoned".into()))?;
+        let mut jobs: HashMap<JobState, u64> = HashMap::new();
+        for e in inner.jobs.values() {
+            *jobs.entry(e.rec.state).or_insert(0) += 1;
+        }
+        let mut nodes_online = 0u64;
+        let mut nodes_drained = 0u64;
+        let mut total = 0u64;
+        for e in inner.nodes.values() {
+            // match nodes(): only nodes that have sent a heartbeat exist
+            if e.heartbeat.is_none() {
+                continue;
+            }
+            total += 1;
+            if now.mono_ms.saturating_sub(e.last_seen_mono_ms) <= lease_ms.saturating_mul(2) {
+                nodes_online += 1;
+            }
+            if e.draining {
+                nodes_drained += 1;
+            }
+        }
+        Ok(JobCounts {
+            jobs: JobState::ALL
+                .into_iter()
+                .map(|s| (s, jobs.get(&s).copied().unwrap_or(0)))
+                .collect(),
+            nodes: total,
+            nodes_online,
+            nodes_drained,
+            completed_done: jobs.get(&JobState::Done).copied().unwrap_or(0),
+            completed_failed: jobs.get(&JobState::Failed).copied().unwrap_or(0),
+            completed_cancelled: jobs.get(&JobState::Cancelled).copied().unwrap_or(0),
+        })
     }
 }
 

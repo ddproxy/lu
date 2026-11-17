@@ -724,6 +724,177 @@ async fn dependency_views_and_validation() {
         err["message"].as_str().unwrap().contains("duplicate"),
         "{r}"
     );
+    let _ = srv.shutdown.send(());
+}
 
+#[tokio::test]
+async fn metrics_requires_operator_token() {
+    let srv = start_server().await;
+    // no token -> 401
+    let r = raw_request(
+        srv.addr,
+        "GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&r), 401, "{r}");
+    // agent token on operator route -> 401
+    let r = raw_request(
+        srv.addr,
+        &format!(
+            "GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 401, "{r}");
+    // valid operator -> 200
+    let r = raw_request(srv.addr, &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert!(header_value(&r, "content-type")
+        .unwrap_or("")
+        .starts_with("text/plain"));
+    assert!(body_str(&r).contains("lu_controller_up 1"), "{r}");
+    // empty system: zero-filled gauges
+    for st in [
+        "queued",
+        "leased",
+        "running",
+        "recovering",
+        "needs_input",
+        "done",
+        "failed",
+        "cancelled",
+    ] {
+        assert!(
+            body_str(&r).contains(&format!("lu_jobs{{state=\"{st}\"}} 0")),
+            "{r}"
+        );
+    }
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn metrics_series_after_job_lifecycle() {
+    let srv = start_server().await;
+    // submit a job
+    let spec = sample_spec(None);
+    let body = serde_json::to_string(&spec).unwrap();
+    let req = format!(
+        "POST /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let j: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = j["id"].as_str().unwrap().to_string();
+
+    // no agents polling: job stays queued
+    let r = raw_request(srv.addr, &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let b = body_str(&r);
+    assert!(b.contains("lu_jobs{state=\"queued\"} 1"), "{b}");
+    assert!(b.contains("lu_nodes 0"), "{b}");
+    assert!(b.contains("lu_nodes_online 0"), "{b}");
+    assert!(b.contains("lu_nodes_drained 0"), "{b}");
+    assert!(b.contains("lu_controller_up 1"), "{b}");
+    assert!(
+        b.contains("# HELP lu_jobs_completed_total Total number of jobs completed per outcome"),
+        "{b}"
+    );
+    assert!(b.contains("# TYPE lu_jobs_completed_total counter"), "{b}");
+    assert!(
+        b.contains("lu_jobs_completed_total{outcome=\"done\"} 0"),
+        "{b}"
+    );
+    assert!(
+        b.contains("lu_jobs_completed_total{outcome=\"failed\"} 0"),
+        "{b}"
+    );
+    assert!(
+        b.contains("lu_jobs_completed_total{outcome=\"cancelled\"} 0"),
+        "{b}"
+    );
+
+    // register a heartbeat with providers incl. escaping-provoked names later
+    let poll_body = serde_json::to_string(&serde_json::json!({"heartbeat": {"node": "node-a", "harness": "idle", "providers": [{"name": "prov-a", "state": "ok"}]}, "wait_secs": 0})).unwrap();
+    let r = raw_request(srv.addr, &format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    )).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let poll_resp = r.clone();
+
+    let r = raw_request(srv.addr, &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    let b = body_str(&r);
+    assert!(b.contains("lu_nodes 1"), "{b}");
+    assert!(b.contains("lu_nodes_online 1"), "{b}");
+    assert!(b.contains("lu_nodes_drained 0"), "{b}");
+    assert!(
+        b.contains("lu_node_providers{node=\"node-a\",provider=\"prov-a\",state=\"ok\"} 1"),
+        "{b}"
+    );
+
+    // assign + start + complete done -> counter updates, state moves to done
+    let events: serde_json::Value = serde_json::from_str(body_str(&poll_resp)).unwrap();
+    let arr = events.as_array().unwrap();
+    let assign = arr.iter().find(|e| e["kind"] == "assign").unwrap();
+    let epoch = assign["epoch"].as_u64().unwrap();
+    let start_body = format!("{{\"epoch\": {epoch}}}");
+    let r = raw_request(srv.addr, &format!("POST /v1/agent/jobs/{id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", start_body.len(), start_body)).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let comp = serde_json::to_string(
+        &serde_json::json!({"job_id": id, "epoch": epoch, "outcome": "done", "exit_code": 0}),
+    )
+    .unwrap();
+    let r = raw_request(srv.addr, &format!("POST /v1/agent/jobs/{id}/complete HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", comp.len(), comp)).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    let b = body_str(&r);
+    assert!(b.contains("lu_jobs{state=\"queued\"} 0"), "{b}");
+    assert!(b.contains("lu_jobs{state=\"done\"} 1"), "{b}");
+    assert!(
+        b.contains("lu_jobs_completed_total{outcome=\"done\"} 1"),
+        "{b}"
+    );
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn metrics_text_format_parses() {
+    let srv = start_server().await;
+    let poll_body = serde_json::to_string(&serde_json::json!({"heartbeat": {"node": "node-a", "harness": "idle", "providers": []}, "wait_secs": 0})).unwrap();
+    let r = raw_request(srv.addr, &format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    )).await;
+    assert!(status(&r) == 200 || status(&r) == 204, "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let b = body_str(&r);
+
+    // body must be valid Prometheus text format: each line either a comment or `metric{...} value`
+    // or `metric value` (no labels).
+    for line in b.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let (metric_part, value_part) = match line.split_once(' ') {
+            Some((m, v)) => (m, v.trim()),
+            None => panic!("malformed line (no value): {line:?}"),
+        };
+        if metric_part.contains('{') {
+            assert!(
+                metric_part.ends_with('}'),
+                "metric line has unbalanced braces: {line:?}"
+            );
+        }
+        assert!(
+            value_part.parse::<i64>().map(|v| v >= 0).unwrap_or(false),
+            "non-numeric value in: {line:?}"
+        );
+    }
     let _ = srv.shutdown.send(());
 }

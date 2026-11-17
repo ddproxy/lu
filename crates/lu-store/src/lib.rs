@@ -43,6 +43,17 @@ pub struct JobRecord {
     pub waiting_on: Vec<JobId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobCounts {
+    pub jobs: Vec<(JobState, u64)>,
+    pub nodes: u64,
+    pub nodes_online: u64,
+    pub nodes_drained: u64,
+    pub completed_done: u64,
+    pub completed_failed: u64,
+    pub completed_cancelled: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeRecord {
     pub name: NodeName,
@@ -151,4 +162,8 @@ pub trait Store: Send + Sync + 'static {
 
     fn set_draining(&self, node: &NodeName, draining: bool) -> Result<(), StoreError>;
     fn nodes(&self, now: Now, lease_ms: u64) -> Result<Vec<NodeRecord>, StoreError>;
+
+    /// Returns counts of jobs per state, including zero for absent states.
+    /// Also returns total nodes, online nodes, drained nodes, and completed job counters.
+    fn job_counts(&self, now: Now, lease_ms: u64) -> Result<JobCounts, StoreError>;
 }

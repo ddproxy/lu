@@ -1,5 +1,6 @@
 //! Shared conformance tests for [`crate::Store`] implementations.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use lu_proto::{
@@ -70,6 +71,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     cancelled_dependency_cascades_two_levels(&make());
     diamond_dependency(&make());
     unknown_and_invalid_dependencies_are_rejected(&make());
+    job_counts(&make());
 }
 
 fn with_after(mut sp: JobSpec, after: &[JobId]) -> JobSpec {
@@ -788,4 +790,99 @@ fn a_recovering_job_resumes_or_finishes_for_its_holder<S: Store>(s: &S) {
         s.renew_lease(&a.job_id, a.epoch + 1, now(6, 6), 1000),
         Err(StoreError::StaleEpoch)
     );
+}
+
+fn job_counts<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(
+        &hb(
+            "node-a",
+            HarnessState::Idle,
+            vec![("p1", ProviderState::Ok)],
+        ),
+        now(10, 1000),
+    )
+    .unwrap();
+    s.set_draining(&n, true).unwrap();
+    // no jobs yet
+    let c = s.job_counts(now(20, 1500), 1000).unwrap();
+    assert_eq!(c.nodes, 1);
+    assert_eq!(c.nodes_online, 1);
+    assert_eq!(c.nodes_drained, 1);
+    // job counts zero for all states
+    for (st, cnt) in &c.jobs {
+        assert_eq!(*cnt, 0, "{st:?} should be zero");
+    }
+    assert_eq!(c.completed_done, 0);
+    assert_eq!(c.completed_failed, 0);
+    assert_eq!(c.completed_cancelled, 0);
+
+    // create some jobs
+    let (j1, _) = s
+        .create_job(&spec("https://x/1.git", None), now(1, 1))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let (j2, _) = s
+        .create_job(&spec("https://x/2.git", None), now(2, 2))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let (j3, _) = s
+        .create_job(&spec("https://x/3.git", None), now(3, 3))
+        .unwrap();
+    // undrain for assignment tests
+    s.set_draining(&n, false).unwrap();
+
+    let a1 = s.next_assignment(&n, now(4, 4), 60_000).unwrap().unwrap();
+    assert_eq!(a1.job_id, j1.id);
+    s.start_job(&j1.id, a1.epoch, now(5, 5)).unwrap();
+    // complete j1 done first so the node is free for the next assignment
+    let comp1 = Completion {
+        job_id: j1.id.clone(),
+        epoch: a1.epoch,
+        outcome: Outcome::Done,
+        exit_code: Some(0),
+        summary: None,
+        retry_after_secs: None,
+    };
+    s.complete(&comp1, None, now(7, 7), 1, 1000).unwrap();
+
+    let a2 = s.next_assignment(&n, now(8, 8), 60_000).unwrap().unwrap();
+    assert_eq!(a2.job_id, j2.id);
+    s.start_job(&j2.id, a2.epoch, now(9, 9)).unwrap();
+    // complete j2 failed
+    let comp2 = Completion {
+        job_id: j2.id.clone(),
+        epoch: a2.epoch,
+        outcome: Outcome::Failed(FailureClass::Execution),
+        exit_code: Some(1),
+        summary: None,
+        retry_after_secs: None,
+    };
+    s.complete(
+        &comp2,
+        Some((FailureClass::Execution, None)),
+        now(10, 10),
+        1,
+        1000,
+    )
+    .unwrap();
+    // cancel j3 queued
+    s.cancel_job(&j3.id, now(11, 11)).unwrap();
+
+    let c = s.job_counts(now(20, 1500), 1000).unwrap();
+    // j1 done, j2 failed, j3 cancelled
+    assert_eq!(c.completed_done, 1);
+    assert_eq!(c.completed_failed, 1);
+    assert_eq!(c.completed_cancelled, 1);
+    // states
+    let states: HashMap<_, _> = c.jobs.into_iter().collect();
+    assert_eq!(states[&JobState::Done], 1);
+    assert_eq!(states[&JobState::Failed], 1);
+    assert_eq!(states[&JobState::Cancelled], 1);
+    // no queued/leased/running/recovering/needs_input
+    assert_eq!(states[&JobState::Queued], 0);
+    assert_eq!(states[&JobState::Leased], 0);
+    assert_eq!(states[&JobState::Running], 0);
+    assert_eq!(states[&JobState::Recovering], 0);
+    assert_eq!(states[&JobState::NeedsInput], 0);
 }
