@@ -246,6 +246,7 @@ fn make_agent(
         work_dir: work_dir.to_path_buf(),
         heartbeat_secs: TEST_HEARTBEAT_SECS,
         provider_marker_grace: super::PROVIDER_MARKER_GRACE,
+        reiki_watch_period: super::REIKI_WATCH_PERIOD,
         opencode_server: None,
         workspace_gid: None,
         opencode_password: None,
@@ -1175,6 +1176,93 @@ async fn job_that_recovers_after_a_marker_is_not_killed_when_it_goes_quiet() {
         job_finished(f.work_dir.join(job_id.as_str())),
     )
     .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Done);
+}
+
+#[tokio::test]
+async fn job_whose_provider_goes_unusable_in_reiki_fails_as_provider() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.provider = Some("zen".to_owned());
+    let controller = assigned_controller(&job_id, spec);
+    let mut agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo started; sleep 30"),
+    );
+    agent.reiki_watch_period = Duration::from_millis(100);
+    let health = agent.clone_health_for_tests();
+    let publisher = tokio::spawn(async move {
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let mut guard = health.lock().unwrap();
+            guard.seq += 1;
+            guard.providers = vec![lu_proto::ProviderStatus {
+                name: "zen".to_owned(),
+                state: lu_proto::ProviderState::Cooling,
+                soonest_secs: Some(90),
+            }];
+        }
+    });
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+    publisher.abort();
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Provider));
+    let summary = done[0].summary.clone().unwrap_or_default();
+    assert!(
+        summary.contains("zen") && summary.contains("90s"),
+        "{summary}"
+    );
+}
+
+#[tokio::test]
+async fn job_survives_a_provider_that_recovers_between_readings() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.provider = Some("zen".to_owned());
+    let controller = assigned_controller(&job_id, spec);
+    let mut agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo started; sleep 1.4; exit 0"),
+    );
+    agent.reiki_watch_period = Duration::from_millis(40);
+    let health = agent.clone_health_for_tests();
+    let publisher = tokio::spawn(async move {
+        for i in 0..12 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut guard = health.lock().unwrap();
+            guard.seq += 1;
+            guard.providers = vec![lu_proto::ProviderStatus {
+                name: "zen".to_owned(),
+                state: if i % 2 == 0 {
+                    lu_proto::ProviderState::Cooling
+                } else {
+                    lu_proto::ProviderState::Ok
+                },
+                soonest_secs: None,
+            }];
+        }
+    });
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+    publisher.abort();
 
     let done = completions(&calls);
     assert_eq!(done.len(), 1, "{done:?}");

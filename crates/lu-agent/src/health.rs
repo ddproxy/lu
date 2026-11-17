@@ -23,6 +23,8 @@ const STALE_AFTER_FAILURES: u32 = 3;
 pub struct Health {
     pub providers: Vec<ProviderStatus>,
     pub reiki: Option<Value>,
+    /// Counts successful reads, so a watcher can tell a new reading from a repeated one.
+    pub seq: u64,
 }
 
 /// The latest answer, shared between the refresher and the heartbeats.
@@ -56,6 +58,7 @@ pub fn parse(doc: &Value) -> Health {
     Health {
         providers,
         reiki: forwarded.then(|| doc.clone()),
+        seq: 0,
     }
 }
 
@@ -127,13 +130,20 @@ pub fn spawn_refresher(url: String, token: Arc<str>, shared: Shared) -> JoinHand
             match fetch(&client, &url, &token).await {
                 Some(doc) => {
                     failures = 0;
-                    *shared.lock().unwrap_or_else(PoisonError::into_inner) = parse(&doc);
+                    let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    let seq = guard.seq.wrapping_add(1);
+                    *guard = Health { seq, ..parse(&doc) };
                 }
                 None => {
                     failures = failures.saturating_add(1);
                     debug!(failures, "could not read the local Reiki health");
                     if failures == STALE_AFTER_FAILURES {
-                        *shared.lock().unwrap_or_else(PoisonError::into_inner) = Health::default();
+                        let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                        let seq = guard.seq;
+                        *guard = Health {
+                            seq,
+                            ..Health::default()
+                        };
                     }
                 }
             }

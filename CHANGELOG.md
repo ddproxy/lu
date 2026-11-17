@@ -12,6 +12,7 @@ uses semantic versioning once it reaches 1.0.
 
 ### Fixed
 
+- A job that names a provider fails as a provider failure, and moves to another node, as soon as the node's Reiki reports no usable key for that provider on two readings in a row. The signal comes from Reiki, not from harness output.
 - A harness that prints a provider-unavailable marker and then goes silent is stopped after 120
   seconds and completes as a `provider` failure, so the controller cordons that provider and
   retries the job elsewhere instead of waiting for the wall-clock timeout.

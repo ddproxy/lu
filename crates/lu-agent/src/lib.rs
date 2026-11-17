@@ -18,7 +18,7 @@ use lu_client::{ApiError, Controller};
 use lu_config::AgentConfig;
 use lu_proto::{
     printable, truncate_chars, AgentEvent, ArtifactName, Completion, FailureClass, HarnessState,
-    Heartbeat, JobId, JobSpec, NodeName, Outcome, MAX_DIFF_BYTES, MAX_SUMMARY_BYTES,
+    Heartbeat, JobId, JobSpec, NodeName, Outcome, ProviderState, MAX_DIFF_BYTES, MAX_SUMMARY_BYTES,
 };
 use lu_staging::{Source, StageRequest, StagedDir, Staging};
 use lu_supervise::{CommandSpec, Limits, Outcome as SuperviseOutcome, Supervisor};
@@ -44,6 +44,11 @@ const STOP_GRACE: Duration = Duration::from_secs(2);
 /// How long a provider-unavailable marker may stand without further output before the harness
 /// is stopped and the job is failed as a provider failure.
 pub const PROVIDER_MARKER_GRACE: Duration = Duration::from_secs(120);
+
+/// How often a running job's provider is checked against the node's Reiki reading.
+const REIKI_WATCH_PERIOD: Duration = Duration::from_secs(5);
+/// Fresh readings in a row that must show the provider unusable before the job is stopped.
+const REIKI_UNAVAILABLE_READS: u32 = 2;
 
 /// Output quoted on a completion summary. Kept small and independent of the log cap.
 const SUMMARY_TAIL_BYTES: usize = 16 * 1024;
@@ -126,6 +131,7 @@ pub struct Agent {
     heartbeat_secs: u64,
     /// How long the harness may stay silent after a provider marker before it is stopped.
     provider_marker_grace: Duration,
+    reiki_watch_period: Duration,
     opencode_server: Option<String>,
     /// The group that may write each job's working tree, resolved once at start.
     workspace_gid: Option<u32>,
@@ -201,6 +207,7 @@ impl Agent {
             work_dir,
             heartbeat_secs: config.heartbeat_secs,
             provider_marker_grace: PROVIDER_MARKER_GRACE,
+            reiki_watch_period: REIKI_WATCH_PERIOD,
             opencode_server: config.opencode_server,
             workspace_gid,
             opencode_password,
@@ -213,6 +220,12 @@ impl Agent {
                     .map_err(|error| error.to_string())
             }),
         })
+    }
+
+    /// The shared Reiki reading, for tests that stand in for the refresher.
+    #[doc(hidden)]
+    pub fn clone_health_for_tests(&self) -> health::Shared {
+        Arc::clone(&self.health)
     }
 
     /// The node name this agent presents. Useful for logging and tests.
@@ -525,6 +538,14 @@ impl Agent {
         let mut end = JobEnd::Finished;
         let mut marker_line: Option<String> = None;
         let mut marker_deadline: Option<Instant> = None;
+        // Reiki says the job's provider has no usable key: the signal is Reiki's, not scraped
+        // from harness output, so it works for any harness.
+        let mut watch = tokio::time::interval(self.reiki_watch_period);
+        watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        watch.tick().await;
+        let mut seen_seq = health::snapshot(&self.health).seq;
+        let mut unavailable_reads = 0u32;
+        let mut reiki_reason: Option<String> = None;
 
         loop {
             tokio::select! {
@@ -602,6 +623,32 @@ impl Agent {
                         None => break,
                     }
                 }
+                _ = watch.tick(), if spec.provider.is_some() => {
+                    let current = health::snapshot(&self.health);
+                    if current.seq != seen_seq {
+                        seen_seq = current.seq;
+                        let wanted = spec.provider.as_deref().unwrap_or_default();
+                        let status = current.providers.iter().find(|p| p.name == wanted);
+                        match status {
+                            Some(p) if matches!(p.state, ProviderState::Cooling | ProviderState::Disabled) => {
+                                unavailable_reads += 1;
+                                if unavailable_reads >= REIKI_UNAVAILABLE_READS {
+                                    reiki_reason = Some(match p.soonest_secs {
+                                        Some(secs) => format!(
+                                            "Reiki reports provider {wanted} has no usable key; the soonest returns in {secs}s"
+                                        ),
+                                        None => format!("Reiki reports provider {wanted} has no usable key"),
+                                    });
+                                    info!(job = %job_id, provider = %wanted, "Reiki reports no usable key; stopping");
+                                    running.stop();
+                                    end = JobEnd::Provider;
+                                    break;
+                                }
+                            }
+                            _ => unavailable_reads = 0,
+                        }
+                    }
+                }
                 () = marker_deadline_wait(marker_deadline), if marker_deadline.is_some() => {
                     let line = marker_line.as_deref().unwrap_or("provider unavailable");
                     info!(job = %job_id, marker = %line, "harness silent after a provider marker");
@@ -667,8 +714,13 @@ impl Agent {
         }
 
         if end == JobEnd::Provider {
-            let line = marker_line.as_deref().unwrap_or("provider unavailable");
-            let summary = format!("harness went silent after a provider failure marker: {line}");
+            let summary = match &reiki_reason {
+                Some(reason) => reason.clone(),
+                None => {
+                    let line = marker_line.as_deref().unwrap_or("provider unavailable");
+                    format!("harness went silent after a provider failure marker: {line}")
+                }
+            };
             self.finish(&Finish {
                 job_id: &job_id,
                 epoch,
