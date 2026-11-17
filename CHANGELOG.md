@@ -5,8 +5,12 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-17
+
 ### Added
 
+- `lu top` draws four sparklines over the last five minutes (running jobs, queued jobs, busy nodes, healthy providers) when the terminal is 24 rows or taller.
+- `lu top` shows a title for each job, taken from the first line of its task.
 - `/etc/lu/operator.toml` is read after the per-user operator file, for a shared operator host.
 
 ## [0.1.6] - 2026-11-16
