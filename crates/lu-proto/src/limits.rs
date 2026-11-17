@@ -30,6 +30,10 @@ pub const MAX_PROVIDERS: usize = 64;
 /// The forwarded Reiki health document, serialized.
 pub const MAX_REIKI_BYTES: usize = 64 * 1024;
 
+/// Host and job stats in one heartbeat, serialized. Processes are dropped before jobs when
+/// the combined document would exceed this.
+pub const MAX_STATS_BYTES: usize = 16 * 1024;
+
 /// One log chunk body.
 pub const MAX_LOG_CHUNK_BYTES: usize = 64 * 1024;
 

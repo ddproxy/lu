@@ -56,11 +56,15 @@ pub fn job_view(r: &JobRecord) -> serde_json::Value {
     })
 }
 
-fn node_view(n: &NodeRecord) -> serde_json::Value {
+fn node_view(n: &NodeRecord, stats: Option<&lu_proto::NodeStats>) -> serde_json::Value {
     let harness = match n.heartbeat.harness {
         lu_proto::HarnessState::Idle => "idle",
         lu_proto::HarnessState::Busy => "busy",
     };
+    let host = stats.and_then(|stats| stats.host.as_ref());
+    let stuck = stats
+        .map(|stats| stats.jobs.iter().filter(|job| job.stuck).count())
+        .unwrap_or(0);
     json!({
         "name": n.name.to_string(),
         "last_seen": n.last_seen,
@@ -71,6 +75,10 @@ fn node_view(n: &NodeRecord) -> serde_json::Value {
         "current_job": n.current_job.as_ref().map(|j| j.to_string()),
         "cordons": &n.cordons,
         "reiki": n.heartbeat.reiki,
+        "load1": host.map(|host| host.load1),
+        "mem_available_kb": host.map(|host| host.mem_available_kb),
+        "mem_total_kb": host.map(|host| host.mem_total_kb),
+        "stuck": stuck,
     })
 }
 
@@ -372,12 +380,62 @@ pub async fn list_nodes(
     })
     .await;
     match res {
-        Ok(Ok(nodes)) => with_version(json_ok(
-            StatusCode::OK,
-            &nodes.iter().map(node_view).collect::<Vec<_>>(),
-        )),
+        Ok(Ok(nodes)) => {
+            let stats = state
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            with_version(json_ok(
+                StatusCode::OK,
+                &nodes
+                    .iter()
+                    .map(|n| node_view(n, stats.get(&n.name)))
+                    .collect::<Vec<_>>(),
+            ))
+        }
         Ok(Err(e)) => with_version(store_err(e).into_response()),
         Err(_) => with_version(ApiError::internal().into_response()),
+    }
+}
+
+pub async fn get_node_stats(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
+        return with_version(ApiError::unauthorized().into_response());
+    }
+    let node = match NodeName::parse(&name) {
+        Ok(n) => n,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let n = now();
+    let res = tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        let lease_ms = state.lease_ms;
+        move || store.nodes(n, lease_ms)
+    })
+    .await;
+    let nodes = match res {
+        Ok(Ok(nodes)) => nodes,
+        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    };
+    if !nodes.iter().any(|record| record.name == node) {
+        return with_version(ApiError::not_found("not found").into_response());
+    }
+    let stats = state
+        .stats
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&node)
+        .cloned();
+    match stats {
+        Some(stats) => with_version(json_ok(StatusCode::OK, &stats)),
+        None => with_version(json_value_ok(StatusCode::OK, json!({}))),
     }
 }
 

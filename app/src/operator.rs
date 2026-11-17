@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use lu_client::{ApiError, Client, JobView, LogPage, NodeView};
+use lu_client::{ApiError, Client, JobView, LogPage, NodeStats, NodeView};
 use lu_proto::{
     printable, truncate_chars, ArtifactName, FailureClass, HarnessState, JobId, JobSpec, JobState,
     NodeName, MAX_TASK_BYTES,
@@ -142,6 +142,10 @@ pub async fn cancel(args: CancelArgs, config: &Path, json: bool) -> ExitCode {
 
 pub async fn nodes(args: NodesArgs, config: &Path, json: bool) -> ExitCode {
     finish(nodes_inner(args, config, json).await)
+}
+
+pub async fn node(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
+    finish(node_inner(args, config, json).await)
 }
 
 pub async fn drain(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
@@ -399,6 +403,24 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
     Ok(ExitCode::SUCCESS)
 }
 
+async fn node_inner(args: NodeArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    if json {
+        let raw = client
+            .node_stats_raw(&args.node)
+            .await
+            .map_err(|error| error.to_string())?;
+        print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let stats = client
+        .node_stats(&args.node)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_node_stats(&args.node, &stats);
+    Ok(ExitCode::SUCCESS)
+}
+
 async fn drain_inner(
     args: NodeArgs,
     config: &Path,
@@ -622,6 +644,65 @@ fn print_node(node: &NodeView) {
     print_pairs(&rows);
 }
 
+fn print_node_stats(node: &NodeName, stats: &NodeStats) {
+    println!("node  {node}");
+    match &stats.host {
+        Some(host) => print_pairs(&[
+            ("load1", format!("{:.2}", host.load1)),
+            ("load5", format!("{:.2}", host.load5)),
+            ("load15", format!("{:.2}", host.load15)),
+            ("mem_total_kb", host.mem_total_kb.to_string()),
+            ("mem_available_kb", host.mem_available_kb.to_string()),
+            ("swap_used_kb", host.swap_used_kb.to_string()),
+            (
+                "disk_free_bytes",
+                host.disk_free_bytes
+                    .map(|bytes| bytes.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+            ),
+            ("uptime_secs", host.uptime_secs.to_string()),
+        ]),
+        None => println!("host  -"),
+    }
+    if stats.jobs.is_empty() {
+        println!("jobs  -");
+        return;
+    }
+    for job in &stats.jobs {
+        println!();
+        println!(
+            "job {}  pgid {}  output_idle {}s  cpu_idle {}s  stuck {}",
+            job.job_id,
+            job.pgid,
+            job.output_idle_secs,
+            job.cpu_idle_secs,
+            if job.stuck { "yes" } else { "no" }
+        );
+        let rows = job
+            .processes
+            .iter()
+            .map(|process| {
+                vec![
+                    process.pid.to_string(),
+                    process.ppid.to_string(),
+                    display_field(&process.state),
+                    process.cpu_secs.to_string(),
+                    process.rss_kb.to_string(),
+                    process.age_secs.to_string(),
+                    process.open_files.to_string(),
+                    display_field(&process.cmdline),
+                ]
+            })
+            .collect();
+        print_indented_table(
+            &[
+                "PID", "PPID", "STATE", "CPU_S", "RSS_KB", "AGE_S", "FILES", "COMMAND",
+            ],
+            rows,
+        );
+    }
+}
+
 fn print_pairs(rows: &[(&str, String)]) {
     let width = rows.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
     for (key, value) in rows {
@@ -646,6 +727,26 @@ fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
 }
 
 fn print_row(cells: &[&str], widths: &[usize]) {
+    println!("{}", row_line(cells, widths));
+}
+
+fn print_indented_table(headers: &[&str], rows: Vec<Vec<String>>) {
+    let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
+    for row in &rows {
+        for (index, cell) in row.iter().enumerate() {
+            if let Some(width) = widths.get_mut(index) {
+                *width = (*width).max(cell.chars().count());
+            }
+        }
+    }
+    println!("  {}", row_line(headers, &widths));
+    for row in &rows {
+        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        println!("  {}", row_line(&cells, &widths));
+    }
+}
+
+fn row_line(cells: &[&str], widths: &[usize]) -> String {
     let mut line = String::new();
     for (index, cell) in cells.iter().enumerate() {
         if index > 0 {
@@ -658,7 +759,7 @@ fn print_row(cells: &[&str], widths: &[usize]) {
             line.push_str(&format!("{cell:<width$}"));
         }
     }
-    println!("{line}");
+    line
 }
 
 fn print_log(data: &str) {

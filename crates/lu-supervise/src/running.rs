@@ -142,6 +142,12 @@ impl Running {
         }
     }
 
+    /// The process group id the harness runs in, or `None` when it never started.
+    pub fn process_group(&self) -> Option<u32> {
+        self.pgid
+            .and_then(|pgid| u32::try_from(pgid.as_raw_pid()).ok())
+    }
+
     /// Asks the supervisor to end the process group: terminate signal, grace
     /// period, then forced-stop signal.
     pub fn stop(&self) {

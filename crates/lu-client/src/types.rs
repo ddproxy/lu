@@ -9,6 +9,8 @@ use lu_proto::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use lu_proto::{HostStats, JobStats, NodeStats, ProcessStats};
+
 /// Largest JSON response the client will read. Artifacts have their own per-file cap.
 pub const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -74,7 +76,7 @@ pub struct ListJobs {
 }
 
 /// One node's heartbeat and cordon state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeView {
     #[serde(alias = "node")]
     pub name: NodeName,
@@ -86,6 +88,14 @@ pub struct NodeView {
     pub last_seen: u64,
     #[serde(default, alias = "drained", alias = "draining")]
     pub cordoned: bool,
+    #[serde(default)]
+    pub load1: Option<f64>,
+    #[serde(default)]
+    pub mem_available_kb: Option<u64>,
+    #[serde(default)]
+    pub mem_total_kb: Option<u64>,
+    #[serde(default)]
+    pub stuck: u64,
 }
 
 impl NodeView {
@@ -97,12 +107,16 @@ impl NodeView {
             providers: Vec::new(),
             last_seen: 0,
             cordoned,
+            load1: None,
+            mem_available_kb: None,
+            mem_total_kb: None,
+            stuck: 0,
         }
     }
 }
 
 /// The node list.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ListNodes {
     #[serde(default)]
     pub nodes: Vec<NodeView>,
@@ -110,7 +124,7 @@ pub struct ListNodes {
 
 /// What an agent sends when it asks for work. The token already identifies the node, so `node`
 /// is optional; it is included when an agent wants the controller to verify it explicitly.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PollRequest {
     #[serde(alias = "name", skip_serializing_if = "Option::is_none")]
@@ -121,6 +135,10 @@ pub struct PollRequest {
     pub providers: Vec<ProviderStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reiki: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostStats>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<JobStats>,
     #[serde(alias = "wait", skip_serializing_if = "Option::is_none")]
     pub wait_secs: Option<u64>,
 }
@@ -132,6 +150,8 @@ impl From<Heartbeat> for PollRequest {
             harness: Some(beat.harness),
             providers: beat.providers,
             reiki: beat.reiki,
+            host: beat.host,
+            jobs: beat.jobs,
             wait_secs: None,
         }
     }

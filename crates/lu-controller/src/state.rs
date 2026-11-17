@@ -2,10 +2,12 @@ use crate::auth::AuthConfig;
 use crate::wait::Waiters;
 use lu_auth::{LoginThrottle, ThrottleSettings};
 use lu_config::ControllerConfig;
+use lu_proto::{NodeName, NodeStats};
 use lu_staging::ArtifactDir;
 use lu_store::Store;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub struct AppState {
@@ -13,6 +15,8 @@ pub struct AppState {
     pub auth: AuthConfig,
     pub throttle: LoginThrottle,
     pub waiters: Arc<Waiters>,
+    /// The latest host and job stats from each node's heartbeat. Deliberately in memory only.
+    pub stats: Mutex<HashMap<NodeName, NodeStats>>,
     pub artifacts_dir: PathBuf,
     pub lease_secs: u64,
     pub recovery_grace_secs: u64,
@@ -50,6 +54,7 @@ impl AppState {
             auth,
             throttle,
             waiters: Arc::new(Waiters::new()),
+            stats: Mutex::new(HashMap::new()),
             artifacts_dir: PathBuf::from(&cfg.artifacts_dir),
             lease_secs,
             recovery_grace_secs: cfg.recovery_grace_secs,

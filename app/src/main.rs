@@ -50,6 +50,8 @@ enum Command {
     Cancel(operator::CancelArgs),
     /// List nodes.
     Nodes(operator::NodesArgs),
+    /// Show the host and job stats a node last reported.
+    Node(operator::NodeArgs),
     /// Stop assigning new jobs to a node.
     Drain(operator::NodeArgs),
     /// Allow a drained node to take jobs again.
@@ -79,6 +81,7 @@ async fn main() -> ExitCode {
         Command::Fetch(args) => operator::fetch(args, &cli.config, json).await,
         Command::Cancel(args) => operator::cancel(args, &cli.config, json).await,
         Command::Nodes(args) => operator::nodes(args, &cli.config, json).await,
+        Command::Node(args) => operator::node(args, &cli.config, json).await,
         Command::Drain(args) => operator::drain(args, &cli.config, json).await,
         Command::Undrain(args) => operator::undrain(args, &cli.config, json).await,
     }

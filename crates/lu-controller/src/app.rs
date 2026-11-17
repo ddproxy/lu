@@ -61,6 +61,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(operator::get_artifact),
         )
         .route("/v1/nodes", get(operator::list_nodes))
+        .route("/v1/nodes/{name}/stats", get(operator::get_node_stats))
         .route(
             "/v1/nodes/{name}/drain",
             post(operator::drain_node).layer(op_json),

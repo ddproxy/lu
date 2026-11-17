@@ -7,18 +7,20 @@
 
 mod health;
 mod logs;
+mod proc;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lu_client::{ApiError, Controller};
 use lu_config::AgentConfig;
 use lu_proto::{
     printable, truncate_chars, AgentEvent, ArtifactName, Completion, FailureClass, HarnessState,
-    Heartbeat, JobId, JobSpec, NodeName, Outcome, ProviderState, MAX_DIFF_BYTES, MAX_SUMMARY_BYTES,
+    Heartbeat, JobId, JobSpec, JobStats, NodeName, Outcome, ProviderState, MAX_DIFF_BYTES,
+    MAX_SUMMARY_BYTES,
 };
 use lu_staging::{Source, StageRequest, StagedDir, Staging};
 use lu_supervise::{CommandSpec, Limits, Outcome as SuperviseOutcome, Supervisor};
@@ -341,12 +343,15 @@ impl Agent {
 
     fn poll_request(&self, harness: HarnessState, wait_secs: u64) -> lu_client::PollRequest {
         let current = health::snapshot(&self.health);
-        let beat = Heartbeat {
+        let mut beat = Heartbeat {
             node: self.node.clone(),
             harness,
             providers: current.providers,
             reiki: current.reiki,
+            host: proc::host_stats(),
+            jobs: Vec::new(),
         };
+        beat.trim_stats();
         let mut request = lu_client::PollRequest::from(beat);
         request.wait_secs = Some(wait_secs);
         request
@@ -514,6 +519,17 @@ impl Agent {
             },
         );
         let mut output = running.output();
+        let observation = if proc::enabled() {
+            running.process_group().map(|pgid| {
+                Arc::new(Mutex::new(proc::JobObservation::new(
+                    job_id.clone(),
+                    pgid,
+                    Instant::now(),
+                )))
+            })
+        } else {
+            None
+        };
 
         let (log_tx, log_rx) = mpsc::channel::<Vec<u8>>(64);
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -529,13 +545,16 @@ impl Agent {
 
         let (control_tx, mut control_rx) = mpsc::channel::<Control>(4);
         let control = tokio::spawn(control_loop(
-            Arc::clone(&self.controller),
-            self.node.clone(),
-            job_id.clone(),
-            epoch,
-            self.heartbeat_secs,
+            ControlTask {
+                controller: Arc::clone(&self.controller),
+                node: self.node.clone(),
+                job_id: job_id.clone(),
+                epoch,
+                heartbeat_secs: self.heartbeat_secs,
+                shared_health: Arc::clone(&self.health),
+                observation: observation.clone(),
+            },
             control_tx,
-            Arc::clone(&self.health),
         ));
 
         let mut tail = Tail::new(SUMMARY_TAIL_BYTES);
@@ -607,6 +626,12 @@ impl Agent {
                 chunk = output.recv() => {
                     match chunk {
                         Some(chunk) => {
+                            if let Some(observation) = &observation {
+                                observation
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .record_output(Instant::now());
+                            }
                             tail.push(&chunk.bytes);
                             // Armed only while the newest output line is the marker: any other
                             // output means the harness recovered.
@@ -932,15 +957,26 @@ impl Drop for Cleanup<'_> {
     }
 }
 
-async fn control_loop(
+struct ControlTask {
     controller: Arc<dyn Controller>,
     node: NodeName,
     job_id: JobId,
     epoch: u64,
     heartbeat_secs: u64,
-    tx: mpsc::Sender<Control>,
     shared_health: health::Shared,
-) {
+    observation: Option<Arc<Mutex<proc::JobObservation>>>,
+}
+
+async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
+    let ControlTask {
+        controller,
+        node,
+        job_id,
+        epoch,
+        heartbeat_secs,
+        shared_health,
+        observation,
+    } = task;
     let mut renew = tokio::time::interval(RENEW_PERIOD);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     renew.tick().await;
@@ -984,12 +1020,30 @@ async fn control_loop(
             }
             _ = heartbeat.tick() => {
                 let current = health::snapshot(&shared_health);
-                let beat = Heartbeat {
+                let host = proc::host_stats();
+                let jobs: Vec<JobStats> = observation
+                    .as_ref()
+                    .map(|observation| {
+                        let mut observation = observation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        vec![observation.sample(
+                            Path::new("/proc"),
+                            host.as_ref().map(|host| host.uptime_secs).unwrap_or(0),
+                            true,
+                            Instant::now(),
+                        )]
+                    })
+                    .unwrap_or_default();
+                let mut beat = Heartbeat {
                     node: node.clone(),
                     harness: HarnessState::Busy,
                     providers: current.providers,
                     reiki: current.reiki,
+                    host,
+                    jobs,
                 };
+                beat.trim_stats();
                 let mut request = lu_client::PollRequest::from(beat);
                 request.wait_secs = Some(0);
                 match controller.poll(&request).await {

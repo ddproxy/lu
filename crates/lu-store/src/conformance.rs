@@ -45,6 +45,8 @@ pub fn hb(name: &str, harness: HarnessState, providers: Vec<(&str, ProviderState
             })
             .collect(),
         reiki: None,
+        host: None,
+        jobs: Vec::new(),
     }
 }
 

@@ -1,6 +1,6 @@
 # Operations
 
-This page covers a packaged controller deployment, upgrades, backup, restart behaviour, leases and retries, provider cordons, and how to read `lu nodes`.
+This page covers a packaged controller deployment, upgrades, backup, restart behaviour, leases and retries, provider cordons, and how to read `lu nodes` and `lu node`.
 
 **0.1.0 status:** controller, agent (`lu agent`) and operator CLI work end to end. Read the agent limitation in `docs/security.md` before running an agent next to anything sensitive.
 
@@ -221,6 +221,34 @@ Two client/controller mismatches affect this view in 0.1.0:
 - `drain` and `undrain` return `{}`; non-JSON mode tries to decode that as a node and fails. `lu drain --json node-a` and `lu undrain --json node-a` send the request successfully and print `{}`. Use those forms until the client is fixed.
 
 A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, or has a matching provider cordon will not be assigned one.
+
+## Reading `lu node`
+
+`lu node <name>` prints the latest host and job stats the node reported. The controller keeps only the most recent heartbeat's stats in memory, so they survive neither a controller restart nor an agent restart until the next heartbeat.
+
+```text
+node  node-a
+load1             0.50
+load5             0.25
+load15            0.12
+mem_total_kb      8192
+mem_available_kb  4096
+swap_used_kb      12
+disk_free_bytes   -
+uptime_secs       600
+
+job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
+  PID   PPID  STATE  CPU_S  RSS_KB  AGE_S  FILES  COMMAND
+  4242  1     S      7      1024    90     3      opencode run
+```
+
+- Host numbers come from the agent's `/proc` sample. `disk_free_bytes` is currently always `-`; the documented optional field is reserved for a later filesystem stat primitive.
+- Each job is a running job owned by that node. `pgid` is the harness process group, and the process table is capped at the 64 busiest members. `COMMAND` is the first 80 characters of the command line with control characters replaced.
+- `output_idle` is seconds since the harness last wrote output; `cpu_idle` is seconds since any process in the job tree last used CPU. `stuck yes` means both are above 300 seconds while the job is still running.
+- A node that has not sent stats prints `host  -` and `jobs  -`. An unknown node is a 404 and exits `1`.
+- `lu node <name> --json` prints the exact `GET /v1/nodes/{name}/stats` body, including an empty `{}` for a known node with no stats.
+
+Stats are sampled on the agent at heartbeat time, which may be slower than `lu top`'s two-second refresh. They describe the agent's view, not live controller state.
 
 ## Logs and artifacts
 

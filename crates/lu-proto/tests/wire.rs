@@ -82,6 +82,8 @@ fn a_heartbeat_carries_a_capped_forwarded_document() {
             soonest_secs: Some(15),
         }],
         reiki: Some(serde_json::json!({"providers": ["peer-a"]})),
+        host: None,
+        jobs: Vec::new(),
     };
     beat.validate().unwrap();
     let wire = serde_json::to_string(&beat).unwrap();

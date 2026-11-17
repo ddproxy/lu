@@ -377,6 +377,116 @@ async fn agent_happy_path_and_forbidden_cross_node_and_stale_epoch() {
 }
 
 #[tokio::test]
+async fn node_stats_are_served_bounded_to_operator_and_clear_on_next_heartbeat() {
+    let srv = start_server().await;
+    let stats_url = |node: &str| {
+        format!("GET /v1/nodes/{node}/stats HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")
+    };
+
+    // unknown node, before any heartbeat
+    let r = raw_request(srv.addr, &stats_url("node-b")).await;
+    assert_eq!(status(&r), 404, "{r}");
+
+    // operator auth is required
+    let r = raw_request(
+        srv.addr,
+        "GET /v1/nodes/node-a/stats HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&r), 401, "{r}");
+
+    // a known node with no reported stats serializes as an empty object
+    let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 204, "{r}");
+    let r = raw_request(srv.addr, &stats_url("node-a")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let empty: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(empty, json!({}), "{r}");
+
+    let job_id = JobId::new().to_string();
+    let heartbeat = json!({
+        "node": "node-a",
+        "harness": "busy",
+        "providers": [],
+        "host": {
+            "load1": 0.5,
+            "load5": 0.25,
+            "load15": 0.125,
+            "mem_total_kb": 8192,
+            "mem_available_kb": 4096,
+            "swap_used_kb": 12,
+            "uptime_secs": 600
+        },
+        "jobs": [{
+            "job_id": job_id,
+            "pgid": 4242,
+            "output_idle_secs": 400,
+            "cpu_idle_secs": 350,
+            "stuck": true,
+            "processes": [{
+                "pid": 4242,
+                "ppid": 1,
+                "state": "S",
+                "cpu_secs": 7,
+                "rss_kb": 1024,
+                "age_secs": 90,
+                "cmdline": "opencode run",
+                "open_files": 3
+            }]
+        }]
+    });
+    let poll_body = json!({"heartbeat": heartbeat, "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 204, "{r}");
+
+    let r = raw_request(srv.addr, &stats_url("node-a")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let stats: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(stats["host"]["load1"], 0.5, "{r}");
+    assert_eq!(stats["jobs"][0]["job_id"], job_id, "{r}");
+    assert_eq!(stats["jobs"][0]["stuck"], true, "{r}");
+    assert_eq!(stats["jobs"][0]["processes"][0]["pid"], 4242, "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let nodes: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let node = nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "node-a")
+        .unwrap();
+    assert_eq!(node["load1"], 0.5, "{r}");
+    assert_eq!(node["mem_available_kb"], 4096, "{r}");
+    assert_eq!(node["mem_total_kb"], 8192, "{r}");
+    assert_eq!(node["stuck"], 1, "{r}");
+
+    // the next heartbeat replaces, rather than merges, the previous stats
+    let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 204, "{r}");
+    let r = raw_request(srv.addr, &stats_url("node-a")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let cleared: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(cleared, json!({}), "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
 async fn long_poll_times_out_and_wakes_on_job_creation() {
     let srv = start_server().await;
     // timeout with 204

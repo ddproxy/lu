@@ -9,7 +9,7 @@ use crate::time::now;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use lu_proto::{ArtifactName, Completion, Heartbeat, JobId};
+use lu_proto::{ArtifactName, Completion, Heartbeat, JobId, NodeStats};
 use lu_serve::PeerAddr;
 use serde::Deserialize;
 use serde_json::json;
@@ -52,6 +52,17 @@ pub async fn poll(
     if body.heartbeat.node != node {
         return with_version(ApiError::forbidden("forbidden").into_response());
     }
+    // The latest stats replace the previous ones even when both fields are absent: a heartbeat
+    // from an older agent, or an idle node, then leaves no stale job tree behind.
+    let stats = NodeStats {
+        host: body.heartbeat.host.clone(),
+        jobs: body.heartbeat.jobs.clone(),
+    };
+    state
+        .stats
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(node.clone(), stats);
     let wait_secs = body.wait_secs;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
     let permit = if wait_secs > 0 {

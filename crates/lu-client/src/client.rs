@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use crate::error::{body_excerpt, ApiError};
 use crate::types::{
-    CompletionBody, JobEnvelope, JobView, ListJobs, ListNodes, LogPage, NodeView, PollRequest,
-    MAX_JSON_BYTES,
+    CompletionBody, JobEnvelope, JobView, ListJobs, ListNodes, LogPage, NodeStats, NodeView,
+    PollRequest, MAX_JSON_BYTES,
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -459,6 +459,34 @@ impl Client {
         Ok(raw_body(&reply))
     }
 
+    /// The latest host and job stats the controller holds for a node. Unknown nodes are
+    /// [`ApiError::NotFound`]; a known node that has not reported stats yields an empty value.
+    pub async fn node_stats(&self, node: &NodeName) -> Result<NodeStats> {
+        let reply = self.node_stats_reply(node).await?;
+        self.scrub(
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode node stats: {error}"),
+            }),
+        )
+    }
+
+    /// The raw stats response, so `lu node --json` can print exactly what was sent.
+    pub async fn node_stats_raw(&self, node: &NodeName) -> Result<String> {
+        let reply = self.node_stats_reply(node).await?;
+        Ok(raw_body(&reply))
+    }
+
+    async fn node_stats_reply(&self, node: &NodeName) -> Result<HttpReply> {
+        let routes = [
+            format!("v1/nodes/{node}/stats"),
+            format!("nodes/{node}/stats"),
+        ];
+        let reply = self
+            .send(Method::GET, &routes, None, &[], &[], true)
+            .await?;
+        self.success(reply)
+    }
+
     pub async fn set_drain(&self, node: &NodeName, drain: bool) -> Result<NodeView> {
         let action = if drain { "drain" } else { "undrain" };
         let routes = [
@@ -529,6 +557,12 @@ impl Client {
         }
         if let Some(reiki) = &request.reiki {
             heartbeat["reiki"] = reiki.clone();
+        }
+        if let Some(host) = &request.host {
+            heartbeat["host"] = serde_json::json!(host);
+        }
+        if !request.jobs.is_empty() {
+            heartbeat["jobs"] = serde_json::json!(request.jobs);
         }
         let body = serde_json::to_vec(&serde_json::json!({
             "heartbeat": heartbeat,

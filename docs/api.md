@@ -15,12 +15,19 @@ Agents poll; there is no push channel in 0.1.0. Lease expiry is measured on the 
 | `GET /v1/jobs/{id}/logs?offset=N` | Bytes of the stored log from `offset`, `Content-Type: text/plain`, header `X-Lu-Log-Length` and `X-Lu-State`; `?wait=25` holds the request up to 25 seconds for new bytes or a state change. |
 | `GET /v1/jobs/{id}/artifacts/{name}` | `name` is `diff.patch`, `run.log` or `report.json`. `404` until stored. |
 | `GET /v1/nodes` | `[NodeView]` |
+| `GET /v1/nodes/{name}/stats` | The latest `NodeStats` the node reported in its heartbeat. `404` for an unknown node; a known node that has not reported stats is `{}`. In-memory only, so it is lost on controller restart. |
 | `POST /v1/nodes/{name}/drain` and `/undrain` | Stop or resume assigning new jobs to a node. |
 | `GET /v1/health` | `{"ok":true,"version":"…","db":"ok"}`, no auth. |
 
 `JobView`: `id`, `state`, `spec`, `attempt` (1 based), `node` (or null), `epoch`, `created_at`, `updated_at`, `started_at`, `finished_at`, `failure_class` (or null), `summary`, `exit_code`, `artifacts` (names present), `cancel_requested`, `after` (dependency ids), `waiting_on` (the subset not yet `done`).
 
-`NodeView`: `name`, `last_seen`, `online` (seen within two lease periods), `draining`, `harness` state, `providers` (list), `current_job` (id or null), `cordons` (provider names with an unexpired cordon), `reiki` (opaque JSON from the heartbeat or null).
+`NodeView`: `name`, `last_seen`, `online` (seen within two lease periods), `draining`, `harness` state, `providers` (list), `current_job` (id or null), `cordons` (provider names with an unexpired cordon), `reiki` (opaque JSON from the heartbeat or null), `load1`, `mem_available_kb`, `mem_total_kb`, and `stuck` (the number of the node's running jobs whose latest stats say `stuck`). The four stats fields are `null`/`0` until the node reports a host heartbeat.
+
+`NodeStats`: `{"host": HostStats|null, "jobs": [JobStats]}`. Both fields are omitted when empty, so a node that reports neither is `{}`.
+
+`HostStats`: `load1`, `load5`, `load15`, `mem_total_kb`, `mem_available_kb`, `swap_used_kb`, `disk_free_bytes` (optional and currently always omitted), `uptime_secs`. Values are read from `/proc`; non-Linux agents report no host stats.
+
+`JobStats`: `job_id`, `pgid`, `output_idle_secs` (since the harness last wrote output), `cpu_idle_secs` (since any process in the job tree last used CPU), `stuck` (running, with both idle values above 300 seconds), and `processes`. `ProcessStats` entries carry `pid`, `ppid`, `state`, `cpu_secs` (clock ticks divided by 100), `rss_kb`, `age_secs`, `cmdline` (first 80 characters, control characters replaced) and `open_files`. A job tree lists at most the 64 busiest processes, so it is a bounded sample rather than a complete process list.
 
 ## Agent
 
@@ -32,6 +39,8 @@ Agents poll; there is no push channel in 0.1.0. Lease expiry is measured on the 
 | `POST /v1/agent/jobs/{id}/log?epoch=N&offset=M` body raw bytes | Append a chunk at `offset`. `offset` must equal the stored length (`409 conflict` with `{"length":L}` otherwise so the agent can resume). At most 64 KiB. Logs beyond the cap are dropped with a marker line and still return 200. |
 | `PUT /v1/agent/jobs/{id}/artifacts/{name}?epoch=N` body raw bytes | Store `diff.patch` or `report.json` (caps from `limits`). Controller names the file; the agent never supplies a path. |
 | `POST /v1/agent/jobs/{id}/complete` body `Completion` | Finish. Outcomes and failure classes follow `lu-proto`. A stale epoch is `409 stale_epoch` and the result is discarded. For a provider failure, optional `retry_after_secs` is when the provider is expected back; the controller cordons the provider on the node for that long (at least 5 seconds, at most 24 hours) instead of the configured length. |
+
+`Heartbeat` may also carry optional `host` and `jobs` stats. Older agents that omit them are accepted; each heartbeat replaces the controller's previous stats for that node, so omitting them clears a stale job tree. The combined stats are trimmed to 16 KiB before validation by dropping processes first and then whole jobs.
 
 ## Controller rules
 

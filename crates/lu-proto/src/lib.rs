@@ -21,11 +21,12 @@ pub use limits::{
     ArtifactName, DEFAULT_TIMEOUT_SECS, JOB_ID_LEN, MAX_AFTER_JOBS, MAX_DIFF_BYTES,
     MAX_GIT_REF_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS, MAX_LOG_BYTES,
     MAX_LOG_CHUNK_BYTES, MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_PROVIDERS, MAX_REIKI_BYTES,
-    MAX_REPORT_BYTES, MAX_REPO_BYTES, MAX_SUMMARY_BYTES, MAX_TASK_BYTES, MAX_TIMEOUT_SECS,
-    MIN_TIMEOUT_SECS,
+    MAX_REPORT_BYTES, MAX_REPO_BYTES, MAX_STATS_BYTES, MAX_SUMMARY_BYTES, MAX_TASK_BYTES,
+    MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
 };
 pub use node::{
-    valid_provider_name, HarnessState, Heartbeat, HeartbeatError, ProviderState, ProviderStatus,
+    valid_provider_name, HarnessState, Heartbeat, HeartbeatError, HostStats, JobStats, NodeStats,
+    ProcessStats, ProviderState, ProviderStatus,
 };
 pub use sanitize::{printable, truncate_chars};
 pub use spec::{JobSpec, JobSpecError};

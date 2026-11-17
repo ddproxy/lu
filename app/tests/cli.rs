@@ -798,6 +798,79 @@ async fn nodes_and_drain_render_aligned_text() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_prints_host_numbers_and_indented_process_tree() {
+    let id = job_id();
+    let stats = json!({
+        "host": {
+            "load1": 0.5,
+            "load5": 0.25,
+            "load15": 0.125,
+            "mem_total_kb": 8192,
+            "mem_available_kb": 4096,
+            "swap_used_kb": 12,
+            "uptime_secs": 600
+        },
+        "jobs": [{
+            "job_id": id,
+            "pgid": 4242,
+            "output_idle_secs": 400,
+            "cpu_idle_secs": 350,
+            "stuck": true,
+            "processes": [{
+                "pid": 4242,
+                "ppid": 1,
+                "state": "S",
+                "cpu_secs": 7,
+                "rss_kb": 1024,
+                "age_secs": 90,
+                "cmdline": "opencode run\n\u{1b}[31m",
+                "open_files": 3
+            }]
+        }]
+    });
+    let expected = stats.to_string();
+    let server = start(move |_| Reply::json(&stats)).await;
+    let dir = scratch("node");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+
+    let output = run_with_env(&["node", "node-a"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("node  node-a"), "{text}");
+    assert!(matches!(
+        text.lines()
+            .find(|line| line.starts_with("load1"))
+            .and_then(|line| line.split_whitespace().nth(1)),
+        Some("0.50")
+    ));
+    assert!(text.contains(&format!("job {id}")), "{text}");
+    assert!(text.contains("stuck yes"), "{text}");
+    let process_line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("4242"))
+        .unwrap();
+    assert!(process_line.starts_with("  4242"), "{process_line:?}");
+    assert!(
+        process_line.contains("PID") || text.contains("  PID"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+
+    let output = run_with_env(&["--json", "node", "node-a"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{expected}\n"));
+    let records = server.records.lock().unwrap();
+    let paths: Vec<&str> = records.iter().map(|record| record.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["/v1/nodes/node-a/stats", "/v1/nodes/node-a/stats"]
+    );
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_error_never_prints_the_token() {
     let id = job_id();
     let echo = format!("the token was {TOKEN}");

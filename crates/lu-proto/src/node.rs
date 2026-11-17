@@ -3,8 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{is_name_byte, NodeName};
-use crate::limits::{MAX_NAME_BYTES, MAX_PROVIDERS, MAX_REIKI_BYTES};
+use crate::ids::{is_name_byte, JobId, NodeName};
+use crate::limits::{MAX_NAME_BYTES, MAX_PROVIDERS, MAX_REIKI_BYTES, MAX_STATS_BYTES};
 
 /// Whether the peer's harness is free to take a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -34,6 +34,58 @@ pub struct ProviderStatus {
     pub soonest_secs: Option<u64>,
 }
 
+/// The host numbers sampled from `/proc`. `disk_free_bytes` is optional because a portable
+/// answer is not available without a platform filesystem call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostStats {
+    pub load1: f64,
+    pub load5: f64,
+    pub load15: f64,
+    pub mem_total_kb: u64,
+    pub mem_available_kb: u64,
+    pub swap_used_kb: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_bytes: Option<u64>,
+    pub uptime_secs: u64,
+}
+
+/// One process in a job's harness tree, as sampled from `/proc`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessStats {
+    pub pid: u32,
+    pub ppid: u32,
+    pub state: String,
+    pub cpu_secs: u64,
+    pub rss_kb: u64,
+    pub age_secs: u64,
+    pub cmdline: String,
+    pub open_files: u32,
+}
+
+/// One running job and the processes in its harness process group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobStats {
+    pub job_id: JobId,
+    pub pgid: u32,
+    pub output_idle_secs: u64,
+    pub cpu_idle_secs: u64,
+    pub stuck: bool,
+    pub processes: Vec<ProcessStats>,
+}
+
+/// The stats a node reports: its host numbers and its running jobs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostStats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<JobStats>,
+}
+
 /// A periodic message from an agent. `reiki` is the opaque health document, forwarded unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Heartbeat {
@@ -43,6 +95,10 @@ pub struct Heartbeat {
     pub providers: Vec<ProviderStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reiki: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostStats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<JobStats>,
 }
 
 #[derive(Deserialize)]
@@ -54,17 +110,24 @@ struct RawHeartbeat {
     pub providers: Vec<ProviderStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reiki: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostStats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<JobStats>,
 }
 
 impl TryFrom<RawHeartbeat> for Heartbeat {
     type Error = HeartbeatError;
     fn try_from(raw: RawHeartbeat) -> Result<Self, Self::Error> {
-        let hb = Heartbeat {
+        let mut hb = Heartbeat {
             node: raw.node,
             harness: raw.harness,
             providers: raw.providers,
             reiki: raw.reiki,
+            host: raw.host,
+            jobs: raw.jobs,
         };
+        hb.trim_stats();
         hb.validate()?;
         Ok(hb)
     }
@@ -81,6 +144,37 @@ impl<'de> Deserialize<'de> for Heartbeat {
 }
 
 impl Heartbeat {
+    /// Drops process entries first, then whole jobs, until the serialized stats fit the cap.
+    /// The order removes the least busy processes first within each job, because a sampler
+    /// lists processes busiest-first and this pops from the end of the list.
+    pub fn trim_stats(&mut self) {
+        while self.stats_len() > MAX_STATS_BYTES {
+            let mut dropped_process = false;
+            for job in self.jobs.iter_mut().rev() {
+                if job.processes.pop().is_some() {
+                    dropped_process = true;
+                    break;
+                }
+            }
+            if !dropped_process && self.jobs.pop().is_none() {
+                break;
+            }
+        }
+    }
+
+    fn stats_len(&self) -> usize {
+        if self.host.is_none() && self.jobs.is_empty() {
+            return 0;
+        }
+        let stats = NodeStats {
+            host: self.host.clone(),
+            jobs: self.jobs.clone(),
+        };
+        serde_json::to_vec(&stats)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+    }
+
     /// Checks the caps a single heartbeat must respect.
     pub fn validate(&self) -> Result<(), HeartbeatError> {
         if self.providers.len() > MAX_PROVIDERS {
@@ -161,6 +255,41 @@ mod tests {
                 soonest_secs: None,
             }],
             reiki: None,
+            host: None,
+            jobs: Vec::new(),
+        }
+    }
+
+    fn host() -> HostStats {
+        HostStats {
+            load1: 1.5,
+            load5: 1.25,
+            load15: 1.0,
+            mem_total_kb: 16_384,
+            mem_available_kb: 8_192,
+            swap_used_kb: 0,
+            disk_free_bytes: Some(1_000_000),
+            uptime_secs: 42,
+        }
+    }
+
+    fn job(job_id: &str) -> JobStats {
+        JobStats {
+            job_id: JobId::from_str(job_id).unwrap(),
+            pgid: 123,
+            output_idle_secs: 301,
+            cpu_idle_secs: 302,
+            stuck: true,
+            processes: vec![ProcessStats {
+                pid: 123,
+                ppid: 1,
+                state: "R".to_owned(),
+                cpu_secs: 7,
+                rss_kb: 2048,
+                age_secs: 30,
+                cmdline: "opencode run".to_owned(),
+                open_files: 12,
+            }],
         }
     }
 
@@ -233,6 +362,92 @@ mod tests {
             beat.validate().unwrap_err(),
             HeartbeatError::ReikiTooLarge { .. }
         ));
+    }
+
+    #[test]
+    fn host_and_job_stats_round_trip() {
+        let mut beat = heartbeat();
+        beat.host = Some(host());
+        beat.jobs = vec![job("01ARZ3NDEKTSV4RRFFQ69G5FAV")];
+        assert!(beat.validate().is_ok());
+        let json = serde_json::to_string(&beat).unwrap();
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, beat);
+    }
+
+    #[test]
+    fn heartbeats_without_stats_keep_the_old_shape() {
+        let beat = heartbeat();
+        let out = serde_json::to_string(&beat).unwrap();
+        assert!(!out.contains("\"host\""), "{out}");
+        assert!(!out.contains("\"jobs\""), "{out}");
+        let parsed: Heartbeat =
+            serde_json::from_str(r#"{"node":"peer-a","harness":"idle"}"#).unwrap();
+        assert!(parsed.host.is_none());
+        assert!(parsed.jobs.is_empty());
+    }
+
+    #[test]
+    fn oversized_stats_drop_processes_then_jobs() {
+        let mut beat = heartbeat();
+        beat.host = Some(host());
+        let mut big = job("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        big.processes = (0..300)
+            .map(|index| ProcessStats {
+                pid: index,
+                ppid: 1,
+                state: "S".to_owned(),
+                cpu_secs: u64::from(index),
+                rss_kb: 1,
+                age_secs: 1,
+                cmdline: "x".repeat(80),
+                open_files: 0,
+            })
+            .collect();
+        beat.jobs = vec![big];
+        beat.trim_stats();
+        assert!(!beat.jobs.is_empty());
+        assert!(beat.jobs[0].processes.len() < 300);
+        assert!(beat.stats_len() <= MAX_STATS_BYTES);
+
+        // Even with no process entries left, whole jobs are dropped.
+        beat.jobs = (0..200)
+            .map(|_| {
+                let mut job = job("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+                job.processes.clear();
+                job
+            })
+            .collect();
+        beat.trim_stats();
+        assert!(beat.stats_len() <= MAX_STATS_BYTES);
+        assert!(beat.jobs.len() < 200);
+    }
+
+    #[test]
+    fn an_incoming_oversized_heartbeat_is_trimmed() {
+        let mut beat = heartbeat();
+        beat.host = Some(host());
+        beat.jobs = vec![job("01ARZ3NDEKTSV4RRFFQ69G5FAV")];
+        beat.jobs[0].processes = (0..300)
+            .map(|index| ProcessStats {
+                pid: index,
+                ppid: 1,
+                state: "S".to_owned(),
+                cpu_secs: u64::from(index),
+                rss_kb: 1,
+                age_secs: 1,
+                cmdline: "y".repeat(80),
+                open_files: 0,
+            })
+            .collect();
+        let json = serde_json::to_string(&beat).unwrap();
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert!(parsed.jobs[0].processes.len() < 300);
+        let stats = NodeStats {
+            host: parsed.host,
+            jobs: parsed.jobs,
+        };
+        assert!(serde_json::to_vec(&stats).unwrap().len() <= MAX_STATS_BYTES);
     }
 
     #[test]

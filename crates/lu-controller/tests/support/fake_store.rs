@@ -639,6 +639,8 @@ impl Store for FakeStore {
                     harness: lu_proto::HarnessState::Idle,
                     providers: vec![],
                     reiki: None,
+                    host: None,
+                    jobs: Vec::new(),
                 },
                 current_job: None,
             });
