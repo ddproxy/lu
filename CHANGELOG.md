@@ -14,6 +14,13 @@ uses semantic versioning once it reaches 1.0.
 - The controller keeps the latest stats per node in memory, exposes `GET /v1/nodes/{name}/stats`, adds `load1`, `mem_available_kb`, `mem_total_kb` and `stuck` to the node list, and clears a node's stats when its next heartbeat omits them.
 - `lu node <name>` prints the host numbers and each running job's process tree as an indented table; `--json` prints the raw stats response.
 - Job stats flag `stuck` when the harness has produced no output and the job tree has used no CPU for more than 300 seconds.
+### Added
+
+- `lu graph [JOB]` draws the dependency graph as text: components newest first, jobs laid out
+  left to right by depth, unknown dependencies as stubs, and at most 6 components and 40 jobs.
+  `JOB` narrows it to one component and `--json` prints the shown nodes.
+- `lu top` draws the same graph under the job list on terminals at least 24 rows tall, toggled
+  with `g`; graph colours and glyphs also apply to the job list.
 
 ## [0.1.9] - 2026-11-17
 

@@ -39,21 +39,6 @@ fn provider_state(state: ProviderState) -> &'static str {
     }
 }
 
-/// The job's title: the first non-empty line of its task, without heading marks or a `Task:` lead.
-fn job_title(task: &str) -> String {
-    let line = task
-        .lines()
-        .map(|line| line.trim().trim_start_matches('#').trim())
-        .find(|line| !line.is_empty())
-        .unwrap_or_default();
-    let line = line
-        .strip_prefix("Task:")
-        .or_else(|| line.strip_prefix("task:"))
-        .unwrap_or(line)
-        .trim();
-    line.chars().filter(|c| !c.is_control()).collect()
-}
-
 /// Drops terminal escape sequences, leaving line breaks and the rest of the text.
 fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -131,7 +116,7 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
             .iter()
             .map(|job| JobRow {
                 id: job.id.to_string(),
-                title: job_title(&job.spec.task),
+                title: operator::job_title(&job.spec.task),
                 state: operator::state_name(job.state).to_owned(),
                 node: job.node.as_ref().map(ToString::to_string),
                 attempt: job.attempt,
@@ -149,6 +134,7 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
                     (None, Some(summary)) => plain_summary(summary),
                     (None, None) => String::new(),
                 },
+                after: job.after.iter().map(ToString::to_string).collect(),
             })
             .collect(),
     })
@@ -263,6 +249,7 @@ pub async fn run(config: &Path, args: TopArgs, json: bool) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::{log_tail, plain_summary};
+    use crate::operator::job_title;
 
     #[test]
     fn escapes_are_dropped_and_the_last_line_kept() {
@@ -276,10 +263,10 @@ mod tests {
         );
         assert_eq!(plain_summary(""), "");
         assert_eq!(
-            super::job_title("# Task: implement `lu top`\n\nbody"),
+            job_title("# Task: implement `lu top`\n\nbody"),
             "implement `lu top`"
         );
-        assert_eq!(super::job_title("\n  plain words\nmore"), "plain words");
+        assert_eq!(job_title("\n  plain words\nmore"), "plain words");
     }
 
     #[test]

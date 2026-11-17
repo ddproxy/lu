@@ -1,6 +1,6 @@
 # Operations
 
-This page covers a packaged controller deployment, upgrades, backup, restart behaviour, leases and retries, provider cordons, and how to read `lu nodes` and `lu node`.
+This page covers a packaged controller deployment, upgrades, backup, restart behaviour, leases and retries, provider cordons, how to read `lu nodes` and `lu node`, and the dependency-graph display.
 
 **0.1.0 status:** controller, agent (`lu agent`) and operator CLI work end to end. Read the agent limitation in `docs/security.md` before running an agent next to anything sensitive.
 
@@ -249,6 +249,24 @@ job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
 - `lu node <name> --json` prints the exact `GET /v1/nodes/{name}/stats` body, including an empty `{}` for a known node with no stats.
 
 Stats are sampled on the agent at heartbeat time, which may be slower than `lu top`'s two-second refresh. They describe the agent's view, not live controller state.
+## Display
+
+`lu top` draws the dependency graph below the job list when the terminal is at least 24 rows tall and a component has an unfinished job. Press `g` to hide or show it. A component is a set of jobs linked by `after`, including finished jobs that connect unfinished ones; a component whose jobs are all terminal is left out.
+
+Each row is one job, placed left to right by depth: `0` with no dependency in the fetched set, otherwise one past its deepest dependency. Box-drawing connectors join a job to its dependencies, and an edge takes the dependency's colour. An `after` id that is not in the fetched jobs is a dim stub `#id…`. Job titles are clipped to the panel width.
+
+| State | Glyph | Colour |
+| --- | --- | --- |
+| `done` | `✓` | dim green |
+| `running`, `leased` | `▶` | bright green |
+| `blocked` | `◌` | orange |
+| `queued`, `recovering`, `needs_input` | `○` | yellow |
+| `failed` | `✗` | red |
+| `cancelled` | `–` | grey |
+
+The job list uses the same colours. The graph shows at most 6 components and 40 jobs, and a dim line reports how many jobs and components were left out.
+
+`lu graph [JOB]` prints the same graph without the dashboard, using up to 200 jobs from the controller. `JOB` selects the component containing that job, even if every job in it is finished. Output is coloured only when stdout is a terminal and `NO_COLOR` is unset. `lu graph --json` prints `{"nodes":[{"id","state","title","after"}]}` for the shown jobs, without stubs or the summary line.
 
 ## Logs and artifacts
 

@@ -42,6 +42,8 @@ enum Command {
     Ls(operator::LsArgs),
     /// Show one job.
     Show(operator::ShowArgs),
+    /// Draw job dependency graphs.
+    Graph(operator::GraphArgs),
     /// Print a job's log.
     Logs(operator::LogsArgs),
     /// Fetch the three artifacts of a job.
@@ -77,6 +79,7 @@ async fn main() -> ExitCode {
         Command::Submit(args) => operator::submit(args, &cli.config, json).await,
         Command::Ls(args) => operator::ls(args, &cli.config, json).await,
         Command::Show(args) => operator::show(args, &cli.config, json).await,
+        Command::Graph(args) => operator::graph(args, &cli.config, json).await,
         Command::Logs(args) => operator::logs(args, &cli.config, json).await,
         Command::Fetch(args) => operator::fetch(args, &cli.config, json).await,
         Command::Cancel(args) => operator::cancel(args, &cli.config, json).await,

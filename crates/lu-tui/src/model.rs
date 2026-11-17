@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::graph::{self, Graph};
 use crate::sanitize::printable;
 
 /// One provider on a node, already reduced to text.
@@ -38,6 +39,8 @@ pub struct JobRow {
     pub model: Option<String>,
     /// The failure class or summary, shortened by the caller.
     pub note: String,
+    /// The ids this job waits for.
+    pub after: Vec<String>,
 }
 
 /// Everything one refresh brings back.
@@ -113,6 +116,10 @@ pub enum Tone {
     Warn,
     Bad,
     Dim,
+    /// A finished job: dim green.
+    Done,
+    /// A blocked job: orange.
+    Blocked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +213,7 @@ pub struct Dashboard {
     log: Option<LogPane>,
     pending: Option<PendingDrain>,
     notice: Option<(String, Tone)>,
+    graph_hidden: bool,
 }
 
 impl Dashboard {
@@ -280,6 +288,11 @@ impl Dashboard {
         } else {
             *index = index.saturating_sub(1);
         }
+    }
+
+    /// Hides or shows the dependency graph under the job list.
+    pub fn toggle_graph(&mut self) {
+        self.graph_hidden = !self.graph_hidden;
     }
 
     /// Switches the arrows and `d` between the node table and the job list.
@@ -451,7 +464,14 @@ impl Dashboard {
             }
         };
         let status = self.notice_status(now).unwrap_or(live_status);
-        ViewModel::build(snapshot, history, status, self.selection, self.log.as_ref())
+        ViewModel::build(
+            snapshot,
+            history,
+            status,
+            self.selection,
+            self.log.as_ref(),
+            !self.graph_hidden,
+        )
     }
 }
 
@@ -475,6 +495,8 @@ pub struct ViewModel {
     /// Index into `lines` of the highlighted row.
     pub selected_line: Option<usize>,
     pub log: Option<LogPane>,
+    /// The dependency graph under the job list, when it has a component to show.
+    pub graph: Option<Graph>,
 }
 
 fn short_age(secs: u64) -> String {
@@ -509,8 +531,10 @@ fn provider_text(cell: &ProviderCell) -> (String, Tone) {
 
 fn job_tone(state: &str) -> Tone {
     match state {
+        "done" => Tone::Done,
         "running" | "leased" => Tone::Good,
-        "queued" | "blocked" | "recovering" | "needs_input" => Tone::Warn,
+        "blocked" => Tone::Blocked,
+        "queued" | "recovering" | "needs_input" => Tone::Warn,
         "failed" => Tone::Bad,
         _ => Tone::Dim,
     }
@@ -548,6 +572,7 @@ impl ViewModel {
         status: Status,
         selection: Selection,
         log: Option<&LogPane>,
+        show_graph: bool,
     ) -> Self {
         let mut lines = vec![Line::new(
             format!("{:<12} {:<8} {:<8} PROVIDERS", "NODE", "STATE", "SEEN"),
@@ -660,22 +685,46 @@ impl ViewModel {
             ),
             Status::Notice { text, tone } => (Line::new(clip(&text, 120), tone), false),
         };
+        let graph = show_graph.then(|| {
+            let jobs: Vec<graph::Job> = snapshot
+                .jobs
+                .iter()
+                .map(|job| graph::Job {
+                    id: job.id.clone(),
+                    state: graph::State::from_name(&job.state),
+                    title: job.title.clone(),
+                    after: job.after.clone(),
+                })
+                .collect();
+            graph::Graph::build(&jobs)
+        });
         Self {
             title: "lu top".to_owned(),
             charts: charts(history),
             lines,
             status,
-            footer: "↑↓/jk select   Tab focus   Enter log   Esc close   d drain   p pause   q quit"
+            footer: "↑↓/jk select   Tab focus   Enter log   Esc close   d drain   g graph   p pause   q quit"
                 .to_owned(),
             paused,
             selected_line,
             log: log.cloned(),
+            graph: graph.filter(|graph| !graph.is_empty()),
         }
     }
 
     /// The two tables, without the title, status, footer or charts; `--once` prints this.
     pub fn table_text(&self) -> String {
-        let lines: Vec<&str> = self.lines.iter().map(|line| line.text.as_str()).collect();
+        let mut lines: Vec<String> = self.lines.iter().map(|line| line.text.clone()).collect();
+        if let Some(graph) = &self.graph {
+            let graph_lines: Vec<String> = graph::render(graph, 100)
+                .iter()
+                .map(graph::GraphLine::text)
+                .collect();
+            if !graph_lines.is_empty() {
+                lines.push(String::new());
+                lines.extend(graph_lines);
+            }
+        }
         lines.join("\n")
     }
 
@@ -728,6 +777,7 @@ mod tests {
             age_secs: 125,
             model: Some("m".to_owned()),
             note: String::new(),
+            after: Vec::new(),
         }
     }
 

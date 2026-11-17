@@ -468,6 +468,49 @@ async fn show_lists_dependency_states() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_draws_a_diamond_and_prints_its_nodes_as_json() {
+    let a = job_id();
+    let b = job_id();
+    let c = job_id();
+    let d = job_id();
+    let mut joined = job_json(&d, "blocked");
+    joined["after"] = json!([b, c]);
+    let mut right = job_json(&c, "failed");
+    right["after"] = json!([a]);
+    let mut left = job_json(&b, "running");
+    left["after"] = json!([a]);
+    let root = job_json(&a, "done");
+    let body = json!({"jobs": [joined, right, left, root]});
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("graph-diamond");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+
+    let output = run_with_env(&["graph"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains('✓'), "{text}");
+    assert!(text.contains('▶'), "{text}");
+    assert!(text.contains('✗'), "{text}");
+    assert!(text.contains('◌'), "{text}");
+    assert!(text.contains("┐") && text.contains("└"), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text}");
+
+    let output = run_with_env(&["--json", "graph"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    let nodes = value["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 4);
+    assert!(nodes
+        .iter()
+        .any(|node| node["id"] == a && node["state"] == "done"));
+    assert!(nodes
+        .iter()
+        .any(|node| node["id"] == d && node["state"] == "blocked"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_reads_stdin_and_sends_every_flag() {
     let id = job_id();
     let body = job_json(&id, "queued");

@@ -1,7 +1,7 @@
 //! Operator subcommands. Every command talks to the controller through `lu-client`; this module
 //! only resolves the connection, formats untrusted values, and maps the outcome to an exit code.
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -11,6 +11,8 @@ use lu_proto::{
     printable, truncate_chars, ArtifactName, FailureClass, HarnessState, JobId, JobSpec, JobState,
     NodeName, MAX_TASK_BYTES,
 };
+use lu_tui::graph::{self, Graph};
+use lu_tui::model::Tone;
 
 const EXIT_ERROR: u8 = 1;
 const EXIT_UNSUCCESSFUL: u8 = 3;
@@ -110,6 +112,13 @@ pub struct CancelArgs {
 pub struct NodesArgs {}
 
 #[derive(Debug, clap::Args)]
+pub struct GraphArgs {
+    /// Show only the component containing this job.
+    #[arg(value_parser = parse_job_id)]
+    pub job: Option<JobId>,
+}
+
+#[derive(Debug, clap::Args)]
 pub struct NodeArgs {
     /// Node name.
     #[arg(value_parser = parse_node)]
@@ -146,6 +155,10 @@ pub async fn nodes(args: NodesArgs, config: &Path, json: bool) -> ExitCode {
 
 pub async fn node(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
     finish(node_inner(args, config, json).await)
+}
+
+pub async fn graph(args: GraphArgs, config: &Path, json: bool) -> ExitCode {
+    finish(graph_inner(args, config, json).await)
 }
 
 pub async fn drain(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
@@ -419,6 +432,106 @@ async fn node_inner(args: NodeArgs, config: &Path, json: bool) -> Result<ExitCod
         .map_err(|error| error.to_string())?;
     print_node_stats(&args.node, &stats);
     Ok(ExitCode::SUCCESS)
+}
+
+const GRAPH_WIDTH: usize = 120;
+
+async fn graph_inner(args: GraphArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    let mut views = client
+        .list_jobs(None, Some(200))
+        .await
+        .map_err(|error| error.to_string())?
+        .jobs;
+    if let Some(id) = &args.job {
+        if !views.iter().any(|view| &view.id == id) {
+            let target = client
+                .get_job(id)
+                .await
+                .map_err(|error| error.to_string())?;
+            views.push(target);
+        }
+    }
+    let jobs: Vec<graph::Job> = views.iter().map(graph_job).collect();
+    let graph = match &args.job {
+        Some(id) => Graph::for_job(&jobs, id.as_str())
+            .ok_or_else(|| format!("job {id} is not in the job list"))?,
+        None => Graph::build(&jobs),
+    };
+    if json {
+        print_graph_json(&graph);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(GRAPH_WIDTH);
+    let colour = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    for line in graph::render(&graph, width) {
+        if colour {
+            print_graph_line(&line);
+        } else {
+            println!("{}", line.text());
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn graph_job(view: &JobView) -> graph::Job {
+    graph::Job {
+        id: view.id.to_string(),
+        state: graph::State::from_name(state_name(view.state)),
+        title: job_title(&view.spec.task),
+        after: view.after.iter().map(ToString::to_string).collect(),
+    }
+}
+
+fn print_graph_json(graph: &Graph) {
+    let nodes: Vec<serde_json::Value> = graph
+        .components
+        .iter()
+        .flat_map(|component| &component.nodes)
+        .map(|node| {
+            serde_json::json!({
+                "id": node.id,
+                "state": node.state.name(),
+                "title": node.title,
+                "after": node.after,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({ "nodes": nodes });
+    match serde_json::to_string(&body) {
+        Ok(text) => println!("{text}"),
+        Err(error) => eprintln!("lu: cannot encode the graph: {error}"),
+    }
+}
+
+fn print_graph_line(line: &graph::GraphLine) {
+    let mut out = String::new();
+    for segment in &line.segments {
+        match ansi(segment.tone) {
+            Some(code) => {
+                out.push_str(code);
+                out.push_str(&segment.text);
+                out.push_str("\u{1b}[0m");
+            }
+            None => out.push_str(&segment.text),
+        }
+    }
+    println!("{out}");
+}
+
+fn ansi(tone: Tone) -> Option<&'static str> {
+    match tone {
+        Tone::Plain | Tone::Heading => None,
+        Tone::Good => Some("\u{1b}[1;92m"),
+        Tone::Warn => Some("\u{1b}[33m"),
+        Tone::Bad => Some("\u{1b}[31m"),
+        Tone::Dim => Some("\u{1b}[90m"),
+        Tone::Done => Some("\u{1b}[2;32m"),
+        Tone::Blocked => Some("\u{1b}[38;5;208m"),
+    }
 }
 
 async fn drain_inner(
@@ -816,6 +929,21 @@ fn time(value: u64) -> String {
 
 fn optional_time(value: Option<u64>) -> String {
     value.map(time).unwrap_or_else(|| "-".to_owned())
+}
+
+/// The job's title: the first non-empty line of its task, without heading marks or a `Task:` lead.
+pub(crate) fn job_title(task: &str) -> String {
+    let line = task
+        .lines()
+        .map(|line| line.trim().trim_start_matches('#').trim())
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let line = line
+        .strip_prefix("Task:")
+        .or_else(|| line.strip_prefix("task:"))
+        .unwrap_or(line)
+        .trim();
+    line.chars().filter(|c| !c.is_control()).collect()
 }
 
 pub(crate) fn harness_name(value: Option<HarnessState>) -> String {

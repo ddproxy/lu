@@ -24,6 +24,7 @@ pub enum Action {
     OpenLog,
     Escape,
     Drain,
+    ToggleGraph,
 }
 
 pub fn action_for(event: KeyEvent) -> Option<Action> {
@@ -43,6 +44,7 @@ pub fn action_for(event: KeyEvent) -> Option<Action> {
         (KeyCode::Tab, _) => Some(Action::ToggleFocus),
         (KeyCode::Enter, _) => Some(Action::OpenLog),
         (KeyCode::Char('d'), _) => Some(Action::Drain),
+        (KeyCode::Char('g'), _) => Some(Action::ToggleGraph),
         _ => None,
     }
 }
@@ -93,6 +95,7 @@ pub fn run_live(
                             });
                         }
                     }
+                    Some(Action::ToggleGraph) => dashboard.toggle_graph(),
                     None => {}
                 }
             }
@@ -160,6 +163,10 @@ mod tests {
         assert_eq!(
             action_for(press(KeyCode::Char('d'), none)),
             Some(Action::Drain)
+        );
+        assert_eq!(
+            action_for(press(KeyCode::Char('g'), none)),
+            Some(Action::ToggleGraph)
         );
         assert_eq!(action_for(press(KeyCode::Char('x'), none)), None);
         assert_eq!(

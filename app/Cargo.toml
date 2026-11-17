@@ -8,8 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-# The `top` subcommand. Off by default: the default binary has no terminal dependencies.
-tui = ["dep:lu-tui", "lu-tui/tui"]
+# The `top` subcommand. The model and `lu graph` build without a terminal library.
+tui = ["lu-tui/tui"]
 
 [dependencies]
 lu-config = { path = "../crates/lu-config" }
@@ -20,7 +20,7 @@ lu-store = { path = "../crates/lu-store" }
 lu-client = { path = "../crates/lu-client" }
 lu-agent = { path = "../crates/lu-agent" }
 lu-proto = { path = "../crates/lu-proto" }
-lu-tui = { path = "../crates/lu-tui", optional = true }
+lu-tui = { path = "../crates/lu-tui" }
 axum.workspace = true
 clap = { workspace = true }
 serde_json.workspace = true
