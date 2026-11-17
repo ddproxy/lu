@@ -45,6 +45,8 @@ enum Command {
     Agent,
     /// Submit a job.
     Submit(operator::SubmitArgs),
+    /// Resubmit a finished job's spec as a new job.
+    Retry(operator::RetryArgs),
     /// List jobs.
     Ls(operator::LsArgs),
     /// Show one job.
@@ -93,6 +95,7 @@ async fn main() -> ExitCode {
             Err(error) => fail(&error),
         },
         Command::Submit(args) => operator::submit(args, &cli.config, json).await,
+        Command::Retry(args) => operator::retry(args, &cli.config, json).await,
         Command::Ls(args) => operator::ls(args, &cli.config, json).await,
         Command::Show(args) => operator::show(args, &cli.config, json).await,
         Command::Graph(args) => operator::graph(args, &cli.config, json).await,

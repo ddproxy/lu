@@ -16,6 +16,7 @@ use lu_tui::model::Tone;
 
 const EXIT_ERROR: u8 = 1;
 const EXIT_UNSUCCESSFUL: u8 = 3;
+const EXIT_USAGE: u8 = 2;
 const TOKEN_LIMIT: u64 = 8 * 1024;
 const FOLLOW_WAIT_SECS: u64 = 25;
 const WAIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -56,6 +57,28 @@ pub struct SubmitArgs {
     /// Read the task from a file.
     #[arg(long = "task-file", conflicts_with = "task")]
     pub task_file: Option<PathBuf>,
+    /// Wait for the job to finish.
+    #[arg(long)]
+    pub wait: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RetryArgs {
+    /// Job id.
+    #[arg(value_parser = parse_job_id)]
+    pub id: JobId,
+    /// Replace the provider name.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Replace the model name.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Only run after this job is done (repeatable); replaces the dependency list.
+    #[arg(long = "after", value_parser = parse_job_id)]
+    pub after: Vec<JobId>,
+    /// Idempotency key. The new job carries none unless this is given.
+    #[arg(long)]
+    pub key: Option<String>,
     /// Wait for the job to finish.
     #[arg(long)]
     pub wait: bool,
@@ -132,6 +155,10 @@ pub async fn submit(args: SubmitArgs, config: &Path, json: bool) -> ExitCode {
     finish(submit_inner(args, config, json).await)
 }
 
+pub async fn retry(args: RetryArgs, config: &Path, json: bool) -> ExitCode {
+    finish(retry_inner(args, config, json).await)
+}
+
 pub async fn ls(args: LsArgs, config: &Path, json: bool) -> ExitCode {
     finish(ls_inner(args, config, json).await)
 }
@@ -193,22 +220,63 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
     spec.validate().map_err(|error| error.to_string())?;
 
     let client = connect(config)?;
+    submit_and_report(&client, &spec, json, args.wait).await
+}
+
+async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    let view = client
+        .get_job(&args.id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !view.state.is_terminal() {
+        eprintln!(
+            "lu: job {} is {}; retry resubmits a finished job (done, failed or cancelled)",
+            view.id,
+            state_name(view.state)
+        );
+        return Ok(ExitCode::from(EXIT_USAGE));
+    }
+
+    let mut spec = view.spec;
+    if let Some(provider) = args.provider {
+        spec.provider = Some(provider);
+    }
+    if let Some(model) = args.model {
+        spec.model = Some(model);
+    }
+    if !args.after.is_empty() {
+        spec.after = args.after;
+    }
+    // A retry is a new job; only --key gives it an idempotency key.
+    spec.idempotency_key = args.key;
+    spec.validate().map_err(|error| error.to_string())?;
+
+    submit_and_report(&client, &spec, json, args.wait).await
+}
+
+async fn submit_and_report(
+    client: &Client,
+    spec: &JobSpec,
+    json: bool,
+    wait: bool,
+) -> Result<ExitCode, String> {
     let (view, raw) = client
-        .submit_with_raw(&spec)
+        .submit_with_raw(spec)
         .await
         .map_err(|error| error.to_string())?;
 
-    if json && !args.wait {
+    if json && !wait {
         print_raw(&raw);
     } else {
         println!("{}", view.id);
     }
 
-    if !args.wait {
+    if !wait {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let final_view = wait_for_job(&client, &view.id).await?;
+    let final_view = wait_for_job(client, &view.id).await?;
     eprintln!("state: {}", state_name(final_view.state));
     if json {
         let raw = client

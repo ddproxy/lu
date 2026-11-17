@@ -245,7 +245,7 @@ Maintenance runs every `max(1, lease_secs / 3)` seconds. An expired lease moves 
 On completion:
 
 - `Done` moves the job to `done` and records `finished_at`; newly unblocked dependents move to `queued`.
-- `Failed(Execution)` moves it to `failed` immediately. Execution failures never retry.
+- `Failed(Execution)` moves it to `failed` immediately. Execution failures never retry. `lu retry <id>` resubmits a finished job's spec as a new job (`--provider`, `--model` and `--after` replace those fields); the new job is independent of the old one.
 - `Failed(Node)` and `Failed(Provider)` retry while `attempt <= max_retries`: the job returns to `queued`, the attempt is incremented, and the node is cleared. Beyond the cap it becomes `failed` with that failure class. A terminal `failed` or `cancelled` job fails its blocked dependents.
 
 `max_retries` is the number of retries, not the total number of attempts. With the default `1`, an initial attempt plus one retry is allowed. A provider failure that is retried also cordons the `(node, provider)` pair for `provider_cooldown_secs`.

@@ -1031,3 +1031,194 @@ async fn usage_errors_exit_two_before_any_request() {
     assert_eq!(output.status.code(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn finished_job(id: &str, state: &str) -> Value {
+    let mut job = job_json(id, state);
+    job["spec"] = json!({
+        "repo": "/srv/repo",
+        "git_ref": "main",
+        "task": "go",
+        "provider": "peer-a",
+        "model": "old-model",
+        "timeout_secs": 60,
+        "idle_timeout_secs": 45,
+        "idempotency_key": "ticket:7",
+        "after": [id]
+    });
+    job
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_resubmits_the_finished_spec_and_applies_the_overrides() {
+    let id = job_id();
+    let new_id = job_id();
+    let finished = finished_job(&id, "failed");
+    let created = job_json(&new_id, "queued");
+    let server = start(move |record| {
+        if record.method == "POST" {
+            Reply::json(&created)
+        } else {
+            Reply::json(&finished)
+        }
+    })
+    .await;
+    let dir = scratch("retry");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let dep = job_id();
+    let output = run_with_env(
+        &[
+            "retry",
+            &id,
+            "--provider",
+            "peer-b",
+            "--model",
+            "new-model",
+            "--after",
+            &dep,
+            "--key",
+            "ticket:42",
+        ],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), new_id);
+    let records = server.records.lock().unwrap();
+    assert_eq!(records[0].method, "GET");
+    assert_eq!(records[0].path, format!("/v1/jobs/{id}"));
+    assert_eq!(records[1].method, "POST");
+    assert_eq!(records[1].path, "/v1/jobs");
+    assert_eq!(records[1].header("idempotency-key"), Some("ticket:42"));
+    let spec: Value = serde_json::from_slice(&records[1].body).unwrap();
+    assert_eq!(spec["repo"], "/srv/repo");
+    assert_eq!(spec["git_ref"], "main");
+    assert_eq!(spec["task"], "go");
+    assert_eq!(spec["harness"], "opencode");
+    assert_eq!(spec["timeout_secs"], 60);
+    assert_eq!(spec["idle_timeout_secs"], 45);
+    assert_eq!(spec["provider"], "peer-b");
+    assert_eq!(spec["model"], "new-model");
+    assert_eq!(spec["after"], json!([dep]));
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_keeps_the_old_spec_and_sends_no_idempotency_key_by_default() {
+    let id = job_id();
+    let new_id = job_id();
+    let finished = finished_job(&id, "cancelled");
+    let created = job_json(&new_id, "queued");
+    let server = start(move |record| {
+        if record.method == "POST" {
+            Reply::json(&created)
+        } else {
+            Reply::json(&finished)
+        }
+    })
+    .await;
+    let dir = scratch("retry-plain");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(&["retry", &id], &env_for(&server, &token), None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), new_id);
+    let records = server.records.lock().unwrap();
+    assert_eq!(records[1].header("idempotency-key"), None);
+    let spec: Value = serde_json::from_slice(&records[1].body).unwrap();
+    assert!(spec.get("idempotency_key").is_none(), "{spec}");
+    assert_eq!(spec["provider"], "peer-a");
+    assert_eq!(spec["model"], "old-model");
+    assert_eq!(spec["after"], json!([id]));
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_refuses_a_job_that_is_not_finished() {
+    let id = job_id();
+    let body = job_json(&id, "running");
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("retry-not-terminal");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(&["retry", &id], &env_for(&server, &token), None, &dir);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("retry resubmits a finished job"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        server.records.lock().unwrap().len(),
+        1,
+        "a refusal must not submit anything"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_json_prints_the_raw_submit_body() {
+    let id = job_id();
+    let new_id = job_id();
+    let finished = finished_job(&id, "done");
+    let created = job_json(&new_id, "queued");
+    let expected = created.to_string();
+    let server = start(move |record| {
+        if record.method == "POST" {
+            Reply::json(&created)
+        } else {
+            Reply::json(&finished)
+        }
+    })
+    .await;
+    let dir = scratch("retry-json");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &["--json", "retry", &id],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{expected}\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_wait_reports_the_new_jobs_state_and_exit_code() {
+    let id = job_id();
+    let new_id = job_id();
+    let finished = finished_job(&id, "done");
+    let post_id = new_id.clone();
+    let poll_id = new_id.clone();
+    let old_path = id.clone();
+    let server = start(move |record| {
+        if record.method == "POST" {
+            Reply::json(&job_json(&post_id, "queued"))
+        } else if record.path == format!("/v1/jobs/{old_path}") {
+            Reply::json(&finished)
+        } else {
+            Reply::json(&job_json(&poll_id, "failed"))
+        }
+    })
+    .await;
+    let dir = scratch("retry-wait");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+
+    let output = run_with_env(&["retry", &id, "--wait"], &envs, None, &dir);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), new_id);
+    assert!(
+        stderr(&output).contains("state: failed"),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = run_with_env(&["--json", "retry", &id, "--wait"], &envs, None, &dir);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains(&new_id), "{text}");
+    assert!(text.contains(r#""state":"failed""#), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

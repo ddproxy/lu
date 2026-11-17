@@ -5,6 +5,14 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `lu retry <job-id>` resubmits a finished job's spec as a new job. `--provider <name>` and
+  `--model <name>` replace those fields, `--after <job-id>` (repeatable) replaces the dependency
+  list, and no other field changes. It refuses with exit 2 while the old job is not terminal, the
+  new job carries no idempotency key unless `--key` is given, and `--wait` and `--json` behave like
+  `lu submit`.
+
 ## [0.1.11] - 2026-11-17
 
 ### Added
