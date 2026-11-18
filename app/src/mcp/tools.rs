@@ -697,6 +697,8 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
         idle_timeout_secs: args.get("idle_timeout_secs").and_then(Value::as_u64),
         idempotency_key: optional_string(args, "key"),
         after,
+        stack_dependencies: true,
+        requires: Vec::new(),
     };
     spec.validate()
         .map_err(|error| ToolError::Failed(format!("invalid job spec: {error}")))?;

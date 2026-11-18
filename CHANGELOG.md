@@ -17,6 +17,8 @@ uses semantic versioning once it reaches 1.0.
 - `lu mcp` initialize instructions now describe read and write tools. Write tools carry `readOnlyHint: false`; `lu_cancel`, `lu_drain` and `lu_undrain` also carry `destructiveHint: true`.
 - One `lu mcp` process allows 30 submissions per rolling minute; over the limit a call returns `isError` with the wait in seconds.
 
+- `lu top`: node `LOAD`, `MEM` and `VERSION` columns with memory thresholds, stuck markers and version-mismatch colouring; a process navigator pane (`x`, refreshed every 2s) showing job liveness counters, the process tree and per-node load/memory sparklines; controller version in the title; and the same new columns in `--once` output.
+
 ## [0.1.14] - 2026-11-18
 
 ### Fixed

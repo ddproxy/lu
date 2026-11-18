@@ -25,6 +25,7 @@ pub enum Action {
     Escape,
     Drain,
     ToggleGraph,
+    ToggleProcess,
 }
 
 pub fn action_for(event: KeyEvent) -> Option<Action> {
@@ -45,6 +46,7 @@ pub fn action_for(event: KeyEvent) -> Option<Action> {
         (KeyCode::Enter, _) => Some(Action::OpenLog),
         (KeyCode::Char('d'), _) => Some(Action::Drain),
         (KeyCode::Char('g'), _) => Some(Action::ToggleGraph),
+        (KeyCode::Char('x'), _) => Some(Action::ToggleProcess),
         _ => None,
     }
 }
@@ -68,16 +70,15 @@ pub fn run_live(
         while let Ok(update) = updates.try_recv() {
             dashboard.apply_update(update);
         }
-        terminal.draw(|frame| {
-            let width = frame.area().width as usize;
-            render::draw(frame, &dashboard.view_sized(Instant::now(), width))
-        })?;
+        terminal.draw(|frame| render::draw(frame, &dashboard.view(Instant::now())))?;
         if event::poll(POLL)? {
             if let Event::Key(key) = event::read()? {
                 match action_for(key) {
                     Some(Action::Quit) => break,
                     Some(Action::Escape) => {
-                        if !dashboard.close_log() {
+                        if dashboard.close_process_pane() {
+                            request(Request::ProcessPane { target: None });
+                        } else if !dashboard.close_log() {
                             break;
                         }
                     }
@@ -99,6 +100,11 @@ pub fn run_live(
                         }
                     }
                     Some(Action::ToggleGraph) => dashboard.toggle_graph(),
+                    Some(Action::ToggleProcess) => {
+                        if let Some(target) = dashboard.toggle_process_pane() {
+                            request(Request::ProcessPane { target });
+                        }
+                    }
                     None => {}
                 }
             }
@@ -171,7 +177,11 @@ mod tests {
             action_for(press(KeyCode::Char('g'), none)),
             Some(Action::ToggleGraph)
         );
-        assert_eq!(action_for(press(KeyCode::Char('x'), none)), None);
+        assert_eq!(
+            action_for(press(KeyCode::Char('x'), none)),
+            Some(Action::ToggleProcess)
+        );
+        assert_eq!(action_for(press(KeyCode::Char('z'), none)), None);
         assert_eq!(
             action_for(press(KeyCode::Char('c'), none)),
             None,
