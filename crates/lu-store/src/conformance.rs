@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use lu_proto::{
-    ArtifactName, Completion, FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobState,
-    NodeName, Outcome, ProviderState, ProviderStatus, MAX_LOG_BYTES,
+    ArtifactName, Choice, Completion, FailureClass, HarnessState, Heartbeat, JobId, JobSpec,
+    JobState, NodeName, Outcome, ProviderState, ProviderStatus, MAX_LOG_BYTES,
 };
 
 use crate::{Now, Store, StoreError};
@@ -29,6 +29,7 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         after: Vec::new(),
         stack_dependencies: true,
         requires: Vec::new(),
+        fallbacks: Vec::new(),
     }
 }
 
@@ -64,6 +65,8 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     cancel_states(&make());
     cancel_recovering_ends_it_cancelled_immediately(&make());
     assignment_and_epoch(&make());
+    fallback_choices_route_and_clear(&make());
+    primary_choice_is_preferred(&make());
     recovering_job_blocks_new_assignment_on_its_node(&make());
     label_requirements_route_and_explain(&make());
     start_renew_log_artifact(&make());
@@ -605,6 +608,100 @@ fn assignment_and_epoch<S: Store>(s: &S) {
         .unwrap()
         .unwrap();
     assert_eq!(ap.job_id, jp.id);
+}
+
+fn fallback_choices_route_and_clear<S: Store>(s: &S) {
+    let n = node("fallback-node");
+    s.heartbeat(
+        &hb(
+            "fallback-node",
+            HarnessState::Idle,
+            vec![
+                ("p1", ProviderState::Cooling),
+                ("p2", ProviderState::Ok),
+                ("p3", ProviderState::Ok),
+            ],
+        ),
+        now(1, 1),
+    )
+    .unwrap();
+    let mut sp = spec("https://x/fallback.git", None);
+    sp.provider = Some("p1".to_owned());
+    sp.model = Some("primary-model".to_owned());
+    sp.fallbacks = vec![
+        Choice {
+            provider: "p2".to_owned(),
+            model: None,
+        },
+        Choice {
+            provider: "p3".to_owned(),
+            model: Some("p3-model".to_owned()),
+        },
+    ];
+    let (job, _) = s.create_job(&sp, now(1, 1)).unwrap();
+
+    // The cooling primary is skipped; the first usable fallback runs with the primary model.
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    assert_eq!(a.job_id, job.id);
+    assert_eq!(a.provider.as_deref(), Some("p2"));
+    assert_eq!(a.model.as_deref(), Some("primary-model"));
+    assert_eq!(a.spec.model.as_deref(), Some("primary-model"));
+    let rec = s.get_job(&job.id).unwrap();
+    assert_eq!(rec.assigned_provider.as_deref(), Some("p2"));
+    assert_eq!(rec.assigned_model.as_deref(), Some("primary-model"));
+
+    s.start_job(&job.id, a.epoch, now(3, 3)).unwrap();
+    let completion = Completion {
+        job_id: job.id.clone(),
+        epoch: a.epoch,
+        outcome: Outcome::Failed(FailureClass::Provider),
+        exit_code: None,
+        summary: Some("no key".to_owned()),
+        retry_after_secs: None,
+    };
+    let rec = s
+        .complete(
+            &completion,
+            Some((FailureClass::Provider, Some("p2".to_owned()))),
+            now(4, 4),
+            1,
+            10_000,
+        )
+        .unwrap();
+    assert_eq!(rec.state, JobState::Queued);
+    assert_eq!(rec.assigned_provider, None);
+    assert_eq!(rec.assigned_model, None);
+
+    // The p2 cordon does not block p3 on the same node.
+    let a = s.next_assignment(&n, now(5, 5), 60_000).unwrap().unwrap();
+    assert_eq!(a.provider.as_deref(), Some("p3"));
+    assert_eq!(a.model.as_deref(), Some("p3-model"));
+}
+
+fn primary_choice_is_preferred<S: Store>(s: &S) {
+    let n = node("primary-node");
+    s.heartbeat(
+        &hb(
+            "primary-node",
+            HarnessState::Idle,
+            vec![("p1", ProviderState::Ok), ("p2", ProviderState::Ok)],
+        ),
+        now(1, 1),
+    )
+    .unwrap();
+    let mut sp = spec("https://x/primary.git", None);
+    sp.provider = Some("p1".to_owned());
+    sp.model = Some("primary-model".to_owned());
+    sp.fallbacks = vec![Choice {
+        provider: "p2".to_owned(),
+        model: Some("fallback-model".to_owned()),
+    }];
+    let (job, _) = s.create_job(&sp, now(1, 1)).unwrap();
+
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    assert_eq!(a.job_id, job.id);
+    assert_eq!(a.provider.as_deref(), Some("p1"));
+    assert_eq!(a.model.as_deref(), Some("primary-model"));
 }
 
 fn recovering_job_blocks_new_assignment_on_its_node<S: Store>(s: &S) {

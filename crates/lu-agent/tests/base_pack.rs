@@ -68,6 +68,8 @@ impl Controller for PackController {
                     job_id: JobId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
                     epoch: self.epoch,
                     spec: self.spec.clone(),
+                    provider: None,
+                    model: None,
                 }])
             }
         })
@@ -208,6 +210,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         after: Vec::new(),
         stack_dependencies: true,
         requires: Vec::new(),
+        fallbacks: Vec::new(),
     };
     let controller = Arc::new(PackController {
         spec,

@@ -9,7 +9,7 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 #[cfg(test)]
 pub mod conformance;
@@ -33,6 +33,10 @@ pub struct JobRecord {
     pub spec: JobSpec,
     pub attempt: u32,
     pub node: Option<NodeName>,
+    /// The provider choice dispatch made for the current attempt, if any.
+    pub assigned_provider: Option<String>,
+    /// The model that goes with `assigned_provider`, if any.
+    pub assigned_model: Option<String>,
     pub epoch: u64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -79,6 +83,9 @@ pub struct Assignment {
     pub job_id: JobId,
     pub epoch: u64,
     pub spec: JobSpec,
+    /// The chosen provider choice; `None` for a job that names no provider.
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 /// Every required label is present. Labels are compared exactly; Lu assigns no meaning to them.
@@ -152,7 +159,8 @@ pub trait Store: Send + Sync + 'static {
     /// Records the heartbeat and the time it was seen.
     fn heartbeat(&self, hb: &Heartbeat, now: Now) -> Result<(), StoreError>;
     /// Leases the oldest queued job this node may run (not draining, harness usable, no job
-    /// held, provider named by the job not cordoned and offered by the node), bumping the epoch.
+    /// held, labels satisfied, and able to serve the primary or one fallback provider choice),
+    /// bumping the epoch.
     fn next_assignment(
         &self,
         node: &NodeName,

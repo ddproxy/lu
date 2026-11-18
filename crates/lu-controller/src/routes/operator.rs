@@ -46,6 +46,8 @@ fn job_view_with(r: &JobRecord, reason: Option<String>) -> serde_json::Value {
         "spec": &r.spec,
         "attempt": r.attempt,
         "node": r.node.as_ref().map(|n| n.to_string()),
+        "assigned_provider": r.assigned_provider,
+        "assigned_model": r.assigned_model,
         "epoch": r.epoch,
         "created_at": r.created_at,
         "updated_at": r.updated_at,

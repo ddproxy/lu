@@ -29,6 +29,10 @@ fn spec() -> JobSpec {
         after: vec![JobId::new()],
         stack_dependencies: true,
         requires: vec!["php8.3".to_owned()],
+        fallbacks: vec![lu_proto::Choice {
+            provider: "peer-b".to_owned(),
+            model: Some("other-model".to_owned()),
+        }],
     }
 }
 
@@ -41,6 +45,8 @@ fn a_submission_travels_as_an_assignment_and_comes_back_as_a_completion() {
         job_id: job_id(),
         epoch: 7,
         spec: spec.clone(),
+        provider: Some("peer-b".to_owned()),
+        model: Some("other-model".to_owned()),
     };
     let wire = serde_json::to_string(&assign).unwrap();
     assert_eq!(serde_json::from_str::<AgentEvent>(&wire).unwrap(), assign);

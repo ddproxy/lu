@@ -122,12 +122,19 @@ pub async fn poll(
             }
         };
         if let Some(a) = assignment {
-            events.push(json!({
+            let mut event = json!({
                 "kind":"assign",
                 "job_id": a.job_id.to_string(),
                 "epoch": a.epoch,
                 "spec": a.spec,
-            }));
+            });
+            if let Some(provider) = a.provider {
+                event["provider"] = provider.into();
+            }
+            if let Some(model) = a.model {
+                event["model"] = model.into();
+            }
+            events.push(event);
         }
 
         if !events.is_empty() {
@@ -580,8 +587,8 @@ pub async fn complete_job(
     let failure = match completion.outcome {
         lu_proto::Outcome::Done | lu_proto::Outcome::Cancelled => None,
         lu_proto::Outcome::Failed(class) => {
-            // provider name? spec says provider failure class cordons (node, provider) if job names a provider.
-            let provider = rec_check.spec.provider.clone();
+            // A fallback attempt must cordon the pair it actually ran on.
+            let provider = rec_check.assigned_provider.clone();
             Some((class, provider))
         }
     };

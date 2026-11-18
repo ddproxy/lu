@@ -44,6 +44,7 @@ Agents poll; the controller has no push channel. Lease expiry uses the controlle
 | `after` | array of job ids | no | At most 16 unique ids; omitted when empty. |
 | `stack_dependencies` | boolean | no | Defaults to `true`; omitted when `true`. When true, dependency diffs are applied to the job's base tree. |
 | `requires` | array of labels | no | At most 8 labels; omitted when empty. |
+| `fallbacks` | array of objects | Up to 4 alternative `{provider, model}` choices, tried in order when the primary provider is unavailable on a node. Omitted when empty. |
 
 An unknown `git_ref` for a configured repository is `422 unprocessable` and names the ref. A job for an unlisted repository has no `base_commit` unless one is supplied by the client.
 
@@ -69,6 +70,8 @@ An unknown `git_ref` for a configured repository is `422 unprocessable` and name
 | `after` | array of strings | Dependency ids from the spec. |
 | `waiting_on` | array of strings | Dependencies that are not yet `done`. |
 | `waiting_reason` | string or null | Why a queued job cannot be placed, such as `no node with label php8.3`. |
+| `assigned_provider` | string or null | The provider choice the job was assigned with, when it has fallbacks. |
+| `assigned_model` | string or null | The model of that choice. |
 | `warnings` | array of strings | Submit replies only. |
 `HostStats`: `load1`, `load5`, `load15`, `mem_total_kb`, `mem_available_kb`, `swap_used_kb`, `disk_free_bytes` and `disk_total_bytes` (both optional; they describe the agent's work filesystem and are omitted when it cannot be read), `uptime_secs`. Host numbers are read from `/proc`; non-Linux agents report no host stats.
 
@@ -150,9 +153,9 @@ A `JobSpec.base_commit` is a 40-hex commit id. The agent fetches a pack for it u
 
 - A job with `after` dependencies starts `blocked`. When a dependency becomes `done`, every blocked dependent whose dependencies are all `done` becomes `queued` in the same transaction. When a dependency becomes `failed` or `cancelled`, blocked dependents fail with `failure_class: "dependency"` and summary `dependency <id> <state>`, cascading through their own dependents. Dependency failures never retry.
 - A dependent job with `stack_dependencies: true` (the default) stages its base commit, then the agent fetches the dependency list and applies each finished dependency's `diff.patch` in `after` order before starting the harness. A dependency with no diff is skipped. If a patch does not apply and a three-way merge leaves conflicts, the agent stops before the harness and completes `Failed(Conflict)`; the summary names the dependency and at most 20 conflicting paths. `conflict` never retries. The job's own `diff.patch` is always against its base and includes the dependency changes, so a consumer merging a chain applies only the last diff.
-- Dispatch assigns a queued job only when its node is idle, not draining, has no held job, offers every label in `spec.requires`, and (when the job names a provider) reports that provider healthy with no matching cordon.
+- Dispatch first applies labels: it assigns a queued job only when its node is idle, not draining, has no held job, and offers every label in `spec.requires`. A job with no `spec.provider` then runs on that node. Otherwise the choices are tried in order—the primary `spec.provider`/`spec.model`, then `spec.fallbacks` in list order—and the job uses the first choice whose provider the node reports healthy and has no unexpired cordon for. The chosen pair is stored as `assigned_provider`/`assigned_model`; a fallback without a model uses the primary `spec.model`. A requeued job is dispatched afresh and may choose another pair, including on the same node.
 - A lease that is not renewed for `lease_secs` expires: the job becomes `recovering`, then after `recovery_grace_secs` returns to `queued` with a bumped attempt (class `node`) unless attempts are exhausted (`max_retries`), when it becomes `failed`.
-- `Completion` with a `provider` failure class cordons `(node, provider)` for `provider_cooldown_secs`, or for `retry_after_secs` when given; assignment skips cordoned pairs when the job names a provider, and two healthy heartbeats clear a `retry_after_secs` cordon.
+- `Completion` with a `provider` failure class cordons `(node, assigned_provider)` for `provider_cooldown_secs`, or for `retry_after_secs` when given; the pair is the one chosen at dispatch, not necessarily the primary. Assignment skips a cordoned choice, so the requeued job can move to its next fallback, another node, or the same node under a different provider. Two healthy heartbeats clear a `retry_after_secs` cordon.
 - Epoch fencing: every agent write names the epoch it was assigned; a write for an older epoch is `409 stale_epoch` and changes nothing.
 - On start the controller marks every `leased` or `running` job `recovering` (it was restarted mid-flight); agents that still hold the lease resume by renewing within the grace period.
 - Job logs and artifacts are stored under `artifacts_dir/<job id>/`, names fixed by the controller, files `0600`, directories `0700`.

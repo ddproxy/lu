@@ -321,6 +321,7 @@ fn test_spec(repo: &str) -> JobSpec {
         after: Vec::new(),
         stack_dependencies: true,
         requires: Vec::new(),
+        fallbacks: Vec::new(),
     }
 }
 
@@ -468,6 +469,8 @@ fn controller_with_assign(job_id: JobId, epoch: u64, spec: JobSpec) -> Arc<FakeC
         job_id: job_id.clone(),
         epoch,
         spec,
+        provider: None,
+        model: None,
     }]));
     controller.push_start(Ok(()));
     controller.push_renew(Ok(false)); // First renew returns false (no cancel)
@@ -531,6 +534,8 @@ async fn stale_epoch_from_any_lease_call_stops_job_without_completing() {
         job_id: job_id.clone(),
         epoch,
         spec: spec.clone(),
+        provider: None,
+        model: None,
     }]));
     // start returns StaleEpoch
     controller.push_start(Err(ApiError::StaleEpoch));
@@ -715,6 +720,8 @@ async fn control_loop_cancel_event_stops_job() {
         job_id: job_id.clone(),
         epoch,
         spec: spec.clone(),
+        provider: None,
+        model: None,
     }]));
     controller.push_start(Ok(()));
     // Heartbeat poll returns Cancel for the job
@@ -759,6 +766,8 @@ async fn control_loop_stale_epoch_stops_job() {
         job_id: job_id.clone(),
         epoch,
         spec: spec.clone(),
+        provider: None,
+        model: None,
     }]));
     controller.push_start(Ok(()));
     // Renew returns StaleEpoch
@@ -998,6 +1007,8 @@ fn assigned_controller(job_id: &JobId, spec: JobSpec) -> Arc<FakeController> {
         job_id: job_id.clone(),
         epoch: EPOCH,
         spec,
+        provider: None,
+        model: None,
     }]));
     controller
 }
@@ -1605,6 +1616,45 @@ async fn job_survives_a_provider_that_recovers_between_readings() {
 }
 
 #[tokio::test]
+async fn job_uses_the_assigned_model() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.provider = Some("p1".to_owned());
+    spec.model = Some("primary-model".to_owned());
+    let controller = Arc::new(FakeController::new());
+    controller.push_poll(Ok(vec![AgentEvent::Assign {
+        job_id: job_id.clone(),
+        epoch: EPOCH,
+        spec,
+        provider: Some("p2".to_owned()),
+        model: Some("fallback-model".to_owned()),
+    }]));
+    controller.push_start(Ok(()));
+    controller.push_renew(Ok(false));
+    controller.push_complete(Ok(()));
+    let seen = Arc::new(Mutex::new(None));
+    let recorder = Arc::clone(&seen);
+    let agent = make_agent(&f.work_dir, controller.clone(), success_harness).with_command_builder(
+        move |task_file, model, _server, _message| {
+            *recorder.lock().unwrap() = model.map(str::to_owned);
+            Ok(success_harness(task_file))
+        },
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert_eq!(*seen.lock().unwrap(), Some("fallback-model".to_owned()));
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    assert_eq!(report["model"], "fallback-model");
+}
+
+#[tokio::test]
 async fn job_unsupported_harness_completes_execution_failure() {
     let f = fixture();
     let job_id = JobId::new();
@@ -1863,6 +1913,8 @@ async fn job_transient_poll_errors_back_off_and_recover() {
         job_id: job_id.clone(),
         epoch: EPOCH,
         spec: test_spec(&f.repo_dir.to_string_lossy()),
+        provider: None,
+        model: None,
     }]));
     let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo recovered"));
     // Backoff uses tokio timers on the real clock (the test-util feature is not enabled), so

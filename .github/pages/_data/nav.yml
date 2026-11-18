@@ -7,6 +7,7 @@
     - { title: Concepts, url: /docs/concepts.html }
     - { title: Job Lifecycle, url: /docs/lifecycle.html }
     - { title: Dependencies, url: /docs/dependencies.html }
+    - { title: Choosing where a job runs, url: /docs/dispatch.html }
 - title: Reference
   items:
     - { title: HTTP API, url: /docs/api.html }

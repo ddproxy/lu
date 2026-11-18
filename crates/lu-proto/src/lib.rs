@@ -20,7 +20,7 @@ pub use failure::FailureClass;
 pub use ids::{JobId, JobIdError, NodeName, NodeNameError};
 pub use label::valid_label;
 pub use limits::{
-    ArtifactName, DEFAULT_TIMEOUT_SECS, JOB_ID_LEN, MAX_AFTER_JOBS, MAX_DIFF_BYTES,
+    ArtifactName, DEFAULT_TIMEOUT_SECS, JOB_ID_LEN, MAX_AFTER_JOBS, MAX_DIFF_BYTES, MAX_FALLBACKS,
     MAX_GIT_REF_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS, MAX_LABEL_BYTES,
     MAX_LABEL_FILES, MAX_LABEL_FILE_BYTES, MAX_LOG_BYTES, MAX_LOG_CHUNK_BYTES, MAX_MODEL_BYTES,
     MAX_NAME_BYTES, MAX_NODE_LABELS, MAX_PROVIDERS, MAX_REIKI_BYTES, MAX_REPORT_BYTES,
@@ -32,5 +32,5 @@ pub use node::{
     ProcessStats, ProviderState, ProviderStatus,
 };
 pub use sanitize::{printable, truncate_chars};
-pub use spec::{validate_idempotency_key, JobSpec, JobSpecError};
+pub use spec::{validate_idempotency_key, Choice, JobSpec, JobSpecError};
 pub use state::{CancelEffect, JobState};

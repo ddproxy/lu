@@ -79,7 +79,7 @@ It returns `{"ok":true,"version":"…","db":"ok"}`. A non-loopback listener requ
 4. Run `lu check --config /etc/lu/lu.toml` to confirm the file structure, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store has schema version 4. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
+The store has schema version 5. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Schema 5 adds the nullable `assigned_provider` and `assigned_model` job columns; an older database upgrades on open with those columns empty. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes.
 
@@ -240,7 +240,7 @@ A job submitted with `after` dependencies starts as `blocked` when at least one 
 
 A dependent job with `stack_dependencies: true` (the default) stages its base commit and applies every finished dependency's `diff.patch` in `after` order before the harness starts. A dependency with no diff is skipped. A patch that applies cleanly is written directly; otherwise the agent reconstructs the dependency's side from the base and three-way merges it. If conflicts remain, the job stops before the harness with `failure_class: "conflict"` and a summary naming the dependency and up to 20 conflicting paths; it never retries and the failed merge writes nothing. `lu submit --no-stack` sets `stack_dependencies: false` to run on the base tree alone. The dependent's own diff is always against its base and includes the dependency changes, so a consumer merging a chain applies only the last diff.
 
-A job starts as `queued` with `attempt = 1` and `epoch = 0`. When an idle, non-draining node with no held job asks for work, the controller assigns the oldest queued job whose provider is available and not cordoned, and whose node advertises every label in the job's `requires` list. Label matching is exact; Lu assigns no meaning to a label. The label rule composes with provider and drain rules. If a queued job's requirements cannot be met by any online node, `lu show` and the `lu top` note column print the first missing label as `no node with label <label>`. A `leased`, `running` or `recovering` job is still held by its node:
+A job starts as `queued` with `attempt = 1` and `epoch = 0`. Dispatch first applies labels: when an idle, non-draining node with no held job asks for work, it is eligible only if it advertises every label in the job's `requires` list. Label matching is exact; Lu assigns no meaning to a label. If the job names no provider, it runs on that node. Otherwise the controller tries the primary `provider`/`model`, then each `fallbacks` entry in list order, and assigns the first choice whose provider the node reports healthy with no unexpired cordon. A fallback without a model reuses the primary model. The chosen pair is stored as `assigned_provider` and `assigned_model`; `lu show` prints the fallbacks and `assigned_provider`. The agent builds the harness command and `report.json` from that assigned model. A requeued job is dispatched afresh and may use another pair, including on the same node. If a queued job's requirements cannot be met by any online node, `lu show` and the `lu top` note column print the first missing label as `no node with label <label>`. A `leased`, `running` or `recovering` job is still held by its node:
 
 - state becomes `leased`, `node` is set, `epoch` is incremented, and the lease runs for `lease_secs`.
 - the agent calls `start` to move the job to `running`; `start` and each log append extend the lease. `poll` renews jobs that have pending cancellations.
@@ -251,9 +251,9 @@ Maintenance runs every `max(1, lease_secs / 3)` seconds. An expired lease moves 
 On completion:
 
 - `Done` moves the job to `done` and records `finished_at`; newly unblocked dependents move to `queued`.
-- `Failed(Execution)` moves it to `failed` immediately. Execution failures never retry. `lu retry <id>` resubmits a finished job's spec as a new job; `--provider`, `--model`, `--after`/`--after-key`, `--require`/`--no-require` and `--key` replace the corresponding fields. The new job is independent of the old one.
+- `Failed(Execution)` moves it to `failed` immediately. Execution failures never retry. `lu retry <id>` resubmits a finished job's spec as a new job (`--provider`, `--model`, `--fallback`/`--no-fallbacks`, `--after` and `--require`/`--no-require` replace those fields); the new job is independent of the old one.
 - `Failed(Conflict)` means a dependency diff could not be applied to the base tree. It moves the job to `failed` immediately and never retries.
-- `Failed(Node)` retries while `attempt <= max_retries`: the job returns to `queued`, the attempt is incremented, and the node is cleared. Beyond the cap it becomes `failed` with that failure class. `Failed(Provider)` does not use that budget: a provider outage is not the job's fault, so the job returns to `queued` and waits until a node can serve the provider again (the node must report it healthy and have no cordon). Only 100 provider failures in a row fail the job. A terminal `failed` or `cancelled` job fails its blocked dependents.
+- `Failed(Node)` retries while `attempt <= max_retries`: the job returns to `queued`, the attempt is incremented, and the node is cleared. Beyond the cap it becomes `failed` with that failure class. `Failed(Provider)` does not use that budget: a provider outage is not the job's fault, so the job returns to `queued` and waits until a node can serve one of its choices (the provider healthy and not cordoned). Only 100 provider failures in a row fail the job. A terminal `failed` or `cancelled` job fails its blocked dependents.
 
 A failure before the harness produced a verdict is classified by the agent, one row per case:
 
@@ -264,11 +264,11 @@ A failure before the harness produced a verdict is classified by the agent, one 
 | A staging error that names a missing ref, an authentication failure or an unknown repository | `execution` | never |
 | A dependency diff could not be applied and the three-way merge left conflicts (or the patch was unreadable) | `conflict` | never |
 
-`max_retries` is the number of node-failure retries, not the total number of attempts. With the default `1`, an initial attempt plus one retry is allowed. A provider failure also cordons the `(node, provider)` pair for `provider_cooldown_secs`.
+`max_retries` is the number of node-failure retries, not the total number of attempts. With the default `1`, an initial attempt plus one retry is allowed. A provider failure also cordons the `(node, assigned_provider)` pair for `provider_cooldown_secs`; the pair is the one chosen at dispatch, not necessarily the primary. The requeued job can then move to another fallback or node, or return to the same node under a different provider.
 
-When a job names a `provider`, the agent also checks it against its node's Reiki reading every five seconds. Reiki is the authority on keys, so this works for any harness: when two fresh readings in a row show the provider cooling or disabled (no usable key), the agent stops the job like a cancel and completes it as `Failed(Provider)`, with a summary that names the provider and the soonest return time Reiki reported. The completion carries that time plus a 60-second buffer as `retry_after_secs`, and the controller cordons the provider on the node for that long instead of the configured cordon length. Two consecutive healthy provider heartbeats after the failure clear that cordon; a non-healthy reading resets the streak.
+When a job resolves to a `provider` (the assigned choice, or the primary when the job names one), the agent also checks it against its node's Reiki reading every five seconds. Reiki is the authority on keys, so this works for any harness: when two fresh readings in a row show the provider cooling or disabled (no usable key), the agent stops the job like a cancel and completes it as `Failed(Provider)`, with a summary that names the provider and the soonest return time Reiki reported. The completion carries that time plus a 60-second buffer as `retry_after_secs`, and the controller cordons that provider on the node for that long instead of the configured cordon length. Two consecutive healthy provider heartbeats after the failure clear that cordon; a non-healthy reading resets the streak.
 
-As a fallback for a job that names no provider, or a node without a Reiki feed, the agent watches a running harness's output. If the newest line matches a provider-unavailable marker (the opencode message about every key in the stream's chain, a quota message, a 429, or a rate limit) and the harness then produces no output for 120 seconds, the agent stops it the same way and completes the job as `Failed(Provider)`, with a summary naming the marker. Any other output after the marker disarms the watch.
+As a fallback for a job with no provider, or a node without a Reiki feed, the agent watches a running harness's output. If the newest line matches a provider-unavailable marker (the opencode message about every key in the stream's chain, a quota message, a 429, or a rate limit) and the harness then produces no output for 120 seconds, the agent stops it the same way and completes the job as `Failed(Provider)`, with a summary naming the marker. Any other output after the marker disarms the watch.
 
 Cancellation is different:
 
@@ -281,7 +281,7 @@ Cancellation is different:
 These are separate mechanisms:
 
 - **Drain** stops a node taking any new job. It is set by `POST /v1/nodes/{name}/drain` and cleared by `/undrain`, and is stored in the `nodes` table. It survives a controller restart. A node must have sent a heartbeat at least once to exist; draining an unknown node returns `404 not_found`.
-- **Cordon** stops a node taking jobs that name a particular provider. It is created when a retryable provider failure completes and the job names a provider, and it expires after `provider_cooldown_secs`. A completion with `retry_after_secs` marks the cordon Reiki-derived; two consecutive healthy provider heartbeats clear it early. A job with no provider is not blocked by a cordon.
+- **Cordon** stops a node taking jobs whose chosen provider is cordoned. It is created when a retryable provider failure completes, keyed by the pair actually assigned rather than necessarily the primary, and it expires after `provider_cooldown_secs`. A completion with `retry_after_secs` marks the cordon Reiki-derived; two consecutive healthy provider heartbeats clear it early. A job with no provider is not blocked by a cordon.
 
 Cordon deadlines are stored as monotonic milliseconds. The controller does not rebase them on restart, so a surviving cordon's remaining time is approximate and may last longer than the configured cooldown if the previous process ran for a long time. `lu nodes --json` shows the currently unexpired cordons; there is no CLI command to clear one. Wait out the cooldown, let a node report the provider healthy twice, or edit the database while the controller is stopped.
 
@@ -292,7 +292,7 @@ Cordon deadlines are stored as monotonic milliseconds. The controller does not r
 ```text
 version             0.1.10
 uptime_secs         3600
-schema_version      4
+schema_version      5
 db_bytes            81920
 recovered_on_boot   2
 oldest_queued_secs  0
@@ -330,7 +330,7 @@ node-a  0.1.10   idle     gpu,php8.3,region=eu       2026-11-16 09:12:00Z no
 
 There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `labels`, `current_job`, `cordons`, `version` and the opaque `reiki` document.
 
-A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, lacks a required label, or has a matching provider cordon will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
+A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, lacks a required label, or (when the job names a provider) cannot serve any of its provider/model choices, including a matching provider cordon, will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
 
 ## Reading `lu node`
 
@@ -481,7 +481,7 @@ Series:
 | `lu_build_info{version="…"}` | gauge | Always 1; the controller build version. |
 | `lu_uptime_seconds` | gauge | Seconds since the controller process started. |
 | `lu_db_bytes` | gauge | Size of the SQLite database file, excluding `-wal` and `-shm`. |
-| `lu_schema_version` | gauge | Schema version the binary expects, currently `4`. |
+| `lu_schema_version` | gauge | Schema version the binary expects, currently `5`. |
 | `lu_recovered_on_boot` | gauge | Jobs moved to `recovering` by this process's boot recovery. |
 | `lu_queue_oldest_seconds` | gauge | Age of the oldest `queued` or `blocked` job, or `0` when there is none. |
 | `lu_node_last_seen_seconds{node}` | gauge | Seconds since that node's last heartbeat. |

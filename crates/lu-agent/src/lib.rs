@@ -319,10 +319,22 @@ impl Agent {
                                 job_id,
                                 epoch,
                                 spec,
+                                provider,
+                                model,
                             } => {
                                 backoff.reset();
                                 info!(job = %job_id, epoch, "assigned");
-                                match this.run_job(job_id, epoch, spec, shutdown.as_mut()).await? {
+                                match this
+                                    .run_job(
+                                        job_id,
+                                        epoch,
+                                        spec,
+                                        provider,
+                                        model,
+                                        shutdown.as_mut(),
+                                    )
+                                    .await?
+                                {
                                     JobEnd::Shutdown => return Ok(()),
                                     JobEnd::Finished
                                     | JobEnd::Cancelled
@@ -427,11 +439,16 @@ impl Agent {
         job_id: JobId,
         epoch: u64,
         spec: JobSpec,
+        assigned_provider: Option<String>,
+        assigned_model: Option<String>,
         mut shutdown: Pin<&mut F>,
     ) -> Result<JobEnd, AgentError>
     where
         F: Future<Output = ()> + Send,
     {
+        // An older controller sends neither field; the primary choice still applies.
+        let provider = assigned_provider.or_else(|| spec.provider.clone());
+        let model = assigned_model.or_else(|| spec.model.clone());
         let started = Instant::now();
         // A harness in another account cannot read `.git`, so its task file sits beside the tree.
         let shared_task = self
@@ -493,6 +510,7 @@ impl Agent {
                         job_id: &job_id,
                         epoch,
                         spec: &spec,
+                        model: model.as_deref(),
                         staged: &staged,
                         started,
                         outcome: Outcome::Failed(FailureClass::Conflict),
@@ -573,6 +591,7 @@ impl Agent {
                 job_id: &job_id,
                 epoch,
                 spec: &spec,
+                model: model.as_deref(),
                 staged: &staged,
                 started,
                 outcome: Outcome::Failed(FailureClass::Execution),
@@ -594,7 +613,7 @@ impl Agent {
 
         let command = match (self.builder)(
             &task_file,
-            spec.model.as_deref(),
+            model.as_deref(),
             self.opencode_server.as_deref(),
             "Follow the task in the provided file.",
         ) {
@@ -612,6 +631,7 @@ impl Agent {
                     job_id: &job_id,
                     epoch,
                     spec: &spec,
+                    model: model.as_deref(),
                     staged: &staged,
                     started,
                     outcome: Outcome::Failed(FailureClass::Execution),
@@ -773,11 +793,11 @@ impl Agent {
                         None => break,
                     }
                 }
-                _ = watch.tick(), if spec.provider.is_some() => {
+                _ = watch.tick(), if provider.is_some() => {
                     let current = health::snapshot(&self.health);
                     if current.seq != seen_seq {
                         seen_seq = current.seq;
-                        let wanted = spec.provider.as_deref().unwrap_or_default();
+                        let wanted = provider.as_deref().unwrap_or_default();
                         let status = current.providers.iter().find(|p| p.name == wanted);
                         match status {
                             Some(p) if matches!(p.state, ProviderState::Cooling | ProviderState::Disabled) => {
@@ -879,6 +899,7 @@ impl Agent {
                 job_id: &job_id,
                 epoch,
                 spec: &spec,
+                model: model.as_deref(),
                 staged: &staged,
                 started,
                 outcome: Outcome::Failed(FailureClass::Provider),
@@ -901,6 +922,7 @@ impl Agent {
             job_id: &job_id,
             epoch,
             spec: &spec,
+            model: model.as_deref(),
             staged: &staged,
             started,
             outcome,
@@ -1035,7 +1057,7 @@ impl Agent {
             finish.exit_code,
             finish.started.elapsed(),
             &finish.spec.harness,
-            finish.spec.model.as_deref(),
+            finish.model,
             finish.applied_dependencies,
         );
         if let Ok(report) = report {
@@ -1112,6 +1134,8 @@ struct Finish<'a> {
     job_id: &'a JobId,
     epoch: u64,
     spec: &'a JobSpec,
+    /// The model that actually runs, which may come from a fallback choice.
+    model: Option<&'a str>,
     staged: &'a StagedDir,
     started: Instant,
     outcome: Outcome,

@@ -699,6 +699,7 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
         after,
         stack_dependencies: true,
         requires: Vec::new(),
+        fallbacks: Vec::new(),
     };
     spec.validate()
         .map_err(|error| ToolError::Failed(format!("invalid job spec: {error}")))?;
