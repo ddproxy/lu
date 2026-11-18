@@ -2,7 +2,7 @@
 //!
 //! Everything here is best-effort: an unreadable file becomes an omitted value or a zero, never
 //! an error that could disturb a running job. Other platforms report nothing. No new dependency
-//! and no `unsafe` is used, so the only filesystem primitive is `std::fs`.
+//! and no `unsafe` is used; the disk fields come from the housekeeping helper.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -30,19 +30,26 @@ pub fn enabled() -> bool {
 }
 
 /// Samples the real host. `None` on a non-Linux build or when the required files cannot be read.
-pub fn host_stats() -> Option<HostStats> {
+/// The disk numbers describe the filesystem holding `disk_root`, when it can be read.
+pub fn host_stats(disk_root: &Path) -> Option<HostStats> {
     #[cfg(target_os = "linux")]
     {
-        host_stats_at(Path::new("/proc"))
+        let mut host = host_stats_at(Path::new("/proc"))?;
+        if let Some(space) = crate::housekeeping::disk_space(disk_root) {
+            host.disk_free_bytes = Some(space.free_bytes);
+            host.disk_total_bytes = Some(space.total_bytes);
+        }
+        Some(host)
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = disk_root;
         None
     }
 }
 
-/// Reads host numbers from a `/proc`-shaped root. `disk_free_bytes` is always `None`: the value
-/// needs a filesystem stat call that `std` does not expose without a platform-specific API.
+/// Reads host numbers from a `/proc`-shaped root. Disk fields stay `None`; [`host_stats`] fills
+/// them from the real filesystem.
 pub fn host_stats_at(root: &Path) -> Option<HostStats> {
     let load = parse_loadavg(&std::fs::read_to_string(root.join("loadavg")).ok()?)?;
     let (mem_total_kb, mem_available_kb, swap_used_kb) =
@@ -56,6 +63,7 @@ pub fn host_stats_at(root: &Path) -> Option<HostStats> {
         mem_available_kb,
         swap_used_kb,
         disk_free_bytes: None,
+        disk_total_bytes: None,
         uptime_secs,
     })
 }
@@ -522,6 +530,7 @@ mod tests {
         assert_eq!(host.swap_used_kb, 3_072);
         assert_eq!(host.uptime_secs, 1_234);
         assert!(host.disk_free_bytes.is_none());
+        assert!(host.disk_total_bytes.is_none());
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -176,10 +176,38 @@ pub struct AgentConfig {
     /// Files re-read before each heartbeat; one label per line.
     #[serde(default)]
     pub label_files: Vec<String>,
+    /// Opt-in removal of leftover build directories between jobs.
+    #[serde(default)]
+    pub housekeeping: Option<HousekeepingConfig>,
 }
 
 fn default_heartbeat_secs() -> u64 {
     15
+}
+
+/// Removes old scratch directories between jobs. Every field has the documented default.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HousekeepingConfig {
+    /// Absolute patterns such as `/srv/work/target-*`. Only the last component may use `*` or `?`.
+    pub scratch_globs: Vec<String>,
+    /// Only entries whose newest modification time is at least this old are removed.
+    pub min_age_hours: u64,
+    /// Act only while the parent filesystem is below this percentage of free space.
+    pub min_free_percent: u64,
+    /// The most directories removed in one pass.
+    pub max_remove_per_pass: usize,
+}
+
+impl Default for HousekeepingConfig {
+    fn default() -> Self {
+        Self {
+            scratch_globs: Vec::new(),
+            min_age_hours: 6,
+            min_free_percent: 15,
+            max_remove_per_pass: 10,
+        }
+    }
 }
 
 /// Both paths are required when the table is present.
@@ -576,8 +604,82 @@ impl AgentConfig {
             }
             (None, None) => {}
         }
+        if let Some(housekeeping) = &self.housekeeping {
+            housekeeping.validate()?;
+        }
         Ok(())
     }
+}
+
+impl HousekeepingConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.scratch_globs.len() > 8 {
+            return invalid(
+                "[agent.housekeeping]",
+                format!(
+                    "scratch_globs must name at most 8 patterns (got {})",
+                    self.scratch_globs.len()
+                ),
+            );
+        }
+        for (index, pattern) in self.scratch_globs.iter().enumerate() {
+            validate_scratch_glob(
+                &format!("[agent.housekeeping] scratch_globs #{index}"),
+                pattern,
+            )?;
+        }
+        if self.min_free_percent > 100 {
+            return invalid(
+                "[agent.housekeeping]",
+                format!(
+                    "min_free_percent must be 0 to 100 (got {})",
+                    self.min_free_percent
+                ),
+            );
+        }
+        if self.max_remove_per_pass == 0 {
+            return invalid(
+                "[agent.housekeeping]",
+                "max_remove_per_pass must be at least 1".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_scratch_glob(table: &str, pattern: &str) -> Result<(), ConfigError> {
+    validate_abs_no_dotdot(table, "pattern", pattern)?;
+    let path = Path::new(pattern);
+    let components: Vec<Component<'_>> = path.components().collect();
+    let Some(Component::Normal(last)) = components.last() else {
+        return invalid(
+            table,
+            format!("pattern must end in a file name (got {pattern:?})"),
+        );
+    };
+    if last.to_string_lossy().contains('/') {
+        return invalid(
+            table,
+            format!("pattern must end in a file name (got {pattern:?})"),
+        );
+    }
+    for component in &components[..components.len() - 1] {
+        if let Component::Normal(part) = component {
+            if part
+                .to_string_lossy()
+                .chars()
+                .any(|ch| ch == '*' || ch == '?')
+            {
+                return invalid(
+                    table,
+                    format!(
+                        "only the final path component may contain '*' or '?' (got {pattern:?})"
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn invalid(table: &str, reason: String) -> Result<(), ConfigError> {
@@ -1050,6 +1152,60 @@ heartbeat_secs = 15
         assert!(a.label_files.is_empty());
         let cfg = Config::parse(&combined()).unwrap();
         assert_eq!(cfg.log.level, "info");
+    }
+
+    #[test]
+    fn housekeeping_is_absent_unless_configured() {
+        let a = Config::parse(&agent_only()).unwrap().agent.unwrap();
+        assert!(a.housekeeping.is_none());
+    }
+
+    #[test]
+    fn housekeeping_defaults_and_globs_are_checked() {
+        let base = "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n[agent.housekeeping]\n";
+        let config = Config::parse(&format!("{base}scratch_globs=[\"/srv/work/target-*\"]\n"))
+            .unwrap()
+            .agent
+            .unwrap()
+            .housekeeping
+            .unwrap();
+        assert_eq!(config.scratch_globs, ["/srv/work/target-*"]);
+        assert_eq!(config.min_age_hours, 6);
+        assert_eq!(config.min_free_percent, 15);
+        assert_eq!(config.max_remove_per_pass, 10);
+
+        assert!(Config::parse(&format!(
+            "{base}scratch_globs=[\"/srv/work/target-?\", \"/srv/work/build-*\", \"/tmp/x*\"]\n"
+        ))
+        .is_ok());
+
+        let too_many = (0..9)
+            .map(|index| format!("\"/scratch-{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        expect_table(
+            &format!("{base}scratch_globs=[{too_many}]\n"),
+            "[agent.housekeeping]",
+        );
+    }
+
+    #[test]
+    fn housekeeping_globs_stay_inside_their_parent() {
+        let base = "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n[agent.housekeeping]\n";
+        for pattern in ["relative/*", "/srv/../work/*", "/srv/*/target"] {
+            expect_table(
+                &format!("{base}scratch_globs=[\"{pattern}\"]\n"),
+                "[agent.housekeeping] scratch_globs #0",
+            );
+        }
+        expect_table(
+            &format!("{base}scratch_globs=[\"/srv/work/target-*\"]\nmin_free_percent=101\n"),
+            "[agent.housekeeping]",
+        );
+        expect_table(
+            &format!("{base}scratch_globs=[\"/srv/work/target-*\"]\nmax_remove_per_pass=0\n"),
+            "[agent.housekeeping]",
+        );
     }
 
     #[test]

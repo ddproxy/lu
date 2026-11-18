@@ -82,6 +82,8 @@ The `[agent]` table describes an agent host. The operator CLI also reads `contro
 | `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set, and rejected when set alone. Checked like `token_file` on `load`; the agent reads at most 4 KiB. |
 | `labels` | no | `[]` | At most 32 labels. Each is 1 to 64 characters from `A-Z a-z 0-9 . _ - /`, with at most one `=`. Lu never interprets them; a job's `requires` must match every label exactly. |
 | `label_files` | no | `[]` | At most 8 absolute paths without `..`. Each file is read again before every heartbeat; a missing or unreadable file contributes nothing. Each file is capped at 4 KiB, must be UTF-8, and holds one label per line; blank lines and lines starting with `#` are ignored. Invalid labels are dropped with one warning per label. File labels are merged with `labels`, then sorted and de-duplicated. |
+| `housekeeping` | no | — | Optional `[agent.housekeeping]` table. Without it the agent removes nothing. |
+| `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set. Checked like `token_file` on `load`. |
 
 Labels let one controller route work to particular hosts without a new job field for every
 machine property. For example:
@@ -93,6 +95,30 @@ labels = ["gpu", "php8.3", "region=eu"]
 label_files = ["/etc/lu/labels.d/installed-software"]
 ```
 
+### `[agent.housekeeping]`
+
+Opt-in removal of old scratch directories, run by the agent at start and between jobs only.
+
+| Key | Required | Default | Validation |
+| --- | --- | --- | --- |
+| `scratch_globs` | no | `[]` | At most 8 absolute patterns without `..`. Only the final path component may contain `*` or `?`, so a pattern cannot match above its parent directory. |
+| `min_age_hours` | no | `6` | Only a directory tree whose newest modification time is at least this many hours old is removable. |
+| `min_free_percent` | no | `15` | Act only while the filesystem holding the pattern's parent has less free space than this. `0` always acts on entries old enough by age. |
+| `max_remove_per_pass` | no | `10` | At least 1. The most directories removed in one pass. |
+
+```toml
+[agent.housekeeping]
+scratch_globs = ["/srv/work/target-*"]
+min_age_hours = 6
+min_free_percent = 15
+max_remove_per_pass = 10
+```
+
+A pass runs at agent start and after each finished job, never while a job is running, and at
+most once every 10 minutes. It removes directories only, oldest first, and stops when the
+filesystem is above `min_free_percent + 5` or `max_remove_per_pass` is reached. It never
+follows a symlink, never removes a pattern's parent, and never touches the configured
+`work_dir` or anything inside it.
 
 ## `[tls]`
 
@@ -121,7 +147,7 @@ A `[tls]` table makes the controller serve HTTPS. It is required when `listen` i
 
 ## Paths and secret files
 
-- `db`, `artifacts_dir`, `work_dir`, each `local_repo_roots` entry and each `label_files` entry must be absolute and must not contain a `..` component.
+- `db`, `artifacts_dir`, `work_dir`, each `local_repo_roots` entry, each `label_files` entry and each `scratch_globs` pattern must be absolute and must not contain a `..` component.
 - `[tls] cert`, `[tls] key`, `token_file`, `ca_file`, `reiki_token_file`, `credential_file` and `[log] file` need not be absolute.
 - Secret files are opened once with `O_NOFOLLOW` and `O_NONBLOCK`, then checked on the open handle. They must be regular files, owned by the effective user, with no group or other permission bits (mode `0600` or tighter). A file with mode `0640` is refused for a secret.
 - The config file itself has no secret-file mode check; it normally contains only hashes and paths. Protect it anyway because it names the token and TLS key locations.

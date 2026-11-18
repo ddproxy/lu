@@ -233,6 +233,27 @@ pub async fn metrics(
         }
     }
 
+    out.push_str("# HELP lu_node_disk_free_percent Free space on each node's work filesystem\n");
+    out.push_str("# TYPE lu_node_disk_free_percent gauge\n");
+    for node_rec in &nodes {
+        let Some(host) = node_rec.heartbeat.host.as_ref() else {
+            continue;
+        };
+        let (Some(free), Some(total)) = (host.disk_free_bytes, host.disk_total_bytes) else {
+            continue;
+        };
+        let Some(percent) = free.saturating_mul(100).checked_div(total) else {
+            continue;
+        };
+        let node_name = escape_label(node_rec.name.as_str());
+        out.push_str(&gauge(
+            "lu_node_disk_free_percent",
+            &[("node", &node_name)],
+            percent,
+        ));
+        out.push('\n');
+    }
+
     out.push_str("# HELP lu_node_providers Provider state per node (1 if reported, 0 otherwise)\n");
     out.push_str("# TYPE lu_node_providers gauge\n");
     for node_rec in &nodes {

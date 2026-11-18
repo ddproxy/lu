@@ -1071,6 +1071,18 @@ fn print_node_stats(node: &NodeName, stats: &NodeStats) {
                     .map(|bytes| bytes.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
             ),
+            (
+                "disk_total_bytes",
+                host.disk_total_bytes
+                    .map(|bytes| bytes.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+            ),
+            (
+                "disk_free_percent",
+                disk_free_percent(host.disk_free_bytes, host.disk_total_bytes)
+                    .map(|percent| percent.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+            ),
             ("uptime_secs", host.uptime_secs.to_string()),
         ]),
         None => println!("host  -"),
@@ -1112,6 +1124,11 @@ fn print_node_stats(node: &NodeName, stats: &NodeStats) {
             rows,
         );
     }
+}
+
+fn disk_free_percent(free: Option<u64>, total: Option<u64>) -> Option<u64> {
+    let (free, total) = (free?, total?);
+    free.saturating_mul(100).checked_div(total)
 }
 
 fn print_pairs(rows: &[(&str, String)]) {

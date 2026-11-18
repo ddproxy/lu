@@ -70,6 +70,7 @@ An unknown `git_ref` for a configured repository is `422 unprocessable` and name
 | `waiting_on` | array of strings | Dependencies that are not yet `done`. |
 | `waiting_reason` | string or null | Why a queued job cannot be placed, such as `no node with label php8.3`. |
 | `warnings` | array of strings | Submit replies only. |
+`HostStats`: `load1`, `load5`, `load15`, `mem_total_kb`, `mem_available_kb`, `swap_used_kb`, `disk_free_bytes` and `disk_total_bytes` (both optional; they describe the agent's work filesystem and are omitted when it cannot be read), `uptime_secs`. Host numbers are read from `/proc`; non-Linux agents report no host stats.
 
 ### `NodeView`
 
