@@ -143,6 +143,12 @@ pub struct AgentConfig {
     pub heartbeat_secs: u64,
     pub reiki_health_url: Option<String>,
     pub reiki_token_file: Option<String>,
+    /// Labels this node always advertises. Lu never interprets them.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Files re-read before each heartbeat; one label per line.
+    #[serde(default)]
+    pub label_files: Vec<String>,
 }
 
 fn default_heartbeat_secs() -> u64 {
@@ -463,6 +469,35 @@ impl AgentConfig {
                 ),
             );
         }
+        if self.labels.len() > 32 {
+            return invalid(
+                "[agent]",
+                format!(
+                    "labels must name at most 32 labels (got {})",
+                    self.labels.len()
+                ),
+            );
+        }
+        for label in &self.labels {
+            if !valid_label(label) {
+                return invalid(
+                    "[agent]",
+                    format!("invalid label {label:?}; it must be 1 to 64 characters from A-Z a-z 0-9 . _ - / with at most one '='"),
+                );
+            }
+        }
+        if self.label_files.len() > 8 {
+            return invalid(
+                "[agent]",
+                format!(
+                    "label_files must name at most 8 files (got {})",
+                    self.label_files.len()
+                ),
+            );
+        }
+        for (index, file) in self.label_files.iter().enumerate() {
+            validate_abs_no_dotdot(&format!("[agent] label_files #{index}"), "path", file)?;
+        }
         match (&self.reiki_health_url, &self.reiki_token_file) {
             (Some(url), Some(file)) => {
                 validate_loopback_http_url("[agent]", "reiki_health_url", url)?;
@@ -508,6 +543,15 @@ fn validate_name(table: &str, name: &str) -> Result<(), ConfigError> {
             "name must be 1 to 64 characters from A-Z a-z 0-9 . _ -".to_owned(),
         )
     }
+}
+
+fn valid_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b'='))
+        && value.bytes().filter(|b| *b == b'=').count() <= 1
 }
 
 fn valid_sha256_hex(value: &str) -> bool {
@@ -908,6 +952,8 @@ heartbeat_secs = 15
         let a = Config::parse(&agent_only()).unwrap().agent.unwrap();
         assert_eq!(a.heartbeat_secs, 15);
         assert_eq!(a.base_source, BaseSource::Auto);
+        assert!(a.labels.is_empty());
+        assert!(a.label_files.is_empty());
         let cfg = Config::parse(&combined()).unwrap();
         assert_eq!(cfg.log.level, "info");
     }
@@ -1009,6 +1055,39 @@ heartbeat_secs = 15
             "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
         ] {
             expect_table(&base(bad), "[agent]");
+        }
+    }
+
+    #[test]
+    fn labels_and_label_files_are_checked() {
+        let base = |field: &str, val: &str| {
+            format!(
+                "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n{field}={val}\n"
+            )
+        };
+        assert!(Config::parse(&base("labels", r#"["php8.3", "region=eu"]"#)).is_ok());
+        assert!(Config::parse(&base("label_files", r#"["/etc/lu/labels"]"#)).is_ok());
+        for bad in [r#"["bad label"]"#, r#"["a=b=c"]"#, r#"[""]"#] {
+            expect_table(&base("labels", bad), "[agent]");
+        }
+        let too_many = format!(
+            "[{}]",
+            (0..=32)
+                .map(|i| format!("\"label-{i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        expect_table(&base("labels", &too_many), "[agent]");
+        let too_many_files = format!(
+            "[{}]",
+            (0..=8)
+                .map(|i| format!("\"/l/{i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        expect_table(&base("label_files", &too_many_files), "[agent]");
+        for bad in [r#"["relative/labels"]"#, r#"["/srv/../labels"]"#] {
+            expect_table(&base("label_files", bad), "[agent] label_files #0");
         }
     }
 

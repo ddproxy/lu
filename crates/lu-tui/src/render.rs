@@ -172,6 +172,7 @@ mod tests {
                     drained: false,
                     seen_secs_ago: Some(2),
                     providers: Vec::new(),
+                    labels: Vec::new(),
                 }],
                 jobs: vec![JobRow {
                     id: "01ABC".to_owned(),

@@ -7,10 +7,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{is_name_byte, JobId};
+use crate::label::valid_label;
 use crate::limits::{
     DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_GIT_REF_BYTES, MAX_IDEMPOTENCY_KEY_BYTES,
-    MAX_IDLE_TIMEOUT_SECS, MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_REPO_BYTES, MAX_TASK_BYTES,
-    MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
+    MAX_IDLE_TIMEOUT_SECS, MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_REPO_BYTES, MAX_REQUIRES_LABELS,
+    MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
 };
 
 /// A field of [`JobSpec`] that failed validation.
@@ -64,6 +65,9 @@ pub struct JobSpec {
     /// Jobs that must be `done` before this one may run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<JobId>,
+    /// Labels a node must advertise before this job may run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +92,8 @@ struct RawJobSpec {
     idempotency_key: Option<String>,
     #[serde(default)]
     after: Vec<JobId>,
+    #[serde(default)]
+    requires: Vec<String>,
 }
 
 impl TryFrom<RawJobSpec> for JobSpec {
@@ -106,6 +112,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
             idle_timeout_secs: raw.idle_timeout_secs,
             idempotency_key: raw.idempotency_key,
             after: raw.after,
+            requires: raw.requires,
         };
         spec.validate()?;
         Ok(spec)
@@ -157,6 +164,23 @@ impl JobSpec {
         for (i, id) in self.after.iter().enumerate() {
             if self.after[..i].contains(id) {
                 return Err(invalid("after", format!("duplicate job {id}")));
+            }
+        }
+        if self.requires.len() > MAX_REQUIRES_LABELS {
+            return Err(invalid(
+                "requires",
+                format!(
+                    "must name at most {MAX_REQUIRES_LABELS} labels (got {})",
+                    self.requires.len()
+                ),
+            ));
+        }
+        for (i, label) in self.requires.iter().enumerate() {
+            if !valid_label(label) {
+                return Err(invalid("requires", format!("invalid label {label:?}")));
+            }
+            if self.requires[..i].contains(label) {
+                return Err(invalid("requires", format!("duplicate label {label}")));
             }
         }
         Ok(())
@@ -279,6 +303,7 @@ mod tests {
             idle_timeout_secs: None,
             idempotency_key: None,
             after: Vec::new(),
+            requires: Vec::new(),
         }
     }
 
@@ -387,6 +412,20 @@ mod tests {
         let id = JobId::new();
         spec.after = vec![id.clone(), id];
         assert_eq!(error_field(&spec), "after");
+
+        spec = sample();
+        spec.requires = (0..=MAX_REQUIRES_LABELS)
+            .map(|i| format!("label-{i}"))
+            .collect();
+        assert_eq!(error_field(&spec), "requires");
+
+        spec = sample();
+        spec.requires = vec!["bad label".to_owned()];
+        assert_eq!(error_field(&spec), "requires");
+
+        spec = sample();
+        spec.requires = vec!["gpu".to_owned(), "gpu".to_owned()];
+        assert_eq!(error_field(&spec), "requires");
     }
 
     #[test]
@@ -407,6 +446,7 @@ mod tests {
         assert_eq!(spec.provider, None);
         assert_eq!(spec.base_commit, None);
         assert!(spec.after.is_empty());
+        assert!(spec.requires.is_empty());
         assert!(spec.validate().is_ok());
     }
 
@@ -473,6 +513,18 @@ mod tests {
         spec.after = vec![JobId::new(), JobId::new()];
         let json = spec.canonical_json();
         assert!(json.contains("\"after\""));
+        let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, spec);
+        assert_eq!(parsed.canonical_json(), json);
+    }
+
+    #[test]
+    fn label_requirements_round_trip_and_are_omitted_when_empty() {
+        let mut spec = sample();
+        assert!(!spec.canonical_json().contains("requires"));
+        spec.requires = vec!["php8.3".to_owned(), "region=eu".to_owned()];
+        let json = spec.canonical_json();
+        assert!(json.contains("\"requires\""));
         let parsed: JobSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, spec);
         assert_eq!(parsed.canonical_json(), json);

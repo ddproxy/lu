@@ -68,7 +68,10 @@ pub fn run_live(
         while let Ok(update) = updates.try_recv() {
             dashboard.apply_update(update);
         }
-        terminal.draw(|frame| render::draw(frame, &dashboard.view(Instant::now())))?;
+        terminal.draw(|frame| {
+            let width = frame.area().width as usize;
+            render::draw(frame, &dashboard.view_sized(Instant::now(), width))
+        })?;
         if event::poll(POLL)? {
             if let Event::Key(key) = event::read()? {
                 match action_for(key) {

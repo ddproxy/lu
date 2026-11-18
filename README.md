@@ -107,6 +107,14 @@ These steps run a controller and the operator CLI on one machine. Run them as yo
 
    `--after-key` is repeatable, can be combined with `--after <job-id>`, and drops duplicate ids. An unknown key is a usage error (exit 2); a key naming a failed or cancelled job hits the same dependency rule as its id.
 
+   To pin work to nodes that advertise every named label, repeat `--require`:
+
+   ```sh
+   lu submit --repo /path/to/repository --ref main --task "run the PHP suite" --require php8.3 --require gpu
+   ```
+
+   Labels are opaque to Lu: an agent advertises them, a job requires them, and dispatch compares them exactly. A submit with a label no online node advertises still succeeds and prints a warning; a queued job that cannot be placed shows why in `lu show` and `lu top`.
+
 5. Run an agent on the same machine. Write `$HOME/lu-demo/agent.toml` with an `[agent]` table (`name = "node-a"`, `controller_url = "http://127.0.0.1:7600"`, `token_file` pointing at `agent.token`, a `work_dir` under `lu-demo`, `harness = "opencode"`), then:
 
    ```sh
@@ -129,16 +137,16 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu status` | Show controller version, uptime, schema, database size, recovered jobs, job counts, oldest queued age and node counts. `--json` prints the raw response. |
 | `lu mcp` | Serve read-only Lu tools over stdio (JSON-RPC 2.0). See [Use Lu from an agent](#use-lu-from-an-agent). |
 | `lu serve` | Run the HTTP(S) controller. This is the default when no subcommand is given. |
-| `lu top` | Live view of the nodes (state, last heartbeat, provider health) and recent jobs, refreshed every two seconds. `↑`/`↓` or `j`/`k` select a row, `Tab` switches focus between nodes and jobs, `Enter` opens the last 20 lines of the selected job's log, `Esc` closes the log pane (or quits when it is closed), `d` twice within three seconds drains or undrains the selected node, `g` toggles the dependency-graph panel, `p` pauses and `q` quits. `--once` prints one snapshot's tables as plain text and exits; `--json` prints one `nodes`/`jobs` object instead, and cannot be combined with `--once`. Only in a build with `--features tui`; connects like the other operator commands. |
-| `lu submit` | Submit a job. `--repo` and `--ref` are required; the task comes from `--task`, `--task-file`, or stdin. `--idle-timeout <secs>` (1 to 86400) stops a harness that has produced no output for that long. `--after <job-id>` and `--after-key <key>` (each repeatable, at most 16 dependencies in total) make the job wait for those dependencies; a key resolves to the newest job submitted with it. `--wait` polls until terminal. |
-| `lu retry <id>` | Resubmit a finished job's spec as a new job. `--provider <name>` and `--model <name>` replace those fields; `--after <job-id>` and `--after-key <key>` (each repeatable) replace the dependency list; nothing else changes. Refuses with exit 2 while the old job is not terminal (`done`, `failed` or `cancelled`) or an `--after-key` is unknown. The new job carries no idempotency key unless `--key` is given. Supports `--wait` and `--json`. |
+| `lu top` | Live view of the nodes (state, last heartbeat, labels on wide terminals, provider health) and recent jobs, refreshed every two seconds. Queued jobs show why they cannot be placed in the note column. `↑`/`↓` or `j`/`k` select a row, `Tab` switches focus between nodes and jobs, `Enter` opens the last 20 lines of the selected job's log, `Esc` closes the log pane (or quits when it is closed), `d` twice within three seconds drains or undrains the selected node, `g` toggles the dependency-graph panel, `p` pauses and `q` quits. `--once` prints one snapshot's tables as plain text and exits; `--json` prints one `nodes`/`jobs` object instead, and cannot be combined with `--once`. Only in a build with `--features tui`; connects like the other operator commands. |
+| `lu submit` | Submit a job. `--repo` and `--ref` are required; the task comes from `--task`, `--task-file`, or stdin. `--idle-timeout <secs>` (1 to 86400) stops a harness that has produced no output for that long. `--require <label>` (repeatable, at most 8) routes the job only to nodes advertising every label; unknown labels are accepted with a warning. `--after <job-id>` and `--after-key <key>` (each repeatable, at most 16 dependencies in total) make the job wait for those dependencies; a key resolves to the newest job submitted with it. `--wait` polls until terminal. |
+| `lu retry <id>` | Resubmit a finished job's spec as a new job. `--provider <name>` and `--model <name>` replace those fields; `--after <job-id>` and `--after-key <key>` (each repeatable) replace the dependency list; `--require <label>` (repeatable) replaces the label requirements and `--no-require` clears them. Nothing else changes. Refuses with exit 2 while the old job is not terminal (`done`, `failed` or `cancelled`) or an `--after-key` is unknown. The new job carries no idempotency key unless `--key` is given. Supports `--wait` and `--json`. |
 | `lu ls` | List jobs, newest first. Filters: `--state`, `--limit`. `AFTER` counts dependencies still unfinished. |
 | `lu show <id>` | Show one job, including each dependency and its state. |
 | `lu graph [job]` | Draw the dependency graph of unfinished jobs, newest component first. With a job id, show only its component. `--json` prints a `nodes` array instead; colour is used only when stdout is a terminal and `NO_COLOR` is unset. |
 | `lu logs <id>` | Print a job's stored log. `--follow` keeps reading until the job is terminal. |
 | `lu fetch <id>` | Save `diff.patch`, `run.log` and `report.json` into `--out` (default `.`). Missing artifacts are skipped; existing files need `--force`. |
 | `lu cancel <id>` | Ask the controller to cancel a job. |
-| `lu nodes` | List known nodes, including the agent version each last reported. |
+| `lu nodes` | List known nodes, including the agent version each last reported and its labels. |
 | `lu drain <node>` | Stop assigning new jobs to a node. |
 | `lu undrain <node>` | Allow a drained node to take jobs again. |
 

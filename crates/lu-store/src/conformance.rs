@@ -27,6 +27,7 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: key.map(|s| s.to_owned()),
         after: Vec::new(),
+        requires: Vec::new(),
     }
 }
 
@@ -50,6 +51,7 @@ pub fn hb(name: &str, harness: HarnessState, providers: Vec<(&str, ProviderState
         reiki: None,
         host: None,
         jobs: Vec::new(),
+        labels: Vec::new(),
     }
 }
 
@@ -61,6 +63,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     cancel_states(&make());
     cancel_recovering_ends_it_cancelled_immediately(&make());
     assignment_and_epoch(&make());
+    label_requirements_route_and_explain(&make());
     start_renew_log_artifact(&make());
     complete_and_retry_cordon(&make());
     reiki_cordon_yields_to_live_health(&make());
@@ -562,6 +565,67 @@ fn assignment_and_epoch<S: Store>(s: &S) {
         .unwrap()
         .unwrap();
     assert_eq!(ap.job_id, jp.id);
+}
+
+fn label_requirements_route_and_explain<S: Store>(s: &S) {
+    let plain = node("plain");
+    let labelled = node("labelled");
+    s.heartbeat(&hb("plain", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let mut beat = hb("labelled", HarnessState::Idle, vec![]);
+    beat.labels = vec!["gpu".to_owned(), "php8.3".to_owned()];
+    s.heartbeat(&beat, now(1, 1)).unwrap();
+
+    let mut job = spec("https://x/labels.git", None);
+    job.requires = vec!["php8.3".to_owned()];
+    let (php, _) = s.create_job(&job, now(2, 2)).unwrap();
+    // A node without the label is skipped; the labelled node gets the job.
+    assert!(s
+        .next_assignment(&plain, now(3, 3), 60_000)
+        .unwrap()
+        .is_none());
+    let assigned = s
+        .next_assignment(&labelled, now(3, 3), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.job_id, php.id);
+
+    // A queued job with no matching online node says which label is missing first.
+    let mut missing = spec("https://x/missing.git", None);
+    missing.requires = vec!["php8.3".to_owned(), "gpu".to_owned(), "arm64".to_owned()];
+    let (waiting, _) = s.create_job(&missing, now(4, 4)).unwrap();
+    let nodes = s.nodes(now(5, 5), 60_000).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .find(|n| n.name == node("labelled"))
+            .unwrap()
+            .heartbeat
+            .labels,
+        vec!["gpu".to_owned(), "php8.3".to_owned()]
+    );
+    let reason = crate::waiting_reason(&waiting, &nodes);
+    assert_eq!(reason.as_deref(), Some("no node with label arm64"));
+    assert!(!crate::labels_satisfied(
+        &waiting.spec.requires,
+        &nodes
+            .iter()
+            .filter(|n| n.online)
+            .flat_map(|n| n.heartbeat.labels.clone())
+            .collect::<Vec<_>>()
+    ));
+
+    // Heartbeating the missing label makes the same queued job placeable.
+    let mut beat = hb("plain", HarnessState::Idle, vec![]);
+    beat.labels = vec!["arm64".to_owned(), "gpu".to_owned(), "php8.3".to_owned()];
+    s.heartbeat(&beat, now(6, 6)).unwrap();
+    let nodes = s.nodes(now(7, 7), 60_000).unwrap();
+    assert_eq!(crate::waiting_reason(&waiting, &nodes), None);
+    let assigned = s
+        .next_assignment(&plain, now(7, 7), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.job_id, waiting.id);
 }
 
 fn start_renew_log_artifact<S: Store>(s: &S) {

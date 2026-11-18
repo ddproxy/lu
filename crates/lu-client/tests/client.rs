@@ -189,6 +189,7 @@ fn spec() -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: Some("ticket:42".to_owned()),
         after: Vec::new(),
+        requires: Vec::new(),
     }
 }
 

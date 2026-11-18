@@ -79,6 +79,38 @@ pub struct Assignment {
     pub spec: JobSpec,
 }
 
+/// Every required label is present. Labels are compared exactly; Lu assigns no meaning to them.
+pub fn labels_satisfied(required: &[String], node_labels: &[String]) -> bool {
+    required
+        .iter()
+        .all(|label| node_labels.iter().any(|node| node == label))
+}
+
+/// The required labels no online node advertises, in the job's order.
+pub fn missing_labels<'a>(required: &'a [String], nodes: &[NodeRecord]) -> Vec<&'a str> {
+    let online = || {
+        nodes
+            .iter()
+            .filter(|node| node.online)
+            .flat_map(|node| node.heartbeat.labels.iter())
+    };
+    required
+        .iter()
+        .filter(|label| !online().any(|node| node == *label))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Why a queued job cannot be placed, when no online node carries all of its labels.
+pub fn waiting_reason(job: &JobRecord, nodes: &[NodeRecord]) -> Option<String> {
+    if job.state != JobState::Queued {
+        return None;
+    }
+    missing_labels(&job.spec.requires, nodes)
+        .first()
+        .map(|label| format!("no node with label {label}"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     NotFound,

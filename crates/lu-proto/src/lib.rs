@@ -8,6 +8,7 @@
 pub mod event;
 pub mod failure;
 pub mod ids;
+pub mod label;
 pub mod limits;
 pub mod node;
 pub mod sanitize;
@@ -17,11 +18,13 @@ pub mod state;
 pub use event::{AgentEvent, Completion, CompletionError, LogChunk, LogChunkError, Outcome};
 pub use failure::FailureClass;
 pub use ids::{JobId, JobIdError, NodeName, NodeNameError};
+pub use label::valid_label;
 pub use limits::{
     ArtifactName, DEFAULT_TIMEOUT_SECS, JOB_ID_LEN, MAX_AFTER_JOBS, MAX_DIFF_BYTES,
-    MAX_GIT_REF_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS, MAX_LOG_BYTES,
-    MAX_LOG_CHUNK_BYTES, MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_PROVIDERS, MAX_REIKI_BYTES,
-    MAX_REPORT_BYTES, MAX_REPO_BYTES, MAX_STATS_BYTES, MAX_SUMMARY_BYTES, MAX_TASK_BYTES,
+    MAX_GIT_REF_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS, MAX_LABEL_BYTES,
+    MAX_LABEL_FILES, MAX_LABEL_FILE_BYTES, MAX_LOG_BYTES, MAX_LOG_CHUNK_BYTES, MAX_MODEL_BYTES,
+    MAX_NAME_BYTES, MAX_NODE_LABELS, MAX_PROVIDERS, MAX_REIKI_BYTES, MAX_REPORT_BYTES,
+    MAX_REPO_BYTES, MAX_REQUIRES_LABELS, MAX_STATS_BYTES, MAX_SUMMARY_BYTES, MAX_TASK_BYTES,
     MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
 };
 pub use node::{

@@ -6,6 +6,7 @@
 //! running job.
 
 mod health;
+mod labels;
 mod logs;
 mod proc;
 
@@ -147,6 +148,7 @@ pub struct Agent {
     reiki_probe: Option<(String, Arc<str>)>,
     /// The last health read from it, sent with every heartbeat.
     health: health::Shared,
+    labels: Arc<labels::LabelSource>,
     harness: String,
     harness_wrapper: Vec<String>,
     builder: Arc<CommandBuilder>,
@@ -188,6 +190,7 @@ impl Agent {
             }
             None => None,
         };
+        let labels = Arc::new(labels::LabelSource::new(config.labels, config.label_files));
         let reiki_probe = match (
             config.reiki_health_url.as_deref(),
             config.reiki_token_file.as_deref(),
@@ -220,6 +223,7 @@ impl Agent {
             opencode_password,
             reiki_probe,
             health: health::Shared::default(),
+            labels,
             harness: config.harness,
             harness_wrapper: config.harness_wrapper,
             builder: Arc::new(|task_file, model, server, message| {
@@ -353,6 +357,7 @@ impl Agent {
             reiki: current.reiki,
             host: proc::host_stats(),
             jobs: Vec::new(),
+            labels: self.labels.current(),
         };
         beat.trim_stats();
         let mut request = lu_client::PollRequest::from(beat);
@@ -612,6 +617,7 @@ impl Agent {
                 epoch,
                 heartbeat_secs: self.heartbeat_secs,
                 shared_health: Arc::clone(&self.health),
+                labels: Arc::clone(&self.labels),
                 observation: observation.clone(),
             },
             control_tx,
@@ -1024,6 +1030,7 @@ struct ControlTask {
     epoch: u64,
     heartbeat_secs: u64,
     shared_health: health::Shared,
+    labels: Arc<labels::LabelSource>,
     observation: Option<Arc<Mutex<proc::JobObservation>>>,
 }
 
@@ -1035,6 +1042,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
         epoch,
         heartbeat_secs,
         shared_health,
+        labels,
         observation,
     } = task;
     let mut renew = tokio::time::interval(RENEW_PERIOD);
@@ -1103,6 +1111,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                     reiki: current.reiki,
                     host,
                     jobs,
+                    labels: labels.current(),
                 };
                 beat.trim_stats();
                 let mut request = lu_client::PollRequest::from(beat);

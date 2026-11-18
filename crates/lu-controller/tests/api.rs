@@ -2,7 +2,7 @@ use git2::{Repository, Signature};
 use lu_auth::sha256_hex;
 use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator};
 use lu_controller::{build_router, run_background, AppState};
-use lu_proto::{JobId, JobSpec, MAX_AFTER_JOBS, MAX_LOG_BYTES};
+use lu_proto::{JobId, JobSpec, MAX_AFTER_JOBS, MAX_LOG_BYTES, MAX_REQUIRES_LABELS};
 use lu_serve::{serve, ServeOptions};
 use lu_store::sqlite::SqliteStore;
 use lu_store::Store;
@@ -166,7 +166,18 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: key.map(|s| s.to_owned()),
         after: Vec::new(),
+        requires: Vec::new(),
     }
+}
+
+async fn submit_spec(addr: SocketAddr, spec: &JobSpec) -> String {
+    let body = serde_json::to_string(spec).unwrap();
+    let req = format!(
+        "POST /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    raw_request(addr, &req).await
 }
 
 #[tokio::test]
@@ -262,6 +273,80 @@ async fn create_list_get_cancel_job_happy_path_and_idempotency() {
 }
 
 #[tokio::test]
+async fn label_requirements_are_validated_and_explained() {
+    let srv = start_server().await;
+
+    for requires in [
+        (0..=MAX_REQUIRES_LABELS)
+            .map(|index| format!("label-{index}"))
+            .collect::<Vec<_>>(),
+        vec!["gpu".to_owned(), "gpu".to_owned()],
+        vec!["bad label".to_owned()],
+    ] {
+        let mut spec = sample_spec(None);
+        spec.requires = requires.clone();
+        let r = submit_spec(srv.addr, &spec).await;
+        assert_eq!(status(&r), 422, "{requires:?}: {r}");
+    }
+
+    let mut spec = sample_spec(None);
+    spec.requires = vec!["php8.3".to_owned(), "gpu".to_owned()];
+    let r = submit_spec(srv.addr, &spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let created: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(
+        created["warnings"],
+        json!(["no node with label php8.3", "no node with label gpu"]),
+        "{r}"
+    );
+    assert_eq!(
+        created["waiting_reason"], "no node with label php8.3",
+        "{r}"
+    );
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let hb = json!({
+        "node": "node-a",
+        "harness": "idle",
+        "providers": [],
+        "labels": ["gpu", "php8.3", "region=eu"],
+    });
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &hb).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["spec"]["requires"], json!(["php8.3", "gpu"]), "{r}");
+    assert_eq!(job["waiting_reason"], serde_json::Value::Null, "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let nodes: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let node = nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "node-a")
+        .unwrap();
+    assert_eq!(node["labels"], json!(["gpu", "php8.3", "region=eu"]), "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let b = body_str(&r);
+    for label in ["gpu", "php8.3", "region=eu"] {
+        assert!(
+            b.contains(&format!(
+                "lu_node_labels_info{{node=\"node-a\",label=\"{label}\"}} 1"
+            )),
+            "{b}"
+        );
+    }
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
 async fn list_jobs_by_key_returns_zero_or_one_job() {
     let srv = start_server().await;
     let spec = sample_spec(Some("build"));
@@ -288,7 +373,8 @@ async fn list_jobs_by_key_returns_zero_or_one_job() {
             assert!(jobs.len() <= 1, "{r}");
             if query == "key=build" {
                 assert_eq!(jobs.len(), 1, "{r}");
-                assert_eq!(jobs[0], created, "{r}");
+                assert_eq!(jobs[0]["id"], created["id"], "{r}");
+                assert_eq!(jobs[0]["spec"], created["spec"], "{r}");
             } else {
                 assert!(jobs.is_empty(), "{r}");
             }

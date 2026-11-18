@@ -11,13 +11,17 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lu_proto::{validate_idempotency_key, ArtifactName, JobId, JobSpec, NodeName};
 use lu_serve::PeerAddr;
-use lu_store::{JobRecord, NodeRecord};
+use lu_store::{missing_labels, waiting_reason, JobRecord, NodeRecord, Now};
 use serde_json::json;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 pub fn job_view(r: &JobRecord) -> serde_json::Value {
+    job_view_with(r, None)
+}
+
+fn job_view_with(r: &JobRecord, reason: Option<String>) -> serde_json::Value {
     let artifacts: Vec<&str> = r.artifacts.iter().map(|a| a.file_name()).collect();
     let failure_class = r.failure_class.map(|f| match f {
         lu_proto::FailureClass::Node => "node",
@@ -53,7 +57,18 @@ pub fn job_view(r: &JobRecord) -> serde_json::Value {
         "cancel_requested": r.cancel_requested,
         "after": r.spec.after.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
         "waiting_on": r.waiting_on.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "waiting_reason": reason,
     })
+}
+
+async fn all_nodes(state: &Arc<AppState>, at: Now) -> Result<Vec<NodeRecord>, ApiError> {
+    let store = Arc::clone(&state.store);
+    let lease_ms = state.lease_ms;
+    match tokio::task::spawn_blocking(move || store.nodes(at, lease_ms)).await {
+        Ok(Ok(nodes)) => Ok(nodes),
+        Ok(Err(e)) => Err(store_err(e)),
+        Err(_) => Err(ApiError::internal()),
+    }
 }
 
 fn node_view(n: &NodeRecord, stats: Option<&lu_proto::NodeStats>) -> serde_json::Value {
@@ -73,6 +88,7 @@ fn node_view(n: &NodeRecord, stats: Option<&lu_proto::NodeStats>) -> serde_json:
         "draining": n.draining,
         "harness": harness,
         "providers": &n.heartbeat.providers,
+        "labels": &n.heartbeat.labels,
         "current_job": n.current_job.as_ref().map(|j| j.to_string()),
         "cordons": &n.cordons,
         "reiki": n.heartbeat.reiki,
@@ -118,11 +134,21 @@ pub async fn create_job(
         Ok(Err(e)) => return with_version(store_err(e).into_response()),
         Err(_) => return with_version(ApiError::internal().into_response()),
     };
+    let nodes = match all_nodes(&state, now).await {
+        Ok(nodes) => nodes,
+        Err(error) => return with_version(error.into_response()),
+    };
+    let warnings: Vec<String> = missing_labels(&rec.spec.requires, &nodes)
+        .into_iter()
+        .map(|label| format!("no node with label {label}"))
+        .collect();
+    let mut body = job_view_with(&rec, waiting_reason(&rec, &nodes));
+    body["warnings"] = json!(warnings);
     if created {
         state.waiters.notify_work();
-        with_version(json_ok(StatusCode::CREATED, &job_view(&rec)))
+        with_version(json_ok(StatusCode::CREATED, &body))
     } else {
-        with_version(json_ok(StatusCode::OK, &job_view(&rec)))
+        with_version(json_ok(StatusCode::OK, &body))
     }
 }
 
@@ -151,9 +177,16 @@ pub async fn list_jobs(
             Ok(rec) => rec,
             Err(_) => return with_version(ApiError::internal().into_response()),
         };
+        let nodes = match all_nodes(&state, now()).await {
+            Ok(nodes) => nodes,
+            Err(error) => return with_version(error.into_response()),
+        };
         let jobs: Vec<JobRecord> = rec.into_iter().collect();
         let body = json!({
-            "jobs": jobs.iter().map(job_view).collect::<Vec<_>>(),
+            "jobs": jobs
+                .iter()
+                .map(|job| job_view_with(job, waiting_reason(job, &nodes)))
+                .collect::<Vec<_>>(),
             "next": null,
         });
         return with_version(json_value_ok(StatusCode::OK, body));
@@ -187,9 +220,16 @@ pub async fn list_jobs(
         Ok(Err(e)) => return with_version(store_err(e).into_response()),
         Err(_) => return with_version(ApiError::internal().into_response()),
     };
+    let nodes = match all_nodes(&state, now()).await {
+        Ok(nodes) => nodes,
+        Err(error) => return with_version(error.into_response()),
+    };
     let next = jobs.last().map(|j| j.id.to_string());
     let body = json!({
-        "jobs": jobs.iter().map(job_view).collect::<Vec<_>>(),
+        "jobs": jobs
+            .iter()
+            .map(|job| job_view_with(job, waiting_reason(job, &nodes)))
+            .collect::<Vec<_>>(),
         "next": next,
     });
     with_version(json_value_ok(StatusCode::OK, body))
@@ -214,7 +254,16 @@ pub async fn get_job(
     })
     .await;
     match res {
-        Ok(Ok(rec)) => with_version(json_ok(StatusCode::OK, &job_view(&rec))),
+        Ok(Ok(rec)) => {
+            let nodes = match all_nodes(&state, now()).await {
+                Ok(nodes) => nodes,
+                Err(error) => return with_version(error.into_response()),
+            };
+            with_version(json_ok(
+                StatusCode::OK,
+                &job_view_with(&rec, waiting_reason(&rec, &nodes)),
+            ))
+        }
         Ok(Err(e)) => with_version(store_err(e).into_response()),
         Err(_) => with_version(ApiError::internal().into_response()),
     }
@@ -243,7 +292,14 @@ pub async fn cancel_job(
         Ok(Ok(rec)) => {
             state.waiters.notify_job(rec.id.as_ref());
             state.waiters.notify_work();
-            with_version(json_ok(StatusCode::OK, &job_view(&rec)))
+            let nodes = match all_nodes(&state, now()).await {
+                Ok(nodes) => nodes,
+                Err(error) => return with_version(error.into_response()),
+            };
+            with_version(json_ok(
+                StatusCode::OK,
+                &job_view_with(&rec, waiting_reason(&rec, &nodes)),
+            ))
         }
         Ok(Err(e)) => with_version(store_err(e).into_response()),
         Err(_) => with_version(ApiError::internal().into_response()),
