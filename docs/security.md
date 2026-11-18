@@ -1,9 +1,9 @@
 # Security
 
-This page describes what Lu protects, what it trusts, and where the remaining risks are. It
-matches the code in this tree. The controller and operator CLI are implemented; the agent
-runtime is not, so the agent and harness parts describe the intended deployment and the HTTP
-contract, not a runnable 0.1.0 agent. See [operations.md](operations.md) for the same status.
+This page describes what Lu protects, what it trusts, and the controls and trust boundaries in
+place. It matches the code in this tree. The controller, agent (`lu agent`) and operator CLI are
+implemented. The agent and harness sections cover the deployment and HTTP contract used by this
+tree. See [operations.md](operations.md) for deployment details.
 
 ## Assets
 
@@ -14,7 +14,7 @@ contract, not a runnable 0.1.0 agent. See [operations.md](operations.md) for the
 | TLS private key | controller host, `[tls] key` | Anyone with it can impersonate the controller. |
 | SQLite database | controller host, `[controller] db` | Job specs and tasks, state, leases, epochs, idempotency keys, node state. |
 | Job logs and artifacts | controller host, `artifacts_dir/<job id>/` | Diffs, run logs and reports can contain source code, credentials and model output. |
-| Provider credentials | leaf/agent host in 0.1.0 | They authorise paid model calls and must not reach the controller or another tenant. |
+| Provider credentials | leaf/agent host | They authorise paid model calls and must not reach the controller or another tenant. |
 | Repository credentials | controller host, `[[controller.repos]].credential_file` | They authorise forge fetches into the controller's bare mirrors and must not reach an agent or appear in a log or error. |
 
 ## Threat model
@@ -37,8 +37,8 @@ The main adversaries considered are:
 - a hostile repository, task text, diff or log that tries to exploit parsing, path handling or
   terminal output.
 
-Out of scope for 0.1.0: a compromised controller host, a malicious kernel or systemd, side
-channels in the model provider, and cryptographic attestation of what a harness actually did.
+The model provider, host kernel and systemd sit outside Lu's control. The controls here cover the
+network path, token scopes, agent writes and harness execution.
 
 ## Tokens, scopes and hashes
 
@@ -57,10 +57,9 @@ There are two scopes:
   current epoch. It cannot use operator routes.
 
 Missing, malformed and unknown tokens are `401 unauthorized` with `WWW-Authenticate: Bearer`.
-A valid token used on the other scope's route does not authenticate. In this tree that is also
-reported as `401`; `docs/api.md` specifies `403` for a wrong scope, which is a code/contract
-mismatch listed in the task report. A valid agent token that names a different node, or an agent
-write for another node's job, is `403 forbidden`.
+A valid token used on the other scope's route is also `401`, so a probe cannot distinguish scope
+failures. A valid agent token that names a different node, or an agent write for another node's
+job, is `403 forbidden`.
 
 Token hashes must be unique across agents and operators, so one token can never hold both
 scopes. An agent name is also the node identity; two agents cannot share a name or a token hash.
@@ -70,20 +69,12 @@ address for the rest of the window and return `429 rate_limited` with `Retry-Aft
 addresses are counted by `/64`, and an IPv4-mapped IPv6 address is counted as IPv4. A
 successful request does not reset the count.
 
-Recommended token handling:
-
-```sh
-umask 077
-printf '%s' "$(head -c 32 /dev/urandom | base64)" > /etc/lu/agent.token
-chown lu:lu /etc/lu/agent.token
-chmod 600 /etc/lu/agent.token
-sha256sum /etc/lu/agent.token
-```
-
-The value printed by `sha256sum` goes in `token_sha256`. The token file is read once with
-`O_NOFOLLOW` and `O_NONBLOCK`, must be a regular file owned by the effective user, must have no
-group or other permission bits, and is capped at 64 KiB. The same rules apply to
-`reiki_token_file` when that optional health check is configured.
+For token generation and the configuration of token hashes, see
+[Tokens and TLS](tokens-and-tls.md). The controller stores only SHA-256 hashes, so the value
+hashed into `token_sha256` is the same byte sequence the client later sends as the bearer token.
+Token files are read once with `O_NOFOLLOW` and `O_NONBLOCK`, must be regular files owned by the
+effective user, must have no group or other permission bits, and are capped at 64 KiB. The same
+rules apply to `reiki_token_file` when that optional health check is configured.
 
 ## TLS and transport
 
@@ -93,15 +84,13 @@ with safe defaults, HTTP/1.1 only, and no client certificates: the bearer token 
 client authentication.
 
 The TLS key is treated as a secret file by `lu serve`: regular file, owned by the effective user,
-no group/other bits, no symlink, no FIFO. The certificate is public. Both are loaded at startup;
-there is no reload, so restart after replacing them. `lu check`, `lu backup` and `lu restore` do
-not read these files.
+no group/other bits, no symlink, no FIFO. The certificate is public. Both are loaded at startup; replacing them takes effect on the next
+restart. `lu check`, `lu backup` and `lu restore` read only `[controller] db`.
 
 Operators and agents verify the controller certificate against the system trust roots. The
-optional `[agent].ca_file` adds up to 1 MiB of PEM certificates to those roots; it does not
-replace them and it is not a pinning mechanism. Use a certificate that matches the host name in
-`controller_url`. A self-signed certificate belongs in `ca_file`, not in a disabled verification
-mode; the client has no such mode.
+optional `[agent].ca_file` adds up to 1 MiB of PEM certificates to those roots. The certificate
+matches the host name in `controller_url`. A self-signed certificate belongs in `ca_file`; the
+client keeps verification enabled.
 
 ## Epoch fencing and node binding
 
@@ -114,20 +103,19 @@ An agent token is bound to one node, and the controller checks that the job's `n
 node before accepting a write. A token from node-a therefore cannot complete, log or upload for
 a job on node-b, even if it guesses the job id and epoch.
 
-Lease expiry is a safety mechanism, not an authentication failure. If an agent is slow, paused
-or partitioned for `lease_secs`, the job becomes `recovering`; after
-`recovery_grace_secs` it is requeued or failed. A late completion from the old lease is
-discarded as stale. On controller restart, `leased` and `running` jobs enter the same recovery
-path so a job cannot stay wedged forever.
+Lease expiry is a safety mechanism governed by the lease epoch and node binding. If an agent is
+slow, paused or partitioned for `lease_secs`, the job becomes `recovering`; after
+`recovery_grace_secs` it is requeued or failed. A late completion from the old lease arrives with
+a stale epoch and changes nothing. On controller restart, `leased` and `running` jobs enter the
+same recovery path so each job reaches a terminal state or a retry.
 
-## What the agent does and does not trust
+## What the agent treats as untrusted
 
-The controller is trusted to assign work and to define the job spec and limits, but the agent
-still validates the spec and treats every field as untrusted input. It should not assume that a
-repository URL, ref, task, provider name or model string is safe merely because the controller
-accepted it.
+The controller assigns work and defines the job spec and limits. The agent validates the spec and
+treats every field as untrusted input, including a repository URL, ref, task, provider name or
+model string accepted by the controller.
 
-The agent does **not** trust:
+The agent treats these inputs as untrusted:
 
 - the repository or ref it checks out, or any file, hook, script or build instruction in it;
 - the task text or model output, which may contain hostile terminal escape sequences, paths,
@@ -144,22 +132,21 @@ no system or global config, no hooks and no inherited askpass or ssh command, wi
 timeout and a size cap. A repository credential is read at fetch time, passed through a
 short-lived private askpass helper, and scrubbed from any stderr before it becomes an error.
 
-Staging invokes `git` directly, not through a shell, with terminal prompts disabled, no system
-config and a restricted transport allowlist (`file`, `https`, `ssh`). The harness is launched
-directly in its own process group with an empty inherited environment except `PATH`, `HOME` and
-`LANG`, no stdin, and capped output. Timeouts and idle-output detection stop a harness that
-never finishes. Those controls limit accidental damage; they are not a VM or container boundary.
-A harness that needs stronger isolation should run inside one.
+Staging invokes `git` directly with prompts disabled, a restricted transport allowlist
+(`file`, `https`, `ssh`), and system config skipped. The harness is launched directly in its own
+process group with an inherited environment of `PATH`, `HOME` and `LANG`, stdin closed, and
+capped output. Timeouts and idle-output detection bound a harness that never finishes. Those
+controls apply at the process and filesystem level. A harness needing a stronger boundary runs
+inside a container or VM through `harness_wrapper`.
 
-The controller trusts an agent to report what its harness did, but cannot prove it. A malicious
-agent can fabricate a diff, log or report for a job assigned to it, and can read the job's task
-and repository content. Do not send secrets to a node you do not trust, and treat artifacts as
-untrusted input when you open them.
+The controller uses the agent's report as the record of what its harness did. An agent reads the
+job's task and repository content and produces the diff, log and report, so operators open those
+files as untrusted input and place secrets only on trusted nodes.
 
 ## The harness runs unprivileged
 
 The contributed units use a separate `lu` service account and an unprivileged `lu-harness`
-account created by `contrib/lu.sysusers`. The intended split is:
+account created by `contrib/lu.sysusers`:
 
 - `lu` runs the controller or agent and owns the token file, mode `0600`;
 - `lu-harness` runs the coding-agent process and cannot read the token, the controller config
@@ -169,33 +156,30 @@ account created by `contrib/lu.sysusers`. The intended split is:
 
 The units apply `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
 `PrivateDevices`, restricted address families, an empty capability set, a system-call filter
-and `LimitNOFILE`. They are `Type=simple`; there is no `sd_notify` support.
+and `LimitNOFILE`. They are `Type=simple`; shutdown drains in-flight connections for a fixed 10
+seconds.
 
-**Separating the harness.** With `[agent] workspace_group` set, the working tree is shared with that group and never `.git`. An agent that runs as one account can then drive a harness that works as another, such as an opencode server in a container, and the harness can neither read the agent's token nor change `.git`.
+**Separating the harness.** With `[agent] workspace_group` set, the working tree is shared with that group and `.git` stays with the agent. An agent that runs as one account can drive a harness that works as another, such as an opencode server in a container, while the harness stays separate from the agent's token and `.git`.
 
-**Without it:** the agent runs the harness as its own user. The harness gets a minimal
+**Without it:** the harness runs as the agent's own user. The harness gets a minimal
 environment and never receives the token as an argument or variable, but it can read any file
 the agent can, including the token file. Run the agent as a dedicated account that holds no other
-secrets, and treat a job's harness as able to act with that account's rights. Separating the
-harness into `lu-harness` is planned.
+secrets, and treat a job's harness as able to act with that account's rights. Use
+`harness_wrapper` to start the harness in another account when that boundary is needed.
 
-## Credentials stay on the leaf in 0.1.0
+## Credentials stay on the leaf
 
 Provider credentials (API keys and similar) belong to the harness on the agent/leaf host. The
-controller stores only the provider name and model in the job spec, and has no provider
-credential store. In the intended agent design the runtime passes the minimum needed environment
-to the harness and never puts those values in a heartbeat, log, artifact or completion.
+controller stores the provider name and model in the job spec. In the agent, the provider
+credential is set for the harness process through `OPENCODE_SERVER_PASSWORD`. The agent clears
+the child environment and adds only `PATH`, `HOME`, `LANG`, the explicit `CommandSpec::env`
+entries, and that credential.
 
-Moving provider credentials to the controller later would be a security-relevant design change:
-it would concentrate valuable secrets in one host, require encryption at rest and a way to
-deliver short-lived credentials to the correct node and job, and require audit logging that does
-not copy the secret into job output. Do not assume that model exists in 0.1.0.
-
-There is no redaction pass in 0.1.0. A task, repository file, command line, model response or
-harness log can contain a secret, and that text is stored in `run.log`, `diff.patch`,
-`report.json` or SQLite. Logs and artifacts are mode `0600`, directories `0700`, and the
-database is created `0600`, but backups and downloads inherit their sensitivity. Treat job
-storage and backups as sensitive as the repositories and credentials of the jobs that ran there.
+A task, repository file, command line, model response or harness log can contain a secret, and
+that text is stored in `run.log`, `diff.patch`, `report.json` or SQLite. Logs and artifacts are
+mode `0600`, directories `0700`, and the database is created `0600`, but backups and downloads
+inherit their sensitivity. Treat job storage and backups as sensitive as the repositories and
+credentials of the jobs that ran there.
 
 ## Denial of service and resource limits
 
@@ -205,12 +189,13 @@ globally (`max_connections`) and per source address (`max_connections_per_addr`)
 header reads and requests, and drains for a fixed 10 seconds on shutdown. `lu-supervise` enforces
 its own run, idle and output limits on the harness.
 
-These are per-request and per-connection limits, not quotas. A valid operator can create jobs
-until the disk fills, and a valid agent can upload up to the artifact caps for each job. Use
-filesystem quotas, a dedicated volume and monitoring if Lu stores work from untrusted users.
-The login throttle is per source address and is not a substitute for network access control.
+These are per-request and per-connection limits. Disk use follows the number of jobs an operator
+submits and the artifacts an agent uploads within the per-file caps. Filesystem quotas, a
+dedicated volume and monitoring bound that growth. The login throttle works per source address
+alongside network access control.
 
 ## Reporting
 
-Report vulnerabilities as described in [SECURITY.md](../SECURITY.md). Do not include real
-tokens, private keys or customer data in a report; rotate anything that may have leaked.
+Report vulnerabilities as described in [SECURITY.md](../SECURITY.md). A useful report includes
+synthetic tokens, test keys and redacted customer data. Any credential that may have leaked is
+rotated before the report is filed.

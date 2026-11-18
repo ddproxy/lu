@@ -1,11 +1,22 @@
 - title: Start
   items:
     - { title: Overview, url: / }
+    - { title: Install, url: /docs/install.html }
+- title: Concepts
+  items:
+    - { title: Concepts, url: /docs/concepts.html }
+    - { title: Job Lifecycle, url: /docs/lifecycle.html }
+    - { title: Dependencies, url: /docs/dependencies.html }
 - title: Reference
   items:
     - { title: HTTP API, url: /docs/api.html }
     - { title: Configuration, url: /docs/config.html }
+    - { title: Tokens and TLS, url: /docs/tokens-and-tls.html }
+    - { title: Client guide, url: /docs/client-guide.html }
+    - { title: MCP server, url: /docs/mcp.html }
 - title: Run it
   items:
     - { title: Operations, url: /docs/operations.html }
+    - { title: Monitoring, url: /docs/monitoring.html }
+    - { title: Troubleshooting, url: /docs/troubleshooting.html }
     - { title: Security, url: /docs/security.html }

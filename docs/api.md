@@ -1,62 +1,147 @@
-# Lu HTTP API, version 1 (0.1.0)
+# Lu HTTP API, version 1
 
-Controller serves JSON over HTTPS (HTTP only on loopback). Every request carries `Authorization: Bearer <token>`. Tokens are scoped `operator` or `agent`; an agent token is bound to one node name. A token of the wrong scope, a missing token and an unknown token all get the same 401, so a probe cannot tell them apart. A valid agent token acting on another node's job is 403. Bodies are capped (1 MiB, log chunks 64 KiB plus framing). Errors are `{"error":"<code>","message":"<text>"}` with codes `bad_request`, `unauthorized`, `forbidden`, `not_found`, `unprocessable`, `conflict`, `stale_epoch`, `too_large`, `rate_limited`, `internal`. Times are RFC 3339 UTC. Ids are 26-character `JobId`s. Unknown `JobSpec` fields are ignored so an older controller accepts a newer client's additive field; other request bodies reject unknown fields.
+The controller serves JSON over HTTPS; plain HTTP is accepted only on loopback. Routes use `Authorization: Bearer <token>` except `GET /v1/health`. Tokens have `operator` or `agent` scope; an agent token is bound to one node name. Missing, unknown and wrong-scope tokens all get `401 unauthorized` with `WWW-Authenticate: Bearer`, so a probe cannot tell them apart. A valid agent token used for another node's job or heartbeat gets `403 forbidden`. JSON bodies are capped at 1 MiB, log chunks at 64 KiB plus framing, diffs at 10 MiB plus framing and reports at 1 MiB plus framing. Errors are `{"error":"<code>","message":"<text>"}`. Codes are `bad_request`, `unauthorized`, `forbidden`, `not_found`, `unprocessable`, `conflict`, `stale_epoch`, `too_large`, `rate_limited` and `internal`. Times in JSON are integer Unix seconds. Job ids are 26-character Crockford base32 strings. Unknown `JobSpec` fields are ignored; other request bodies reject unknown fields.
 
-Agents poll; there is no push channel in 0.1.0. Lease expiry is measured on the controller's monotonic clock.
+Agents poll; the controller has no push channel. Lease expiry uses the controller's monotonic clock.
 
 ## Operator
 
 | Route | Meaning |
 |---|---|
-| `POST /v1/jobs` body `JobSpec` | Create a job. `201` with `JobView`. `spec.after` lists up to 16 job ids that must be `done` first; the new job starts `blocked` while any are unfinished, otherwise `queued`. `spec.stack_dependencies` defaults to `true`; when true the agent applies each dependency's `diff.patch` to the new job's base tree in `after` order before the harness starts. Set it to `false` to run on the base tree alone. `spec.requires` lists up to 8 labels; dispatch gives the job only to a node that advertises every one, and composes with provider and drain rules. An unknown dependency, one that already failed or was cancelled, more than 16, a duplicate, or any other invalid spec gets `422 unprocessable` naming the fault. Submit accepts a label no online node advertises; the reply's `warnings` names it. Same `idempotency_key` and same spec returns the existing job with `200`; same key and a different spec is `409 conflict`. |
-| `GET /v1/jobs?state=&limit=&after=` | List, newest first, `limit` at most 200, `after` is a `JobId` cursor. `{"jobs":[JobView],"next":"<id>|null"}` |
-| `GET /v1/jobs?key=<key>` | Look up an idempotency key: the same envelope with zero or one job and `next: null`; other list filters are ignored. An empty, over-long or malformed key is `400 bad_request`. If legacy data holds several jobs with the key, the newest is returned. |
-| `GET /v1/jobs/{id}` | `JobView` |
-| `POST /v1/jobs/{id}/cancel` | Queued, blocked or recovering: becomes `cancelled` at once. Leased or running: the agent is told on its next poll. Terminal: `409`. Returns `JobView`. |
-| `GET /v1/jobs/{id}/logs?offset=N` | Bytes of the stored log from `offset`, `Content-Type: text/plain`, header `X-Lu-Log-Length` and `X-Lu-State`; `?wait=25` holds the request up to 25 seconds for new bytes or a state change. |
-| `GET /v1/jobs/{id}/artifacts/{name}` | `name` is `diff.patch`, `run.log` or `report.json`. `404` until stored. |
-| `GET /v1/status` | `StatusView`: controller `version`, `uptime_secs`, `schema_version`, `db_bytes`, `recovered_on_boot`, `jobs` counts by state, `oldest_queued_secs`, `nodes`, `nodes_online` and `lease_secs`. |
-| `GET /v1/nodes` | `[NodeView]` |
-| `GET /v1/nodes/{name}/stats` | The latest `NodeStats` the node reported in its heartbeat. `404` for an unknown node; a known node that has not reported stats is `{}`. In-memory only, so it is lost on controller restart. |
-| `POST /v1/nodes/{name}/drain` and `/undrain` | Stop or resume assigning new jobs to a node. `404` for a node that has never heartbeated. |
-| `GET /v1/repos` | List the configured repository mirrors: `{"repos":[{"name","url","synced_at","heads"}]}`. `synced_at` is null before the first sync; `heads` maps up to 20 branch names to commit ids. |
-| `POST /v1/repos/{name}/sync` | Fetch one configured mirror and return `{"name","heads","synced_at"}`. An unknown configured name is `404`; a fetch failure is `500` with the credential removed from the message. |
-| `GET /v1/health` | `{"ok":true,"version":"…","db":"ok"}`, no auth. |
-| `GET /metrics` | Prometheus text (`text/plain; version=0.0.4`): `lu_jobs` by state, `lu_nodes`/`lu_nodes_online`/`lu_nodes_drained`, `lu_node_providers{node,provider,state}`, `lu_controller_up`, `lu_jobs_completed_total` by outcome, `lu_build_info{version}`, `lu_uptime_seconds`, `lu_db_bytes`, `lu_schema_version`, `lu_recovered_on_boot`, `lu_queue_oldest_seconds`, `lu_node_last_seen_seconds{node}` and `lu_repo_last_sync_seconds{repo}`. See docs/operations.md. |
+| `POST /v1/jobs` body `JobSpec` | Create a job. `201` with a `JobView` and a `warnings` array. `spec.after` holds at most 16 job ids; an unknown, failed, cancelled or duplicate dependency or any other invalid spec is `422 unprocessable` and names the fault. `spec.stack_dependencies` defaults to `true`, so the agent applies each dependency's `diff.patch` in `after` order before the harness starts. `spec.requires` holds at most 8 labels; an unknown label is accepted with a warning in the reply. A repeated `idempotency_key` with the same spec returns the existing job with `200`; the same key with a different spec is `409 conflict`. |
+| `GET /v1/jobs?state=&limit=&after=` | List jobs, newest first. `limit` defaults to 200 and is capped at 200. `after` is a `JobId` cursor; an invalid value is `400 bad_request`. Returns `{"jobs":[JobView],"next":"<id>|null"}`. |
+| `GET /v1/jobs?key=<key>` | Look up an idempotency key. Returns the same envelope with zero or one job and `next: null`; other filters are ignored. An empty, over-long or malformed key is `400 bad_request`. |
+| `GET /v1/jobs/{id}` | Return a `JobView`. An unknown id is `404 not_found`. |
+| `POST /v1/jobs/{id}/cancel` | `blocked`, `queued` and `recovering` jobs become `cancelled` at once; `leased`, `running` and `needs_input` jobs get `cancel_requested = true` and the agent is told on its next poll. A terminal job is `409 conflict`. Returns a `JobView`. |
+| `GET /v1/jobs/{id}/logs?offset=N&wait=25` | Return raw log bytes from `offset` with `Content-Type: text/plain`, `X-Lu-Log-Length` and `X-Lu-State`. `wait` holds the request for up to 25 seconds while no new bytes arrive. An unknown id is `404`. |
+| `GET /v1/jobs/{id}/artifacts/{name}` | Return one fixed artifact name: `diff.patch`, `run.log` or `report.json`. An unknown name or an artifact that is not stored is `404`. |
+| `GET /v1/status` | Return a `StatusView`. |
+| `GET /v1/repos` | Return `{"repos":[{"name","url","synced_at","heads"}]}`. `synced_at` is null before the first sync; `heads` maps up to 20 branch names to commit ids. |
+| `POST /v1/repos/{name}/sync` | Fetch one configured mirror and return `{"name","heads","synced_at"}`. An unknown configured name is `404`; a fetch failure is `500` with any credential removed from the message. |
+| `GET /v1/nodes` | Return an array of `NodeView`s. |
+| `GET /v1/nodes/{name}/stats` | Return the latest `NodeStats` from the node's heartbeat. An unknown node is `404`; a known node with no stats returns `{}`. Stats live in memory and are lost on controller restart. |
+| `POST /v1/nodes/{name}/drain` | Stop assigning new jobs to the node. A node that has never heartbeated is `404`. |
+| `POST /v1/nodes/{name}/undrain` | Let the node take new jobs again. A node that has never heartbeated is `404`. |
+| `GET /metrics` | Return Prometheus text with `Content-Type: text/plain; version=0.0.4; charset=utf-8`. It needs an operator token. Series are listed in [operations.md](operations.md#metrics). |
+| `GET /v1/health` | Return `{"ok":true,"version":"…","db":"ok"}` without authentication. |
 
-`JobSpec`: `repo`, `git_ref`, optional `base_commit`, `task`, `harness`, `provider`, `model`, `timeout_secs`, optional `idle_timeout_secs`, `idempotency_key`, `after`. `base_commit` is the 40-hex commit the controller pinned for a configured repository; it is absent for an unlisted repository and is ignored by agents in this version. A job for a configured repository whose `git_ref` is not a branch, tag or commit in the mirror gets `422` naming the ref.
-| `GET /metrics` | Prometheus text (`text/plain; version=0.0.4`): `lu_jobs` by state, `lu_nodes`/`lu_nodes_online`/`lu_nodes_drained`, `lu_node_providers{node,provider,state}`, `lu_node_labels_info{node,label}`, `lu_controller_up`, `lu_jobs_completed_total` by outcome, `lu_build_info{version}`, `lu_uptime_seconds`, `lu_db_bytes`, `lu_schema_version`, `lu_recovered_on_boot`, `lu_queue_oldest_seconds` and `lu_node_last_seen_seconds{node}`. See docs/operations.md. |
+## JSON shapes
 
-`JobView`: `id`, `state`, `spec`, `attempt` (1 based), `node` (or null), `epoch`, `created_at`, `updated_at`, `started_at`, `finished_at`, `failure_class` (or null), `summary`, `exit_code`, `artifacts` (names present), `cancel_requested`, `after` (dependency ids), `waiting_on` (the subset not yet `done`), `waiting_reason` (for a queued job no online node can place, such as `no node with label php8.3`; otherwise null) and `warnings` (submit replies only; otherwise empty/omitted).
+### `JobSpec`
 
-`NodeView`: `name`, `version` (the agent's last reported version, or null), `last_seen`, `online` (seen within two lease periods), `draining`, `harness` state, `providers` (list), `labels` (sorted labels from the latest heartbeat), `current_job` (id or null), `cordons` (provider names with an unexpired cordon), `reiki` (opaque JSON from the heartbeat or null), `load1`, `mem_available_kb`, `mem_total_kb`, and `stuck` (the number of the node's running jobs whose latest stats say `stuck`). The four stats fields are `null`/`0` until the node reports a host heartbeat.
+| Field | Type | Required | Rule |
+| --- | --- | --- | --- |
+| `repo` | string | yes | Git URL or absolute local path. |
+| `git_ref` | string | yes | Branch, tag or commit to check out. |
+| `base_commit` | string | no | 40-hex commit id. The controller pins it for a configured repository; the agent uses it as the base tree. Omitted when absent. |
+| `task` | string | yes | Up to 256 KiB. |
+| `harness` | string | no | Defaults to `opencode`. |
+| `provider` | string | no | Omitted when absent. |
+| `model` | string | no | Omitted when absent. |
+| `timeout_secs` | integer | no | 1 to 86400; defaults to 3600. |
+| `idle_timeout_secs` | integer | no | 1 to 86400; omitted when absent. |
+| `idempotency_key` | string | no | Omitted when absent. |
+| `after` | array of job ids | no | At most 16 unique ids; omitted when empty. |
+| `stack_dependencies` | boolean | no | Defaults to `true`; omitted when `true`. When true, dependency diffs are applied to the job's base tree. |
+| `requires` | array of labels | no | At most 8 labels; omitted when empty. |
 
-`StatusView`: `version`, `uptime_secs`, `schema_version`, `db_bytes` (the SQLite file only), `recovered_on_boot`, `jobs` (an object with every state, zero-filled), `oldest_queued_secs` (`0` when no job is queued or blocked), `nodes`, `nodes_online`, and `lease_secs`.
+An unknown `git_ref` for a configured repository is `422 unprocessable` and names the ref. A job for an unlisted repository has no `base_commit` unless one is supplied by the client.
 
-`NodeStats`: `{"host": HostStats|null, "jobs": [JobStats]}`. Both fields are omitted when empty, so a node that reports neither is `{}`.
+### `JobView`
 
-`HostStats`: `load1`, `load5`, `load15`, `mem_total_kb`, `mem_available_kb`, `swap_used_kb`, `disk_free_bytes` (optional and currently always omitted), `uptime_secs`. Values are read from `/proc`; non-Linux agents report no host stats.
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | Job id. |
+| `state` | string | One of `blocked`, `queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`. |
+| `spec` | `JobSpec` | The submitted spec. |
+| `attempt` | integer | 1-based attempt number. |
+| `node` | string or null | Node holding the job. |
+| `epoch` | integer | Lease epoch used for fencing. |
+| `created_at` | integer | Unix seconds when the job was created. |
+| `updated_at` | integer | Unix seconds of the last state change. |
+| `started_at` | integer or null | Unix seconds when the harness started. |
+| `finished_at` | integer or null | Unix seconds when the job reached a terminal state. |
+| `failure_class` | string or null | `node`, `provider`, `execution`, `dependency` or `conflict`. |
+| `summary` | string or null | Last failure or completion summary. |
+| `exit_code` | integer or null | Harness exit code when known. |
+| `artifacts` | array of strings | Fixed names currently stored: `diff.patch`, `run.log`, `report.json`. |
+| `cancel_requested` | boolean | Whether cancellation has been requested. |
+| `after` | array of strings | Dependency ids from the spec. |
+| `waiting_on` | array of strings | Dependencies that are not yet `done`. |
+| `waiting_reason` | string or null | Why a queued job cannot be placed, such as `no node with label php8.3`. |
+| `warnings` | array of strings | Submit replies only. |
 
-`JobStats`: `job_id`, `pgid`, `output_idle_secs` (since the harness last wrote output), `cpu_idle_secs` (since any process in the job tree last used CPU), `stuck` (running, with both idle values above 300 seconds), and `processes`. `ProcessStats` entries carry `pid`, `ppid`, `state`, `cpu_secs` (clock ticks divided by 100), `rss_kb`, `age_secs`, `cmdline` (first 80 characters, control characters replaced) and `open_files`. A job tree lists at most the 64 busiest processes, so it is a bounded sample rather than a complete process list.
+### `NodeView`
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `name` | string | Node name bound to the agent token. |
+| `version` | string or null | Agent version from its latest heartbeat. |
+| `last_seen` | integer | Unix seconds of the latest heartbeat. |
+| `online` | boolean | Seen within two lease periods. |
+| `draining` | boolean | Whether new assignment is stopped. |
+| `harness` | string | Last reported harness state: `idle` or `busy`. |
+| `providers` | array | Provider names and states from the latest heartbeat. |
+| `labels` | array of strings | Labels from the latest heartbeat. |
+| `current_job` | string or null | Job id the node holds. |
+| `cordons` | array | Providers with an unexpired cordon on this node. |
+| `reiki` | object or null | Opaque Reiki document from the heartbeat. |
+| `load1` | number or null | One-minute load from the latest host stats. |
+| `mem_available_kb` | integer or null | Available memory from the latest host stats. |
+| `mem_total_kb` | integer or null | Total memory from the latest host stats. |
+| `stuck` | integer | Number of the node's running jobs whose latest stats say `stuck`. |
+
+### `StatusView`
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `version` | string | Controller build version. |
+| `uptime_secs` | integer | Seconds since the controller started. |
+| `schema_version` | integer | Schema version the binary expects. |
+| `db_bytes` | integer | Size of the SQLite file, excluding `-wal` and `-shm`. |
+| `recovered_on_boot` | integer | Jobs moved to `recovering` by startup recovery. |
+| `jobs` | object | Counts for all nine states, zero-filled. |
+| `oldest_queued_secs` | integer | Age of the oldest `queued` or `blocked` job, or `0`. |
+| `nodes` | integer | Registered nodes. |
+| `nodes_online` | integer | Nodes seen within two lease periods. |
+| `lease_secs` | integer | Configured lease duration. |
+
+### Repository shapes
+
+`GET /v1/repos` returns `{"repos":[RepoInfo]}`. `POST /v1/repos/{name}/sync` returns a `SyncResult`.
+
+| Shape | Fields |
+| --- | --- |
+| `RepoInfo` | `name`, `url`, `synced_at` (integer or null), `heads` (up to 20 branch names mapped to commit ids). |
+| `SyncResult` | `name`, `heads`, `synced_at` (integer). |
+
+### Node stats
+
+`GET /v1/nodes/{name}/stats` returns `NodeStats`. Both fields are omitted when empty, so a node that reports neither is `{}`.
+
+| Shape | Fields |
+| --- | --- |
+| `NodeStats` | `host` (`HostStats` or null), `jobs` (array of `JobStats`). |
+| `HostStats` | `load1`, `load5`, `load15`, `mem_total_kb`, `mem_available_kb`, `swap_used_kb`, `disk_free_bytes` (reserved and currently omitted), `uptime_secs`. Read from `/proc`; non-Linux agents report no host stats. |
+| `JobStats` | `job_id`, `pgid`, `output_idle_secs`, `cpu_idle_secs`, `stuck`, `processes` (array of `ProcessStats`, at most 64 busiest entries). |
+| `ProcessStats` | `pid`, `ppid`, `state`, `cpu_secs`, `rss_kb`, `age_secs`, `cmdline` (first 80 characters with control characters replaced), `open_files`. |
 
 ## Agent
 
 | Route | Meaning |
 |---|---|
-| `POST /v1/agent/poll` body `{"heartbeat": Heartbeat, "wait_secs": 0..30}` | Registers a heartbeat and asks for work. Returns `204` when there is nothing, or `200` `[AgentEvent]` with `Assign` (when the node is free, not draining, harness healthy, and a queued job matches), `Cancel`, or `Followup`. Holds up to `wait_secs` for work. Assigning creates a lease: `lease_secs` from now, epoch incremented. |
-| `POST /v1/agent/jobs/{id}/start` body `{"epoch":N}` | Leased to running. `409 stale_epoch` if the lease moved on. |
-| `POST /v1/agent/jobs/{id}/renew` body `{"epoch":N}` | Extends the lease by `lease_secs`. Also implied by `poll`, `log` and `start`. Returns `{"cancel":bool}`. |
-| `GET /v1/agent/jobs/{id}/deps?epoch=N` | The job's `after` dependencies in order: `[{"job_id","state","diff_bytes"}]`. `403` unless this node owns the job; stale epoch is `409`. `diff_bytes` is `0` when the dependency has no `diff.patch`, and the agent then skips it. |
-| `GET /v1/agent/jobs/{id}/deps/{dep}/diff?epoch=N` | Raw `diff.patch` bytes for a dependency. `403` unless `dep` is in the job's `after` list, `404` when no diff is stored, stale epoch is `409`. |
-| `POST /v1/agent/jobs/{id}/log?epoch=N&offset=M` body raw bytes | Append a chunk at `offset`. `offset` must equal the stored length (`409 conflict` with `{"length":L}` otherwise so the agent can resume). At most 64 KiB. When a chunk must be cut to fit the cap, room for the `[log truncated]` marker line is reserved first, so the stored log ends with the marker and never exceeds the cap; the append still returns 200. |
-| `PUT /v1/agent/jobs/{id}/artifacts/{name}?epoch=N` body raw bytes | Store `diff.patch` or `report.json` (caps from `limits`). Controller names the file; the agent never supplies a path. |
-| `POST /v1/agent/jobs/{id}/complete` body `Completion` | Finish. Outcomes and failure classes follow `lu-proto`. A stale epoch is `409 stale_epoch` and the result is discarded. For a provider failure, optional `retry_after_secs` is when the provider is expected back; the controller cordons the provider on the node for that long (at least 5 seconds, at most 24 hours) instead of the configured length. Two consecutive healthy provider heartbeats clear such a cordon early. |
-| `GET /v1/agent/jobs/{id}/base?epoch=N` | Fetch the job's base as a pack when its spec has `base_commit`. Body is `application/x-git-pack`; header `x-lu-base-commit` carries the 40-hex commit id. The pack holds that commit and its tree without parent history. `404` when no commit or base provider serves the job, `413 too_large` when the pack would exceed 256 MiB. |
-| `POST /v1/agent/jobs/{id}/complete` body `Completion` | Finish. Outcomes and failure classes follow `lu-proto`. A stale epoch is `409 stale_epoch` and the result is discarded. For a provider failure, optional `retry_after_secs` is when the provider is expected back; the controller cordons the provider on the node for that long (at least 5 seconds, at most 24 hours) instead of the configured length. |
+| `POST /v1/agent/poll` body `{"heartbeat": Heartbeat, "wait_secs": 0..30}` | Register a heartbeat and ask for work. `wait_secs` above 30 is `400`. Returns `204` when there is no work, or `200` with an array of events: `{"kind":"cancel","job_id":…,"epoch":…}` and `{"kind":"assign","job_id":…,"epoch":…,"spec":JobSpec}`. An `assign` creates a lease for `lease_secs` and increments the epoch. A heartbeat whose node differs from the token's node is `403`. |
+| `GET /v1/agent/jobs/{id}/base?epoch=N` | Fetch the job's base pack when the spec has `base_commit`. Returns `application/x-git-pack` with header `x-lu-base-commit`; the pack holds that commit and its tree without parent history. Missing commit, wrong node, unavailable base or stale epoch gives `403`, `404` or `409` as appropriate; a pack over 256 MiB gives `413 too_large`. |
+| `POST /v1/agent/jobs/{id}/start` body `{"epoch":N}` | Move a leased job to `running` and return its `JobView`. A wrong node is `403`; a stale epoch is `409 stale_epoch`. The lease is extended. |
+| `POST /v1/agent/jobs/{id}/renew` body `{"epoch":N}` | Extend the lease by `lease_secs` and return `{"cancel":bool}`. Log append and `start` also extend the lease; `poll` renews jobs that have pending cancellations. |
+| `POST /v1/agent/jobs/{id}/log?epoch=N&offset=M` body raw bytes | Append a chunk at `offset`. The offset must equal the stored length; otherwise `409 conflict` returns `{"length":L}`. The body is limited to 64 KiB plus framing. When the 50 MiB log cap is reached, room for the `[log truncated]` marker is reserved first so the stored log ends with that marker. |
+| `PUT /v1/agent/jobs/{id}/artifacts/diff.patch?epoch=N` body raw bytes | Store the diff, capped at 10 MiB. The controller chooses the path and returns `200` or `413 too_large`. |
+| `PUT /v1/agent/jobs/{id}/artifacts/report.json?epoch=N` body raw bytes | Store the report, capped at 1 MiB. The controller chooses the path and returns `200` or `413 too_large`. |
+| `GET /v1/agent/jobs/{id}/deps?epoch=N` | Return the job's dependencies in `after` order as `[{"job_id","state","diff_bytes"}]`. `diff_bytes` is `0` when no diff is stored. Wrong node is `403`; stale epoch is `409 stale_epoch`. |
+| `GET /v1/agent/jobs/{id}/deps/{dep}/diff?epoch=N` | Return the dependency's raw `diff.patch`. A `dep` outside the job's `after` list is `403`; a missing diff is `404`; a stale epoch is `409 stale_epoch`. |
+| `POST /v1/agent/jobs/{id}/complete` body `Completion` | Finish the job and return its `JobView`. A stale epoch is `409 stale_epoch` and the result is discarded. For a provider failure, `retry_after_secs` sets the cordon length on the node, clamped to 5 seconds through 24 hours. Two healthy provider heartbeats clear such a cordon early. |
 
-An optional `JobSpec.base_commit` is a 40-hex commit id. Agents use it only with a controller that
-can serve that commit; `[agent].base_source` controls whether a `404` falls back to cloning the
-spec's `repo` (`auto`, the default) or fails the job (`controller`). `clone` never asks for a pack.
+A `JobSpec.base_commit` is a 40-hex commit id. The agent fetches a pack for it unless `base_source` is `clone`. With `controller`, a `404` fails the job; with `auto`, the default, a `404` falls back to cloning the spec's `repo`.
 
 `Heartbeat` may also carry optional `version` (at most 32 printable ASCII characters), optional `labels` (at most 32 labels, each 1–64 characters from letters, digits, `.`, `_`, `-`, `/`, with at most one `=`) plus optional `host` and `jobs` stats. Older agents that omit them are accepted; each heartbeat replaces the controller's previous stats and labels for that node, so omitting them clears a stale job tree and label set. The combined stats are trimmed to 16 KiB before validation by dropping processes first and then whole jobs. Lu never interprets labels; dispatch compares them exactly.
 

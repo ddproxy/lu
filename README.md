@@ -1,48 +1,43 @@
 # lu
 
-Lu is a small job queue for coding-agent work: an operator submits a repository, ref and task to a controller, and an agent on a peer checks out the repository, runs a harness under supervision, and uploads a diff, log and report. The controller keeps jobs in SQLite and serves a JSON API over HTTPS; one `lu` binary provides the controller, the operator CLI and, with the `tui` feature, a terminal dashboard. Agents dial out to the controller and poll for work; the controller never connects back to an agent.
+Lu is a small job queue for finite coding-agent work against git repositories. An operator
+submits a repo, ref and task; the controller stores jobs in SQLite and hands out leases. An agent
+stages a fresh checkout and runs the `opencode` harness, then uploads `diff.patch`, `run.log` and
+`report.json`. One `lu` binary is the controller, the operator CLI and the agent. Agents dial out
+to the controller, which never connects back to them.
 
-## Architecture
+## When to use it
 
-```mermaid
-flowchart LR
-    operator["operator<br/>lu CLI"] -->|HTTPS| controller
-    agent -->|"HTTPS poll"| controller
-    controller --- store[("SQLite<br/>+ artifacts")]
-    agent -->|"process group"| harness
-```
+| Situation | Lu fits when | Look elsewhere when |
+| --- | --- | --- |
+| One-off code changes | You want a repeatable run against a git ref and a reviewable diff | You need a shared interactive terminal |
+| Chained work | Later jobs wait for earlier ones and stack their diffs | Dependencies form cycles or must run everywhere |
+| Several agents | Nodes advertise labels and you want exact routing, leases and cordons | You need broadcast or long-running services |
+| Automation | You want an HTTP API or MCP tools to submit and inspect jobs | You need a hosted UI or managed workers |
 
-The controller owns job state, leases, retry decisions and node cordons. An agent has one job slot in 0.1.0; it stages a fresh checkout, supervises the harness, and reports logs and artifacts back to the controller.
+Build with `make build` (release binary with the `tui` feature). `make install` puts `lu` in
+`$(PREFIX)/bin`, defaulting to `/usr/local` for root and `$HOME/.local` otherwise; `PREFIX` and
+`DESTDIR` can be overridden. Root installs also install the `contrib/` systemd units.
 
-**Status:** controller, agent and operator CLI work end to end. A submitted job is leased to an agent, run by a harness under supervision, and finishes with a diff, a log and a report. See *Known gaps* below.
+## Quickstart
 
-## Install
+This runs a controller, one agent and the operator CLI on one machine. Prerequisites: `make`, a
+Rust toolchain, `git`, `opencode` on `PATH` (or a `harness_wrapper` that starts it), a local git
+repository, and three shells. Replace `/home/you` with your home directory and
+`/home/you/src/demo` with your repository path. The commands use the binary from `make build`;
+put `target/release` on `PATH` or run `make install` first.
 
-```sh
-make build
-make install
-```
-
-`make install` builds `lu` with the `tui` feature and installs it to `$(PREFIX)/bin`. `PREFIX` defaults to `/usr/local` for root and `$HOME/.local` otherwise; `DESTDIR` and `PREFIX` can be overridden. When run as root, `make install` also installs the systemd units from `contrib/` to `$(PREFIX)/lib/systemd/system`; `make uninstall` removes them again.
-
-Configuration and operational details are in [docs/config.md](docs/config.md), [docs/operations.md](docs/operations.md) and [docs/security.md](docs/security.md). The HTTP contract is [docs/api.md](docs/api.md).
-
-## Quick start
-
-These steps run a controller and the operator CLI on one machine. Run them as your own user, not root. Replace `/home/you` with your home directory.
-
-1. Generate one agent token and one operator token. The controller stores only their SHA-256 hashes, so keep the token files:
+1. Make a demo directory, then create one agent token and one operator token under it. Keep the
+   plaintext token files: the controller stores only their SHA-256 hashes. The exact commands,
+   file checks and ownership rules are in [Tokens and TLS](docs/tokens-and-tls.md).
 
    ```sh
-   umask 077
-   mkdir -p "$HOME/lu-demo/artifacts"
-   printf '%s' "$(head -c 32 /dev/urandom | base64)" > "$HOME/lu-demo/agent.token"
-   printf '%s' "$(head -c 32 /dev/urandom | base64)" > "$HOME/lu-demo/operator.token"
-   chmod 600 "$HOME/lu-demo/agent.token" "$HOME/lu-demo/operator.token"
-   sha256sum "$HOME/lu-demo/agent.token" "$HOME/lu-demo/operator.token"
+   mkdir -p "$HOME/lu-demo"
    ```
 
-2. Write `$HOME/lu-demo/lu.toml`. Put the two hashes from `sha256sum` in the `token_sha256` fields:
+2. Write `$HOME/lu-demo/lu.toml`, replacing the two hash placeholders with the values printed
+   for the token files. The agent's `work_dir` is created with mode `0700` on first start if it
+   does not exist; if it does exist, it must be a real directory, not a symlink.
 
    ```toml
    [controller]
@@ -52,11 +47,18 @@ These steps run a controller and the operator CLI on one machine. Run them as yo
 
    [[controller.agents]]
    name = "node-a"
-   token_sha256 = "<sha256 of agent.token>"
+   token_sha256 = "<64 lowercase hex chars from agent.token>"
 
    [[controller.operators]]
    name = "ops"
-   token_sha256 = "<sha256 of operator.token>"
+   token_sha256 = "<64 lowercase hex chars from operator.token>"
+
+   [agent]
+   name = "node-a"
+   controller_url = "http://127.0.0.1:7600"
+   token_file = "/home/you/lu-demo/agent.token"
+   work_dir = "/home/you/lu-demo/work"
+   harness = "opencode"
 
    [log]
    level = "info"
@@ -64,66 +66,66 @@ These steps run a controller and the operator CLI on one machine. Run them as yo
    stderr = true
    ```
 
-3. Check the config, then start the controller in the foreground:
+3. In shell 1, check the config and start the controller:
 
    ```sh
    lu check --config "$HOME/lu-demo/lu.toml"
    lu serve --config "$HOME/lu-demo/lu.toml"
    ```
 
-4. In a second shell, point the operator CLI at the controller and submit a job from a local git repository:
+   `lu check` prints `controller: listen 127.0.0.1:7600, 1 agent(s), 1 operator(s), tls off`
+   and `agent: node-a -> http://127.0.0.1:7600, work dir /home/you/lu-demo/work`. It prints no
+   database line until the database exists.
+
+4. In shell 2, start the agent. A successful start loads the agent token, heartbeats and polls
+   the controller:
+
+   ```sh
+   lu agent --config "$HOME/lu-demo/lu.toml"
+   ```
+
+5. In shell 3, point the operator CLI at the controller and submit a job:
 
    ```sh
    export LU_URL=http://127.0.0.1:7600
    export LU_TOKEN_FILE="$HOME/lu-demo/operator.token"
 
-   lu submit --repo /path/to/repository --ref main --task "run the test suite"
+   lu submit --repo /home/you/src/demo --ref main --task "run the test suite" --wait
+   ```
+
+   Expected output is a 26-character job id on stdout, then `state: done` on stderr. The command
+   exits `0` for `done` and `3` for `failed` or `cancelled`. Without `--wait`, the id is printed
+   immediately and the job stays `queued` until the agent picks it up.
+
+6. Inspect the result:
+
+   ```sh
    lu ls
    lu show <job-id>
-   lu logs <job-id>
-   lu cancel <job-id>
-   lu retry <job-id> # resubmit a finished job's spec as a new job
+   lu logs --follow <job-id>
+   mkdir -p results
+   lu fetch <job-id> --out results
    ```
 
-   `lu submit` prints the new job id. With no agent running the job remains `queued`; `lu logs` is empty and `lu cancel` moves a queued job to `cancelled`.
+   `lu ls` uses the header `ID STATE NODE ATTEMPT AFTER CREATED`. `lu show` prints key/value
+   rows (`id`, `state`, `node`, `attempt`, `epoch`, `created_at`, `started_at`, `finished_at`,
+   `failure`, `waiting`, `summary`). `lu logs --follow` streams stored output and stops when the
+   job reaches a terminal state. `lu fetch` prints one `saved <path>` line per file:
+   `results/diff.patch`, `results/run.log` and `results/report.json`.
 
-   To chain jobs, repeat `--after` with the ids that must finish first:
+7. To chain work, use idempotency keys instead of copying ids:
 
    ```sh
-   lu submit --repo /path/to/repository --ref main --task "run the linter" --after <job-id>
-   lu ls   # AFTER shows how many dependencies are still unfinished, or - for none
-   lu show <job-id>   # prints each dependency and its state
+   lu submit --key build --repo /home/you/src/demo --ref main --task "build"
+   lu submit --key test --after-key build --repo /home/you/src/demo --ref main --task "test"
    ```
 
-   The dependent job stays `blocked` until every dependency is `done`, then becomes `queued`. By default the agent applies each dependency's diff to the dependent's base tree in `after` order before the harness starts; the dependent's own diff includes those changes. If a dependency diff cannot be merged, the job fails with `failure_class: "conflict"` and names the conflicting paths. `--no-stack` runs on the base tree alone. If a dependency ends `failed` or `cancelled`, the dependent fails with `failure_class: "dependency"` and no diff is applied.
+   The second job stays `blocked` while `build` is unfinished, then becomes `queued`. By default
+   its agent applies the first job's `diff.patch` to its own base tree before starting;
+   `--no-stack` disables that. See [Dependencies](docs/dependencies.md).
 
-   A chain can use idempotency keys instead of capturing ids:
-
-   ```sh
-   lu submit --key build --repo /path/to/repository --ref main --task "build"
-   lu submit --key test --after-key build --repo /path/to/repository --ref main --task "test"
-   lu submit --key ship --after-key build --after-key test --repo /path/to/repository --ref main --task "ship"
-   ```
-
-   `--after-key` is repeatable, can be combined with `--after <job-id>`, and drops duplicate ids. An unknown key is a usage error (exit 2); a key naming a failed or cancelled job hits the same dependency rule as its id.
-
-   To pin work to nodes that advertise every named label, repeat `--require`:
-
-   ```sh
-   lu submit --repo /path/to/repository --ref main --task "run the PHP suite" --require php8.3 --require gpu
-   ```
-
-   Labels are opaque to Lu: an agent advertises them, a job requires them, and dispatch compares them exactly. A submit with a label no online node advertises still succeeds and prints a warning; a queued job that cannot be placed shows why in `lu show` and `lu top`.
-
-5. Run an agent on the same machine. Write `$HOME/lu-demo/agent.toml` with an `[agent]` table (`name = "node-a"`, `controller_url = "http://127.0.0.1:7600"`, `token_file` pointing at `agent.token`, a `work_dir` under `lu-demo`, `harness = "opencode"`), then:
-
-   ```sh
-   lu agent --config "$HOME/lu-demo/agent.toml"
-   ```
-
-   In the other shell, `lu submit ... --wait` returns when the job is done, `lu logs --follow <job-id>` streams its output, and `lu fetch <job-id> --out results` saves the diff, log and report.
-
-For a controller on a non-loopback address, add a `[tls]` table with `cert` and `key`; plain HTTP is accepted only on loopback. See [docs/config.md](docs/config.md).
+A controller listening on a non-loopback address requires a `[tls]` table; plain HTTP is accepted
+only on loopback. See [Tokens and TLS](docs/tokens-and-tls.md).
 
 ## Commands
 
@@ -131,34 +133,30 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 
 | Command | What it does |
 | --- | --- |
-| `lu check` | Parse and validate the config and TLS files, print a summary, and report the controller database's `quick_check`, schema, size and consistency counts when it exists. |
-| `lu backup --out <file>` | Copy the live controller database to `<file>` with `VACUUM INTO`, verify it, and set mode `0600`. Existing files need `--force`. |
-| `lu restore <file>` | Install a backup as the controller database after stopping the controller; the previous file is moved to `<db>.pre-restore-<unix seconds>`. |
-| `lu status` | Show controller version, uptime, schema, database size, recovered jobs, job counts, oldest queued age and node counts. `--json` prints the raw response. |
-| `lu mcp` | Serve Lu tools over stdio (JSON-RPC 2.0), including job submission and control. See [Use Lu from an agent](#use-lu-from-an-agent). |
-| `lu serve` | Run the HTTP(S) controller. This is the default when no subcommand is given. |
-| `lu top` | Live view of the nodes (version, state, last heartbeat, load, memory, provider health) and recent jobs, refreshed every two seconds. `↑`/`↓` or `j`/`k` select a row, `Tab` switches focus between nodes and jobs, `Enter` opens the last 20 lines of the selected job's log, `x` opens the process pane for a running job selected in the job list, `Esc` closes the log or process pane (or quits when none is open), `d` twice within three seconds drains or undrains the selected node, `g` toggles the dependency-graph panel, `p` pauses and `q` quits. `--once` prints one snapshot's tables with the same columns as plain text and exits; `--json` prints one `nodes`/`jobs` object instead, and cannot be combined with `--once`. Only in a build with `--features tui`; connects like the other operator commands. |
-| `lu submit` | Submit a job. `--repo` and `--ref` are required; the task comes from `--task`, `--task-file`, or stdin. `--idle-timeout <secs>` (1 to 86400) stops a harness that has produced no output for that long. `--after <job-id>` and `--after-key <key>` (each repeatable, at most 16 dependencies in total) make the job wait for those dependencies; a key resolves to the newest job submitted with it. `--wait` polls until terminal. |
-| `lu retry <id>` | Resubmit a finished job's spec as a new job. `--provider <name>` and `--model <name>` replace those fields; `--after <job-id>` and `--after-key <key>` (each repeatable) replace the dependency list; nothing else changes. Refuses with exit 2 while the old job is not terminal (`done`, `failed` or `cancelled`) or an `--after-key` is unknown. The new job carries no idempotency key unless `--key` is given. Supports `--wait` and `--json`. |
-| `lu submit` | Submit a job. `--repo` and `--ref` are required; the task comes from `--task`, `--task-file`, or stdin. `--idle-timeout <secs>` (1 to 86400) stops a harness that has produced no output for that long. `--after <job-id>` (repeatable, at most 16) makes the job wait for those dependencies; their diffs are applied in `after` order unless `--no-stack` is given. `--wait` polls until terminal. |
-| `lu retry <id>` | Resubmit a finished job's spec as a new job. `--provider <name>` and `--model <name>` replace those fields; `--after <job-id>` (repeatable) replaces the dependency list; nothing else changes. Refuses with exit 2 while the old job is not terminal (`done`, `failed` or `cancelled`). The new job carries no idempotency key unless `--key` is given. Supports `--wait` and `--json`. |
-| `lu top` | Live view of the nodes (state, last heartbeat, labels on wide terminals, provider health) and recent jobs, refreshed every two seconds. Queued jobs show why they cannot be placed in the note column. `↑`/`↓` or `j`/`k` select a row, `Tab` switches focus between nodes and jobs, `Enter` opens the last 20 lines of the selected job's log, `Esc` closes the log pane (or quits when it is closed), `d` twice within three seconds drains or undrains the selected node, `g` toggles the dependency-graph panel, `p` pauses and `q` quits. `--once` prints one snapshot's tables as plain text and exits; `--json` prints one `nodes`/`jobs` object instead, and cannot be combined with `--once`. Only in a build with `--features tui`; connects like the other operator commands. |
-| `lu submit` | Submit a job. `--repo` and `--ref` are required; the task comes from `--task`, `--task-file`, or stdin. `--idle-timeout <secs>` (1 to 86400) stops a harness that has produced no output for that long. `--require <label>` (repeatable, at most 8) routes the job only to nodes advertising every label; unknown labels are accepted with a warning. `--after <job-id>` and `--after-key <key>` (each repeatable, at most 16 dependencies in total) make the job wait for those dependencies; a key resolves to the newest job submitted with it. `--wait` polls until terminal. |
-| `lu retry <id>` | Resubmit a finished job's spec as a new job. `--provider <name>` and `--model <name>` replace those fields; `--after <job-id>` and `--after-key <key>` (each repeatable) replace the dependency list; `--require <label>` (repeatable) replaces the label requirements and `--no-require` clears them. Nothing else changes. Refuses with exit 2 while the old job is not terminal (`done`, `failed` or `cancelled`) or an `--after-key` is unknown. The new job carries no idempotency key unless `--key` is given. Supports `--wait` and `--json`. |
-| `lu ls` | List jobs, newest first. Filters: `--state`, `--limit`. `AFTER` counts dependencies still unfinished. |
-| `lu show <id>` | Show one job, including each dependency and its state. |
-| `lu graph [job]` | Draw the dependency graph of unfinished jobs, newest component first. With a job id, show only its component. `--json` prints a `nodes` array instead; colour is used only when stdout is a terminal and `NO_COLOR` is unset. |
-| `lu logs <id>` | Print a job's stored log. `--follow` keeps reading until the job is terminal. |
-| `lu fetch <id>` | Save `diff.patch`, `run.log` and `report.json` into `--out` (default `.`). Missing artifacts are skipped; existing files need `--force`. |
-| `lu cancel <id>` | Ask the controller to cancel a job. |
-| `lu repos` | List the configured repository mirrors with their last sync time and branch-head counts. `--json` prints the raw response. |
+| `lu check` | Read the config file's structure and print a controller or agent summary. When `[controller] db` exists, it prints the database's `quick_check`, schema, size and consistency counts. It does not read TLS keys or token files. |
+| `lu backup --out <file> [--force]` | Copy the live controller database into `<file>` with `VACUUM INTO`, verify it and set mode `0600`. Existing files need `--force`. |
+| `lu restore <file>` | Install a backup as the controller database after stopping the controller. The previous file is moved to `<db>.pre-restore-<unix seconds>`. |
+| `lu status` | Show controller version, uptime, schema version, database size, recovered jobs, job counts by state, oldest queued age and node counts. `--json` prints the raw response. |
+| `lu mcp` | Serve Lu tools over stdio using newline-delimited JSON-RPC 2.0. See [Use Lu from an agent](#use-lu-from-an-agent). |
+| `lu repos` | List the configured repository mirrors with their last sync time and branch heads. `--json` prints the raw response. |
 | `lu sync <name>` | Fetch one configured repository mirror and print its last sync time and branch heads. `--json` prints the raw response. |
-| `lu nodes` | List known nodes, including the agent version each last reported. |
-| `lu nodes` | List known nodes, including the agent version each last reported and its labels. |
-| `lu drain <node>` | Stop assigning new jobs to a node. |
-| `lu undrain <node>` | Allow a drained node to take jobs again. |
+| `lu serve` | Run the HTTP(S) controller. This is the default when no subcommand is given. |
+| `lu top [--once]` | Live view of the nodes and recent jobs, refreshed every two seconds. `--once` prints one snapshot as text and exits; global `--json` prints one snapshot as JSON and cannot be combined with `--once`. Only in a build with `--features tui`. |
+| `lu agent` | Run the node agent loop. It needs an `[agent]` config. |
+| `lu submit` | Submit a job. `--repo` and `--ref` are required. The task comes from `--task`, `--task-file` or stdin. Flags: `--harness` (default `opencode`), `--provider`, `--model`, `--timeout` (default `3600`), `--idle-timeout` (1 to 86400 seconds), `--after`, `--after-key`, `--no-stack`, `--require`, `--key` and `--wait`. `--after` and `--after-key` are repeatable, at most 16 dependencies in total; a key resolves to the newest job submitted with it. `--require` is repeatable, at most 8 labels. `--wait` polls until the job is terminal. |
+| `lu retry <id>` | Resubmit a finished job's spec as a new job. `--provider` and `--model` replace those fields; `--after` and `--after-key` replace the dependency list; `--require` replaces the label requirements and `--no-require` clears them. `--key` gives the new job an idempotency key, and `--wait` polls until it is terminal. A nonterminal job or an unknown `--after-key` is a usage error. |
+| `lu ls [--state <state>] [--limit <n>]` | List jobs, newest first. `--state` accepts the nine job states. `AFTER` counts dependencies still unfinished. |
+| `lu show <id>` | Show one job, including each dependency and its state. |
+| `lu graph [job]` | Draw the dependency graph of unfinished jobs, newest component first. With a job id, show only its component. `--json` prints a `nodes` array instead. |
+| `lu logs <id> [--follow]` | Print a job's stored log. `--follow` reads until the job reaches a terminal state. |
+| `lu fetch <id> [--out <dir>] [--force]` | Save `diff.patch`, `run.log` and `report.json` into `--out` (default `.`). Missing artifacts are skipped; existing files need `--force`. |
+| `lu cancel <id>` | Ask the controller to cancel a job. |
+| `lu nodes` | List known nodes, including the agent version and labels each last reported. |
+| `lu node <name>` | Show the host and job stats the node last reported. |
+| `lu drain <node>` | Stop assigning new jobs to a node. The node must have heartbeated at least once. |
+| `lu undrain <node>` | Allow a drained node to take jobs again. The node must have heartbeated at least once. |
 
-Operator connection settings come from `LU_URL`, `LU_TOKEN_FILE` and optional `LU_CA_FILE`, or from `~/.config/lu/operator.toml`, then `/etc/lu/operator.toml` (`url`, `token_file`, optional `ca_file`; a leading `~/` is expanded) when `--config` names no file, or from the `[agent]` table in `--config`. The token file must be private (mode `0600` or tighter).
+Operator connection settings are read in this order: `LU_URL` with `LU_TOKEN_FILE` and optional `LU_CA_FILE`; the `[agent]` table in the `--config` file when that file exists; then the first existing operator file at `$XDG_CONFIG_HOME/lu/operator.toml` (or `~/.config/lu/operator.toml`) or `/etc/lu/operator.toml`. An operator file uses `url`, `token_file` and optional `ca_file`; a leading `~/` is expanded. The token file must be private (mode `0600` or tighter).
 
 ### Exit codes
 
@@ -208,3 +206,14 @@ Write tools: `lu_submit`, `lu_submit_many`, `lu_result`, `lu_cancel`, `lu_retry`
 | `app` | the `lu` binary |
 
 MIT. See `LICENSE`.
+
+## Documentation
+
+- [Concepts](docs/concepts.md)
+- [Job Lifecycle](docs/lifecycle.md)
+- [Dependencies](docs/dependencies.md)
+- [Tokens and TLS](docs/tokens-and-tls.md)
+- [Configuration](docs/config.md)
+- [HTTP API](docs/api.md)
+- [Operations](docs/operations.md)
+- [Security](docs/security.md)

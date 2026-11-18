@@ -2,7 +2,7 @@
 
 This page covers a packaged controller deployment, upgrades, backup and restore, restart behaviour, leases and retries, provider cordons, how to read `lu status` and `lu nodes`, monitoring, and the dependency-graph display.
 
-**0.1.0 status:** controller, agent (`lu agent`) and operator CLI work end to end. Read the agent limitation in `docs/security.md` before running an agent next to anything sensitive.
+The controller, `lu agent` and operator CLI work end to end. See [security.md](security.md) for the agent's isolation model.
 
 ## Layout
 
@@ -61,7 +61,7 @@ systemctl status lu-controller.service
 
 `lu-controller.service` is `Type=simple`; `lu` does not implement `sd_notify`, so `Type=notify` is not available. It runs as `lu`, uses `StateDirectory=lu`, and applies `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, restricted address families, an empty capability set and `LimitNOFILE=65536`. `ReadWritePaths=/var/lib/lu` is the only writable system path. `TimeoutStopSec=40` is above the fixed 10-second in-flight drain the binary performs on shutdown.
 
-`lu-agent.service` is present for the intended agent layout, but it runs `lu agent`, which this tree does not implement. Do not enable it in 0.1.0; it will fail with a command-line usage error.
+`lu-agent.service` starts `lu agent --config /etc/lu/agent.toml`. Copy `contrib/lu-agent.toml` to that path and create `/etc/lu/agent.token` before enabling the unit. The service runs as `lu` with the `lu-harness` supplementary group; keep the harness in the separate account described in [security.md](security.md).
 
 The HTTP health route needs no token:
 
@@ -73,13 +73,13 @@ It returns `{"ok":true,"version":"…","db":"ok"}`. A non-loopback listener requ
 
 ## Upgrade
 
-1. Read `CHANGELOG.md` and run the new binary's `lu check --config /etc/lu/lu.toml` before replacing anything.
-2. Back up the database and artifacts (below).
-3. Stop the controller: `systemctl stop lu-controller.service`.
-4. Replace `/usr/local/bin/lu` and any changed unit files, then `systemctl daemon-reload`.
-5. Start the controller and check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`.
+1. Read `CHANGELOG.md` and back up the database and artifacts (below).
+2. Stop the controller: `systemctl stop lu-controller.service`.
+3. Replace `/usr/local/bin/lu` and any changed unit files, then `systemctl daemon-reload`.
+4. Run `lu check --config /etc/lu/lu.toml` to confirm the file structure, then start the controller.
+5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store has schema version 3. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
+The store has schema version 4. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes.
 
@@ -96,9 +96,10 @@ lu backup --config /etc/lu/lu.toml --out "/var/backups/lu/lu-$(date +%F).db"
 
 `lu backup` uses SQLite's `VACUUM INTO`, writes the copy with mode `0600`, runs
 `PRAGMA integrity_check`, and prints the size, schema version and job count. It refuses to
-replace an existing file unless `--force` is given. `lu backup`, `lu restore` and `lu check` read
-only `[controller] db`; they do not check or load TLS keys and token files, so they also run as
-root against a service account's secrets.
+replace an existing file unless `--force` is given. `lu backup` and `lu restore` read only
+`[controller] db`; `lu check` reads the config structure and that database. None of these
+commands opens TLS keys or token files, so they also run as root against a service account's
+secrets.
 
 For a daily snapshot, install a small wrapper, a service and a timer as root:
 
@@ -233,17 +234,16 @@ stateDiagram-v2
     cancelled --> [*]
 ```
 
-A `needs_input` state is reserved for interactive harnesses and unreachable in 0.1.0.
+The `needs_input` state is reserved for interactive harnesses; the controller does not assign it.
 
 A job submitted with `after` dependencies starts as `blocked` when at least one dependency is not `done`; if all are already `done`, it starts as `queued`. When a dependency finishes `done`, all blocked dependents whose remaining dependencies are `done` move to `queued` and waiter polls wake. When a dependency finishes `failed` or `cancelled`, blocked dependents fail with `failure_class: "dependency"`, a summary naming the dependency and its state, and the failure cascades through their own dependents. Dependency failures never retry.
 
 A dependent job with `stack_dependencies: true` (the default) stages its base commit and applies every finished dependency's `diff.patch` in `after` order before the harness starts. A dependency with no diff is skipped. A patch that applies cleanly is written directly; otherwise the agent reconstructs the dependency's side from the base and three-way merges it. If conflicts remain, the job stops before the harness with `failure_class: "conflict"` and a summary naming the dependency and up to 20 conflicting paths; it never retries and the failed merge writes nothing. `lu submit --no-stack` sets `stack_dependencies: false` to run on the base tree alone. The dependent's own diff is always against its base and includes the dependency changes, so a consumer merging a chain applies only the last diff.
 
-A job starts as `queued` with `attempt = 1` and `epoch = 0`. When an idle, non-draining node with no held job asks for work, the controller assigns the oldest queued job whose provider is available and not cordoned. A `leased`, `running` or `recovering` job is still held by its node:
-A job starts as `queued` with `attempt = 1` and `epoch = 0`. When an idle, non-draining node with no held job asks for work, the controller assigns the oldest queued job whose provider is available and not cordoned, and whose node advertises every label in the job's `requires` list. Label matching is exact; Lu assigns no meaning to a label. The label rule composes with provider and drain rules. If a queued job's requirements cannot be met by any online node, `lu show` and the `lu top` note column print the first missing label as `no node with label <label>`.
+A job starts as `queued` with `attempt = 1` and `epoch = 0`. When an idle, non-draining node with no held job asks for work, the controller assigns the oldest queued job whose provider is available and not cordoned, and whose node advertises every label in the job's `requires` list. Label matching is exact; Lu assigns no meaning to a label. The label rule composes with provider and drain rules. If a queued job's requirements cannot be met by any online node, `lu show` and the `lu top` note column print the first missing label as `no node with label <label>`. A `leased`, `running` or `recovering` job is still held by its node:
 
 - state becomes `leased`, `node` is set, `epoch` is incremented, and the lease runs for `lease_secs`.
-- the agent calls `start` to move the job to `running`, then renews the lease. In 0.1.0 the controller also best-effort renews on `poll`, `start` and log append.
+- the agent calls `start` to move the job to `running`; `start` and each log append extend the lease. `poll` renews jobs that have pending cancellations.
 - every agent write names the epoch. A write with an older epoch is `409 stale_epoch` and changes nothing.
 
 Maintenance runs every `max(1, lease_secs / 3)` seconds. An expired lease moves the job to `recovering`; after `recovery_grace_secs` it is requeued or failed as described above.
@@ -251,7 +251,7 @@ Maintenance runs every `max(1, lease_secs / 3)` seconds. An expired lease moves 
 On completion:
 
 - `Done` moves the job to `done` and records `finished_at`; newly unblocked dependents move to `queued`.
-- `Failed(Execution)` moves it to `failed` immediately. Execution failures never retry. `lu retry <id>` resubmits a finished job's spec as a new job (`--provider`, `--model` and `--after` replace those fields); the new job is independent of the old one.
+- `Failed(Execution)` moves it to `failed` immediately. Execution failures never retry. `lu retry <id>` resubmits a finished job's spec as a new job; `--provider`, `--model`, `--after`/`--after-key`, `--require`/`--no-require` and `--key` replace the corresponding fields. The new job is independent of the old one.
 - `Failed(Conflict)` means a dependency diff could not be applied to the base tree. It moves the job to `failed` immediately and never retries.
 - `Failed(Node)` retries while `attempt <= max_retries`: the job returns to `queued`, the attempt is incremented, and the node is cleared. Beyond the cap it becomes `failed` with that failure class. `Failed(Provider)` does not use that budget: a provider outage is not the job's fault, so the job returns to `queued` and waits until a node can serve the provider again (the node must report it healthy and have no cordon). Only 100 provider failures in a row fail the job. A terminal `failed` or `cancelled` job fails its blocked dependents.
 
@@ -292,7 +292,7 @@ Cordon deadlines are stored as monotonic milliseconds. The controller does not r
 ```text
 version             0.1.10
 uptime_secs         3600
-schema_version      3
+schema_version      4
 db_bytes            81920
 recovered_on_boot   2
 oldest_queued_secs  0
@@ -326,12 +326,11 @@ node-a  0.1.10   idle     gpu,php8.3,region=eu       2026-11-16 09:12:00Z no
 - `HARNESS` is the last reported harness state (`idle`, `busy`, or `-` if unknown).
 - `LABELS` is the comma-separated label list from the latest heartbeat, or `-` for none. A long list is cut to fit the column and ends with `+N` for the hidden labels.
 - `LAST_SEEN` is the last heartbeat time in UTC.
-- `DRAINED` is intended to show the drain flag.
+- `DRAINED` shows the drain flag from the controller's node view.
 
 There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `labels`, `current_job`, `cordons`, `version` and the opaque `reiki` document.
 
-A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, or has a matching provider cordon will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
-A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, lacks a required label, or has a matching provider cordon will not be assigned one.
+A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, lacks a required label, or has a matching provider cordon will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
 
 ## Reading `lu node`
 
@@ -353,13 +352,14 @@ job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
   4242  1     S      7      1024    90     3      opencode run
 ```
 
-- Host numbers come from the agent's `/proc` sample. `disk_free_bytes` is currently always `-`; the documented optional field is reserved for a later filesystem stat primitive.
+- Host numbers come from the agent's `/proc` sample. The agent omits `disk_free_bytes`, so the CLI prints `-`.
 - Each job is a running job owned by that node. `pgid` is the harness process group, and the process table is capped at the 64 busiest members. `COMMAND` is the first 80 characters of the command line with control characters replaced.
 - `output_idle` is seconds since the harness last wrote output; `cpu_idle` is seconds since any process in the job tree last used CPU. `stuck yes` means both are above 300 seconds while the job is still running.
 - A node that has not sent stats prints `host  -` and `jobs  -`. An unknown node is a 404 and exits `1`.
 - `lu node <name> --json` prints the exact `GET /v1/nodes/{name}/stats` body, including an empty `{}` for a known node with no stats.
 
 Stats are sampled on the agent at heartbeat time, which may be slower than `lu top`'s two-second refresh. They describe the agent's view, not live controller state.
+
 ## Display
 
 `lu top` shows the controller and agent versions in its title (`lu top <version> · controller <version>`). The node table includes `VERSION`, `LOAD` (`load1`, one decimal or `-`), and `MEM` (used percent of total, or `-`). Memory is green below 80%, orange at 80%, and red at 95%. A node with `stuck > 0` shows a red `stuck` marker after its state, and a node whose version differs from the controller's is coloured orange.
@@ -416,7 +416,7 @@ Logs are stored at `<artifacts_dir>/<job id>/run.log`; artifacts are `diff.patch
 - `GET /v1/jobs/{id}/logs?offset=N` returns raw bytes from the offset, with `X-Lu-Log-Length` and `X-Lu-State`. `?wait=25` waits up to 25 seconds for new bytes or a state change.
 - Total log storage is capped at 50 MiB. Bytes beyond the cap are dropped with a marker line and the upload still succeeds.
 - `diff.patch` is capped at 10 MiB, `report.json` at 1 MiB, and one log chunk at 64 KiB plus framing.
-- `lu logs <id>` prints the stored text. `lu logs --follow` is intended to stop at a terminal state, but the client currently ignores the controller's `X-Lu-State` header, so it may keep waiting. Use `lu show <id>` to check the state if follow does not stop.
+- `lu logs <id>` prints the stored text. `lu logs --follow` reads `X-Lu-State` and stops when the job reaches a terminal state. It exits `3` when that state is `failed` or `cancelled`.
 - `lu fetch <id> --out DIR` writes the fixed names into `DIR`, mode `0600`, and refuses to overwrite existing files unless `--force` is given. Missing artifacts are skipped; if none are available the command exits `1`.
 
 ## Repository mirrors
@@ -435,7 +435,7 @@ Series:
 
 | Series | Type | Meaning |
 | --- | --- | --- |
-| `lu_jobs{state="…"}` | gauge | Jobs in each of the eight states (`queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`); all eight are zero-filled. |
+| `lu_jobs{state="…"}` | gauge | Jobs in each of the nine states (`blocked`, `queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`); all nine are zero-filled. |
 | `lu_nodes` | gauge | Registered nodes that have sent at least one heartbeat. |
 | `lu_nodes_online` | gauge | … and seen within two lease periods. |
 | `lu_nodes_drained` | gauge | … with the drain flag set. |
@@ -446,7 +446,7 @@ Series:
 | `lu_build_info{version="…"}` | gauge | Always 1; the controller build version. |
 | `lu_uptime_seconds` | gauge | Seconds since the controller process started. |
 | `lu_db_bytes` | gauge | Size of the SQLite database file, excluding `-wal` and `-shm`. |
-| `lu_schema_version` | gauge | Schema version the binary expects, currently `2`. |
+| `lu_schema_version` | gauge | Schema version the binary expects, currently `4`. |
 | `lu_recovered_on_boot` | gauge | Jobs moved to `recovering` by this process's boot recovery. |
 | `lu_queue_oldest_seconds` | gauge | Age of the oldest `queued` or `blocked` job, or `0` when there is none. |
 | `lu_node_last_seen_seconds{node}` | gauge | Seconds since that node's last heartbeat. |
@@ -506,14 +506,14 @@ version, size, `leased`/`running` jobs without a lease, and orphan `job_deps` ro
 
 | Symptom | Check |
 | --- | --- |
-| `lu serve` exits with a config error | `lu check --config …`; the error names the table. |
+| `lu serve` exits with a config error | Read the error; `lu check` checks only file structure, so full validation happens in `lu serve`. |
 | `cannot open …/lu.db: … database directory does not exist` | Create the parent directory and ensure `lu` can write it. |
 | `cannot listen …` | Port already in use or not permitted; `listen` must be a socket address. |
 | TLS key refused | Mode must be `0600` or tighter and the file must be owned by `lu`; symlinks are refused. |
 | `401 unauthorized` | Wrong token, wrong scope, a hash mismatch, or a token file with the wrong contents. Operator commands need an operator token; agent routes need an agent token. |
 | `403 forbidden` | The token is valid but the job or heartbeat belongs to a different node. |
 | Job stays `queued` | No agent is polling, the node is busy or draining, provider missing, provider cordon, or no online node has every required label. `lu show` prints the missing label; inspect `lu nodes --json`. |
-| `logs --follow` never stops | Known client mismatch; `Ctrl-C` and use `lu show`/`lu logs`. |
+| `logs --follow` exited `3` | The job ended in `failed` or `cancelled`; check `lu show <id>`. |
 | `lu fetch` exits `1` | No artifacts yet, or the job has not uploaded any; check the job state. |
 
 Limits and route details are in [api.md](api.md). Config keys and validation rules are in [config.md](config.md). The threat model is in [security.md](security.md).
