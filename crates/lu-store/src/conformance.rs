@@ -61,6 +61,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     cancel_states(&make());
     cancel_recovering_ends_it_cancelled_immediately(&make());
     assignment_and_epoch(&make());
+    recovering_job_blocks_new_assignment_on_its_node(&make());
     start_renew_log_artifact(&make());
     complete_and_retry_cordon(&make());
     reiki_cordon_yields_to_live_health(&make());
@@ -78,6 +79,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     diamond_dependency(&make());
     unknown_and_invalid_dependencies_are_rejected(&make());
     job_counts(&make());
+    crate::model::run(&make);
 }
 
 fn with_after(mut sp: JobSpec, after: &[JobId]) -> JobSpec {
@@ -562,6 +564,44 @@ fn assignment_and_epoch<S: Store>(s: &S) {
         .unwrap()
         .unwrap();
     assert_eq!(ap.job_id, jp.id);
+}
+
+fn recovering_job_blocks_new_assignment_on_its_node<S: Store>(s: &S) {
+    let n = node("node-r");
+    s.heartbeat(&hb("node-r", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (first, _) = s
+        .create_job(&spec("https://x/first.git", None), now(1, 1))
+        .unwrap();
+    let assignment = s.next_assignment(&n, now(2, 2), 100).unwrap().unwrap();
+    assert_eq!(assignment.job_id, first.id);
+
+    let expired = s.expire_leases(now(103, 103)).unwrap();
+    assert_eq!(expired, vec![first.id.clone()]);
+    let recovering = s.get_job(&first.id).unwrap();
+    assert_eq!(recovering.state, JobState::Recovering);
+    assert_eq!(recovering.node, Some(n.clone()));
+
+    let view = s
+        .nodes(now(103, 103), 100)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.name == n)
+        .expect("node-r is known");
+    assert_eq!(
+        view.current_job,
+        Some(first.id.clone()),
+        "a recovering job is still the node's current job"
+    );
+
+    let (second, _) = s
+        .create_job(&spec("https://x/second.git", None), now(104, 104))
+        .unwrap();
+    assert_ne!(second.id, first.id);
+    assert!(
+        s.next_assignment(&n, now(105, 105), 100).unwrap().is_none(),
+        "a node holding a recovering job must not be assigned another"
+    );
 }
 
 fn start_renew_log_artifact<S: Store>(s: &S) {

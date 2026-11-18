@@ -983,10 +983,11 @@ impl Store for SqliteStore {
         if !matches!(hb.harness, lu_proto::HarnessState::Idle) {
             return Ok(None);
         }
-        // node must not hold a job
+        // A recovering job still belongs to its node: the agent may come back for it, so the
+        // node must not take a second job in the meantime.
         let held: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM jobs WHERE node=?1 AND state IN ('leased','running') LIMIT 1",
+                "SELECT 1 FROM jobs WHERE node=?1 AND state IN ('leased','running','recovering') LIMIT 1",
                 params![node.as_str()],
                 |r| r.get(0),
             )
@@ -1454,7 +1455,7 @@ impl Store for SqliteStore {
             // current job
             let current: Option<String> = conn
                 .query_row(
-                    "SELECT id FROM jobs WHERE node=?1 AND state IN ('leased','running') LIMIT 1",
+                    "SELECT id FROM jobs WHERE node=?1 AND state IN ('leased','running','recovering') LIMIT 1",
                     params![name],
                     |r| r.get(0),
                 )
@@ -1662,6 +1663,15 @@ mod tests {
     fn conformance() {
         crate::conformance::run_all(|| {
             let p = temp_db("db.sqlite");
+            SqliteStore::open(&p).unwrap()
+        });
+    }
+
+    #[test]
+    #[ignore = "long randomised model run; the normal conformance test covers a shorter run"]
+    fn model_long() {
+        crate::model::run_long(|| {
+            let p = temp_db("model-long.sqlite");
             SqliteStore::open(&p).unwrap()
         });
     }

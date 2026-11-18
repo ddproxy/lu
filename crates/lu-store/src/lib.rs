@@ -13,6 +13,8 @@ pub const SCHEMA_VERSION: i64 = 4;
 
 #[cfg(test)]
 pub mod conformance;
+#[cfg(test)]
+mod model;
 
 use lu_proto::{
     ArtifactName, Completion, FailureClass, Heartbeat, JobId, JobSpec, JobState, NodeName,

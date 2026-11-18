@@ -236,7 +236,7 @@ A `needs_input` state is reserved for interactive harnesses and unreachable in 0
 
 A job submitted with `after` dependencies starts as `blocked` when at least one dependency is not `done`; if all are already `done`, it starts as `queued`. When a dependency finishes `done`, all blocked dependents whose remaining dependencies are `done` move to `queued` and waiter polls wake. When a dependency finishes `failed` or `cancelled`, blocked dependents fail with `failure_class: "dependency"`, a summary naming the dependency and its state, and the failure cascades through their own dependents. Dependency failures never retry, and dependencies do not transfer results or artifacts to the dependent job.
 
-A job starts as `queued` with `attempt = 1` and `epoch = 0`. When an idle, non-draining node with no held job asks for work, the controller assigns the oldest queued job whose provider is available and not cordoned:
+A job starts as `queued` with `attempt = 1` and `epoch = 0`. When an idle, non-draining node with no held job asks for work, the controller assigns the oldest queued job whose provider is available and not cordoned. A `leased`, `running` or `recovering` job is still held by its node:
 
 - state becomes `leased`, `node` is set, `epoch` is incremented, and the lease runs for `lease_secs`.
 - the agent calls `start` to move the job to `running`, then renews the lease. In 0.1.0 the controller also best-effort renews on `poll`, `start` and log append.
@@ -323,7 +323,7 @@ node-a  0.1.10   idle     2026-11-16 09:12:00Z no
 
 There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `current_job`, `cordons`, `version` and the opaque `reiki` document.
 
-A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, or has a matching provider cordon will not be assigned one.
+A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, or has a matching provider cordon will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
 
 ## Reading `lu node`
 

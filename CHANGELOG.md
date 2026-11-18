@@ -30,6 +30,18 @@ uses semantic versioning once it reaches 1.0.
 - `[controller].local_repo_roots` allows absolute local repositories to be served as bases; it is empty by default. `[agent].base_source` is `auto` by default: try the controller then clone on `404`; `controller` fails as a node failure on `404`, and `clone` never asks.
 - `lu-staging` can stage from a controller pack with `git2`, without a `git` binary or forge network access. The checkout keeps the same permissions and group sharing as a clone, and `export_diff` is unchanged.
 
+### Added
+
+- Randomised model-based tests for the store: 200 fixed seeds replay 300 operations each against a
+  fresh SQLite database, checking lifecycle, dependency, lease, epoch, log and artifact invariants
+  after every step. The ignored `model_long` test runs 24 seeds for 3,000 operations each.
+
+### Fixed
+
+- A node holding a `recovering` job is no longer offered another job. `next_assignment` treats
+  `recovering` as held, and `lu nodes` shows that job as the node's `current_job`, so one node
+  cannot run two jobs after a lost lease.
+
 ## [0.1.13] - 2026-11-17
 
 ### Changed
