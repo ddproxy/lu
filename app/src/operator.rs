@@ -609,7 +609,7 @@ async fn graph_inner(args: GraphArgs, config: &Path, json: bool) -> Result<ExitC
     Ok(ExitCode::SUCCESS)
 }
 
-fn graph_job(view: &JobView) -> graph::Job {
+pub(crate) fn graph_job(view: &JobView) -> graph::Job {
     graph::Job {
         id: view.id.to_string(),
         state: graph::State::from_name(state_name(view.state)),

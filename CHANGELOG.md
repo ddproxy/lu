@@ -19,6 +19,10 @@ uses semantic versioning once it reaches 1.0.
 
 - Schema 3 indexes the spec's idempotency key for the new lookup. Older databases gain the index on open.
 
+### Added
+
+- `lu mcp`: a stdio Model Context Protocol server with read-only tools for controller status, jobs, one job's detail, logs, nodes and the dependency graph.
+
 ## [0.1.13] - 2026-11-17
 
 ### Changed

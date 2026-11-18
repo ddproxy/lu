@@ -3,10 +3,15 @@
 mod admin;
 mod agent;
 mod logging;
+mod mcp;
 mod operator;
 mod service;
 #[cfg(feature = "tui")]
 mod top;
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod mock;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,6 +41,8 @@ enum Command {
     Restore(admin::RestoreArgs),
     /// Show controller uptime, database size, queue and node counts.
     Status(operator::StatusArgs),
+    /// Serve the Model Context Protocol over stdio (read tools).
+    Mcp,
     /// Run the HTTP listener. This is the default.
     Serve,
     /// Live terminal view of the nodes and recent jobs. Needs a build with the `tui` feature.
@@ -84,6 +91,7 @@ async fn main() -> ExitCode {
             Err(error) => fail(&error),
         },
         Command::Status(args) => operator::status(args, &cli.config, json).await,
+        Command::Mcp => mcp::run(&cli.config).await,
         Command::Serve => serve(&cli.config).await,
         #[cfg(feature = "tui")]
         Command::Top(args) => match top::run(&cli.config, args, json).await {

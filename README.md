@@ -127,6 +127,7 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu backup --out <file>` | Copy the live controller database to `<file>` with `VACUUM INTO`, verify it, and set mode `0600`. Existing files need `--force`. |
 | `lu restore <file>` | Install a backup as the controller database after stopping the controller; the previous file is moved to `<db>.pre-restore-<unix seconds>`. |
 | `lu status` | Show controller version, uptime, schema, database size, recovered jobs, job counts, oldest queued age and node counts. `--json` prints the raw response. |
+| `lu mcp` | Serve read-only Lu tools over stdio (JSON-RPC 2.0). See [Use Lu from an agent](#use-lu-from-an-agent). |
 | `lu serve` | Run the HTTP(S) controller. This is the default when no subcommand is given. |
 | `lu top` | Live view of the nodes (state, last heartbeat, provider health) and recent jobs, refreshed every two seconds. `↑`/`↓` or `j`/`k` select a row, `Tab` switches focus between nodes and jobs, `Enter` opens the last 20 lines of the selected job's log, `Esc` closes the log pane (or quits when it is closed), `d` twice within three seconds drains or undrains the selected node, `g` toggles the dependency-graph panel, `p` pauses and `q` quits. `--once` prints one snapshot's tables as plain text and exits; `--json` prints one `nodes`/`jobs` object instead, and cannot be combined with `--once`. Only in a build with `--features tui`; connects like the other operator commands. |
 | `lu submit` | Submit a job. `--repo` and `--ref` are required; the task comes from `--task`, `--task-file`, or stdin. `--idle-timeout <secs>` (1 to 86400) stops a harness that has produced no output for that long. `--after <job-id>` and `--after-key <key>` (each repeatable, at most 16 dependencies in total) make the job wait for those dependencies; a key resolves to the newest job submitted with it. `--wait` polls until terminal. |
@@ -151,6 +152,16 @@ Operator connection settings come from `LU_URL`, `LU_TOKEN_FILE` and optional `L
 | `1` | Any error: bad config, connection or HTTP failure, no artifacts available, bad token file. |
 | `2` | Command-line usage error (from clap), an unknown `--after-key`, or `lu retry` given a job that is not terminal. |
 | `3` | `submit --wait` or `logs --follow` ended in `failed` or `cancelled`. |
+
+## Use Lu from an agent
+
+`lu mcp` is a read-only MCP server over newline-delimited JSON-RPC on stdio. Register the command with a runtime that supports stdio servers, for example:
+
+```sh
+claude mcp add lu -- lu mcp
+```
+
+The server uses the operator connection settings above. A connection failure at startup is reported by each tool call as an `isError` result, so an agent can see why the controller is unavailable. Tools: `lu_status`, `lu_jobs`, `lu_job`, `lu_logs`, `lu_nodes`, `lu_graph`.
 
 ## What it is not
 
