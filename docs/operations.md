@@ -371,6 +371,32 @@ The job list uses the same colours. The graph shows at most 6 components and 40 
 
 `lu graph [JOB]` prints the same graph without the dashboard, using up to 200 jobs from the controller. `JOB` selects the component containing that job, even if every job in it is finished. Output is coloured only when stdout is a terminal and `NO_COLOR` is unset. `lu graph --json` prints `{"nodes":[{"id","state","title","after"}]}` for the shown jobs, without stubs or the summary line.
 
+## Agent access over MCP
+
+`lu mcp` serves newline-delimited JSON-RPC 2.0 on stdio, using the same operator connection settings as the CLI. A controller that is unreachable at startup does not stop the server: every call returns an `isError` result with the connection error. The operator token is used only for controller requests and is never included in tool results.
+
+Read-only tools are `lu_status`, `lu_jobs`, `lu_job`, `lu_logs`, `lu_nodes` and `lu_graph`. They are advertised with `readOnlyHint: true`.
+
+Write tools:
+
+| Tool | Effect |
+| --- | --- |
+| `lu_submit` | Submit one job. Takes `repo`, `ref`, inline `task`, and optional `provider`, `model`, `after`, `after_keys`, `timeout_secs`, `idle_timeout_secs`, `key`. |
+| `lu_submit_many` | Submit up to 12 named jobs in order. Each job may use `after_names` to depend on earlier jobs in the same call. |
+| `lu_result` | Return a finished job's summary, report, diff stats and one page of the diff. |
+| `lu_cancel` | Ask the controller to cancel a job. Destructive. |
+| `lu_retry` | Resubmit a terminal job's spec as a new job. Optional `provider`, `model`, `after` and `key`. |
+| `lu_drain` | Stop assigning new jobs to a node. Destructive. |
+| `lu_undrain` | Let a drained node take jobs again. Destructive. |
+
+`lu_submit` derives an idempotency key when `key` is absent: `mcp-` plus 16 hex characters of SHA-256 over the spec without its key. Repeating the same submission therefore targets the same job. `lu_retry` copies the old spec but does not derive a key; supply `key` to make the retry idempotent.
+
+`lu_submit_many` validates every name before sending anything. Empty or duplicate names, unknown `after_names`, references to later jobs and cycles are rejected without a partial submission. If the controller fails partway through, the error result lists the jobs that were submitted and those that were not.
+
+`lu_result` defaults to 24 KiB of diff and accepts `max_bytes` up to 32 KiB. It returns `offset`, `next_offset` and `done`; call it again with `next_offset` until `done` is true. Stats (`files`, `added`, `removed`) describe the whole diff, not the page. An unfinished job returns its state with `done: false` and no artifact request.
+
+Submissions from one server process are limited to 30 per rolling minute; `lu_submit`, `lu_submit_many` and `lu_retry` share the budget, and a batch reserves all of its slots before the first request. Over the limit, the call returns an `isError` result with the seconds to wait.
+
 ## Logs and artifacts
 
 Logs are stored at `<artifacts_dir>/<job id>/run.log`; artifacts are `diff.patch`, `run.log` and `report.json` in the same directory. The controller chooses the paths and names. Files are `0600`; directories are `0700`.

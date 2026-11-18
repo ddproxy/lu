@@ -5,6 +5,16 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `lu mcp` can submit and control jobs: `lu_submit`, `lu_submit_many`, `lu_result`, `lu_cancel`, `lu_retry`, `lu_drain` and `lu_undrain`, alongside the read tools. Submissions without a key derive `mcp-` plus 16 SHA-256 hex characters from the spec, so repeated identical calls are idempotent. `lu_submit_many` takes up to 12 named jobs and rejects duplicate, unknown, forward or cyclic names before submitting, reporting partial failures.
+- `lu_result` returns a job's summary, report, diff stats and a paged diff (24 KiB by default, at most 32 KiB) with `next_offset` and `done`.
+
+### Changed
+
+- `lu mcp` initialize instructions now describe read and write tools. Write tools carry `readOnlyHint: false`; `lu_cancel`, `lu_drain` and `lu_undrain` also carry `destructiveHint: true`.
+- One `lu mcp` process allows 30 submissions per rolling minute; over the limit a call returns `isError` with the wait in seconds.
+
 ## [0.1.14] - 2026-11-18
 
 ### Fixed

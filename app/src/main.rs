@@ -41,7 +41,7 @@ enum Command {
     Restore(admin::RestoreArgs),
     /// Show controller uptime, database size, queue and node counts.
     Status(operator::StatusArgs),
-    /// Serve the Model Context Protocol over stdio (read tools).
+    /// Serve the Model Context Protocol over stdio (read and write tools).
     Mcp,
     /// Run the HTTP listener. This is the default.
     Serve,

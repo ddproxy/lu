@@ -157,11 +157,15 @@ fn cap_value(value: Value, budget: usize) -> (Value, bool) {
     }
 }
 
-pub(super) fn cap_result(mut output: ToolOutput) -> ToolOutput {
-    let (text, cut_text) = cap_string(&output.text, PART_BUDGET);
-    let (structured, cut_json) = cap_value(clean_value(output.structured), PART_BUDGET);
+pub(super) fn cap_result(output: ToolOutput) -> ToolOutput {
+    cap_result_with(output, PART_BUDGET)
+}
+
+pub(super) fn cap_result_with(mut output: ToolOutput, budget: usize) -> ToolOutput {
+    let (text, cut_text) = cap_string(&output.text, budget);
+    let (structured, cut_json) = cap_value(clean_value(output.structured), budget);
     output.text = if cut_text || cut_json {
-        format!("{text}\n[cut: result shortened to fit the 32 KiB limit]")
+        format!("{text}\n[cut: result shortened to fit the size limit]")
     } else {
         text
     };

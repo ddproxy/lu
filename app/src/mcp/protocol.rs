@@ -79,6 +79,8 @@ pub enum ToolError {
     Args(String),
     /// A job/controller failure: the caller gets a normal result with `isError: true`.
     Failed(String),
+    /// A failure that also reports structured detail, such as a partly submitted batch.
+    Detailed { text: String, structured: Value },
 }
 
 pub trait ToolHost {
@@ -125,7 +127,7 @@ impl Server {
                     "protocolVersion": version,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "lu", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Read Lu job queue state through the lu_* tools. All tools are read-only."
+                    "instructions": "Read, submit and control Lu jobs through the lu_* tools. Read tools do not change state; lu_submit, lu_submit_many, lu_retry, lu_cancel, lu_drain and lu_undrain do. Submissions are limited to 30 per rolling minute."
                 }))
             }
             _ if !initialized => Err((-32002, format!("{method} before initialize"))),
@@ -145,6 +147,9 @@ impl Server {
                     Ok(output) => Ok(tool_result(output.text, output.structured, false)),
                     Err(ToolError::Failed(reason)) => {
                         Ok(tool_result(reason.clone(), json!({"error": reason}), true))
+                    }
+                    Err(ToolError::Detailed { text, structured }) => {
+                        Ok(tool_result(text, structured, true))
                     }
                     Err(ToolError::Args(reason)) => Err((-32602, reason)),
                 }
