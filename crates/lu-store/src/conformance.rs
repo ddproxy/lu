@@ -61,6 +61,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     assignment_and_epoch(&make());
     start_renew_log_artifact(&make());
     complete_and_retry_cordon(&make());
+    reiki_cordon_yields_to_live_health(&make());
     stale_epoch_rejected(&make());
     expire_and_recover(&make());
     recover_on_boot(&make());
@@ -620,6 +621,21 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
     assert_eq!(rec.failure_class, Some(FailureClass::Provider));
     // cordoned so cannot assign
     assert!(s.next_assignment(&n, now(5, 5), 60_000).unwrap().is_none());
+    assert_eq!(s.nodes(now(5, 5), 60_000).unwrap()[0].cordons, vec!["p1"]);
+    // A flagless cordon has no live signal, so healthy heartbeats do not clear it.
+    for mono in [6i64, 7] {
+        s.heartbeat(
+            &hb(
+                "node-a",
+                HarnessState::Idle,
+                vec![("p1", ProviderState::Ok)],
+            ),
+            now(mono, mono as u64),
+        )
+        .unwrap();
+    }
+    assert_eq!(s.nodes(now(8, 8), 60_000).unwrap()[0].cordons, vec!["p1"]);
+    assert!(s.next_assignment(&n, now(8, 8), 60_000).unwrap().is_none());
     // after expiry
     assert!(s
         .next_assignment(&n, now(20_000, 20_000), 60_000)
@@ -673,6 +689,57 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
     };
     let rec3 = s.complete(&comp3, None, now(4, 4), 1, 1000).unwrap();
     assert_eq!(rec3.state, JobState::Done);
+}
+
+fn reiki_cordon_yields_to_live_health<S: Store>(s: &S) {
+    let n = node("node-reiki");
+    let healthy = || {
+        hb(
+            "node-reiki",
+            HarnessState::Idle,
+            vec![("p1", ProviderState::Ok)],
+        )
+    };
+    s.heartbeat(&healthy(), now(1, 1)).unwrap();
+    let mut sp = spec("https://x/reiki.git", None);
+    sp.provider = Some("p1".to_owned());
+    let (j, _) = s.create_job(&sp, now(1, 1)).unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    s.start_job(&j.id, a.epoch, now(3, 3)).unwrap();
+    let comp = Completion {
+        job_id: j.id.clone(),
+        epoch: a.epoch,
+        outcome: Outcome::Failed(FailureClass::Provider),
+        exit_code: None,
+        summary: None,
+        retry_after_secs: Some(3600),
+    };
+    s.complete(
+        &comp,
+        Some((FailureClass::Provider, Some("p1".into()))),
+        now(4, 4),
+        1,
+        10_000,
+    )
+    .unwrap();
+    assert_eq!(s.nodes(now(5, 5), 60_000).unwrap()[0].cordons, vec!["p1"]);
+    // A non-healthy reading breaks the streak; two healthy ones after it clear the cordon.
+    s.heartbeat(
+        &hb(
+            "node-reiki",
+            HarnessState::Idle,
+            vec![("p1", ProviderState::Cooling)],
+        ),
+        now(5, 5),
+    )
+    .unwrap();
+    s.heartbeat(&healthy(), now(6, 6)).unwrap();
+    assert_eq!(s.nodes(now(7, 7), 60_000).unwrap()[0].cordons, vec!["p1"]);
+    assert!(s.next_assignment(&n, now(7, 7), 60_000).unwrap().is_none());
+    s.heartbeat(&healthy(), now(8, 8)).unwrap();
+    assert!(s.nodes(now(9, 9), 60_000).unwrap()[0].cordons.is_empty());
+    let a2 = s.next_assignment(&n, now(9, 9), 60_000).unwrap().unwrap();
+    assert_eq!(a2.job_id, j.id);
 }
 
 fn stale_epoch_rejected<S: Store>(s: &S) {

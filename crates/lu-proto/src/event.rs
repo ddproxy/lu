@@ -178,7 +178,8 @@ pub struct Completion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     /// For a provider failure: when the provider is expected back, in seconds. The controller
-    /// cordons the provider on the node for this long.
+    /// cordons the provider on the node for this long, but clears that cordon after two healthy
+    /// provider heartbeats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_secs: Option<u64>,
 }

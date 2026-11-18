@@ -206,6 +206,9 @@ impl SqliteStore {
                 if v < 2 {
                     apply_v2(&tx)?;
                 }
+                if v < 3 {
+                    apply_v3(&tx)?;
+                }
                 tx.execute("DELETE FROM schema_version", [])
                     .map_err(internal)?;
                 tx.execute(
@@ -217,6 +220,7 @@ impl SqliteStore {
             None => {
                 apply_v1(&tx)?;
                 apply_v2(&tx)?;
+                apply_v3(&tx)?;
                 tx.execute(
                     "INSERT INTO schema_version(version) VALUES (?1)",
                     params![CURRENT_SCHEMA_VERSION],
@@ -285,6 +289,17 @@ fn apply_v2(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
             FOREIGN KEY(dep) REFERENCES jobs(id)
         );
         CREATE INDEX IF NOT EXISTS job_deps_dep ON job_deps(dep);",
+    )
+    .map_err(internal)?;
+    Ok(())
+}
+
+fn apply_v3(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    // Reiki-derived cordons yield to live health, so they also need a streak counter. Rows from
+    // older databases keep their time-based behaviour (both columns default to false/zero).
+    tx.execute_batch(
+        "ALTER TABLE cordons ADD COLUMN reiki_derived INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE cordons ADD COLUMN healthy_hb_count INTEGER NOT NULL DEFAULT 0;",
     )
     .map_err(internal)?;
     Ok(())
@@ -474,6 +489,44 @@ fn node_offers_provider(hb: &Heartbeat, provider: &str) -> bool {
     hb.providers
         .iter()
         .any(|p| p.name == provider && matches!(p.state, lu_proto::ProviderState::Ok))
+}
+
+fn refresh_reiki_cordons(tx: &rusqlite::Transaction<'_>, hb: &Heartbeat) -> Result<(), StoreError> {
+    let cordons: Vec<(String, u64)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT provider, healthy_hb_count FROM cordons WHERE node=?1 AND reiki_derived=1",
+            )
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map(params![hb.node.as_str()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })
+            .map_err(internal)?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(internal)?);
+        }
+        v
+    };
+    for (provider, count) in cordons {
+        let healthy = node_offers_provider(hb, &provider);
+        if healthy && count.saturating_add(1) >= 2 {
+            tx.execute(
+                "DELETE FROM cordons WHERE node=?1 AND provider=?2 AND reiki_derived=1",
+                params![hb.node.as_str(), provider],
+            )
+            .map_err(internal)?;
+        } else {
+            let next = if healthy { count.saturating_add(1) } else { 0 };
+            tx.execute(
+                "UPDATE cordons SET healthy_hb_count=?3 WHERE node=?1 AND provider=?2 AND reiki_derived=1",
+                params![hb.node.as_str(), provider, next as i64],
+            )
+            .map_err(internal)?;
+        }
+    }
+    Ok(())
 }
 
 impl Store for SqliteStore {
@@ -843,6 +896,7 @@ impl Store for SqliteStore {
              ON CONFLICT(name) DO UPDATE SET heartbeat_json=excluded.heartbeat_json,last_seen_wall=excluded.last_seen_wall,last_seen_mono_ms=excluded.last_seen_mono_ms",
             params![hb.node.as_str(), hb_json, now.wall_unix, now.mono_ms as i64, draining],
         ).map_err(internal)?;
+        refresh_reiki_cordons(&tx, hb)?;
         tx.commit().map_err(internal)?;
         Ok(())
     }
@@ -1145,10 +1199,17 @@ impl Store for SqliteStore {
                     if class == FailureClass::Provider {
                         if let (Some(node), Some(p)) = (node_for_cordon, provider) {
                             let until = now.mono_ms.saturating_add(cordon_ms) as i64;
+                            let reiki_derived = completion.retry_after_secs.is_some();
                             tx.execute(
-                                "INSERT INTO cordons(node,provider,until_mono_ms) VALUES(?1,?2,?3)
-                                 ON CONFLICT(node,provider) DO UPDATE SET until_mono_ms=excluded.until_mono_ms",
-                                params![node.as_str(), p, until],
+                                "INSERT INTO cordons(node,provider,until_mono_ms,reiki_derived,healthy_hb_count) VALUES(?1,?2,?3,?4,0)
+                                 ON CONFLICT(node,provider) DO UPDATE SET until_mono_ms=excluded.until_mono_ms,
+                                 reiki_derived=excluded.reiki_derived, healthy_hb_count=0",
+                                params![
+                                    node.as_str(),
+                                    p,
+                                    until,
+                                    if reiki_derived { 1i64 } else { 0i64 }
+                                ],
                             ).map_err(internal)?;
                         }
                     }
@@ -1635,6 +1696,54 @@ mod tests {
             crate::StoreError::Internal(msg) => assert!(msg.contains("newer"), "{msg}"),
             other => panic!("expected internal newer-version error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn v2_database_upgrades_without_changing_old_cordons() {
+        use lu_proto::{HarnessState, ProviderState};
+
+        let p = temp_db("v2.sqlite");
+        {
+            let mut conn = rusqlite::Connection::open(&p).unwrap();
+            conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL);")
+                .unwrap();
+            let tx = conn.transaction().unwrap();
+            super::apply_v1(&tx).unwrap();
+            super::apply_v2(&tx).unwrap();
+            tx.execute("INSERT INTO schema_version(version) VALUES (2)", [])
+                .unwrap();
+            tx.execute(
+                "INSERT INTO cordons(node,provider,until_mono_ms) VALUES ('node-a','p1',9000)",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let s = SqliteStore::open(&p).unwrap();
+            let hb = crate::conformance::hb(
+                "node-a",
+                HarnessState::Idle,
+                vec![("p1", ProviderState::Ok)],
+            );
+            s.heartbeat(&hb, crate::conformance::now(1, 1)).unwrap();
+            s.heartbeat(&hb, crate::conformance::now(2, 2)).unwrap();
+            let nodes = s.nodes(crate::conformance::now(3, 3), 60_000).unwrap();
+            assert_eq!(nodes[0].cordons, vec!["p1"]);
+        }
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, crate::SCHEMA_VERSION);
+        let (derived, streak): (i64, i64) = conn
+            .query_row(
+                "SELECT reiki_derived, healthy_hb_count FROM cordons WHERE node='node-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((derived, streak), (0, 0));
     }
 
     #[test]

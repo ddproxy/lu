@@ -5,6 +5,11 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- A provider failure cordon created from Reiki's `retry_after_secs` now clears after two consecutive healthy provider heartbeats, so a stale outage estimate no longer leaves jobs queued for hours. Non-healthy readings reset the streak; output-marker cordons still wait out their timer. Store schema version is 3; older databases upgrade with their existing cordons unchanged.
+- `lu check`, `lu backup` and `lu restore` read only `[controller] db` and no longer check or load TLS keys and token files, so they work when run as root against a service account's secrets. `lu serve` still validates the whole config and its secret files.
+
 ## [0.1.13] - 2026-11-17
 
 ### Changed

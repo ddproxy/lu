@@ -1,6 +1,6 @@
 # Configuration
 
-`lu` reads one TOML file. `--config <path>` selects it; the default is `lu.toml` in the current directory. `lu check` parses and validates the file, reads the secret files it names, and loads the TLS certificate and key, without opening the database or listening.
+`lu` reads one TOML file. `--config <path>` selects it; the default is `lu.toml` in the current directory. `lu check` parses the file and prints a summary plus database health, but does not check values, read secret files or load the TLS certificate. `lu serve` validates the whole file and its secret files; `lu backup` and `lu restore` read only `[controller] db`.
 
 The file is UTF-8 and limited to 64 KiB. Unknown keys and tables are rejected rather than ignored. Every validation error names the table at fault, for example:
 
@@ -21,7 +21,7 @@ At least one of `[controller]` and `[agent]` must be present. A file may contain
 | `artifacts_dir` | yes | — | Absolute path; must not contain `..`. Created at startup if missing; mode is set to `0700` where supported. Job logs and artifacts live under `<artifacts_dir>/<job id>/`. |
 | `lease_secs` | no | `60` | Integer `5` to `3600`. A lease is extended by this many seconds. Maintenance runs every `max(1, lease_secs / 3)` seconds. |
 | `max_retries` | no | `1` | Integer `0` to `3`. Node and provider failures retry while `attempt <= max_retries`; `0` means no retry. Execution failures never retry. |
-| `provider_cooldown_secs` | no | `1800` | Integer `60` to `86400`. How long a `(node, provider)` pair is cordoned after a retryable provider failure. |
+| `provider_cooldown_secs` | no | `1800` | Integer `60` to `86400`. How long a `(node, provider)` pair is cordoned after a retryable provider failure without `retry_after_secs`. |
 | `recovery_grace_secs` | no | `30` | Integer `0` to `600`. How long a job stays `recovering` before it is requeued or failed. |
 | `max_connections` | no | `256` | Integer greater than `0`. Global concurrent connection cap. |
 | `max_connections_per_addr` | no | `64` | Integer `1` to `max_connections`. Concurrent connection cap per remote IP. |

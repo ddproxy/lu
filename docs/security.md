@@ -86,13 +86,14 @@ group or other permission bits, and is capped at 64 KiB. The same rules apply to
 ## TLS and transport
 
 Plain HTTP is accepted only when `[controller].listen` is a loopback address. Any non-loopback
-listener must have a `[tls]` table; `lu check` and `lu serve` both enforce that. The listener
-uses TLS 1.2 or 1.3 with safe defaults, HTTP/1.1 only, and no client certificates: the bearer
-token is the only client authentication.
+listener must have a `[tls]` table; `lu serve` enforces that. The listener uses TLS 1.2 or 1.3
+with safe defaults, HTTP/1.1 only, and no client certificates: the bearer token is the only
+client authentication.
 
-The TLS key is treated as a secret file by `lu check` and `lu serve`: regular file, owned by the
-effective user, no group/other bits, no symlink, no FIFO. The certificate is public. Both are
-loaded at startup; there is no reload, so restart after replacing them.
+The TLS key is treated as a secret file by `lu serve`: regular file, owned by the effective user,
+no group/other bits, no symlink, no FIFO. The certificate is public. Both are loaded at startup;
+there is no reload, so restart after replacing them. `lu check`, `lu backup` and `lu restore` do
+not read these files.
 
 Operators and agents verify the controller certificate against the system trust roots. The
 optional `[agent].ca_file` adds up to 1 MiB of PEM certificates to those roots; it does not

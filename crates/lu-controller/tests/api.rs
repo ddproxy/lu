@@ -255,6 +255,92 @@ fn heartbeat_json(node: &str) -> serde_json::Value {
     json!({"node": node, "harness": "idle", "providers": []})
 }
 
+async fn poll_with(addr: SocketAddr, token: &str, hb: &serde_json::Value) -> String {
+    let body = json!({"heartbeat": hb, "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    );
+    raw_request(addr, &req).await
+}
+
+async fn cordons_for(addr: SocketAddr, node: &str) -> Vec<String> {
+    let r = raw_request(addr, &format!("GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let view: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let n = view
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == node)
+        .unwrap_or_else(|| panic!("node {node} missing: {view}"));
+    n["cordons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_owned())
+        .collect()
+}
+
+async fn complete_as(
+    srv: &TestServer,
+    token: &str,
+    id: &str,
+    epoch: u64,
+    outcome: serde_json::Value,
+    retry_after_secs: Option<u64>,
+) -> String {
+    let mut comp = json!({"job_id": id, "epoch": epoch, "outcome": outcome});
+    if let Some(secs) = retry_after_secs {
+        comp["retry_after_secs"] = json!(secs);
+    }
+    let comp = comp.to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/complete HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", comp.len(), comp);
+    raw_request(srv.addr, &req).await
+}
+
+async fn fail_provider(srv: &TestServer, retry_after_secs: Option<u64>) -> (String, u64) {
+    let mut spec = sample_spec(None);
+    spec.provider = Some("p1".to_owned());
+    let body = serde_json::to_string(&spec).unwrap();
+    let req = format!(
+        "POST /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let j: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = j["id"].as_str().unwrap().to_owned();
+    let healthy =
+        json!({"node": "node-a", "harness": "idle", "providers": [{"name": "p1", "state": "ok"}]});
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &healthy).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let assign = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign")
+        .unwrap();
+    assert_eq!(assign["job_id"], id);
+    let epoch = assign["epoch"].as_u64().unwrap();
+    let b = json!({"epoch": epoch}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", b.len(), b);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let r = complete_as(
+        srv,
+        AGENT_A_TOKEN,
+        &id,
+        epoch,
+        json!({"failed": "provider"}),
+        retry_after_secs,
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    (id, epoch)
+}
+
 #[tokio::test]
 async fn agent_happy_path_and_forbidden_cross_node_and_stale_epoch() {
     let srv = start_server().await;
@@ -785,7 +871,7 @@ async fn status_requires_operator_token_and_reports_counts() {
     let body = body_str(&r);
     let status: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(status["version"], env!("CARGO_PKG_VERSION"), "{body}");
-    assert_eq!(status["schema_version"], 2, "{body}");
+    assert_eq!(status["schema_version"], lu_store::SCHEMA_VERSION, "{body}");
     assert_eq!(status["jobs"]["queued"], 1, "{body}");
     assert_eq!(status["jobs"]["done"], 0, "{body}");
     assert_eq!(status["nodes"], 0, "{body}");
@@ -874,7 +960,10 @@ async fn metrics_series_after_job_lifecycle() {
         )),
         "{b}"
     );
-    assert!(b.contains("lu_schema_version 2"), "{b}");
+    assert!(
+        b.contains(&format!("lu_schema_version {}", lu_store::SCHEMA_VERSION)),
+        "{b}"
+    );
     assert!(b.contains("lu_recovered_on_boot 0"), "{b}");
     assert!(b.contains("lu_queue_oldest_seconds "), "{b}");
     assert!(
@@ -1117,6 +1206,48 @@ async fn log_append_100_bytes_below_the_cap_keeps_the_marker() {
     );
     let rec = srv.store.get_job(&job_id).unwrap();
     assert_eq!(rec.log_len, MAX_LOG_BYTES);
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn reiki_cordon_yields_to_two_healthy_heartbeats_and_flagless_does_not() {
+    let srv = start_server().await;
+    let healthy =
+        json!({"node": "node-a", "harness": "idle", "providers": [{"name": "p1", "state": "ok"}]});
+
+    let (id, _) = fail_provider(&srv, Some(3600)).await;
+    assert_eq!(cordons_for(srv.addr, "node-a").await, vec!["p1"]);
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &healthy).await;
+    assert_eq!(status(&r), 204, "{r}");
+    assert_eq!(cordons_for(srv.addr, "node-a").await, vec!["p1"]);
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &healthy).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let assign = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign")
+        .unwrap_or_else(|| panic!("no assignment after two healthy heartbeats: {events}"));
+    assert_eq!(assign["job_id"], id);
+    assert!(cordons_for(srv.addr, "node-a").await.is_empty());
+    let epoch = assign["epoch"].as_u64().unwrap();
+    let b = json!({"epoch": epoch}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", b.len(), b);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let r = complete_as(&srv, AGENT_A_TOKEN, &id, epoch, json!("done"), None).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let (id, _) = fail_provider(&srv, None).await;
+    assert_eq!(cordons_for(srv.addr, "node-a").await, vec!["p1"]);
+    for _ in 0..2 {
+        let r = poll_with(srv.addr, AGENT_A_TOKEN, &healthy).await;
+        assert_eq!(status(&r), 204, "{r}");
+    }
+    assert_eq!(cordons_for(srv.addr, "node-a").await, vec!["p1"]);
+    let rec = srv.store.get_job(&JobId::parse(&id).unwrap()).unwrap();
+    assert_eq!(rec.state, lu_proto::JobState::Queued);
     let _ = srv.shutdown.send(());
 }
 

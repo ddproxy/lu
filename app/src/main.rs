@@ -28,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Parse and validate the config and the TLS files, print a summary, and exit.
+    /// Print a config summary and database health without reading secret files.
     Check,
     /// Copy the controller database to a file while the controller keeps running.
     Backup(admin::BackupArgs),
@@ -110,18 +110,10 @@ async fn main() -> ExitCode {
 }
 
 fn check(path: &std::path::Path) -> ExitCode {
-    let config = match lu_config::load(path) {
+    let config = match lu_config::load_structure(path) {
         Ok(config) => config,
         Err(error) => return fail(&error.to_string()),
     };
-    if let Some(tls) = &config.tls {
-        if let Err(error) = lu_serve::tls::load(
-            std::path::Path::new(&tls.cert),
-            std::path::Path::new(&tls.key),
-        ) {
-            return fail(&error);
-        }
-    }
     let tls_on = config.tls.is_some();
     if let Some(c) = &config.controller {
         println!(

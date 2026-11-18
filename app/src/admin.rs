@@ -69,9 +69,5 @@ pub fn database_check(config: &Path) -> Result<Vec<String>, String> {
 }
 
 fn controller_db(config: &Path) -> Result<PathBuf, String> {
-    let config = lu_config::load(config).map_err(|error| error.to_string())?;
-    let controller = config
-        .controller
-        .ok_or_else(|| "the command requires a [controller] config".to_owned())?;
-    Ok(PathBuf::from(controller.db))
+    lu_config::controller_db(config).map_err(|error| error.to_string())
 }

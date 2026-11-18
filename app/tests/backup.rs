@@ -58,7 +58,10 @@ fn backup_check_and_restore_round_trip() {
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
     assert!(text.contains("backup: "), "{text}");
-    assert!(text.contains("schema 2"), "{text}");
+    assert!(
+        text.contains(&format!("schema {}", lu_store::SCHEMA_VERSION)),
+        "{text}"
+    );
     assert!(text.contains("0 job(s)"), "{text}");
     assert_eq!(
         std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
@@ -69,7 +72,10 @@ fn backup_check_and_restore_round_trip() {
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
     assert!(
-        text.contains("database: quick_check ok, schema 2, size "),
+        text.contains(&format!(
+            "database: quick_check ok, schema {}, size ",
+            lu_store::SCHEMA_VERSION
+        )),
         "{text}"
     );
     assert!(
@@ -90,6 +96,51 @@ fn backup_check_and_restore_round_trip() {
     assert!(Path::new(previous).exists(), "{previous}");
     assert!(previous.contains(".pre-restore-"), "{previous}");
 
+    let restored = lu_store::sqlite::SqliteStore::open(&db).unwrap();
+    drop(restored);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn backup_check_and_restore_ignore_unreadable_secret_files() {
+    let dir = scratch("unreadable-key");
+    let db = dir.join("lu.db");
+    let backup = dir.join("copy.db");
+    {
+        let _store = lu_store::sqlite::SqliteStore::open(&db).unwrap();
+    }
+    // A directory cannot be read as a TLS key or an agent token by any account.
+    let key = dir.join("tls.key");
+    std::fs::create_dir(&key).unwrap();
+    let token = dir.join("agent.token");
+    std::fs::create_dir(&token).unwrap();
+    let cfg = dir.join("lu.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[controller]\nlisten = \"127.0.0.1:1\"\ndb = \"{}\"\nartifacts_dir = \"{}\"\n\
+             [tls]\ncert = \"{}\"\nkey = \"{}\"\n\
+             [agent]\nname = \"node-a\"\ncontroller_url = \"https://127.0.0.1:1\"\n\
+             token_file = \"{}\"\nwork_dir = \"{}\"\nharness = \"opencode\"\n",
+            db.display(),
+            dir.join("artifacts").display(),
+            dir.join("tls.crt").display(),
+            key.display(),
+            token.display(),
+            dir.join("work").display(),
+        ),
+    )
+    .unwrap();
+    let cfg = cfg.to_str().unwrap();
+
+    for args in [
+        vec!["--config", cfg, "backup", "--out", backup.to_str().unwrap()],
+        vec!["--config", cfg, "check"],
+        vec!["--config", cfg, "restore", backup.to_str().unwrap()],
+    ] {
+        let output = run(&args);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
     let restored = lu_store::sqlite::SqliteStore::open(&db).unwrap();
     drop(restored);
     let _ = std::fs::remove_dir_all(&dir);

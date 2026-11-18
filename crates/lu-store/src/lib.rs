@@ -9,7 +9,7 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 #[cfg(test)]
 pub mod conformance;

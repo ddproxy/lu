@@ -6,7 +6,7 @@ mod secret;
 
 use std::io::Read;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -169,9 +169,13 @@ impl Default for LogConfig {
 impl Config {
     /// Parses and validates config text. Does not touch the filesystem.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let config = Self::parse_structure(text)?;
         config.validate()?;
         Ok(config)
+    }
+
+    fn parse_structure(text: &str) -> Result<Self, ConfigError> {
+        toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -704,17 +708,7 @@ pub fn operator_config_paths() -> Vec<std::path::PathBuf> {
 
 /// Reads an operator file. A leading `~/` in a path means the home directory.
 pub fn load_operator(path: &Path) -> Result<OperatorConfig, ConfigError> {
-    let shown = path.display().to_string();
-    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: shown.clone(),
-        source,
-    })?;
-    if text.len() as u64 > MAX_CONFIG_BYTES {
-        return Err(ConfigError::TooLarge {
-            path: shown,
-            limit: MAX_CONFIG_BYTES,
-        });
-    }
+    let text = read_config_text(path)?;
     let mut config: OperatorConfig =
         toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string()))?;
     let home = std::env::var("HOME").unwrap_or_default();
@@ -736,7 +730,7 @@ fn expand_home(value: &str, home: &str) -> String {
     }
 }
 
-pub fn load(path: &Path) -> Result<Config, ConfigError> {
+fn read_config_text(path: &Path) -> Result<String, ConfigError> {
     let shown = path.display().to_string();
     let file = std::fs::File::open(path).map_err(|source| ConfigError::Io {
         path: shown.clone(),
@@ -755,7 +749,12 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
             limit: MAX_CONFIG_BYTES,
         });
     }
-    let config = Config::parse(&text)?;
+    Ok(text)
+}
+
+/// Reads and validates a config file, including the secret files it names.
+pub fn load(path: &Path) -> Result<Config, ConfigError> {
+    let config = Config::parse(&read_config_text(path)?)?;
     if let Some(tls) = &config.tls {
         secret::read_private_file("[tls] key", Path::new(&tls.key), MAX_CONFIG_BYTES)?;
     }
@@ -770,6 +769,35 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         }
     }
     Ok(config)
+}
+
+/// Parses a config file without checking values or reading the secret files it names. For
+/// commands that only print a summary and do not use the secrets.
+pub fn load_structure(path: &Path) -> Result<Config, ConfigError> {
+    Config::parse_structure(&read_config_text(path)?)
+}
+
+#[derive(Deserialize)]
+struct ControllerDbConfig {
+    controller: Option<ControllerDbSection>,
+}
+
+#[derive(Deserialize)]
+struct ControllerDbSection {
+    db: String,
+}
+
+/// Reads only `[controller] db`. No secret files are opened, so local database commands work
+/// even when their user cannot read the service's TLS key or tokens.
+pub fn controller_db(path: &Path) -> Result<PathBuf, ConfigError> {
+    let cfg: ControllerDbConfig =
+        toml::from_str(&read_config_text(path)?).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let section = cfg.controller.ok_or_else(|| ConfigError::Invalid {
+        table: "[config]".to_owned(),
+        reason: "the command requires a [controller] config".to_owned(),
+    })?;
+    validate_abs_no_dotdot("[controller]", "db", &section.db)?;
+    Ok(PathBuf::from(section.db))
 }
 
 #[cfg(test)]

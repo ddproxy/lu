@@ -79,7 +79,7 @@ It returns `{"ok":true,"version":"…","db":"ok"}`. A non-loopback listener requ
 4. Replace `/usr/local/bin/lu` and any changed unit files, then `systemctl daemon-reload`.
 5. Start the controller and check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`.
 
-The store has schema version 2. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
+The store has schema version 3. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes.
 
@@ -96,7 +96,9 @@ lu backup --config /etc/lu/lu.toml --out "/var/backups/lu/lu-$(date +%F).db"
 
 `lu backup` uses SQLite's `VACUUM INTO`, writes the copy with mode `0600`, runs
 `PRAGMA integrity_check`, and prints the size, schema version and job count. It refuses to
-replace an existing file unless `--force` is given.
+replace an existing file unless `--force` is given. `lu backup`, `lu restore` and `lu check` read
+only `[controller] db`; they do not check or load TLS keys and token files, so they also run as
+root against a service account's secrets.
 
 For a daily snapshot, install a small wrapper, a service and a timer as root:
 
@@ -258,7 +260,7 @@ A failure before the harness produced a verdict is classified by the agent, one 
 
 `max_retries` is the number of node-failure retries, not the total number of attempts. With the default `1`, an initial attempt plus one retry is allowed. A provider failure also cordons the `(node, provider)` pair for `provider_cooldown_secs`.
 
-When a job names a `provider`, the agent also checks it against its node's Reiki reading every five seconds. Reiki is the authority on keys, so this works for any harness: when two fresh readings in a row show the provider cooling or disabled (no usable key), the agent stops the job like a cancel and completes it as `Failed(Provider)`, with a summary that names the provider and the soonest return time Reiki reported. The completion carries that time plus a 60-second buffer as `retry_after_secs`, and the controller cordons the provider on the node for that long instead of the configured cordon length. The controller then cordons that provider on the node and requeues the job on another node.
+When a job names a `provider`, the agent also checks it against its node's Reiki reading every five seconds. Reiki is the authority on keys, so this works for any harness: when two fresh readings in a row show the provider cooling or disabled (no usable key), the agent stops the job like a cancel and completes it as `Failed(Provider)`, with a summary that names the provider and the soonest return time Reiki reported. The completion carries that time plus a 60-second buffer as `retry_after_secs`, and the controller cordons the provider on the node for that long instead of the configured cordon length. Two consecutive healthy provider heartbeats after the failure clear that cordon; a non-healthy reading resets the streak.
 
 As a fallback for a job that names no provider, or a node without a Reiki feed, the agent watches a running harness's output. If the newest line matches a provider-unavailable marker (the opencode message about every key in the stream's chain, a quota message, a 429, or a rate limit) and the harness then produces no output for 120 seconds, the agent stops it the same way and completes the job as `Failed(Provider)`, with a summary naming the marker. Any other output after the marker disarms the watch.
 
@@ -273,9 +275,9 @@ Cancellation is different:
 These are separate mechanisms:
 
 - **Drain** stops a node taking any new job. It is set by `POST /v1/nodes/{name}/drain` and cleared by `/undrain`, and is stored in the `nodes` table. It survives a controller restart. A node must have sent a heartbeat at least once to exist; draining an unknown node returns `404 not_found`.
-- **Cordon** stops a node taking jobs that name a particular provider. It is created when a retryable provider failure completes and the job names a provider, and it expires after `provider_cooldown_secs`. A job with no provider is not blocked by a cordon.
+- **Cordon** stops a node taking jobs that name a particular provider. It is created when a retryable provider failure completes and the job names a provider, and it expires after `provider_cooldown_secs`. A completion with `retry_after_secs` marks the cordon Reiki-derived; two consecutive healthy provider heartbeats clear it early. A job with no provider is not blocked by a cordon.
 
-Cordon deadlines are stored as monotonic milliseconds. The controller does not rebase them on restart, so a surviving cordon's remaining time is approximate and may last longer than the configured cooldown if the previous process ran for a long time. `lu nodes --json` shows the currently unexpired cordons; there is no CLI command to clear one. Waiting out the cooldown or editing the database while the controller is stopped are the available options.
+Cordon deadlines are stored as monotonic milliseconds. The controller does not rebase them on restart, so a surviving cordon's remaining time is approximate and may last longer than the configured cooldown if the previous process ran for a long time. `lu nodes --json` shows the currently unexpired cordons; there is no CLI command to clear one. Wait out the cooldown, let a node report the provider healthy twice, or edit the database while the controller is stopped.
 
 ## Reading `lu status`
 
@@ -284,7 +286,7 @@ Cordon deadlines are stored as monotonic milliseconds. The controller does not r
 ```text
 version             0.1.10
 uptime_secs         3600
-schema_version      2
+schema_version      3
 db_bytes            81920
 recovered_on_boot   2
 oldest_queued_secs  0
