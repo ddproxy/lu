@@ -9,6 +9,14 @@ uses semantic versioning once it reaches 1.0.
 
 - Node labels and job requirements. Agents advertise up to 32 opaque labels from `[agent].labels` and `[agent].label_files` (re-read before each heartbeat); jobs require up to 8 with `JobSpec.requires` and dispatch gives a job only to a node that has every required label. `lu submit --require` and `lu retry --require`/`--no-require` set them, `lu nodes` shows a `LABELS` column, and `lu show`/`lu top` explain a stalled queued job as `no node with label <label>`. Submitting an unknown label succeeds with a warning. Metrics add `lu_node_labels_info{node,label}`. No schema change: labels live in the stored heartbeat.
 
+- `lu mcp` can submit and control jobs: `lu_submit`, `lu_submit_many`, `lu_result`, `lu_cancel`, `lu_retry`, `lu_drain` and `lu_undrain`, alongside the read tools. Submissions without a key derive `mcp-` plus 16 SHA-256 hex characters from the spec, so repeated identical calls are idempotent. `lu_submit_many` takes up to 12 named jobs and rejects duplicate, unknown, forward or cyclic names before submitting, reporting partial failures.
+- `lu_result` returns a job's summary, report, diff stats and a paged diff (24 KiB by default, at most 32 KiB) with `next_offset` and `done`.
+
+### Changed
+
+- `lu mcp` initialize instructions now describe read and write tools. Write tools carry `readOnlyHint: false`; `lu_cancel`, `lu_drain` and `lu_undrain` also carry `destructiveHint: true`.
+- One `lu mcp` process allows 30 submissions per rolling minute; over the limit a call returns `isError` with the wait in seconds.
+
 ## [0.1.14] - 2026-11-18
 
 ### Fixed

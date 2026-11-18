@@ -41,7 +41,7 @@ enum Command {
     Restore(admin::RestoreArgs),
     /// Show controller uptime, database size, queue and node counts.
     Status(operator::StatusArgs),
-    /// Serve the Model Context Protocol over stdio (read tools).
+    /// Serve the Model Context Protocol over stdio (read and write tools).
     Mcp,
     /// List the repositories the controller mirrors.
     Repos(operator::ReposArgs),
