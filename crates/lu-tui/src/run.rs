@@ -25,6 +25,7 @@ pub enum Action {
     Escape,
     Drain,
     ToggleGraph,
+    ToggleProcess,
 }
 
 pub fn action_for(event: KeyEvent) -> Option<Action> {
@@ -45,6 +46,7 @@ pub fn action_for(event: KeyEvent) -> Option<Action> {
         (KeyCode::Enter, _) => Some(Action::OpenLog),
         (KeyCode::Char('d'), _) => Some(Action::Drain),
         (KeyCode::Char('g'), _) => Some(Action::ToggleGraph),
+        (KeyCode::Char('x'), _) => Some(Action::ToggleProcess),
         _ => None,
     }
 }
@@ -74,7 +76,9 @@ pub fn run_live(
                 match action_for(key) {
                     Some(Action::Quit) => break,
                     Some(Action::Escape) => {
-                        if !dashboard.close_log() {
+                        if dashboard.close_process_pane() {
+                            request(Request::ProcessPane { target: None });
+                        } else if !dashboard.close_log() {
                             break;
                         }
                     }
@@ -96,6 +100,11 @@ pub fn run_live(
                         }
                     }
                     Some(Action::ToggleGraph) => dashboard.toggle_graph(),
+                    Some(Action::ToggleProcess) => {
+                        if let Some(target) = dashboard.toggle_process_pane() {
+                            request(Request::ProcessPane { target });
+                        }
+                    }
                     None => {}
                 }
             }
@@ -168,7 +177,11 @@ mod tests {
             action_for(press(KeyCode::Char('g'), none)),
             Some(Action::ToggleGraph)
         );
-        assert_eq!(action_for(press(KeyCode::Char('x'), none)), None);
+        assert_eq!(
+            action_for(press(KeyCode::Char('x'), none)),
+            Some(Action::ToggleProcess)
+        );
+        assert_eq!(action_for(press(KeyCode::Char('z'), none)), None);
         assert_eq!(
             action_for(press(KeyCode::Char('c'), none)),
             None,

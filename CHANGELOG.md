@@ -5,6 +5,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `lu top`: node `LOAD`, `MEM` and `VERSION` columns with memory thresholds, stuck markers and version-mismatch colouring; a process navigator pane (`x`, refreshed every 2s) showing job liveness counters, the process tree and per-node load/memory sparklines; controller version in the title; and the same new columns in `--once` output.
+
 ## [0.1.14] - 2026-11-18
 
 ### Fixed

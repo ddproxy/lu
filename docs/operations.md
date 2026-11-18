@@ -354,6 +354,10 @@ job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
 Stats are sampled on the agent at heartbeat time, which may be slower than `lu top`'s two-second refresh. They describe the agent's view, not live controller state.
 ## Display
 
+`lu top` shows the controller and agent versions in its title (`lu top <version> · controller <version>`). The node table includes `VERSION`, `LOAD` (`load1`, one decimal or `-`), and `MEM` (used percent of total, or `-`). Memory is green below 80%, orange at 80%, and red at 95%. A node with `stuck > 0` shows a red `stuck` marker after its state, and a node whose version differs from the controller's is coloured orange.
+
+With the job list focused and a running job selected, `x` opens a process pane under the lists. It shows the selected job's three liveness counters (output idle, CPU idle, uploader behind) and its process tree (`PID`, `STATE`, `CPU_S`, `RSS`, `AGE`, `COMMAND`) from `GET /v1/nodes/{name}/stats`, refreshed every two seconds while open. States `D` and `Z` are red; both idle counters above 120 seconds are orange, and a stuck job is red. The pane also draws load and memory-used sparklines for that node from the dashboard's recent samples. `Esc` or `x` closes the pane. `--once` prints the same node columns as plain text.
+
 `lu top` draws the dependency graph below the job list when the terminal is at least 24 rows tall and a component has an unfinished job. Press `g` to hide or show it. A component is a set of jobs linked by `after`, including finished jobs that connect unfinished ones; a component whose jobs are all terminal is left out.
 
 Each row is one job, placed left to right by depth: `0` with no dependency in the fetched set, otherwise one past its deepest dependency. Box-drawing connectors join a job to its dependencies, and an edge takes the dependency's colour. An `after` id that is not in the fetched jobs is a dim stub `#id…`. Job titles are clipped to the panel width.

@@ -1,5 +1,6 @@
 //! State and view model for the dashboard; no terminal is touched, so it tests without a tty.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::graph::{self, Graph};
@@ -15,7 +16,7 @@ pub struct ProviderCell {
     pub soonest_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeRow {
     pub name: String,
     /// `idle`, `busy` or `-`.
@@ -24,6 +25,11 @@ pub struct NodeRow {
     /// Seconds since the node's last heartbeat, when it has sent one.
     pub seen_secs_ago: Option<u64>,
     pub providers: Vec<ProviderCell>,
+    pub version: Option<String>,
+    pub load1: Option<f64>,
+    pub mem_available_kb: Option<u64>,
+    pub mem_total_kb: Option<u64>,
+    pub stuck: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,10 +50,11 @@ pub struct JobRow {
 }
 
 /// Everything one refresh brings back.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Snapshot {
     pub nodes: Vec<NodeRow>,
     pub jobs: Vec<JobRow>,
+    pub controller_version: Option<String>,
 }
 
 /// Which table the selection keys act on.
@@ -83,8 +90,45 @@ pub struct LogPane {
 /// Work the UI asks the feeder to do; the screen keeps running while it happens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    Log { job_id: String },
-    Drain { node: String, drain: bool },
+    Log {
+        job_id: String,
+    },
+    Drain {
+        node: String,
+        drain: bool,
+    },
+    /// Set or clear the process pane target; feeder refreshes stats every tick while set.
+    ProcessPane {
+        target: Option<ProcessPaneTarget>,
+    },
+}
+
+/// The job whose node stats the process pane shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessPaneTarget {
+    pub job_id: String,
+    pub node: String,
+}
+
+/// One process in a job's tree, as shown in the process pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessTreeRow {
+    pub pid: u32,
+    pub state: String,
+    pub cpu_s: u64,
+    pub rss_kb: u64,
+    pub age_secs: u64,
+    pub command: String,
+}
+
+/// Stats for the selected job, as shown in the process pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessJobView {
+    pub output_idle_secs: u64,
+    pub cpu_idle_secs: u64,
+    pub uploader_behind: Option<String>,
+    pub stuck: bool,
+    pub processes: Vec<ProcessTreeRow>,
 }
 
 /// What the feeder sends back over the second channel.
@@ -98,6 +142,12 @@ pub enum Update {
         node: String,
         drain: bool,
         result: Result<(), String>,
+    },
+    ProcessStats {
+        job_id: String,
+        node: String,
+        /// `Ok(None)` means the node sent no stats.
+        result: Result<Option<ProcessJobView>, String>,
     },
 }
 
@@ -122,17 +172,49 @@ pub enum Tone {
     Blocked,
 }
 
+/// One coloured span within a line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Line {
+pub struct Segment {
     pub text: String,
     pub tone: Tone,
 }
 
-impl Line {
-    fn new(text: impl Into<String>, tone: Tone) -> Self {
+impl Segment {
+    pub fn new(text: impl Into<String>, tone: Tone) -> Self {
         Self {
             text: text.into(),
             tone,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    pub text: String,
+    pub tone: Tone,
+    pub segments: Vec<Segment>,
+}
+
+impl Line {
+    fn new(text: impl Into<String>, tone: Tone) -> Self {
+        let text = text.into();
+        Self {
+            segments: vec![Segment::new(text.clone(), tone)],
+            text,
+            tone,
+        }
+    }
+
+    fn rich(segments: Vec<Segment>) -> Self {
+        let text = segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        let tone = segments.first().map_or(Tone::Plain, |segment| segment.tone);
+        Self {
+            text,
+            tone,
+            segments,
         }
     }
 }
@@ -201,12 +283,34 @@ struct PendingDrain {
 }
 
 /// Pausing keeps a copy with its age, so a paused screen never looks live.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NodeHistory {
+    load: Vec<u64>,
+    mem_pct: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProcessPaneState {
+    Loading,
+    NoStats,
+    Error(String),
+    Stats(ProcessJobView),
+}
+
+#[derive(Debug, Clone)]
+struct Frozen {
+    snapshot: Snapshot,
+    history: Vec<Sample>,
+    node_history: HashMap<String, NodeHistory>,
+    taken: Instant,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Dashboard {
     live: Snapshot,
     updated: Option<Instant>,
     error: Option<String>,
-    frozen: Option<(Snapshot, Vec<Sample>, Instant)>,
+    frozen: Option<Frozen>,
     history: Vec<Sample>,
     updates: u64,
     selection: Selection,
@@ -214,6 +318,10 @@ pub struct Dashboard {
     pending: Option<PendingDrain>,
     notice: Option<(String, Tone)>,
     graph_hidden: bool,
+    controller_version: Option<String>,
+    node_history: HashMap<String, NodeHistory>,
+    process_target: Option<ProcessPaneTarget>,
+    process: Option<ProcessPaneState>,
 }
 
 impl Dashboard {
@@ -229,6 +337,26 @@ impl Dashboard {
                 if self.history.len() > HISTORY {
                     self.history.remove(0);
                 }
+                self.controller_version = snapshot.controller_version.clone();
+                for node in &snapshot.nodes {
+                    let entry = self.node_history.entry(node.name.clone()).or_default();
+                    if let Some(load) = node.load1 {
+                        entry.load.push((load.max(0.0) * 100.0).round() as u64);
+                        if entry.load.len() > HISTORY {
+                            entry.load.remove(0);
+                        }
+                    }
+                    if let (Some(avail), Some(total)) = (node.mem_available_kb, node.mem_total_kb) {
+                        if total > 0 {
+                            let used = total.saturating_sub(avail);
+                            let pct = (used.saturating_mul(100) / total).min(100);
+                            entry.mem_pct.push(pct);
+                            if entry.mem_pct.len() > HISTORY {
+                                entry.mem_pct.remove(0);
+                            }
+                        }
+                    }
+                }
                 self.selection.clamp(&snapshot);
                 self.live = snapshot;
                 self.updated = Some(now);
@@ -239,7 +367,7 @@ impl Dashboard {
         }
     }
 
-    /// Applies a feeder result; a stale log answer is ignored.
+    /// Applies a feeder result; stale answers for another target are ignored.
     pub fn apply_update(&mut self, update: Update) {
         match update {
             Update::Log { job_id, result } => self.apply_log(&job_id, result),
@@ -248,7 +376,66 @@ impl Dashboard {
                 drain,
                 result,
             } => self.apply_drain(&node, drain, result),
+            Update::ProcessStats {
+                job_id,
+                node,
+                result,
+            } => self.apply_process_stats(&job_id, &node, result),
         }
+    }
+
+    /// Opens or closes the process pane. Returns the target to track when opened.
+    pub fn toggle_process_pane(&mut self) -> Option<Option<ProcessPaneTarget>> {
+        if self.process_target.is_some() {
+            self.process_target = None;
+            self.process = None;
+            return Some(None);
+        }
+        if self.selection.focus != Focus::Jobs {
+            return None;
+        }
+        let job = self.current().jobs.get(self.selection.job)?;
+        if job.state != "running" {
+            return None;
+        }
+        let node = job.node.as_ref()?.clone();
+        let target = ProcessPaneTarget {
+            job_id: job.id.clone(),
+            node,
+        };
+        self.process_target = Some(target.clone());
+        self.process = Some(ProcessPaneState::Loading);
+        self.pending = None;
+        Some(Some(target))
+    }
+
+    /// Closes the process pane; returns whether one was open.
+    pub fn close_process_pane(&mut self) -> bool {
+        if self.process_target.take().is_some() {
+            self.process = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn apply_process_stats(
+        &mut self,
+        job_id: &str,
+        node: &str,
+        result: Result<Option<ProcessJobView>, String>,
+    ) {
+        let Some(target) = &self.process_target else {
+            return;
+        };
+        if target.job_id != job_id || target.node != node {
+            return;
+        }
+        self.process = Some(match result {
+            Ok(Some(stats)) => ProcessPaneState::Stats(stats),
+            Ok(None) => ProcessPaneState::NoStats,
+            Err(error) => ProcessPaneState::Error(printable(&error)),
+        });
     }
 
     pub fn paused(&self) -> bool {
@@ -259,13 +446,18 @@ impl Dashboard {
     pub fn toggle_pause(&mut self, now: Instant) {
         self.frozen = match self.frozen.take() {
             Some(_) => None,
-            None => Some((self.live.clone(), self.history.clone(), now)),
+            None => Some(Frozen {
+                snapshot: self.live.clone(),
+                history: self.history.clone(),
+                node_history: self.node_history.clone(),
+                taken: now,
+            }),
         };
     }
 
     fn current(&self) -> &Snapshot {
         match &self.frozen {
-            Some((snapshot, _, _)) => snapshot,
+            Some(frozen) => &frozen.snapshot,
             None => &self.live,
         }
     }
@@ -400,8 +592,8 @@ impl Dashboard {
                         row.drained = drain;
                     }
                 }
-                if let Some((snapshot, _, _)) = &mut self.frozen {
-                    for row in &mut snapshot.nodes {
+                if let Some(frozen) = &mut self.frozen {
+                    for row in &mut frozen.snapshot.nodes {
                         if row.name == node {
                             row.drained = drain;
                         }
@@ -445,11 +637,12 @@ impl Dashboard {
     }
 
     pub fn view(&self, now: Instant) -> ViewModel {
-        let (snapshot, history, live_status) = match &self.frozen {
-            Some((snapshot, history, taken)) => (
-                snapshot,
-                history.as_slice(),
-                Status::Paused(now.saturating_duration_since(*taken)),
+        let (snapshot, history, node_history, live_status) = match &self.frozen {
+            Some(frozen) => (
+                &frozen.snapshot,
+                frozen.history.as_slice(),
+                &frozen.node_history,
+                Status::Paused(now.saturating_duration_since(frozen.taken)),
             ),
             None => {
                 let status = match (&self.error, self.updated) {
@@ -460,18 +653,31 @@ impl Dashboard {
                     },
                     (None, None) => Status::Waiting,
                 };
-                (&self.live, self.history.as_slice(), status)
+                (
+                    &self.live,
+                    self.history.as_slice(),
+                    &self.node_history,
+                    status,
+                )
             }
         };
         let status = self.notice_status(now).unwrap_or(live_status);
-        ViewModel::build(
+        let controller_version = snapshot
+            .controller_version
+            .as_deref()
+            .or(self.controller_version.as_deref());
+        ViewModel::build(ViewBuild {
             snapshot,
             history,
+            node_history,
+            controller_version,
             status,
-            self.selection,
-            self.log.as_ref(),
-            !self.graph_hidden,
-        )
+            selection: self.selection,
+            log: self.log.as_ref(),
+            show_graph: !self.graph_hidden,
+            process_target: self.process_target.as_ref(),
+            process: self.process.as_ref(),
+        })
     }
 }
 
@@ -481,6 +687,15 @@ enum Status {
     Failing(String),
     Paused(Duration),
     Notice { text: String, tone: Tone },
+}
+
+/// The process navigator pane shown under the lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessPaneView {
+    pub title: String,
+    pub lines: Vec<Line>,
+    pub load_spark: Vec<u64>,
+    pub mem_spark: Vec<u64>,
 }
 
 /// What the screen shows; the renderer only lays the lines out.
@@ -497,6 +712,20 @@ pub struct ViewModel {
     pub log: Option<LogPane>,
     /// The dependency graph under the job list, when it has a component to show.
     pub graph: Option<Graph>,
+    pub process_pane: Option<ProcessPaneView>,
+}
+
+struct ViewBuild<'a> {
+    snapshot: &'a Snapshot,
+    history: &'a [Sample],
+    node_history: &'a HashMap<String, NodeHistory>,
+    controller_version: Option<&'a str>,
+    status: Status,
+    selection: Selection,
+    log: Option<&'a LogPane>,
+    show_graph: bool,
+    process_target: Option<&'a ProcessPaneTarget>,
+    process: Option<&'a ProcessPaneState>,
 }
 
 fn short_age(secs: u64) -> String {
@@ -565,49 +794,323 @@ fn charts(history: &[Sample]) -> Vec<Chart> {
     ]
 }
 
+fn mem_used_pct(node: &NodeRow) -> Option<u64> {
+    match (node.mem_available_kb, node.mem_total_kb) {
+        (Some(avail), Some(total)) if total > 0 => {
+            Some(total.saturating_sub(avail).saturating_mul(100) / total)
+        }
+        _ => None,
+    }
+}
+
+fn mem_tone(pct: u64) -> Tone {
+    if pct >= 95 {
+        Tone::Bad
+    } else if pct >= 80 {
+        Tone::Warn
+    } else {
+        Tone::Good
+    }
+}
+
+fn node_state_base(node: &NodeRow) -> (String, Tone) {
+    let stale = node.seen_secs_ago.is_none_or(|age| age > STALE_SECS);
+    if stale {
+        ("stale".to_owned(), Tone::Bad)
+    } else if node.drained {
+        ("drained".to_owned(), Tone::Warn)
+    } else {
+        (printable(&node.harness), Tone::Plain)
+    }
+}
+
+fn pad_right(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count >= width {
+        text.to_owned()
+    } else {
+        format!("{text}{}", " ".repeat(width - count))
+    }
+}
+
+fn pad_left(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count >= width {
+        text.to_owned()
+    } else {
+        format!("{}{}", " ".repeat(width - count), text)
+    }
+}
+
+fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
+    let (base_state, base_tone) = node_state_base(node);
+    let seen = node.seen_secs_ago.map_or("-".to_owned(), short_age);
+    let version = node
+        .version
+        .as_deref()
+        .map(printable)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "-".to_owned());
+    let version_tone = match controller_version {
+        Some(cv) => {
+            if node.version.as_deref() != Some(cv) {
+                Tone::Warn
+            } else {
+                Tone::Plain
+            }
+        }
+        None => Tone::Plain,
+    };
+    let load_text = node
+        .load1
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or_else(|| "-".to_owned());
+    let mem_pct = mem_used_pct(node);
+    let mem_text = mem_pct
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| "-".to_owned());
+    let mem_text_tone = mem_pct.map(mem_tone).unwrap_or(Tone::Plain);
+
+    let state_segments = if node.stuck > 0 {
+        vec![
+            Segment::new(base_state.clone(), base_tone),
+            Segment::new(" ", base_tone),
+            Segment::new("stuck", Tone::Bad),
+        ]
+    } else {
+        vec![Segment::new(base_state.clone(), base_tone)]
+    };
+    let state_plain = if node.stuck > 0 {
+        format!("{base_state} stuck")
+    } else {
+        base_state
+    };
+
+    let provider_cells: Vec<(String, Tone)> = node.providers.iter().map(provider_text).collect();
+    let providers_plain = provider_cells
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("   ");
+
+    let mut segments = vec![
+        Segment::new(pad_right(&clip(&node.name, 12), 12), Tone::Plain),
+        Segment::new(" ", Tone::Plain),
+        Segment::new(pad_right(&clip(&version, 10), 10), version_tone),
+        Segment::new(" ", Tone::Plain),
+    ];
+    // state column (14)
+    let state_pad = 14usize.saturating_sub(state_plain.chars().count());
+    for seg in state_segments {
+        segments.push(seg);
+    }
+    if state_pad > 0 {
+        segments.push(Segment::new(" ".repeat(state_pad), Tone::Plain));
+    }
+    segments.push(Segment::new(" ", Tone::Plain));
+    segments.push(Segment::new(pad_right(&seen, 8), Tone::Plain));
+    segments.push(Segment::new(" ", Tone::Plain));
+    segments.push(Segment::new(pad_left(&load_text, 6), Tone::Plain));
+    segments.push(Segment::new(" ", Tone::Plain));
+    segments.push(Segment::new(pad_left(&mem_text, 5), mem_text_tone));
+    segments.push(Segment::new("  ", Tone::Plain));
+    if provider_cells.is_empty() {
+        // nothing
+    } else {
+        for (i, (text, tone)) in provider_cells.iter().enumerate() {
+            if i > 0 {
+                segments.push(Segment::new("   ", Tone::Plain));
+            }
+            segments.push(Segment::new(text.clone(), *tone));
+        }
+    }
+
+    // row fallback tone: stale/drained bad/warn dominates; include mem/stuck/version/provider issues
+    let mut row_tone = base_tone;
+    if node.stuck > 0 {
+        row_tone = Tone::Bad;
+    }
+    if let Some(pct) = mem_pct {
+        row_tone = worst([row_tone, mem_tone(pct)].into_iter());
+    }
+    if version_tone == Tone::Warn {
+        row_tone = worst([row_tone, Tone::Warn].into_iter());
+    }
+    if base_tone == Tone::Plain && !provider_cells.is_empty() {
+        row_tone =
+            worst(std::iter::once(row_tone).chain(provider_cells.iter().map(|(_, tone)| *tone)));
+    }
+    let mut line = Line::rich(segments);
+    // ensure plain text matches expected formatting for providers spacing
+    if !providers_plain.is_empty() {
+        let expected_prefix = format!(
+            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5}  ",
+            clip(&node.name, 12),
+            clip(&version, 10),
+            clip(&state_plain, 14),
+            pad_right(&seen, 8).trim_end(),
+            load_text,
+            mem_text
+        );
+        // rebuild plain text cleanly
+        line.text = format!(
+            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5}  {}",
+            clip(&node.name, 12),
+            clip(&version, 10),
+            clip(&state_plain, 14),
+            seen,
+            load_text,
+            mem_text,
+            providers_plain
+        );
+        let _ = expected_prefix;
+    } else {
+        line.text = format!(
+            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5}",
+            clip(&node.name, 12),
+            clip(&version, 10),
+            clip(&state_plain, 14),
+            seen,
+            load_text,
+            mem_text
+        );
+    }
+    line.tone = row_tone;
+    line
+}
+
+fn process_pane_view(
+    target: &ProcessPaneTarget,
+    process: Option<&ProcessPaneState>,
+    node_history: &HashMap<String, NodeHistory>,
+) -> ProcessPaneView {
+    let title = format!(
+        "process {} @ {}",
+        printable(&target.job_id),
+        printable(&target.node)
+    );
+    let history = node_history.get(&target.node).cloned().unwrap_or_default();
+    let mut lines = Vec::new();
+    match process {
+        Some(ProcessPaneState::Stats(stats)) => {
+            let counter_tone = if stats.stuck {
+                Tone::Bad
+            } else if stats.output_idle_secs > 120 && stats.cpu_idle_secs > 120 {
+                Tone::Warn
+            } else {
+                Tone::Plain
+            };
+            let uploader = stats
+                .uploader_behind
+                .as_deref()
+                .map(printable)
+                .unwrap_or_else(|| "-".to_owned());
+            lines.push(Line::new(
+                format!(
+                    "output idle {}s   cpu idle {}s   uploader behind {}",
+                    stats.output_idle_secs, stats.cpu_idle_secs, uploader
+                ),
+                counter_tone,
+            ));
+            lines.push(Line::new(
+                format!(
+                    "{:>7} {:>5} {:>6} {:>7} {:>6}  COMMAND",
+                    "PID", "STATE", "CPU_S", "RSS", "AGE"
+                ),
+                Tone::Heading,
+            ));
+            if stats.processes.is_empty() {
+                lines.push(Line::new("no processes", Tone::Dim));
+            }
+            for (i, proc) in stats.processes.iter().enumerate() {
+                let indent = "  ".repeat(i.min(6));
+                let state = printable(&proc.state);
+                let state_tone = if state == "D" || state == "Z" {
+                    Tone::Bad
+                } else {
+                    Tone::Plain
+                };
+                let mut segments = vec![
+                    Segment::new(format!("{:>7} ", proc.pid), Tone::Plain),
+                    Segment::new(format!("{:>5}", state), state_tone),
+                    Segment::new(
+                        format!(
+                            " {:>6} {:>7} {:>6}  {}{}",
+                            proc.cpu_s,
+                            proc.rss_kb,
+                            short_age(proc.age_secs),
+                            indent,
+                            printable(&proc.command)
+                        ),
+                        Tone::Plain,
+                    ),
+                ];
+                let mut line = Line::rich(std::mem::take(&mut segments));
+                line.text = format!(
+                    "{:>7} {:>5} {:>6} {:>7} {:>6}  {}{}",
+                    proc.pid,
+                    state,
+                    proc.cpu_s,
+                    proc.rss_kb,
+                    short_age(proc.age_secs),
+                    indent,
+                    printable(&proc.command)
+                );
+                line.tone = if state_tone == Tone::Bad {
+                    Tone::Bad
+                } else {
+                    Tone::Plain
+                };
+                lines.push(line);
+            }
+        }
+        Some(ProcessPaneState::NoStats) => {
+            lines.push(Line::new("no stats reported by node", Tone::Dim));
+        }
+        Some(ProcessPaneState::Error(error)) => {
+            lines.push(Line::new(
+                format!("stats unavailable: {}", clip(error, 120)),
+                Tone::Bad,
+            ));
+        }
+        Some(ProcessPaneState::Loading) | None => {
+            lines.push(Line::new("loading stats…", Tone::Dim));
+        }
+    }
+    ProcessPaneView {
+        title,
+        lines,
+        load_spark: history.load,
+        mem_spark: history.mem_pct,
+    }
+}
+
 impl ViewModel {
-    fn build(
-        snapshot: &Snapshot,
-        history: &[Sample],
-        status: Status,
-        selection: Selection,
-        log: Option<&LogPane>,
-        show_graph: bool,
-    ) -> Self {
+    fn build(args: ViewBuild<'_>) -> Self {
+        let ViewBuild {
+            snapshot,
+            history,
+            node_history,
+            controller_version,
+            status,
+            selection,
+            log,
+            show_graph,
+            process_target,
+            process,
+        } = args;
         let mut lines = vec![Line::new(
-            format!("{:<12} {:<8} {:<8} PROVIDERS", "NODE", "STATE", "SEEN"),
+            format!(
+                "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5}  PROVIDERS",
+                "NODE", "VERSION", "STATE", "SEEN", "LOAD", "MEM"
+            ),
             Tone::Heading,
         )];
         if snapshot.nodes.is_empty() {
             lines.push(Line::new("no nodes have reported", Tone::Dim));
         }
         for node in &snapshot.nodes {
-            let stale = node.seen_secs_ago.is_none_or(|age| age > STALE_SECS);
-            let (state, tone) = if stale {
-                ("stale".to_owned(), Tone::Bad)
-            } else if node.drained {
-                ("drained".to_owned(), Tone::Warn)
-            } else {
-                (printable(&node.harness), Tone::Plain)
-            };
-            let seen = node.seen_secs_ago.map_or("-".to_owned(), short_age);
-            let cells: Vec<(String, Tone)> = node.providers.iter().map(provider_text).collect();
-            let providers: Vec<&str> = cells.iter().map(|(text, _)| text.as_str()).collect();
-            let tone = if tone == Tone::Plain && !cells.is_empty() {
-                worst(cells.iter().map(|(_, tone)| *tone))
-            } else {
-                tone
-            };
-            lines.push(Line::new(
-                format!(
-                    "{:<12} {:<8} {:<8} {}",
-                    clip(&node.name, 12),
-                    state,
-                    seen,
-                    providers.join("   ")
-                ),
-                tone,
-            ));
+            lines.push(node_line(node, controller_version));
         }
         lines.push(Line::new("", Tone::Plain));
         lines.push(Line::new(
@@ -698,17 +1201,29 @@ impl ViewModel {
                 .collect();
             graph::Graph::build(&jobs)
         });
+        let controller = controller_version
+            .map(printable)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "-".to_owned());
+        let title = format!(
+            "lu top {} · controller {}",
+            env!("CARGO_PKG_VERSION"),
+            controller
+        );
+        let process_pane =
+            process_target.map(|target| process_pane_view(target, process, node_history));
         Self {
-            title: "lu top".to_owned(),
+            title,
             charts: charts(history),
             lines,
             status,
-            footer: "↑↓/jk select   Tab focus   Enter log   Esc close   d drain   g graph   p pause   q quit"
+            footer: "↑↓/jk select  Tab focus  Enter log  x proc  Esc close  d drain  g graph  p pause  q quit"
                 .to_owned(),
             paused,
             selected_line,
             log: log.cloned(),
             graph: graph.filter(|graph| !graph.is_empty()),
+            process_pane,
         }
     }
 
@@ -725,6 +1240,11 @@ impl ViewModel {
                 lines.extend(graph_lines);
             }
         }
+        if let Some(pane) = &self.process_pane {
+            lines.push(String::new());
+            lines.push(pane.title.clone());
+            lines.extend(pane.lines.iter().map(|line| line.text.clone()));
+        }
         lines.join("\n")
     }
 
@@ -735,6 +1255,10 @@ impl ViewModel {
         if let Some(log) = &self.log {
             lines.push(format!("log {}: {}", log.job_id, log.title));
             lines.extend(log.lines.iter().map(|line| line.text.clone()));
+        }
+        if let Some(pane) = &self.process_pane {
+            lines.push(pane.title.clone());
+            lines.extend(pane.lines.iter().map(|line| line.text.clone()));
         }
         lines.push(self.status.text.clone());
         lines.push(self.footer.clone());
@@ -764,6 +1288,11 @@ mod tests {
                     soonest_secs: None,
                 },
             ],
+            version: None,
+            load1: None,
+            mem_available_kb: None,
+            mem_total_kb: None,
+            stuck: 0,
         }
     }
 
@@ -788,6 +1317,7 @@ mod tests {
                 node("ct-2", "idle", Some(90)),
             ],
             jobs: vec![job("01ABC", "running"), job("01BLK", "blocked")],
+            controller_version: None,
         }
     }
 
@@ -898,7 +1428,8 @@ mod tests {
         snap.nodes[0].name = "peer\u{1b}[31m".to_owned();
         snap.jobs[0].note = "x\u{1b}[2J".to_owned();
         dashboard.apply(Ok(snap), t0);
-        assert!(!dashboard.view(t0).plain_text().contains('\u{1b}'));
+        let text = dashboard.view(t0).plain_text();
+        assert!(!text.contains('\u{1b}'));
     }
 
     #[test]
@@ -907,6 +1438,7 @@ mod tests {
         assert!(text.contains("no nodes have reported"));
         assert!(text.contains("no jobs"));
         assert!(text.contains("q quit"));
+        assert!(text.contains("lu top"));
     }
 
     #[test]
@@ -1030,9 +1562,468 @@ mod tests {
         assert!(text.contains("PROVIDERS"));
         assert!(text.contains("JOB"));
         assert!(text.contains("01ABC"));
+        assert!(text.contains("VERSION"));
+        assert!(text.contains("LOAD"));
+        assert!(text.contains("MEM"));
         assert!(!text.contains("lu top"));
         assert!(!text.contains("q quit"));
         assert!(!text.contains("running jobs"));
         assert!(!text.contains('\u{1b}'));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn node_full(
+        name: &str,
+        harness: &str,
+        seen: Option<u64>,
+        version: Option<&str>,
+        load1: Option<f64>,
+        mem_available_kb: Option<u64>,
+        mem_total_kb: Option<u64>,
+        stuck: u64,
+    ) -> NodeRow {
+        NodeRow {
+            name: name.to_owned(),
+            harness: harness.to_owned(),
+            drained: false,
+            seen_secs_ago: seen,
+            providers: Vec::new(),
+            version: version.map(str::to_owned),
+            load1,
+            mem_available_kb,
+            mem_total_kb,
+            stuck,
+        }
+    }
+
+    #[test]
+    fn node_load_mem_thresholds_and_absent_values() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        dashboard.apply(
+            Ok(Snapshot {
+                controller_version: None,
+                nodes: vec![
+                    node_full(
+                        "n1",
+                        "idle",
+                        Some(1),
+                        None,
+                        Some(1.234),
+                        Some(300),
+                        Some(1000),
+                        0,
+                    ), // 70%
+                    node_full("n2", "idle", Some(1), None, None, Some(200), Some(1000), 0), // 80%
+                    node_full(
+                        "n3",
+                        "idle",
+                        Some(1),
+                        None,
+                        Some(0.0),
+                        Some(40),
+                        Some(1000),
+                        0,
+                    ), // 96%
+                    node_full("n4", "idle", Some(1), None, None, None, None, 0),
+                ],
+                jobs: Vec::new(),
+            }),
+            t0,
+        );
+        let view = dashboard.view(t0);
+        let text = view.plain_text();
+        assert!(text.contains("1.2"), "{text}");
+        assert!(text.contains("70%"), "{text}");
+        assert!(text.contains("80%"), "{text}");
+        assert!(text.contains("96%"), "{text}");
+        let n2 = view
+            .lines
+            .iter()
+            .find(|l| l.text.starts_with("n2"))
+            .unwrap();
+        assert!(
+            n2.segments
+                .iter()
+                .any(|s| s.text.contains("80%") && s.tone == Tone::Warn),
+            "{:?}",
+            n2.segments
+        );
+        let n3 = view
+            .lines
+            .iter()
+            .find(|l| l.text.starts_with("n3"))
+            .unwrap();
+        assert!(
+            n3.segments
+                .iter()
+                .any(|s| s.text.contains("96%") && s.tone == Tone::Bad),
+            "{:?}",
+            n3.segments
+        );
+        let n1 = view
+            .lines
+            .iter()
+            .find(|l| l.text.starts_with("n1"))
+            .unwrap();
+        assert!(
+            n1.segments
+                .iter()
+                .any(|s| s.text.contains("70%") && s.tone == Tone::Good),
+            "{:?}",
+            n1.segments
+        );
+        let n4 = view
+            .lines
+            .iter()
+            .find(|l| l.text.starts_with("n4"))
+            .unwrap();
+        assert!(n4.text.contains("-"), "{text}");
+    }
+
+    #[test]
+    fn stuck_node_shows_red_marker_after_state() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        let mut row = node("ct-1", "busy", Some(1));
+        row.stuck = 2;
+        dashboard.apply(
+            Ok(Snapshot {
+                controller_version: None,
+                nodes: vec![row],
+                jobs: Vec::new(),
+            }),
+            t0,
+        );
+        let view = dashboard.view(t0);
+        let line = view
+            .lines
+            .iter()
+            .find(|l| l.text.starts_with("ct-1"))
+            .unwrap();
+        assert!(line.text.contains("busy stuck"), "{:?}", line.text);
+        assert!(
+            line.segments
+                .iter()
+                .any(|s| s.text == "stuck" && s.tone == Tone::Bad),
+            "{:?}",
+            line.segments
+        );
+    }
+
+    #[test]
+    fn node_version_mismatch_is_orange_and_title_shows_versions() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        dashboard.apply(
+            Ok(Snapshot {
+                controller_version: Some("0.2.0".to_owned()),
+                nodes: vec![
+                    node_full("same", "idle", Some(1), Some("0.2.0"), None, None, None, 0),
+                    node_full("old", "idle", Some(1), Some("0.1.0"), None, None, None, 0),
+                    node_full("none", "idle", Some(1), None, None, None, None, 0),
+                ],
+                jobs: Vec::new(),
+            }),
+            t0,
+        );
+        let view = dashboard.view(t0);
+        assert!(view.title.contains("lu top "), "{:?}", view.title);
+        assert!(view.title.contains("controller 0.2.0"), "{:?}", view.title);
+        let old = view
+            .lines
+            .iter()
+            .find(|l| l.text.starts_with("old"))
+            .unwrap();
+        assert!(
+            old.segments
+                .iter()
+                .any(|s| s.text.trim() == "0.1.0" && s.tone == Tone::Warn),
+            "{:?}",
+            old.segments
+        );
+        let none = view
+            .lines
+            .iter()
+            .find(|l| l.text.starts_with("none"))
+            .unwrap();
+        assert!(
+            none.segments
+                .iter()
+                .any(|s| s.text.trim() == "-" && s.tone == Tone::Warn),
+            "{:?}",
+            none.segments
+        );
+        let same = view
+            .lines
+            .iter()
+            .find(|l| l.text.starts_with("same"))
+            .unwrap();
+        assert!(
+            same.segments
+                .iter()
+                .any(|s| s.text.trim() == "0.2.0" && s.tone == Tone::Plain),
+            "{:?}",
+            same.segments
+        );
+    }
+
+    #[test]
+    fn per_node_history_is_capped_at_150_samples() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        for i in 0..160u64 {
+            dashboard.apply(
+                Ok(Snapshot {
+                    controller_version: None,
+                    nodes: vec![node_full(
+                        "n1",
+                        "idle",
+                        Some(1),
+                        None,
+                        Some(i as f64 / 10.0),
+                        Some(1000 - (i % 100)),
+                        Some(1000),
+                        0,
+                    )],
+                    jobs: Vec::new(),
+                }),
+                t0,
+            );
+        }
+        // open process pane to expose spark data
+        dashboard.apply(
+            Ok(Snapshot {
+                controller_version: None,
+                nodes: vec![node_full(
+                    "n1",
+                    "idle",
+                    Some(1),
+                    None,
+                    Some(1.0),
+                    Some(500),
+                    Some(1000),
+                    0,
+                )],
+                jobs: vec![JobRow {
+                    id: "01RUN".to_owned(),
+                    title: "run".to_owned(),
+                    state: "running".to_owned(),
+                    node: Some("n1".to_owned()),
+                    attempt: 1,
+                    age_secs: 1,
+                    model: None,
+                    note: String::new(),
+                    after: Vec::new(),
+                }],
+            }),
+            t0,
+        );
+        dashboard.toggle_focus(); // jobs
+        let opened = dashboard.toggle_process_pane();
+        assert!(opened.is_some());
+        let pane = dashboard.view(t0).process_pane.unwrap();
+        assert_eq!(pane.load_spark.len(), 150, "load history capped");
+        assert_eq!(pane.mem_spark.len(), 150, "mem history capped");
+    }
+
+    #[test]
+    fn process_pane_shows_counters_tree_colours_and_no_stats() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        dashboard.apply(
+            Ok(Snapshot {
+                controller_version: None,
+                nodes: vec![node_full(
+                    "n1",
+                    "busy",
+                    Some(1),
+                    None,
+                    Some(1.0),
+                    Some(500),
+                    Some(1000),
+                    0,
+                )],
+                jobs: vec![JobRow {
+                    id: "01RUN".to_owned(),
+                    title: "run".to_owned(),
+                    state: "running".to_owned(),
+                    node: Some("n1".to_owned()),
+                    attempt: 1,
+                    age_secs: 1,
+                    model: None,
+                    note: String::new(),
+                    after: Vec::new(),
+                }],
+            }),
+            t0,
+        );
+        dashboard.toggle_focus();
+        dashboard.toggle_process_pane();
+        dashboard.apply_update(Update::ProcessStats {
+            job_id: "01RUN".to_owned(),
+            node: "n1".to_owned(),
+            result: Ok(Some(ProcessJobView {
+                output_idle_secs: 130,
+                cpu_idle_secs: 140,
+                uploader_behind: None,
+                stuck: false,
+                processes: vec![
+                    ProcessTreeRow {
+                        pid: 10,
+                        state: "D".to_owned(),
+                        cpu_s: 1,
+                        rss_kb: 2,
+                        age_secs: 3,
+                        command: "cmd".to_owned(),
+                    },
+                    ProcessTreeRow {
+                        pid: 11,
+                        state: "Z".to_owned(),
+                        cpu_s: 0,
+                        rss_kb: 0,
+                        age_secs: 4,
+                        command: "zombie".to_owned(),
+                    },
+                ],
+            })),
+        });
+        let view = dashboard.view(t0);
+        let pane = view.process_pane.as_ref().unwrap();
+        assert!(
+            pane.lines[0].text.contains("output idle 130s"),
+            "{:?}",
+            pane.lines
+        );
+        assert!(
+            pane.lines[0].text.contains("cpu idle 140s"),
+            "{:?}",
+            pane.lines
+        );
+        assert!(
+            pane.lines[0].text.contains("uploader behind -"),
+            "{:?}",
+            pane.lines
+        );
+        assert_eq!(
+            pane.lines[0].tone,
+            Tone::Warn,
+            "idle>120s and not stuck => orange/warn"
+        );
+        let drow = pane
+            .lines
+            .iter()
+            .find(|l| l.text.contains("  10 ") || l.text.starts_with("     10"))
+            .unwrap();
+        assert!(
+            drow.segments
+                .iter()
+                .any(|s| s.text.trim() == "D" && s.tone == Tone::Bad),
+            "{:?}",
+            drow.segments
+        );
+        let zrow = pane
+            .lines
+            .iter()
+            .find(|l| l.text.contains("  11 ") || l.text.starts_with("     11"))
+            .unwrap();
+        assert!(
+            zrow.segments
+                .iter()
+                .any(|s| s.text.trim() == "Z" && s.tone == Tone::Bad),
+            "{:?}",
+            zrow.segments
+        );
+
+        dashboard.apply_update(Update::ProcessStats {
+            job_id: "01RUN".to_owned(),
+            node: "n1".to_owned(),
+            result: Ok(Some(ProcessJobView {
+                output_idle_secs: 130,
+                cpu_idle_secs: 140,
+                uploader_behind: Some("5s".to_owned()),
+                stuck: true,
+                processes: Vec::new(),
+            })),
+        });
+        let pane = dashboard.view(t0).process_pane.unwrap();
+        assert_eq!(pane.lines[0].tone, Tone::Bad, "stuck => red");
+        assert!(
+            pane.lines[0].text.contains("uploader behind 5s"),
+            "{:?}",
+            pane.lines[0].text
+        );
+
+        dashboard.apply_update(Update::ProcessStats {
+            job_id: "01RUN".to_owned(),
+            node: "n1".to_owned(),
+            result: Ok(None),
+        });
+        let pane = dashboard.view(t0).process_pane.unwrap();
+        assert_eq!(pane.lines.len(), 1);
+        assert_eq!(pane.lines[0].tone, Tone::Dim);
+        assert!(
+            pane.lines[0].text.contains("no stats"),
+            "{:?}",
+            pane.lines[0].text
+        );
+    }
+
+    #[test]
+    fn hostile_names_versions_and_process_fields_are_sanitized() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        dashboard.apply(
+            Ok(Snapshot {
+                controller_version: Some("ctrl\u{1b}[31m".to_owned()),
+                nodes: vec![node_full(
+                    "node\u{1b}[31m",
+                    "idle",
+                    Some(1),
+                    Some("v\u{202e}1"),
+                    Some(1.0),
+                    Some(500),
+                    Some(1000),
+                    0,
+                )],
+                jobs: vec![JobRow {
+                    id: "01RUN".to_owned(),
+                    title: "run".to_owned(),
+                    state: "running".to_owned(),
+                    node: Some("node\u{1b}[31m".to_owned()),
+                    attempt: 1,
+                    age_secs: 1,
+                    model: None,
+                    note: String::new(),
+                    after: Vec::new(),
+                }],
+            }),
+            t0,
+        );
+        dashboard.toggle_focus();
+        dashboard.toggle_process_pane();
+        dashboard.apply_update(Update::ProcessStats {
+            job_id: "01RUN".to_owned(),
+            node: "node\u{1b}[31m".to_owned(),
+            result: Ok(Some(ProcessJobView {
+                output_idle_secs: 1,
+                cpu_idle_secs: 1,
+                uploader_behind: Some("x\u{1b}[2J".to_owned()),
+                stuck: false,
+                processes: vec![ProcessTreeRow {
+                    pid: 1,
+                    state: "R\u{1b}[0m".to_owned(),
+                    cpu_s: 1,
+                    rss_kb: 1,
+                    age_secs: 1,
+                    command: "echo \u{2028}bad".to_owned(),
+                }],
+            })),
+        });
+        let view = dashboard.view(t0);
+        let all = view.plain_text();
+        assert!(!all.contains('\u{1b}'), "{all}");
+        assert!(!all.contains('\u{202e}'), "{all}");
+        assert!(!all.contains('\u{2028}'), "{all}");
     }
 }

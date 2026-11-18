@@ -4,6 +4,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lu_proto::{
@@ -75,7 +76,6 @@ struct SendParts<'a> {
     headers: &'a [(String, String)],
 }
 
-/// An authenticated controller client. Cheap to clone; the underlying connection pool is shared.
 /// A controller base URL that `lu_config::validate_controller_url` accepted (scheme, host and port rules,
 /// plain http only on loopback), with no query, fragment or dot segments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +103,7 @@ impl HttpUrl {
     }
 }
 
+/// An authenticated controller client. Cheap to clone; the underlying connection pool is shared.
 #[derive(Clone)]
 pub struct Client {
     base: HttpUrl,
@@ -111,6 +112,7 @@ pub struct Client {
     max_json_bytes: u64,
     max_attempts: u32,
     backoff: Duration,
+    controller_version: Arc<Mutex<Option<String>>>,
 }
 
 impl fmt::Debug for Client {
@@ -169,6 +171,7 @@ impl Client {
             max_json_bytes: options.max_json_bytes,
             max_attempts: options.max_attempts.max(1),
             backoff: options.backoff,
+            controller_version: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -369,6 +372,14 @@ impl Client {
             .await?;
         let reply = self.success(reply)?;
         Ok(raw_body(&reply))
+    }
+
+    /// The controller's version, as last reported in an `x-lu-version` response header.
+    pub fn controller_version(&self) -> Option<String> {
+        self.controller_version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The controller's version, uptime, database size and queue summary.
@@ -769,6 +780,16 @@ impl Client {
                 break;
             }
             body.extend_from_slice(&chunk);
+        }
+        if let Some(value) = headers
+            .get("x-lu-version")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+        {
+            *self
+                .controller_version
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value.to_owned());
         }
         Ok(HttpReply {
             status,

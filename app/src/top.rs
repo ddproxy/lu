@@ -8,7 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lu_client::Client;
 use lu_proto::{JobId, NodeName, ProviderState};
-use lu_tui::model::{Dashboard, JobRow, NodeRow, ProviderCell, Request, Snapshot, Update};
+use lu_tui::model::{
+    Dashboard, JobRow, NodeRow, ProcessJobView, ProcessPaneTarget, ProcessTreeRow, ProviderCell,
+    Request, Snapshot, Update,
+};
 use lu_tui::sanitize::printable;
 
 use crate::operator;
@@ -92,6 +95,7 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
         .await
         .map_err(|e| e.to_string())?;
     Ok(Snapshot {
+        controller_version: client.controller_version(),
         nodes: nodes
             .nodes
             .iter()
@@ -109,6 +113,11 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
                         soonest_secs: p.soonest_secs,
                     })
                     .collect(),
+                version: node.version.clone(),
+                load1: node.load1,
+                mem_available_kb: node.mem_available_kb,
+                mem_total_kb: node.mem_total_kb,
+                stuck: node.stuck,
             })
             .collect(),
         jobs: jobs
@@ -147,6 +156,47 @@ async fn fetch_log(client: &Client, job_id: &str) -> Result<String, String> {
         .await
         .map_err(|error| error.to_string())?;
     Ok(log_tail(&page.data))
+}
+
+async fn fetch_process_stats(client: &Client, target: &ProcessPaneTarget) -> Update {
+    let result = async {
+        let node = NodeName::parse(&target.node).map_err(|error| error.to_string())?;
+        let stats = client
+            .node_stats(&node)
+            .await
+            .map_err(|error| error.to_string())?;
+        if stats.host.is_none() && stats.jobs.is_empty() {
+            return Ok(None);
+        }
+        let job_id = JobId::parse(&target.job_id).map_err(|error| error.to_string())?;
+        let Some(job) = stats.jobs.into_iter().find(|job| job.job_id == job_id) else {
+            return Ok(None);
+        };
+        Ok(Some(ProcessJobView {
+            output_idle_secs: job.output_idle_secs,
+            cpu_idle_secs: job.cpu_idle_secs,
+            uploader_behind: None,
+            stuck: job.stuck,
+            processes: job
+                .processes
+                .into_iter()
+                .map(|proc| ProcessTreeRow {
+                    pid: proc.pid,
+                    state: printable(&proc.state),
+                    cpu_s: proc.cpu_secs,
+                    rss_kb: proc.rss_kb,
+                    age_secs: proc.age_secs,
+                    command: printable(&proc.cmdline),
+                })
+                .collect(),
+        }))
+    }
+    .await;
+    Update::ProcessStats {
+        job_id: target.job_id.clone(),
+        node: target.node.clone(),
+        result,
+    }
 }
 
 async fn print_once(client: &Client) -> Result<(), String> {
@@ -195,11 +245,18 @@ pub async fn run(config: &Path, args: TopArgs, json: bool) -> Result<(), String>
     let feeder_client = client.clone();
     let feeder = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(REFRESH);
+        let mut process_target: Option<ProcessPaneTarget> = None;
         while !feeder_stop.load(Ordering::Relaxed) {
             tokio::select! {
                 _ = ticker.tick() => {
                     if tx.send(snapshot(&feeder_client).await).is_err() {
                         break;
+                    }
+                    if let Some(target) = process_target.clone() {
+                        let update = fetch_process_stats(&feeder_client, &target).await;
+                        if update_tx.send(update).is_err() {
+                            break;
+                        }
                     }
                 }
                 request = request_rx.recv() => {
@@ -223,6 +280,15 @@ pub async fn run(config: &Path, args: TopArgs, json: bool) -> Result<(), String>
                             let update = Update::Drain { node, drain, result };
                             if update_tx.send(update).is_err() {
                                 break;
+                            }
+                        }
+                        Some(Request::ProcessPane { target }) => {
+                            process_target = target.clone();
+                            if let Some(target) = target {
+                                let update = fetch_process_stats(&feeder_client, &target).await;
+                                if update_tx.send(update).is_err() {
+                                    break;
+                                }
                             }
                         }
                         None => break,
