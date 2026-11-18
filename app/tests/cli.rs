@@ -92,8 +92,10 @@ async fn show_uses_the_agent_table_and_sanitises_hostile_text() {
     let id = job_id();
     let mut job = job_json(&id, "failed");
     job["node"] = json!("node-a");
+    job["assigned_provider"] = json!("peer-b");
     job["failure_class"] = json!("execution");
     job["summary"] = json!("bad tests\n\u{1b}[31m");
+    job["spec"]["fallbacks"] = json!([{"provider": "peer-b", "model": "m2"}]);
     let server = start(move |_| Reply::json(&job)).await;
     let dir = scratch("show-config");
     let token = write_token(&dir, "operator.token", TOKEN);
@@ -126,6 +128,8 @@ harness = "opencode"
     assert!(text.contains("bad tests??[31m"), "{text}");
     assert!(text.contains("node-a"), "{text}");
     assert!(text.contains("execution"), "{text}");
+    assert!(text.contains("peer-b"), "{text}");
+    assert!(text.contains("peer-b:m2"), "{text}");
     let state = text
         .lines()
         .find(|line| line.trim_start().starts_with("state"))
@@ -582,6 +586,47 @@ async fn submit_reads_stdin_and_sends_every_flag() {
     assert_eq!(spec["model"], "big-pickle");
     assert_eq!(spec["timeout_secs"], 90);
     drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_passes_fallback_choices() {
+    let id = job_id();
+    let body = job_json(&id, "queued");
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("submit-fallback");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--provider",
+            "peer-a",
+            "--model",
+            "primary-model",
+            "--fallback",
+            "peer-b",
+            "--fallback",
+            "peer-c:model-c:tag",
+        ],
+        &env_for(&server, &token),
+        Some("keep going\n"),
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap()[0].body).unwrap();
+    assert_eq!(spec["provider"], "peer-a");
+    assert_eq!(spec["model"], "primary-model");
+    assert_eq!(
+        spec["fallbacks"],
+        json!([
+            {"provider": "peer-b"},
+            {"provider": "peer-c", "model": "model-c:tag"},
+        ])
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1156,7 +1201,8 @@ fn finished_job(id: &str, state: &str) -> Value {
         "idle_timeout_secs": 45,
         "idempotency_key": "ticket:7",
         "after": [id],
-        "requires": ["old-label"]
+        "requires": ["old-label"],
+        "fallbacks": [{"provider": "peer-x", "model": "old-fallback"}]
     });
     job
 }
@@ -1197,6 +1243,59 @@ async fn retry_replaces_or_clears_label_requirements() {
         .collect();
     assert_eq!(posts[0]["requires"], json!(["php8.3", "gpu"]));
     assert!(posts[1].get("requires").is_none(), "{}", posts[1]);
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_replaces_or_clears_fallback_choices() {
+    let id = job_id();
+    let new_id = job_id();
+    let finished = finished_job(&id, "failed");
+    let created = job_json(&new_id, "queued");
+    let server = start(move |record| {
+        if record.method == "POST" {
+            Reply::json(&created)
+        } else {
+            Reply::json(&finished)
+        }
+    })
+    .await;
+    let dir = scratch("retry-fallback");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let env = env_for(&server, &token);
+
+    let output = run_with_env(
+        &[
+            "retry",
+            &id,
+            "--fallback",
+            "peer-c:new-model",
+            "--fallback",
+            "peer-d",
+        ],
+        &env,
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = run_with_env(&["retry", &id, "--no-fallbacks"], &env, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let records = server.records.lock().unwrap();
+    let posts: Vec<Value> = records
+        .iter()
+        .filter(|record| record.method == "POST")
+        .map(|record| serde_json::from_slice(&record.body).unwrap())
+        .collect();
+    assert_eq!(
+        posts[0]["fallbacks"],
+        json!([
+            {"provider": "peer-c", "model": "new-model"},
+            {"provider": "peer-d"},
+        ])
+    );
+    assert!(posts[1].get("fallbacks").is_none(), "{}", posts[1]);
     drop(records);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{is_name_byte, JobId};
 use crate::label::valid_label;
 use crate::limits::{
-    DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_GIT_REF_BYTES, MAX_IDEMPOTENCY_KEY_BYTES,
-    MAX_IDLE_TIMEOUT_SECS, MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_REPO_BYTES, MAX_REQUIRES_LABELS,
-    MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
+    DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_FALLBACKS, MAX_GIT_REF_BYTES,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS, MAX_MODEL_BYTES, MAX_NAME_BYTES,
+    MAX_REPO_BYTES, MAX_REQUIRES_LABELS, MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
 };
 
 /// A field of [`JobSpec`] that failed validation.
@@ -40,6 +40,14 @@ impl fmt::Display for JobSpecError {
 }
 
 impl std::error::Error for JobSpecError {}
+
+/// An alternative provider and model a job may run on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Choice {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
 
 /// A job to run. `harness` defaults to `opencode` and `timeout_secs` to an hour.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -71,6 +79,9 @@ pub struct JobSpec {
     /// Labels a node must advertise before this job may run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<String>,
+    /// Alternatives to the primary provider and model, tried in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<Choice>,
 }
 
 #[derive(Deserialize)]
@@ -98,6 +109,8 @@ struct RawJobSpec {
     stack_dependencies: bool,
     #[serde(default)]
     requires: Vec<String>,
+    #[serde(default)]
+    fallbacks: Vec<Choice>,
 }
 
 impl TryFrom<RawJobSpec> for JobSpec {
@@ -118,6 +131,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
             after: raw.after,
             stack_dependencies: raw.stack_dependencies,
             requires: raw.requires,
+            fallbacks: raw.fallbacks,
         };
         spec.validate()?;
         Ok(spec)
@@ -186,6 +200,36 @@ impl JobSpec {
             }
             if self.requires[..i].contains(label) {
                 return Err(invalid("requires", format!("duplicate label {label}")));
+            }
+        }
+        if self.fallbacks.len() > MAX_FALLBACKS {
+            return Err(invalid(
+                "fallbacks",
+                format!(
+                    "must name at most {MAX_FALLBACKS} choices (got {})",
+                    self.fallbacks.len()
+                ),
+            ));
+        }
+        for (i, choice) in self.fallbacks.iter().enumerate() {
+            check_name("fallbacks", &choice.provider)?;
+            if let Some(model) = &choice.model {
+                check_len("fallbacks", model, MAX_MODEL_BYTES)?;
+            }
+            if self.provider.as_deref() == Some(choice.provider.as_str()) {
+                return Err(invalid(
+                    "fallbacks",
+                    format!("duplicate provider {} (primary)", choice.provider),
+                ));
+            }
+            if self.fallbacks[..i]
+                .iter()
+                .any(|previous| previous.provider == choice.provider)
+            {
+                return Err(invalid(
+                    "fallbacks",
+                    format!("duplicate provider {}", choice.provider),
+                ));
             }
         }
         Ok(())
@@ -318,6 +362,7 @@ mod tests {
             after: Vec::new(),
             stack_dependencies: true,
             requires: Vec::new(),
+            fallbacks: Vec::new(),
         }
     }
 
@@ -440,6 +485,50 @@ mod tests {
         spec = sample();
         spec.requires = vec!["gpu".to_owned(), "gpu".to_owned()];
         assert_eq!(error_field(&spec), "requires");
+
+        spec = sample();
+        spec.fallbacks = (0..=MAX_FALLBACKS)
+            .map(|i| Choice {
+                provider: format!("peer-{i}"),
+                model: None,
+            })
+            .collect();
+        assert_eq!(error_field(&spec), "fallbacks");
+
+        spec = sample();
+        spec.fallbacks = vec![Choice {
+            provider: "bad/provider".to_owned(),
+            model: None,
+        }];
+        assert_eq!(error_field(&spec), "fallbacks");
+
+        spec = sample();
+        spec.fallbacks = vec![Choice {
+            provider: "peer-a".to_owned(),
+            model: Some(String::new()),
+        }];
+        assert_eq!(error_field(&spec), "fallbacks");
+
+        spec = sample();
+        spec.provider = Some("peer-a".to_owned());
+        spec.fallbacks = vec![Choice {
+            provider: "peer-a".to_owned(),
+            model: None,
+        }];
+        assert_eq!(error_field(&spec), "fallbacks");
+
+        spec = sample();
+        spec.fallbacks = vec![
+            Choice {
+                provider: "peer-a".to_owned(),
+                model: Some("one".to_owned()),
+            },
+            Choice {
+                provider: "peer-a".to_owned(),
+                model: Some("two".to_owned()),
+            },
+        ];
+        assert_eq!(error_field(&spec), "fallbacks");
     }
 
     #[test]
@@ -462,6 +551,7 @@ mod tests {
         assert!(spec.after.is_empty());
         assert!(spec.stack_dependencies);
         assert!(spec.requires.is_empty());
+        assert!(spec.fallbacks.is_empty());
         assert!(spec.validate().is_ok());
     }
 
@@ -576,6 +666,41 @@ mod tests {
         let parsed: JobSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, spec);
         assert_eq!(parsed.canonical_json(), json);
+    }
+
+    #[test]
+    fn fallbacks_round_trip_and_are_omitted_when_empty() {
+        let mut spec = sample();
+        assert!(!spec.canonical_json().contains("fallbacks"));
+        spec.provider = Some("peer-a".to_owned());
+        spec.model = Some("primary-model".to_owned());
+        spec.fallbacks = vec![
+            Choice {
+                provider: "peer-b".to_owned(),
+                model: Some("other-model".to_owned()),
+            },
+            Choice {
+                provider: "peer-c".to_owned(),
+                model: None,
+            },
+        ];
+        assert!(spec.validate().is_ok());
+        let json = spec.canonical_json();
+        assert!(json.contains("\"fallbacks\""));
+        let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, spec);
+        assert_eq!(parsed.canonical_json(), json);
+        assert!(!json.contains("peer-c:"));
+    }
+
+    #[test]
+    fn a_fallback_without_a_model_keeps_the_primary_model_choice_open() {
+        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go",
+            "provider":"peer-a","model":"big","fallbacks":[{"provider":"peer-b"}]}"#;
+        let spec: JobSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.fallbacks[0].provider, "peer-b");
+        assert_eq!(spec.fallbacks[0].model, None);
+        assert_eq!(spec.model.as_deref(), Some("big"));
     }
 
     #[test]

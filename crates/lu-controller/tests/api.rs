@@ -2,7 +2,9 @@ use git2::{Repository, Signature};
 use lu_auth::sha256_hex;
 use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator, ControllerRepo};
 use lu_controller::{build_router, run_background, AppState};
-use lu_proto::{JobId, JobSpec, MAX_AFTER_JOBS, MAX_LOG_BYTES, MAX_REQUIRES_LABELS};
+use lu_proto::{
+    Choice, JobId, JobSpec, MAX_AFTER_JOBS, MAX_FALLBACKS, MAX_LOG_BYTES, MAX_REQUIRES_LABELS,
+};
 use lu_serve::{serve, ServeOptions};
 use lu_store::sqlite::SqliteStore;
 use lu_store::Store;
@@ -184,6 +186,7 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         after: Vec::new(),
         stack_dependencies: true,
         requires: Vec::new(),
+        fallbacks: Vec::new(),
     }
 }
 
@@ -359,6 +362,97 @@ async fn label_requirements_are_validated_and_explained() {
             "{b}"
         );
     }
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn fallback_choices_are_validated_and_assigned() {
+    let srv = start_server().await;
+
+    let too_many = (0..=MAX_FALLBACKS)
+        .map(|index| Choice {
+            provider: format!("p{index}"),
+            model: None,
+        })
+        .collect::<Vec<_>>();
+    let mut cases = Vec::new();
+    let mut spec = sample_spec(None);
+    spec.provider = Some("primary".to_owned());
+    spec.fallbacks = too_many;
+    cases.push(spec);
+    let mut spec = sample_spec(None);
+    spec.provider = Some("p1".to_owned());
+    spec.fallbacks = vec![Choice {
+        provider: "p1".to_owned(),
+        model: None,
+    }];
+    cases.push(spec);
+    let mut spec = sample_spec(None);
+    spec.provider = Some("p1".to_owned());
+    spec.fallbacks = vec![
+        Choice {
+            provider: "p2".to_owned(),
+            model: None,
+        },
+        Choice {
+            provider: "p2".to_owned(),
+            model: Some("m2".to_owned()),
+        },
+    ];
+    cases.push(spec);
+    let mut spec = sample_spec(None);
+    spec.provider = Some("p1".to_owned());
+    spec.fallbacks = vec![Choice {
+        provider: "bad name".to_owned(),
+        model: None,
+    }];
+    cases.push(spec);
+    for spec in cases {
+        let r = submit_spec(srv.addr, &spec).await;
+        assert_eq!(status(&r), 422, "{r}");
+    }
+
+    let mut spec = sample_spec(None);
+    spec.provider = Some("p1".to_owned());
+    spec.model = Some("m1".to_owned());
+    spec.fallbacks = vec![Choice {
+        provider: "p2".to_owned(),
+        model: Some("m2".to_owned()),
+    }];
+    let r = submit_spec(srv.addr, &spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let created: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let hb = json!({
+        "node": "node-a",
+        "harness": "idle",
+        "providers": [
+            {"name": "p1", "state": "cooling"},
+            {"name": "p2", "state": "ok"},
+        ],
+    });
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &hb).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let assign = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "assign")
+        .unwrap_or_else(|| panic!("no assignment: {events}"));
+    assert_eq!(assign["job_id"], id);
+    assert_eq!(assign["provider"], "p2", "{assign}");
+    assert_eq!(assign["model"], "m2", "{assign}");
+    assert_eq!(assign["spec"]["model"], "m1", "{assign}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["assigned_provider"], "p2", "{job}");
+    assert_eq!(job["assigned_model"], "m2", "{job}");
+    assert_eq!(job["spec"]["fallbacks"][0]["provider"], "p2", "{job}");
 
     let _ = srv.shutdown.send(());
 }

@@ -18,6 +18,10 @@ pub enum AgentEvent {
         job_id: JobId,
         epoch: u64,
         spec: JobSpec,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Followup {
         job_id: JobId,
@@ -38,6 +42,10 @@ enum RawAgentEvent {
         job_id: JobId,
         epoch: u64,
         spec: JobSpec,
+        #[serde(default)]
+        provider: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     Followup {
         job_id: JobId,
@@ -58,10 +66,14 @@ impl TryFrom<RawAgentEvent> for AgentEvent {
                 job_id,
                 epoch,
                 spec,
+                provider,
+                model,
             } => AgentEvent::Assign {
                 job_id,
                 epoch,
                 spec,
+                provider,
+                model,
             },
             RawAgentEvent::Followup {
                 job_id,
@@ -282,6 +294,7 @@ mod tests {
             after: Vec::new(),
             stack_dependencies: true,
             requires: Vec::new(),
+            fallbacks: Vec::new(),
         }
     }
 
@@ -292,6 +305,8 @@ mod tests {
                 job_id: job_id(),
                 epoch: 3,
                 spec: spec(),
+                provider: Some("peer-b".to_owned()),
+                model: Some("fallback-model".to_owned()),
             },
             AgentEvent::Followup {
                 job_id: job_id(),
@@ -308,6 +323,29 @@ mod tests {
             let parsed: AgentEvent = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, event);
         }
+    }
+
+    #[test]
+    fn an_assign_without_a_chosen_pair_still_deserialises_and_omits_the_fields() {
+        let spec = serde_json::to_value(spec()).unwrap();
+        let json = format!(
+            r#"{{"kind":"assign","job_id":"{}","epoch":3,"spec":{}}}"#,
+            job_id(),
+            spec
+        );
+        let event: AgentEvent = serde_json::from_str(&json).unwrap();
+        match &event {
+            AgentEvent::Assign {
+                provider, model, ..
+            } => {
+                assert!(provider.is_none());
+                assert!(model.is_none());
+            }
+            other => panic!("expected assign, got {other:?}"),
+        }
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(!wire.contains("\"provider\""), "{wire}");
+        assert!(!wire.contains("\"model\""), "{wire}");
     }
 
     #[test]

@@ -7,7 +7,13 @@ uses semantic versioning once it reaches 1.0.
 
 ### Added
 
+- Job fallback choices. `JobSpec.fallbacks` lists up to 4 alternate `{provider, model}` choices. Dispatch applies labels first, then tries the primary `provider`/`model` and each fallback in order, assigning the first provider the node reports healthy and uncordoned; a fallback without a model reuses the primary model. The chosen pair is stored as `assigned_provider`/`assigned_model`, exposed in `JobView` and printed by `lu show`. The `Assign` event carries additive `provider`/`model` fields; older agents ignore them and run the primary choice. A provider failure cordons the assigned pair and requeues the job, so the next dispatch can choose another fallback, node, or provider on the same node. The agent builds the harness command and `report.json` from the assigned model.
+- `lu submit --fallback <provider[:model]>` (repeatable, up to 4) adds fallbacks; `lu retry --fallback` replaces the list and `--no-fallbacks` clears it. `--fallback <provider>` without a colon reuses the primary model, while each fallback that names a model keeps its own.
 - Node labels and job requirements. Agents advertise up to 32 opaque labels from `[agent].labels` and `[agent].label_files` (re-read before each heartbeat); jobs require up to 8 with `JobSpec.requires` and dispatch gives a job only to a node that has every required label. `lu submit --require` and `lu retry --require`/`--no-require` set them, `lu nodes` shows a `LABELS` column, and `lu show`/`lu top` explain a stalled queued job as `no node with label <label>`. Submitting an unknown label succeeds with a warning. Metrics add `lu_node_labels_info{node,label}`. No schema change: labels live in the stored heartbeat.
+
+### Changed
+
+- Schema 5 adds nullable `assigned_provider` and `assigned_model` job columns. Older databases upgrade on open with both empty.
 
 ## [0.1.14] - 2026-11-18
 

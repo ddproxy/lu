@@ -25,6 +25,10 @@ pub struct JobView {
     #[serde(default)]
     pub node: Option<NodeName>,
     #[serde(default)]
+    pub assigned_provider: Option<String>,
+    #[serde(default)]
+    pub assigned_model: Option<String>,
+    #[serde(default)]
     pub attempt: u32,
     #[serde(default)]
     pub epoch: u64,
@@ -58,6 +62,8 @@ impl JobView {
             state,
             spec: empty_spec(),
             node: None,
+            assigned_provider: None,
+            assigned_model: None,
             attempt: 0,
             epoch: 0,
             created_at: 0,
@@ -379,6 +385,7 @@ fn empty_spec() -> JobSpec {
         after: Vec::new(),
         stack_dependencies: true,
         requires: Vec::new(),
+        fallbacks: Vec::new(),
     }
 }
 

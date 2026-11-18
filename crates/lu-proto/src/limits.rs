@@ -22,6 +22,9 @@ pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 /// The most dependencies one job may name.
 pub const MAX_AFTER_JOBS: usize = 16;
 
+/// The most alternative provider choices one job may name.
+pub const MAX_FALLBACKS: usize = 4;
+
 pub const MIN_TIMEOUT_SECS: u64 = 1;
 pub const MAX_TIMEOUT_SECS: u64 = 86_400;
 pub const MAX_IDLE_TIMEOUT_SECS: u64 = 86_400;

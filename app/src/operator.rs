@@ -41,6 +41,9 @@ pub struct SubmitArgs {
     /// Model name.
     #[arg(long)]
     pub model: Option<String>,
+    /// Alternative provider[:model] to try in order (repeatable).
+    #[arg(long = "fallback", value_parser = parse_fallback)]
+    pub fallbacks: Vec<lu_proto::Choice>,
     /// Job timeout in seconds.
     #[arg(long, default_value_t = lu_proto::DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
@@ -84,6 +87,12 @@ pub struct RetryArgs {
     /// Replace the model name.
     #[arg(long)]
     pub model: Option<String>,
+    /// Replace the fallback list with these provider[:model] choices (repeatable).
+    #[arg(long = "fallback", value_parser = parse_fallback, conflicts_with = "no_fallbacks")]
+    pub fallbacks: Vec<lu_proto::Choice>,
+    /// Clear the fallback list.
+    #[arg(long = "no-fallbacks")]
+    pub no_fallbacks: bool,
     /// Only run after this job is done (repeatable); replaces the dependency list.
     #[arg(long = "after", value_parser = parse_job_id)]
     pub after: Vec<JobId>,
@@ -260,6 +269,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         after,
         stack_dependencies: !args.no_stack,
         requires: args.require,
+        fallbacks: args.fallbacks,
     };
     spec.validate().map_err(|error| error.to_string())?;
 
@@ -321,6 +331,11 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
         spec.requires = args.require;
     } else if args.no_require {
         spec.requires.clear();
+    }
+    if !args.fallbacks.is_empty() {
+        spec.fallbacks = args.fallbacks;
+    } else if args.no_fallbacks {
+        spec.fallbacks.clear();
     }
     // A retry is a new job; only --key gives it an idempotency key.
     spec.idempotency_key = args.key;
@@ -938,6 +953,20 @@ fn write_artifact(
 }
 
 fn print_job(view: &JobView) {
+    let fallbacks = view
+        .spec
+        .fallbacks
+        .iter()
+        .map(|choice| match &choice.model {
+            Some(model) => format!(
+                "{}:{}",
+                display_field(&choice.provider),
+                display_field(model)
+            ),
+            None => display_field(&choice.provider),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let rows = vec![
         ("id", view.id.to_string()),
         ("state", state_name(view.state).to_owned()),
@@ -947,6 +976,21 @@ fn print_job(view: &JobView) {
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "-".to_owned()),
+        ),
+        (
+            "assigned_provider",
+            view.assigned_provider
+                .as_deref()
+                .map(display_field)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        (
+            "fallbacks",
+            if fallbacks.is_empty() {
+                "-".to_owned()
+            } else {
+                fallbacks
+            },
         ),
         ("attempt", view.attempt.to_string()),
         ("epoch", view.epoch.to_string()),
@@ -1322,6 +1366,18 @@ fn parse_job_id(value: &str) -> Result<JobId, String> {
 
 fn parse_node(value: &str) -> Result<NodeName, String> {
     NodeName::parse(value).map_err(|error| error.to_string())
+}
+
+/// `provider` or `provider:model`; the model may contain colons, the provider cannot.
+fn parse_fallback(value: &str) -> Result<lu_proto::Choice, String> {
+    let (provider, model) = match value.split_once(':') {
+        Some((provider, model)) => (provider, Some(model.to_owned())),
+        None => (value, None),
+    };
+    Ok(lu_proto::Choice {
+        provider: provider.to_owned(),
+        model,
+    })
 }
 
 fn parse_state(value: &str) -> Result<JobState, String> {

@@ -444,6 +444,7 @@ mod tests {
             after: Vec::new(),
             stack_dependencies: true,
             requires: Vec::new(),
+            fallbacks: Vec::new(),
         }
     }
 
