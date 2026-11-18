@@ -1557,6 +1557,7 @@ mod tests {
         let spec = lu_proto::JobSpec {
             repo: "https://example.net/r.git".to_owned(),
             git_ref: "main".to_owned(),
+            base_commit: None,
             task: "t".to_owned(),
             harness: "opencode".to_owned(),
             provider: None,

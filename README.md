@@ -127,6 +127,8 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu logs <id>` | Print a job's stored log. `--follow` keeps reading until the job is terminal. |
 | `lu fetch <id>` | Save `diff.patch`, `run.log` and `report.json` into `--out` (default `.`). Missing artifacts are skipped; existing files need `--force`. |
 | `lu cancel <id>` | Ask the controller to cancel a job. |
+| `lu repos` | List the configured repository mirrors with their last sync time and branch-head counts. `--json` prints the raw response. |
+| `lu sync <name>` | Fetch one configured repository mirror and print its last sync time and branch heads. `--json` prints the raw response. |
 | `lu nodes` | List known nodes, including the agent version each last reported. |
 | `lu drain <node>` | Stop assigning new jobs to a node. |
 | `lu undrain <node>` | Allow a drained node to take jobs again. |
@@ -152,6 +154,7 @@ Operator connection settings come from `LU_URL`, `LU_TOKEN_FILE` and optional `L
 
 - The agent runs the harness as its own user; see `docs/security.md`.
 - The agent sends no provider health, so the controller does not yet steer around a cooling provider.
+- The agent still clones from the forge and ignores the controller's pinned `base_commit`; only jobs for a configured `[[controller.repos]]` entry are pinned.
 
 ## Crates
 

@@ -379,6 +379,14 @@ Logs are stored at `<artifacts_dir>/<job id>/run.log`; artifacts are `diff.patch
 - `lu logs <id>` prints the stored text. `lu logs --follow` is intended to stop at a terminal state, but the client currently ignores the controller's `X-Lu-State` header, so it may keep waiting. Use `lu show <id>` to check the state if follow does not stop.
 - `lu fetch <id> --out DIR` writes the fixed names into `DIR`, mode `0600`, and refuses to overwrite existing files unless `--force` is given. Missing artifacts are skipped; if none are available the command exits `1`.
 
+## Repository mirrors
+
+When `[[controller.repos]]` lists a repository, the controller keeps a bare mirror at `<artifacts_dir>/../mirrors/<name>.git` and pins each job for that URL to the commit its ref names. A submit syncs first when the mirror has never synced, is older than 60 seconds, or does not know the ref. An unknown ref is `422` naming the ref; a fetch failure is `500` with any credential scrubbed from the message. Syncs run on a blocking thread with a 5-minute timeout and a 10 GiB mirror cap.
+
+- `lu repos` lists each configured mirror, its URL, last sync time and number of branch heads. `--json` prints the raw `GET /v1/repos` body.
+- `lu sync <name>` fetches one mirror and prints its last sync time and branch heads. `--json` prints the raw response.
+- Both commands use the operator token, like the rest of the CLI. `GET /v1/repos` and `POST /v1/repos/{name}/sync` are the corresponding routes.
+
 ## Metrics
 
 `GET /metrics` serves Prometheus text (exposition `0.0.4`, `Content-Type: text/plain; version=0.0.4; charset=utf-8`). It needs an operator token, like every other operator route. It is safe to scrape from any host that holds the operator token; keep that host tight.
@@ -401,6 +409,7 @@ Series:
 | `lu_recovered_on_boot` | gauge | Jobs moved to `recovering` by this process's boot recovery. |
 | `lu_queue_oldest_seconds` | gauge | Age of the oldest `queued` or `blocked` job, or `0` when there is none. |
 | `lu_node_last_seen_seconds{node}` | gauge | Seconds since that node's last heartbeat. |
+| `lu_repo_last_sync_seconds{repo}` | gauge | Seconds since that configured repository was last mirrored, or `0` before the first sync. |
 
 Example scrape config (operator token read from the file, never from the config itself):
 

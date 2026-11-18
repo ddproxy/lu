@@ -46,6 +46,9 @@ pub struct JobSpec {
     /// A git URL or an absolute local path.
     pub repo: String,
     pub git_ref: String,
+    /// The commit the controller pinned this job to. Absent for repositories it does not mirror.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
     /// The prompt text. Control characters are allowed; they are sanitised for display.
     pub task: String,
     pub harness: String,
@@ -64,10 +67,11 @@ pub struct JobSpec {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawJobSpec {
     repo: String,
     git_ref: String,
+    #[serde(default)]
+    base_commit: Option<String>,
     task: String,
     #[serde(default = "default_harness")]
     harness: String,
@@ -92,6 +96,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
         let spec = JobSpec {
             repo: raw.repo,
             git_ref: raw.git_ref,
+            base_commit: raw.base_commit,
             task: raw.task,
             harness: raw.harness,
             provider: raw.provider,
@@ -121,6 +126,9 @@ impl JobSpec {
     pub fn validate(&self) -> Result<(), JobSpecError> {
         check_repo(&self.repo)?;
         check_len("git_ref", &self.git_ref, MAX_GIT_REF_BYTES)?;
+        if let Some(commit) = &self.base_commit {
+            check_hex_commit(commit)?;
+        }
         check_len("task", &self.task, MAX_TASK_BYTES)?;
         check_name("harness", &self.harness)?;
         if let Some(provider) = &self.provider {
@@ -202,6 +210,16 @@ fn check_repo(repo: &str) -> Result<(), JobSpecError> {
     Ok(())
 }
 
+fn check_hex_commit(value: &str) -> Result<(), JobSpecError> {
+    if value.len() != 40 || value.bytes().any(|b| !b.is_ascii_hexdigit()) {
+        return Err(invalid(
+            "base_commit",
+            "must be exactly 40 hexadecimal characters",
+        ));
+    }
+    Ok(())
+}
+
 fn check_name(field: &'static str, value: &str) -> Result<(), JobSpecError> {
     if value.is_empty() {
         return Err(invalid(field, "must not be empty"));
@@ -250,6 +268,7 @@ mod tests {
         JobSpec {
             repo: "https://example.net/repo.git".to_owned(),
             git_ref: "main".to_owned(),
+            base_commit: None,
             task: "run the tests".to_owned(),
             harness: "opencode".to_owned(),
             provider: None,
@@ -302,6 +321,18 @@ mod tests {
         spec = sample();
         spec.git_ref = "a".repeat(MAX_GIT_REF_BYTES + 1);
         assert_eq!(error_field(&spec), "git_ref");
+
+        spec = sample();
+        spec.base_commit = Some("abc".to_owned());
+        assert_eq!(error_field(&spec), "base_commit");
+
+        spec = sample();
+        spec.base_commit = Some("A".repeat(40));
+        assert!(spec.validate().is_ok());
+
+        spec = sample();
+        spec.base_commit = Some("g".repeat(40));
+        assert_eq!(error_field(&spec), "base_commit");
 
         spec = sample();
         spec.task = String::new();
@@ -382,10 +413,29 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_are_refused() {
+    fn an_old_style_spec_without_base_commit_still_deserialises() {
+        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let spec: JobSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.base_commit, None);
+        assert!(!spec.canonical_json().contains("base_commit"));
+    }
+
+    #[test]
+    fn a_pinned_spec_serialises_and_round_trips_base_commit() {
+        let mut spec = sample();
+        spec.base_commit = Some("0123456789abcdef0123456789abcdef01234567".to_owned());
+        let json = spec.canonical_json();
+        assert!(json.contains("base_commit"));
+        let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, spec);
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored_for_forward_compatibility() {
         let json =
             r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go","surprise":1}"#;
-        assert!(serde_json::from_str::<JobSpec>(json).is_err());
+        let spec: JobSpec = serde_json::from_str(json).unwrap();
+        assert!(spec.validate().is_ok());
     }
 
     #[test]

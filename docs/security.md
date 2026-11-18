@@ -15,14 +15,16 @@ contract, not a runnable 0.1.0 agent. See [operations.md](operations.md) for the
 | SQLite database | controller host, `[controller] db` | Job specs and tasks, state, leases, epochs, idempotency keys, node state. |
 | Job logs and artifacts | controller host, `artifacts_dir/<job id>/` | Diffs, run logs and reports can contain source code, credentials and model output. |
 | Provider credentials | leaf/agent host in 0.1.0 | They authorise paid model calls and must not reach the controller or another tenant. |
+| Repository credentials | controller host, `[[controller.repos]].credential_file` | They authorise forge fetches into the controller's bare mirrors and must not reach an agent or appear in a log or error. |
 
 ## Threat model
 
 The controller treats everything arriving over the network as hostile: bearer headers, ids,
 node names, JSON bodies, raw log chunks, artifact bytes, lengths, offsets and query strings.
 Requests are authenticated before their bodies are parsed, bodies and logs are size-capped,
-JSON rejects unknown fields, ids and names are validated, and artifact file names are chosen by
-the controller rather than supplied by the agent. The controller never connects back to an
+unknown `JobSpec` fields are ignored for forward compatibility while other bodies reject unknown
+fields, ids and names are validated, and artifact file names are chosen by the controller rather
+than supplied by the agent. The controller never connects back to an
 agent, so there is no inbound path to an agent from the controller or from another agent.
 
 The main adversaries considered are:
@@ -133,6 +135,13 @@ The agent does **not** trust:
   should not;
 - log or artifact content returned by the controller, which is printed or written for the
   operator.
+
+For a configured repository the controller mirrors the forge itself and pins the job to a
+commit, so an agent no longer needs forge access or its credential. A mirror is a bare repository
+under `<artifacts_dir>/../mirrors`, mode `0700`; fetching uses `https` only, no terminal prompts,
+no system or global config, no hooks and no inherited askpass or ssh command, with a 5-minute
+timeout and a size cap. A repository credential is read at fetch time, passed through a
+short-lived private askpass helper, and scrubbed from any stderr before it becomes an error.
 
 Staging invokes `git` directly, not through a shell, with terminal prompts disabled, no system
 config and a restricted transport allowlist (`file`, `https`, `ssh`). The harness is launched

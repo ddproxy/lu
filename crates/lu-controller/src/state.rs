@@ -1,4 +1,5 @@
 use crate::auth::AuthConfig;
+use crate::mirror::Mirror;
 use crate::wait::Waiters;
 use lu_auth::{LoginThrottle, ThrottleSettings};
 use lu_config::ControllerConfig;
@@ -23,6 +24,7 @@ pub struct AppState {
     /// The latest host and job stats from each node's heartbeat. Deliberately in memory only.
     pub stats: Mutex<HashMap<NodeName, NodeStats>>,
     pub artifacts_dir: PathBuf,
+    pub mirror: Arc<Mirror>,
     pub lease_secs: u64,
     pub recovery_grace_secs: u64,
     pub provider_cooldown_secs: u64,
@@ -54,6 +56,7 @@ impl AppState {
             );
         }
         let lease_secs = cfg.lease_secs;
+        let mirror = Arc::new(Mirror::from_config(cfg)?);
         Ok(Self {
             store,
             db_path: PathBuf::from(&cfg.db),
@@ -64,6 +67,7 @@ impl AppState {
             waiters: Arc::new(Waiters::new()),
             stats: Mutex::new(HashMap::new()),
             artifacts_dir: PathBuf::from(&cfg.artifacts_dir),
+            mirror,
             lease_secs,
             recovery_grace_secs: cfg.recovery_grace_secs,
             provider_cooldown_secs: cfg.provider_cooldown_secs,

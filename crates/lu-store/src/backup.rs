@@ -433,6 +433,7 @@ mod tests {
         JobSpec {
             repo: format!("https://example.net/r{n}.git"),
             git_ref: "main".to_owned(),
+            base_commit: None,
             task: "t".to_owned(),
             harness: "opencode".to_owned(),
             provider: None,

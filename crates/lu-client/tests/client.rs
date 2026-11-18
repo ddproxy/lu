@@ -180,6 +180,7 @@ fn spec() -> JobSpec {
     JobSpec {
         repo: "https://example.net/repo.git".to_owned(),
         git_ref: "main".to_owned(),
+        base_commit: None,
         task: "run the tests".to_owned(),
         harness: "opencode".to_owned(),
         provider: None,
@@ -365,6 +366,48 @@ async fn nodes_reads_a_bare_list() {
     let nodes = client(&server).nodes().await.unwrap();
     assert_eq!(nodes.nodes[0].name.as_str(), "node-a");
     assert_eq!(nodes.nodes[0].harness, Some(lu_proto::HarnessState::Idle));
+}
+
+#[tokio::test]
+async fn repos_and_sync_read_the_controller_replies() {
+    let repos = json!({"repos": [
+        {"name": "mirror", "url": "https://example.net/a.git", "synced_at": 9, "heads": {"main": "abc"}},
+        {"name": "idle", "url": "https://example.net/b.git"}
+    ]});
+    let synced = json!({"name": "mirror", "synced_at": 10, "heads": {"main": "abc"}});
+    let server = start(move |record| {
+        if record.path == "/v1/repos" {
+            Reply::json(&repos)
+        } else {
+            Reply::json(&synced)
+        }
+    })
+    .await;
+    let client = client(&server);
+    let list = client.repos().await.unwrap();
+    assert_eq!(list.repos.len(), 2);
+    assert_eq!(list.repos[0].name, "mirror");
+    assert_eq!(list.repos[0].synced_at, Some(9));
+    assert_eq!(
+        list.repos[0].heads.get("main").map(String::as_str),
+        Some("abc")
+    );
+    assert_eq!(list.repos[1].synced_at, None);
+
+    let repo = client.sync_repo("mirror").await.unwrap();
+    assert_eq!(repo.name, "mirror");
+    assert_eq!(repo.synced_at, Some(10));
+    assert_eq!(repo.heads.get("main").map(String::as_str), Some("abc"));
+
+    let error = client.sync_repo("../escape").await.unwrap_err();
+    assert!(matches!(error, ApiError::Config { .. }), "{error:?}");
+
+    let records = server.records.lock().unwrap();
+    assert_eq!(records[0].method, "GET");
+    assert_eq!(records[0].path, "/v1/repos");
+    assert_eq!(records[1].method, "POST");
+    assert_eq!(records[1].path, "/v1/repos/mirror/sync");
+    assert_eq!(records.len(), 2, "an invalid name must not be sent");
 }
 
 #[tokio::test]

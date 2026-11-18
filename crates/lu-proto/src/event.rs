@@ -9,6 +9,7 @@ use crate::limits::{MAX_LOG_CHUNK_BYTES, MAX_SUMMARY_BYTES};
 use crate::spec::JobSpec;
 
 /// A message from the controller to an agent, tagged by `kind`.
+#[allow(clippy::large_enum_variant)] // Boxing the spec would change the public event API for one allocation per poll.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -28,6 +29,7 @@ pub enum AgentEvent {
     },
 }
 
+#[allow(clippy::large_enum_variant)] // Mirrors AgentEvent; the spec is moved straight back out.
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RawAgentEvent {
@@ -267,6 +269,7 @@ mod tests {
         JobSpec {
             repo: "https://example.net/repo.git".to_owned(),
             git_ref: "main".to_owned(),
+            base_commit: None,
             task: "run the tests".to_owned(),
             harness: "opencode".to_owned(),
             provider: None,

@@ -1,5 +1,5 @@
 use crate::auth::authenticate_operator;
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorCode};
 use crate::routes::{
     json_ok, json_value_ok, parse_job_state, read_raw_limited, store_err, with_version,
     MAX_JSON_BODY,
@@ -103,10 +103,33 @@ pub async fn create_job(
             return with_version(ApiError::bad_request("invalid request body").into_response())
         }
     };
-    let spec: JobSpec = match serde_json::from_value(value) {
+    let mut spec: JobSpec = match serde_json::from_value(value) {
         Ok(s) => s,
         Err(e) => return with_version(ApiError::unprocessable(e.to_string()).into_response()),
     };
+    if let Some(repo) = state.mirror.repo_for_url(&spec.repo) {
+        let name = repo.name.clone();
+        let git_ref = spec.git_ref.clone();
+        let mirror = Arc::clone(&state.mirror);
+        let resolved =
+            tokio::task::spawn_blocking(move || mirror.ensure_resolved(&name, &git_ref)).await;
+        match resolved {
+            Ok(Ok(commit)) => spec.base_commit = Some(commit),
+            Ok(Err(e)) if e.is_unknown_ref() => {
+                return with_version(ApiError::unprocessable(e.to_string()).into_response())
+            }
+            Ok(Err(e)) => {
+                return with_version(
+                    ApiError::new(
+                        ErrorCode::Internal,
+                        format!("could not mirror {}: {e}", spec.repo),
+                    )
+                    .into_response(),
+                )
+            }
+            Err(_) => return with_version(ApiError::internal().into_response()),
+        }
+    }
     let now = now();
     let res = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
@@ -437,6 +460,42 @@ pub async fn get_node_stats(
     match stats {
         Some(stats) => with_version(json_ok(StatusCode::OK, &stats)),
         None => with_version(json_value_ok(StatusCode::OK, json!({}))),
+    }
+}
+
+pub async fn list_repos(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
+        return with_version(ApiError::unauthorized().into_response());
+    }
+    let repos = state.mirror.infos();
+    with_version(json_value_ok(StatusCode::OK, json!({ "repos": repos })))
+}
+
+pub async fn sync_repo(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
+        return with_version(ApiError::unauthorized().into_response());
+    }
+    if state.mirror.repo(&name).is_none() {
+        return with_version(ApiError::not_found("not found").into_response());
+    }
+    let mirror = Arc::clone(&state.mirror);
+    let result = tokio::task::spawn_blocking(move || mirror.sync(&name)).await;
+    match result {
+        Ok(Ok(sync)) => with_version(json_ok(StatusCode::OK, &sync)),
+        Ok(Err(e)) => with_version(
+            ApiError::new(ErrorCode::Internal, format!("repository sync failed: {e}"))
+                .into_response(),
+        ),
+        Err(_) => with_version(ApiError::internal().into_response()),
     }
 }
 

@@ -18,6 +18,7 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
     JobSpec {
         repo: repo.to_owned(),
         git_ref: "main".to_owned(),
+        base_commit: None,
         task: "do it".to_owned(),
         harness: "opencode".to_owned(),
         provider: None,

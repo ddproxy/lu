@@ -123,6 +123,26 @@ pub struct ListNodes {
     pub nodes: Vec<NodeView>,
 }
 
+/// A configured repository mirror and its latest sync.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoView {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub synced_at: Option<u64>,
+    #[serde(default)]
+    pub heads: BTreeMap<String, String>,
+}
+
+/// The configured repository list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListRepos {
+    #[serde(default)]
+    pub repos: Vec<RepoView>,
+}
+
 /// A controller status snapshot. The controller may add fields later; unknown ones are ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusView {
@@ -324,6 +344,7 @@ fn empty_spec() -> JobSpec {
     JobSpec {
         repo: String::new(),
         git_ref: String::new(),
+        base_commit: None,
         task: String::new(),
         harness: "opencode".to_owned(),
         provider: None,
