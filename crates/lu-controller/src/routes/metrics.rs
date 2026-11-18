@@ -156,6 +156,20 @@ pub async fn metrics(
     out.push_str("# TYPE lu_controller_up gauge\n");
     out.push_str("lu_controller_up 1\n");
 
+    out.push_str(
+        "# HELP lu_repo_last_sync_seconds Seconds since each repository was last mirrored\n",
+    );
+    out.push_str("# TYPE lu_repo_last_sync_seconds gauge\n");
+    for repo in state.mirror.infos() {
+        let name = escape_label(&repo.name);
+        let age = repo
+            .synced_at
+            .map(|at| n.wall_unix.saturating_sub(at).max(0) as u64)
+            .unwrap_or(0);
+        out.push_str(&gauge("lu_repo_last_sync_seconds", &[("repo", &name)], age));
+        out.push('\n');
+    }
+
     // Counters
     out.push_str("# HELP lu_jobs_completed_total Total number of jobs completed per outcome\n");
     out.push_str("# TYPE lu_jobs_completed_total counter\n");

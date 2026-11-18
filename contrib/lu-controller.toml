@@ -28,6 +28,14 @@ token_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 name = "ops"
 token_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
+# Optional: mirror repositories on the controller and pin jobs for their URLs.
+# The credential file holds username:password or a token and must be mode 0600.
+# [[controller.repos]]
+# name = "app"
+# url = "https://git.example.net/team/app.git"
+# credential_file = "/etc/lu/app.credential"
+# refs = ["main", "release/*"]
+
 # A non-loopback listen address requires TLS. Install the certificate and key first;
 # the key must be a regular file owned by lu with mode 0600 or tighter.
 [tls]

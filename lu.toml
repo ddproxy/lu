@@ -17,6 +17,13 @@ token_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 name = "ops"
 token_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
+# Optional repository mirror and commit pinning:
+# [[controller.repos]]
+# name = "app"
+# url = "https://git.example.net/team/app.git"
+# credential_file = "/etc/lu/app.credential"   # username:password or a token
+# refs = ["main", "release/*"]
+
 # For an agent host, add an [agent] table instead (or in addition). Example:
 # [agent]
 # name = "node-a"

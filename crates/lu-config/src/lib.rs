@@ -66,6 +66,9 @@ pub struct ControllerConfig {
     pub agents: Vec<ControllerAgent>,
     #[serde(default)]
     pub operators: Vec<ControllerOperator>,
+    /// Repositories the controller mirrors and pins jobs to.
+    #[serde(default)]
+    pub repos: Vec<ControllerRepo>,
 }
 
 fn default_lease_secs() -> u64 {
@@ -112,6 +115,30 @@ pub enum BaseSource {
     /// Try the controller first and clone when it has no base to serve.
     #[default]
     Auto,
+}
+
+/// A repository the controller mirrors itself. Jobs whose `repo` matches `url` are pinned to a
+/// commit resolved from this mirror.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerRepo {
+    /// An `https` URL, or `file://` when `allow_file_urls` is true.
+    pub url: String,
+    /// A short label, also used as the mirror directory name.
+    pub name: String,
+    /// A private file holding `username:password` or a token line.
+    #[serde(default)]
+    pub credential_file: Option<String>,
+    /// Glob allow-list of refs to expose. Defaults to `["*"]`.
+    #[serde(default = "default_repo_refs")]
+    pub refs: Vec<String>,
+    /// Test-only escape hatch for local `file://` repositories.
+    #[serde(default)]
+    pub allow_file_urls: bool,
+}
+
+fn default_repo_refs() -> Vec<String> {
+    vec!["*".to_owned()]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -396,6 +423,36 @@ impl ControllerConfig {
             }
             onames.push(op.name.clone());
             ohashes.push(op.token_sha256.clone());
+        }
+        let mut reponames = Vec::new();
+        for (index, repo) in self.repos.iter().enumerate() {
+            let table = format!("[[controller.repos]] #{} ({})", index + 1, repo.name);
+            validate_name(&table, &repo.name)?;
+            if reponames.contains(&repo.name) {
+                return invalid(&table, "name is used by an earlier repository".to_owned());
+            }
+            reponames.push(repo.name.clone());
+            validate_repo_url(&table, &repo.url, repo.allow_file_urls)?;
+            if let Some(file) = &repo.credential_file {
+                if file.is_empty() {
+                    return invalid(&table, "credential_file must not be empty".to_owned());
+                }
+            }
+            if repo.refs.is_empty() {
+                return invalid(&table, "refs must not be empty; use [\"*\"]".to_owned());
+            }
+            for pattern in &repo.refs {
+                if pattern.is_empty()
+                    || pattern.len() > 256
+                    || pattern.chars().any(char::is_control)
+                {
+                    return invalid(
+                        &table,
+                        "each refs entry must be 1 to 256 characters without control characters"
+                            .to_owned(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -700,6 +757,32 @@ fn validate_loopback_http_url(table: &str, field: &str, url: &str) -> Result<(),
     Ok(())
 }
 
+fn validate_repo_url(table: &str, url: &str, allow_file_urls: bool) -> Result<(), ConfigError> {
+    if let Some(path) = url.strip_prefix("file://") {
+        if !allow_file_urls {
+            return invalid(
+                table,
+                "url must use https; file:// is allowed only with allow_file_urls = true"
+                    .to_owned(),
+            );
+        }
+        if !path.starts_with('/')
+            || path.contains('@')
+            || path.contains('?')
+            || path.contains('#')
+            || path.chars().any(char::is_control)
+        {
+            return invalid(table, "file url must name an absolute path".to_owned());
+        }
+        return Ok(());
+    }
+    let parsed = parse_http_url(url).map_err(|e| map_url_error(table, "url", e, url))?;
+    if !parsed.https {
+        return invalid(table, "url must use https".to_owned());
+    }
+    Ok(())
+}
+
 /// Reads and validates a config file. Refuses files over [`MAX_CONFIG_BYTES`] and secret files
 /// that group or others can read.
 /// The operator's own connection settings, read from `~/.config/lu/operator.toml`.
@@ -788,6 +871,17 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
         )?;
         if let Some(rt) = &agent.reiki_token_file {
             secret::read_private_file("[agent] reiki_token_file", Path::new(rt), MAX_CONFIG_BYTES)?;
+        }
+    }
+    if let Some(controller) = &config.controller {
+        for repo in &controller.repos {
+            if let Some(file) = &repo.credential_file {
+                secret::read_private_file(
+                    &format!("[[controller.repos]] ({}) credential_file", repo.name),
+                    Path::new(file),
+                    MAX_CONFIG_BYTES,
+                )?;
+            }
         }
     }
     Ok(config)
@@ -1221,6 +1315,70 @@ heartbeat_secs = 15
         assert!(Config::parse(&format!("{base}reiki_health_url=\"http://127.0.0.1:4100/v1/health\"\nreiki_token_file=\"/rt\"\n")).is_ok());
         expect_table(&format!("{base}reiki_health_url=\"http://example.net:4100/v1/health\"\nreiki_token_file=\"/rt\"\n"), "[agent]");
         expect_table(&format!("{base}reiki_token_file=\"/rt\"\n"), "[agent]");
+    }
+
+    #[test]
+    fn repo_urls_names_and_refs_are_validated() {
+        let base = |body: &str| {
+            format!(
+                "[controller]\nlisten=\"127.0.0.1:7600\"\ndb=\"/db\"\nartifacts_dir=\"/a\"\n[[controller.repos]]\n{body}"
+            )
+        };
+        assert!(Config::parse(&base(
+            "name=\"mirror\"\nurl=\"https://example.net/team/repo.git\"\n"
+        ))
+        .is_ok());
+        expect_table(
+            &base("name=\"mirror\"\nurl=\"http://example.net/team/repo.git\"\n"),
+            "[[controller.repos]] #1 (mirror)",
+        );
+        expect_table(
+            &base("name=\"mirror\"\nurl=\"https://user:pw@example.net/team/repo.git\"\n"),
+            "[[controller.repos]] #1 (mirror)",
+        );
+        expect_table(
+            &base("name=\"mirror\"\nurl=\"file:///srv/repo\"\n"),
+            "[[controller.repos]] #1 (mirror)",
+        );
+        assert!(Config::parse(&base(
+            "name=\"mirror\"\nurl=\"file:///srv/repo\"\nallow_file_urls=true\n"
+        ))
+        .is_ok());
+        let dup = format!(
+            "{}{}",
+            base("name=\"mirror\"\nurl=\"https://example.net/a.git\"\n"),
+            "[[controller.repos]]\nname=\"mirror\"\nurl=\"https://example.net/b.git\"\n"
+        );
+        let (table, reason) = invalid(Config::parse(&dup).unwrap_err());
+        assert_eq!(table, "[[controller.repos]] #2 (mirror)");
+        assert!(reason.contains("earlier repository"), "{reason}");
+        expect_table(
+            &base("name=\"mirror\"\nurl=\"https://example.net/a.git\"\nrefs=[]\n"),
+            "[[controller.repos]] #1 (mirror)",
+        );
+    }
+
+    #[test]
+    fn a_repo_credential_file_must_be_private_on_load() {
+        let dir = std::env::temp_dir().join(format!("lu-cfg-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cred = dir.join("credential");
+        std::fs::write(&cred, "user:password").unwrap();
+        std::fs::set_permissions(&cred, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let cfg = dir.join("c.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "[controller]\nlisten=\"127.0.0.1:1\"\ndb=\"/db\"\nartifacts_dir=\"/a\"\n[[controller.repos]]\nname=\"mirror\"\nurl=\"https://example.net/a.git\"\ncredential_file=\"{}\"\n",
+                cred.display()
+            ),
+        )
+        .unwrap();
+        assert!(matches!(load(&cfg), Err(ConfigError::InsecureFile { .. })));
+        std::fs::set_permissions(&cred, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(load(&cfg).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

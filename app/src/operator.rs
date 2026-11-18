@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use lu_client::{ApiError, Client, JobView, LogPage, NodeStats, NodeView, StatusView};
+use lu_client::{
+    ApiError, Client, JobView, ListRepos, LogPage, NodeStats, NodeView, RepoView, StatusView,
+};
 use lu_proto::{
     printable, truncate_chars, ArtifactName, FailureClass, HarnessState, JobId, JobSpec, JobState,
     NodeName, MAX_TASK_BYTES,
@@ -147,6 +149,15 @@ pub struct NodesArgs {}
 pub struct StatusArgs {}
 
 #[derive(Debug, clap::Args)]
+pub struct ReposArgs {}
+
+#[derive(Debug, clap::Args)]
+pub struct SyncArgs {
+    /// Repository name from the controller config.
+    pub name: String,
+}
+
+#[derive(Debug, clap::Args)]
 pub struct GraphArgs {
     /// Show only the component containing this job.
     #[arg(value_parser = parse_job_id)]
@@ -194,6 +205,14 @@ pub async fn nodes(args: NodesArgs, config: &Path, json: bool) -> ExitCode {
 
 pub async fn status(args: StatusArgs, config: &Path, json: bool) -> ExitCode {
     finish(status_inner(args, config, json).await)
+}
+
+pub async fn repos(args: ReposArgs, config: &Path, json: bool) -> ExitCode {
+    finish(repos_inner(args, config, json).await)
+}
+
+pub async fn sync_repo(args: SyncArgs, config: &Path, json: bool) -> ExitCode {
+    finish(sync_repo_inner(args, config, json).await)
 }
 
 pub async fn node(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
@@ -550,6 +569,39 @@ async fn status_inner(_args: StatusArgs, config: &Path, json: bool) -> Result<Ex
     }
     let status = client.status().await.map_err(|error| error.to_string())?;
     print_status(&status);
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn repos_inner(_args: ReposArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    if json {
+        let raw = client
+            .repos_raw()
+            .await
+            .map_err(|error| error.to_string())?;
+        print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let list = client.repos().await.map_err(|error| error.to_string())?;
+    print_repos(&list);
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn sync_repo_inner(args: SyncArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    if json {
+        let raw = client
+            .sync_repo_raw(&args.name)
+            .await
+            .map_err(|error| error.to_string())?;
+        print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let repo = client
+        .sync_repo(&args.name)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_repo(&repo);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -914,6 +966,39 @@ fn print_status(status: &StatusView) {
         })
         .collect();
     print_table(&["STATE", "COUNT"], rows);
+}
+
+fn print_repos(list: &ListRepos) {
+    let rows = list
+        .repos
+        .iter()
+        .map(|repo| {
+            vec![
+                display_field(&repo.name),
+                display_field(&repo.url),
+                optional_time(repo.synced_at),
+                repo.heads.len().to_string(),
+            ]
+        })
+        .collect();
+    print_table(&["NAME", "URL", "SYNCED", "HEADS"], rows);
+}
+
+fn print_repo(repo: &RepoView) {
+    print_pairs(&[
+        ("name", display_field(&repo.name)),
+        ("synced_at", optional_time(repo.synced_at)),
+    ]);
+    if repo.heads.is_empty() {
+        println!("heads  -");
+        return;
+    }
+    let rows = repo
+        .heads
+        .iter()
+        .map(|(branch, commit)| vec![display_field(branch), commit.clone()])
+        .collect();
+    print_indented_table(&["BRANCH", "COMMIT"], rows);
 }
 
 fn print_node(node: &NodeView) {

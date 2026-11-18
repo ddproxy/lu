@@ -28,6 +28,7 @@ At least one of `[controller]` and `[agent]` must be present. A file may contain
 | `local_repo_roots` | no | `[]` | Absolute local paths, without `..`, that the controller may read job bases from. Each must exist as a directory at startup. With no roots, `GET /v1/agent/jobs/{id}/base` returns `404`. |
 | `agents` | no | `[]` | Array of `[[controller.agents]]` tables. With no agent entries, no agent token can authenticate. |
 | `operators` | no | `[]` | Array of `[[controller.operators]]` tables. With no operator entries, no operator token can authenticate. |
+| `repos` | no | `[]` | Array of `[[controller.repos]]` tables. A repository listed here is mirrored by the controller and jobs for its `url` are pinned to a resolved commit. A repository not listed behaves as before. |
 
 ### `[[controller.agents]]`
 
@@ -47,6 +48,19 @@ A token must not work in both scopes. Reusing a hash across the two arrays is re
 
 For `base` requests, a job's `repo` is opened only when it is an absolute path resolving beneath a
 `local_repo_roots` entry (roots and candidates are canonicalised, so symlinks cannot escape).
+### `[[controller.repos]]`
+
+| Key | Required | Default | Validation |
+| --- | --- | --- | --- |
+| `url` | yes | — | `https` URL with a host and no userinfo (no `user:password@`). `http` is refused. A `file://` URL is accepted only with `allow_file_urls = true`. Jobs whose `repo` equals this string are pinned. |
+| `name` | yes | — | 1 to 64 characters from `A-Z a-z 0-9 . _ -`; unique among repositories. It also names the mirror directory. |
+| `credential_file` | no | — | Non-empty path when set. A private file holding `username:password` or a single token line, checked like `token_file` on `load` (regular file, owner-only, no symlink or FIFO, at most 8 KiB). The controller reads it only while fetching. The value never enters the git command line, a log or an error. |
+| `refs` | no | `["*"]` | Non-empty glob allow-list of branches and tags, using `*` and `?`. A ref outside the list resolves as unknown. |
+| `allow_file_urls` | no | `false` | Test-only. Allows `file://` repository URLs; do not enable it in production. |
+
+Each mirror is a bare repository at `<artifacts_dir>/../mirrors/<name>.git`; the `mirrors` directory is created mode `0700`. A sync fetches every branch and tag and is limited to 5 minutes and 10 GiB. The controller fetches with `git` using only the configured transport, no terminal prompts, no system or global config, no hooks and no inherited askpass or command-transport variables. `credential_file` is supplied through a short-lived private askpass helper that is removed after the fetch.
+
+A job submitted for a configured repository is pinned in `base_commit` to the commit its `git_ref` names. The controller syncs first when the mirror has never been synced, is older than 60 seconds, or does not know the ref. An unknown ref is `422 unprocessable` and names the ref. Jobs for repositories not in this list are unchanged.
 
 ## `[agent]`
 
@@ -91,12 +105,13 @@ A `[tls]` table makes the controller serve HTTPS. It is required when `listen` i
 
 - At least one of `[controller]` and `[agent]` must exist.
 - Every `token_sha256` must be unique across all agents and operators.
-- Agent and operator names are unique within their own arrays.
+- Agent, operator and repository names are unique within their own arrays.
 - When both tables are present, `heartbeat_secs * 2 < lease_secs`.
 
 ## Paths and secret files
 
 - `db`, `artifacts_dir`, `work_dir` and each `local_repo_roots` entry must be absolute and must not contain a `..` component. `[tls]` paths, `token_file`, `ca_file`, `reiki_token_file` and `[log] file` are not required to be absolute.
+- `db`, `artifacts_dir` and `work_dir` must be absolute and must not contain a `..` component. `[tls]` paths, `token_file`, `ca_file`, `reiki_token_file`, `credential_file` and `[log] file` are not required to be absolute.
 - Secret files are opened once with `O_NOFOLLOW` and `O_NONBLOCK`, then checked on the open handle. They must be regular files, owned by the effective user, with no group or other permission bits (mode `0600` or tighter). A file with mode `0640` is refused for a secret.
 - The config file itself has no secret-file mode check; it normally contains only hashes and paths. Protect it anyway because it names the token and TLS key locations.
 
@@ -119,6 +134,12 @@ token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 [[controller.operators]]
 name = "ops"
 token_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[controller.repos]]
+name = "app"
+url = "https://git.example.net/team/app.git"
+credential_file = "/etc/lu/app.credential" # optional; username:password or a token
+refs = ["main", "release/*"]
 ```
 
 Minimal agent:

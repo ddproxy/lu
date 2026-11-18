@@ -61,6 +61,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(operator::get_artifact),
         )
         .route("/v1/status", get(status::status))
+        .route("/v1/repos", get(operator::list_repos))
+        .route(
+            "/v1/repos/{name}/sync",
+            post(operator::sync_repo).layer(op_json),
+        )
         .route("/v1/nodes", get(operator::list_nodes))
         .route("/v1/nodes/{name}/stats", get(operator::get_node_stats))
         .route(

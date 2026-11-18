@@ -892,6 +892,75 @@ async fn status_prints_a_summary_and_json_prints_the_raw_body() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repos_and_sync_render_text_and_json() {
+    let repos = json!({"repos": [
+        {"name": "mirror", "url": "https://example.net/team/repo.git", "synced_at": 42, "heads": {"main": "abcdef"}},
+        {"name": "idle", "url": "https://example.net/other.git", "synced_at": null, "heads": {}}
+    ]});
+    let synced = json!({"name": "mirror", "synced_at": 50, "heads": {"main": "abcdef"}});
+    let repos_expected = repos.to_string();
+    let sync_expected = synced.to_string();
+    let server = start(move |record| {
+        if record.path == "/v1/repos" {
+            Reply::json(&repos)
+        } else {
+            Reply::json(&synced)
+        }
+    })
+    .await;
+    let dir = scratch("repos");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+
+    let output = run_with_env(&["repos"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    let header = text.lines().next().unwrap();
+    assert!(header.starts_with("NAME"), "{text}");
+    assert!(header.contains("URL"), "{text}");
+    assert!(header.contains("SYNCED"), "{text}");
+    assert!(header.contains("HEADS"), "{text}");
+    assert!(text.contains("mirror"), "{text}");
+    assert!(text.contains("idle"), "{text}");
+
+    let output = run_with_env(&["--json", "repos"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{repos_expected}\n"));
+
+    let output = run_with_env(&["sync", "mirror"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.lines()
+            .any(|line| line.split_whitespace().collect::<Vec<_>>() == ["name", "mirror"]),
+        "{text}"
+    );
+    assert!(text.contains("main"), "{text}");
+    assert!(text.contains("abcdef"), "{text}");
+
+    let output = run_with_env(&["--json", "sync", "mirror"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{sync_expected}\n"));
+
+    let records = server.records.lock().unwrap();
+    let calls: Vec<(&str, &str)> = records
+        .iter()
+        .map(|record| (record.method.as_str(), record.path.as_str()))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            ("GET", "/v1/repos"),
+            ("GET", "/v1/repos"),
+            ("POST", "/v1/repos/mirror/sync"),
+            ("POST", "/v1/repos/mirror/sync"),
+        ]
+    );
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn node_prints_host_numbers_and_indented_process_tree() {
     let id = job_id();
     let stats = json!({

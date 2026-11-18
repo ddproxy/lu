@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use crate::error::{body_excerpt, ApiError};
 use crate::types::{
-    CompletionBody, DependencyView, JobView, ListJobs, ListNodes, LogPage, NodeStats, NodeView,
-    PollRequest, StatusView, MAX_JSON_BYTES,
+    CompletionBody, DependencyView, JobView, ListJobs, ListNodes, ListRepos, LogPage, NodeStats,
+    NodeView, PollRequest, RepoView, StatusView, MAX_JSON_BYTES,
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -391,6 +391,53 @@ impl Client {
             .await?;
         let reply = self.success(reply)?;
         Ok(raw_body(&reply))
+    }
+
+    /// The configured repository mirrors, with their last sync and branch heads.
+    pub async fn repos(&self) -> Result<ListRepos> {
+        let reply = self
+            .send(Method::GET, "v1/repos", None, &[], &[], true)
+            .await?;
+        let reply = self.success(reply)?;
+        self.scrub(
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode the repository list: {error}"),
+            }),
+        )
+    }
+
+    /// The raw repository list response.
+    pub async fn repos_raw(&self) -> Result<String> {
+        let reply = self
+            .send(Method::GET, "v1/repos", None, &[], &[], true)
+            .await?;
+        let reply = self.success(reply)?;
+        Ok(raw_body(&reply))
+    }
+
+    /// Syncs one configured repository mirror.
+    pub async fn sync_repo(&self, name: &str) -> Result<RepoView> {
+        let reply = self.sync_repo_reply(name).await?;
+        self.scrub(
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode the sync result: {error}"),
+            }),
+        )
+    }
+
+    /// The raw sync response.
+    pub async fn sync_repo_raw(&self, name: &str) -> Result<String> {
+        let reply = self.sync_repo_reply(name).await?;
+        Ok(raw_body(&reply))
+    }
+
+    async fn sync_repo_reply(&self, name: &str) -> Result<HttpReply> {
+        check_repo_name(name)?;
+        let route = format!("v1/repos/{name}/sync");
+        let reply = self
+            .send(Method::POST, &route, None, &[], &[], false)
+            .await?;
+        self.success(reply)
     }
 
     /// The latest host and job stats the controller holds for a node. Unknown nodes are
@@ -1096,6 +1143,20 @@ fn retry_after(reply: &HttpReply) -> Option<u64> {
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok())
+}
+
+fn check_repo_name(name: &str) -> Result<()> {
+    let ok = (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::Config {
+            message: "repository name must be 1 to 64 characters from A-Z a-z 0-9 . _ -".to_owned(),
+        })
+    }
 }
 
 fn parse_job(body: &[u8]) -> Result<JobView> {

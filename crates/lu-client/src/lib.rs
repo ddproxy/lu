@@ -15,8 +15,9 @@ mod types;
 pub use client::{Client, ClientOptions, Controller};
 pub use error::ApiError;
 pub use types::{
-    CompletionBody, DependencyView, HostStats, JobStats, JobView, ListJobs, ListNodes, LogPage,
-    NodeStats, NodeView, PollReply, PollRequest, ProcessStats, StatusView, MAX_JSON_BYTES,
+    CompletionBody, DependencyView, HostStats, JobStats, JobView, ListJobs, ListNodes, ListRepos,
+    LogPage, NodeStats, NodeView, PollReply, PollRequest, ProcessStats, RepoView, StatusView,
+    MAX_JSON_BYTES,
 };
 
 /// Canonical paths, exactly as documented in docs/api.md; the client sends each of these and
@@ -28,6 +29,8 @@ pub mod routes {
     pub const ARTIFACT: &str = "/v1/jobs/{id}/artifacts/{name}";
     pub const CANCEL: &str = "/v1/jobs/{id}/cancel";
     pub const STATUS: &str = "/v1/status";
+    pub const REPOS: &str = "/v1/repos";
+    pub const REPO_SYNC: &str = "/v1/repos/{name}/sync";
     pub const NODES: &str = "/v1/nodes";
     pub const NODE_STATS: &str = "/v1/nodes/{node}/stats";
     pub const DRAIN: &str = "/v1/nodes/{node}/{action}";

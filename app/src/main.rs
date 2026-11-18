@@ -43,6 +43,10 @@ enum Command {
     Status(operator::StatusArgs),
     /// Serve the Model Context Protocol over stdio (read tools).
     Mcp,
+    /// List the repositories the controller mirrors.
+    Repos(operator::ReposArgs),
+    /// Sync one repository mirror.
+    Sync(operator::SyncArgs),
     /// Run the HTTP listener. This is the default.
     Serve,
     /// Live terminal view of the nodes and recent jobs. Needs a build with the `tui` feature.
@@ -92,6 +96,8 @@ async fn main() -> ExitCode {
         },
         Command::Status(args) => operator::status(args, &cli.config, json).await,
         Command::Mcp => mcp::run(&cli.config).await,
+        Command::Repos(args) => operator::repos(args, &cli.config, json).await,
+        Command::Sync(args) => operator::sync_repo(args, &cli.config, json).await,
         Command::Serve => serve(&cli.config).await,
         #[cfg(feature = "tui")]
         Command::Top(args) => match top::run(&cli.config, args, json).await {

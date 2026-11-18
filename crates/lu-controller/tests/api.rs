@@ -1,6 +1,6 @@
 use git2::{Repository, Signature};
 use lu_auth::sha256_hex;
-use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator};
+use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator, ControllerRepo};
 use lu_controller::{build_router, run_background, AppState};
 use lu_proto::{JobId, JobSpec, MAX_AFTER_JOBS, MAX_LOG_BYTES};
 use lu_serve::{serve, ServeOptions};
@@ -8,6 +8,8 @@ use lu_store::sqlite::SqliteStore;
 use lu_store::Store;
 use serde_json::json;
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,6 +46,7 @@ fn controller_cfg(db: &str, artifacts_dir: &str) -> ControllerConfig {
             name: "ops".to_owned(),
             token_sha256: sha256_hex(OP_TOKEN),
         }],
+        repos: Vec::new(),
     }
 }
 
@@ -62,11 +65,24 @@ async fn start_server() -> TestServer {
 }
 
 async fn start_server_with(roots: Vec<String>, pack_cap: Option<usize>) -> TestServer {
+    start_server_full(roots, pack_cap, Vec::new()).await
+}
+
+async fn start_server_with_repos(repos: Vec<ControllerRepo>) -> TestServer {
+    start_server_full(Vec::new(), None, repos).await
+}
+
+async fn start_server_full(
+    roots: Vec<String>,
+    pack_cap: Option<usize>,
+    repos: Vec<ControllerRepo>,
+) -> TestServer {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("lu.db");
     let artifacts_dir = tmp.path().join("artifacts");
     let mut cfg = controller_cfg(db.to_str().unwrap(), artifacts_dir.to_str().unwrap());
     cfg.local_repo_roots = roots;
+    cfg.repos = repos;
     let store = Arc::new(SqliteStore::open(&db).unwrap());
     let mut state = AppState::from_config(&cfg, store.clone()).unwrap();
     state.max_pack_bytes = pack_cap.unwrap_or(lu_staging::PACK_CAP_BYTES);
@@ -783,6 +799,75 @@ async fn graceful_shutdown_ends_waiting_polls() {
     // server may end connection or return 204/empty response depending on shutdown timing; key is no leak/hang.
     // If it returned a response, it should be valid HTTP status or empty due to connection close.
     let _ = resp;
+}
+
+fn local_repo(path: &Path) -> (String, String, String) {
+    use git2::{IndexAddOption, Repository, Signature};
+
+    let repo = Repository::init(path).unwrap();
+    // The default branch name depends on the machine's git config, so name it explicitly.
+    repo.set_head("refs/heads/main").unwrap();
+    let file = path.join("file.txt");
+    std::fs::write(&file, "one\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let signature = Signature::now("lu", "lu@example.net").unwrap();
+    let first = repo
+        .commit(Some("HEAD"), &signature, &signature, "first", &tree, &[])
+        .unwrap();
+    let first_commit = repo.find_commit(first).unwrap();
+    repo.tag_lightweight("v1", first_commit.as_object(), false)
+        .unwrap();
+    std::fs::write(&file, "two\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let second = repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "second",
+            &tree,
+            &[&first_commit],
+        )
+        .unwrap();
+    (
+        format!("file://{}", path.display()),
+        first.to_string(),
+        second.to_string(),
+    )
+}
+
+fn repo_entry(url: &str) -> ControllerRepo {
+    ControllerRepo {
+        url: url.to_owned(),
+        name: "local".to_owned(),
+        credential_file: None,
+        refs: vec!["*".to_owned()],
+        allow_file_urls: true,
+    }
+}
+
+fn operator_get(path: &str) -> String {
+    format!(
+        "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"
+    )
+}
+
+fn operator_post(path: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n"
+    )
 }
 
 async fn post_job(addr: SocketAddr, spec: &JobSpec) -> String {
@@ -1713,6 +1798,38 @@ async fn base_route_serves_a_pack_with_auth_node_and_epoch_fencing() {
 }
 
 #[tokio::test]
+async fn a_mirrored_repository_pins_at_submit_and_serves_its_base_from_the_mirror() {
+    let repo_tmp = tempfile::tempdir().unwrap();
+    let (url, _first, second) = local_repo(repo_tmp.path());
+    let srv = start_server_with_repos(vec![repo_entry(&url)]).await;
+
+    let r = raw_request(srv.addr, &operator_post("/v1/repos/local/sync")).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let mut spec = sample_spec(None);
+    spec.repo = url.clone();
+    spec.git_ref = "main".to_owned();
+    let (id, epoch) = assigned_epoch(&srv, &spec).await;
+
+    let r = base_request(srv.addr, &id, epoch, AGENT_A_TOKEN).await;
+    assert_eq!(
+        response_status(&r),
+        200,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
+    assert_eq!(
+        response_header(&r, "x-lu-base-commit").as_deref(),
+        Some(second.as_str())
+    );
+    assert!(
+        response_body(&r).starts_with(b"PACK"),
+        "pack header missing"
+    );
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
 async fn base_route_is_404_without_a_provider_and_413_over_the_cap() {
     let srv = start_server().await;
     let mut spec = sample_spec(None);
@@ -1744,5 +1861,89 @@ async fn base_route_is_404_without_a_provider_and_413_over_the_cap() {
         "{:?}",
         String::from_utf8_lossy(&r)
     );
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn configured_repositories_sync_list_and_pin_branch_tag_and_commit() {
+    let repo_tmp = tempfile::tempdir().unwrap();
+    let (url, first, second) = local_repo(repo_tmp.path());
+    let srv = start_server_with_repos(vec![repo_entry(&url)]).await;
+
+    let r = raw_request(srv.addr, &operator_get("/v1/repos")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let listed: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(listed["repos"][0]["name"], "local");
+    assert_eq!(listed["repos"][0]["url"], url);
+    assert!(listed["repos"][0]["synced_at"].is_null(), "{listed}");
+    assert_eq!(listed["repos"][0]["heads"], json!({}));
+
+    let r = raw_request(srv.addr, &operator_post("/v1/repos/local/sync")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let synced: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(synced["name"], "local");
+    assert_eq!(synced["heads"]["main"], second);
+    assert!(synced["synced_at"].as_i64().unwrap() > 0, "{synced}");
+
+    let mut spec = sample_spec(None);
+    spec.repo = url.clone();
+    spec.git_ref = "main".to_owned();
+    let r = post_job(srv.addr, &spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["spec"]["base_commit"], second);
+
+    spec.git_ref = "v1".to_owned();
+    let r = post_job(srv.addr, &spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["spec"]["base_commit"], first);
+
+    spec.git_ref = first.clone();
+    let r = post_job(srv.addr, &spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["spec"]["base_commit"], first);
+
+    spec.git_ref = "missing-branch".to_owned();
+    let r = post_job(srv.addr, &spec).await;
+    assert_eq!(status(&r), 422, "{r}");
+    assert!(body_str(&r).contains("missing-branch"), "{r}");
+
+    let r = post_job(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let unlisted: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert!(unlisted["spec"].get("base_commit").is_none(), "{unlisted}");
+
+    let r = raw_request(srv.addr, &operator_get("/v1/repos")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let listed: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert!(listed["repos"][0]["synced_at"].as_i64().unwrap() > 0);
+    assert_eq!(listed["repos"][0]["heads"]["main"], second);
+
+    let r = raw_request(
+        srv.addr,
+        &format!("POST /v1/repos/local/sync HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: 0\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&r), 401, "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn a_sync_error_never_contains_the_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = repo_entry(&format!("file://{}/missing", tmp.path().display()));
+    let credential = tmp.path().join("credential");
+    std::fs::write(&credential, "user:super-secret-token\n").unwrap();
+    std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+    repo.credential_file = Some(credential.display().to_string());
+    let srv = start_server_with_repos(vec![repo]).await;
+
+    let r = raw_request(srv.addr, &operator_post("/v1/repos/local/sync")).await;
+    assert_eq!(status(&r), 500, "{r}");
+    assert!(!r.contains("super-secret-token"), "{r}");
+    assert!(!r.contains("user:super-secret-token"), "{r}");
     let _ = srv.shutdown.send(());
 }

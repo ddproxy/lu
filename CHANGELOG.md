@@ -57,6 +57,14 @@ uses semantic versioning once it reaches 1.0.
   `GET /v1/agent/jobs/{id}/deps/{dep}/diff` serve the ordered dependency list and their diffs.
   `JobSpec.stack_dependencies` defaults to `true` and is omitted from JSON when true, so older
   agents keep working against a new controller.
+### Added
+
+- Optional `[[controller.repos]]` entries (`url`, `name`, optional `credential_file` and `refs`) make the controller keep a bare mirror under `<artifacts_dir>/../mirrors/<name>.git` and pin each job for that URL to a resolved commit. `POST /v1/repos/{name}/sync`, `GET /v1/repos`, `lu sync <name>` and `lu repos` expose the mirrors; `lu_repo_last_sync_seconds{repo}` reports their age.
+- `JobSpec` gains an optional `base_commit` (40 hex characters), serialised only when set. The controller fills it for a configured repository; an unknown ref is `422` naming the ref. The agent ignores it for now.
+
+### Changed
+
+- Deserialising a `JobSpec` now ignores unknown fields, so an older controller accepts a newer client's additive fields. Other request bodies still reject unknown fields.
 
 ## [0.1.13] - 2026-11-17
 

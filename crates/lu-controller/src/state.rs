@@ -1,4 +1,5 @@
 use crate::auth::AuthConfig;
+use crate::mirror::Mirror;
 use crate::repo::{LocalPathProvider, RepoProvider};
 use crate::wait::Waiters;
 use lu_auth::{LoginThrottle, ThrottleSettings};
@@ -28,6 +29,7 @@ pub struct AppState {
     pub repo_providers: Vec<Arc<dyn RepoProvider>>,
     /// Cap applied when generating a base pack.
     pub max_pack_bytes: usize,
+    pub mirror: Arc<Mirror>,
     pub lease_secs: u64,
     pub recovery_grace_secs: u64,
     pub provider_cooldown_secs: u64,
@@ -63,6 +65,9 @@ impl AppState {
         if !cfg.local_repo_roots.is_empty() {
             repo_providers.push(Arc::new(LocalPathProvider::new(&cfg.local_repo_roots)?));
         }
+        let mirror = Arc::new(Mirror::from_config(cfg)?);
+        // A mirrored repository serves its pinned base from the mirror, after any local path root.
+        repo_providers.push(mirror.clone());
         Ok(Self {
             store,
             db_path: PathBuf::from(&cfg.db),
@@ -75,6 +80,7 @@ impl AppState {
             artifacts_dir: PathBuf::from(&cfg.artifacts_dir),
             repo_providers,
             max_pack_bytes: lu_staging::PACK_CAP_BYTES,
+            mirror,
             lease_secs,
             recovery_grace_secs: cfg.recovery_grace_secs,
             provider_cooldown_secs: cfg.provider_cooldown_secs,

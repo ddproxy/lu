@@ -70,7 +70,6 @@ pub struct JobSpec {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawJobSpec {
     repo: String,
     git_ref: String,
@@ -427,10 +426,29 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_are_refused() {
+    fn an_old_style_spec_without_base_commit_still_deserialises() {
+        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let spec: JobSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.base_commit, None);
+        assert!(!spec.canonical_json().contains("base_commit"));
+    }
+
+    #[test]
+    fn a_pinned_spec_serialises_and_round_trips_base_commit() {
+        let mut spec = sample();
+        spec.base_commit = Some("0123456789abcdef0123456789abcdef01234567".to_owned());
+        let json = spec.canonical_json();
+        assert!(json.contains("base_commit"));
+        let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, spec);
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored_for_forward_compatibility() {
         let json =
             r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go","surprise":1}"#;
-        assert!(serde_json::from_str::<JobSpec>(json).is_err());
+        let spec: JobSpec = serde_json::from_str(json).unwrap();
+        assert!(spec.validate().is_ok());
     }
 
     #[test]
