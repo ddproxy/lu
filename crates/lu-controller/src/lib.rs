@@ -3,6 +3,7 @@
 pub mod app;
 pub mod auth;
 pub mod error;
+pub mod repo;
 pub mod routes;
 pub mod state;
 pub mod time;

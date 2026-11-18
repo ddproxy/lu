@@ -20,6 +20,7 @@ tokio = { workspace = true, features = ["macros", "process", "rt", "sync", "time
 tracing.workspace = true
 
 [dev-dependencies]
+git2 = { version = "0.21", default-features = false }
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
 tempfile = "3"
 lu-proto = { path = "../lu-proto" }

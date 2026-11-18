@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lu_client::{ApiError, Controller};
-use lu_config::AgentConfig;
+use lu_config::{AgentConfig, BaseSource};
 use lu_proto::{
     printable, truncate_chars, AgentEvent, ArtifactName, Completion, FailureClass, HarnessState,
     Heartbeat, JobId, JobSpec, JobStats, NodeName, Outcome, ProviderState, MAX_DIFF_BYTES,
@@ -132,6 +132,7 @@ pub struct Agent {
     node: NodeName,
     controller: Arc<dyn Controller>,
     staging: Staging,
+    base_source: BaseSource,
     work_dir: PathBuf,
     heartbeat_secs: u64,
     /// How long the harness may stay silent after a provider marker before it is stopped.
@@ -209,6 +210,7 @@ impl Agent {
             node,
             controller,
             staging,
+            base_source: config.base_source,
             work_dir,
             heartbeat_secs: config.heartbeat_secs,
             provider_marker_grace: PROVIDER_MARKER_GRACE,
@@ -358,6 +360,45 @@ impl Agent {
         request
     }
 
+    /// Fetches the base pack when the job names one and the configured source allows it.
+    /// A controller-mode miss is a node failure; `auto` silently falls back to cloning.
+    async fn fetch_base(
+        &self,
+        job_id: &JobId,
+        epoch: u64,
+        commit: Option<&str>,
+    ) -> Result<Option<(String, Vec<u8>)>, AgentError> {
+        let Some(commit) = commit else {
+            return Ok(None);
+        };
+        if self.base_source == BaseSource::Clone {
+            return Ok(None);
+        }
+        match self.controller.job_base(job_id, epoch).await {
+            Ok(Some((got, pack))) => {
+                if got != commit {
+                    return Err(AgentError::Controller(format!(
+                        "controller returned base {got}, expected {commit}"
+                    )));
+                }
+                Ok(Some((got, pack)))
+            }
+            Ok(None) | Err(ApiError::NotFound) => match self.base_source {
+                BaseSource::Controller => Err(AgentError::Controller(
+                    "controller has no base for the job".to_owned(),
+                )),
+                BaseSource::Auto => {
+                    info!(job = %job_id, "controller has no base; cloning instead");
+                    Ok(None)
+                }
+                BaseSource::Clone => Ok(None),
+            },
+            Err(error) => Err(fatal_error(&error).unwrap_or_else(|| {
+                AgentError::Controller(format!("could not fetch the base: {error}"))
+            })),
+        }
+    }
+
     async fn run_job<F>(
         &self,
         job_id: JobId,
@@ -385,16 +426,23 @@ impl Agent {
             return Ok(JobEnd::Finished);
         }
 
-        let source = if spec.repo.starts_with('/') {
-            Source::Path(PathBuf::from(&spec.repo))
-        } else {
-            Source::Url(spec.repo.clone())
-        };
-        let staged = match self.staging.stage(StageRequest {
+        let request = StageRequest {
             job_id: job_id.to_string(),
-            source,
+            source: if spec.repo.starts_with('/') {
+                Source::Path(PathBuf::from(&spec.repo))
+            } else {
+                Source::Url(spec.repo.clone())
+            },
             git_ref: spec.git_ref.clone(),
-        }) {
+        };
+        let base = self
+            .fetch_base(&job_id, epoch, spec.base_commit.as_deref())
+            .await?;
+        let staged = match base {
+            Some((commit, pack)) => self.staging.stage_from_pack(request, &commit, &pack),
+            None => self.staging.stage(request),
+        };
+        let staged = match staged {
             Ok(staged) => staged,
             Err(error) => {
                 let summary = format!("staging failed: {error}");

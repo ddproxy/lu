@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-11-18
+
 ### Fixed
 
 - A provider failure cordon created from Reiki's `retry_after_secs` now clears after two consecutive healthy provider heartbeats, so a stale outage estimate no longer leaves jobs queued for hours. Non-healthy readings reset the streak; output-marker cordons still wait out their timer. Store schema version is 3; older databases upgrade with their existing cordons unchanged.
@@ -22,6 +24,11 @@ uses semantic versioning once it reaches 1.0.
 ### Added
 
 - `lu mcp`: a stdio Model Context Protocol server with read-only tools for controller status, jobs, one job's detail, logs, nodes and the dependency graph.
+### Added
+
+- A job spec may carry a 40-hex `base_commit`. The controller can serve that commit as a git pack (commit and tree, no parents) at `GET /v1/agent/jobs/{id}/base?epoch=N` for the job's node and epoch. Packs over 256 MiB get `413`.
+- `[controller].local_repo_roots` allows absolute local repositories to be served as bases; it is empty by default. `[agent].base_source` is `auto` by default: try the controller then clone on `404`; `controller` fails as a node failure on `404`, and `clone` never asks.
+- `lu-staging` can stage from a controller pack with `git2`, without a `git` binary or forge network access. The checkout keeps the same permissions and group sharing as a clone, and `export_diff` is unchanged.
 
 ## [0.1.13] - 2026-11-17
 

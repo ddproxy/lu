@@ -218,6 +218,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
     let spec = JobSpec {
         repo: args.repo,
         git_ref: args.git_ref,
+        base_commit: None,
         task,
         harness: args.harness,
         provider: args.provider,

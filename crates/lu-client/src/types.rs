@@ -324,6 +324,7 @@ fn empty_spec() -> JobSpec {
     JobSpec {
         repo: String::new(),
         git_ref: String::new(),
+        base_commit: None,
         task: String::new(),
         harness: "opencode".to_owned(),
         provider: None,

@@ -7,10 +7,11 @@ use crate::routes::{
 use crate::state::AppState;
 use crate::time::now;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lu_proto::{ArtifactName, Completion, Heartbeat, JobId, NodeStats};
 use lu_serve::PeerAddr;
+use lu_staging::{pack_commit_capped, StageError};
 use serde::Deserialize;
 use serde_json::json;
 use std::io::Cursor;
@@ -28,6 +29,11 @@ struct PollBody {
 #[serde(deny_unknown_fields)]
 struct EpochBody {
     epoch: u64,
+}
+
+enum BasePackError {
+    Provider(String),
+    Pack(StageError),
 }
 
 // query params parsed manually from URI to avoid axum "query" feature dependency
@@ -621,6 +627,96 @@ pub async fn put_report_artifact(
     req: axum::extract::Request,
 ) -> Response {
     put_artifact_impl(state, peer, headers, id, "report.json", uri, req).await
+}
+
+/// Serves a job's base commit as a git pack. The commit is fenced by the job's node and epoch.
+pub async fn job_base(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    uri: axum::http::Uri,
+) -> Response {
+    let node = match authenticate_agent(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(n) => n,
+        Err(e) => return with_version(e.into_response()),
+    };
+    let job_id = match JobId::parse(&id) {
+        Ok(i) => i,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let rec = {
+        let store = Arc::clone(&state.store);
+        let jid = job_id.clone();
+        match tokio::task::spawn_blocking(move || store.get_job(&jid)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return with_version(store_err(e).into_response()),
+            Err(_) => return with_version(ApiError::internal().into_response()),
+        }
+    };
+    if rec.node.as_ref() != Some(&node) {
+        return with_version(ApiError::forbidden("forbidden").into_response());
+    }
+    let q = crate::routes::parse_query(&uri);
+    let Some(epoch) = q.get("epoch").and_then(|s| s.parse::<u64>().ok()) else {
+        return with_version(ApiError::bad_request("missing or invalid epoch").into_response());
+    };
+    if rec.epoch != epoch {
+        return with_version(ApiError::stale_epoch().into_response());
+    }
+    let Some(commit_id) = rec.spec.base_commit.as_deref() else {
+        return with_version(ApiError::not_found("no base commit").into_response());
+    };
+    let Ok(oid) = git2::Oid::from_str(commit_id) else {
+        return with_version(ApiError::not_found("invalid base commit").into_response());
+    };
+
+    let packed = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let repo = rec.spec.repo.clone();
+        let cap = state.max_pack_bytes;
+        move || -> Result<Option<Vec<u8>>, BasePackError> {
+            for provider in &state.repo_providers {
+                let repository = provider.open(&repo).map_err(BasePackError::Provider)?;
+                if let Some(repository) = repository {
+                    let bytes =
+                        pack_commit_capped(&repository, oid, cap).map_err(BasePackError::Pack)?;
+                    return Ok(Some(bytes));
+                }
+            }
+            Ok(None)
+        }
+    })
+    .await;
+
+    match packed {
+        Ok(Ok(Some(pack))) => with_version(
+            (
+                [
+                    (header::CONTENT_TYPE, "application/x-git-pack"),
+                    (
+                        header::HeaderName::from_static("x-lu-base-commit"),
+                        commit_id,
+                    ),
+                ],
+                pack,
+            )
+                .into_response(),
+        ),
+        Ok(Ok(None)) => with_version(ApiError::not_found("base not available").into_response()),
+        Ok(Err(BasePackError::Provider(message))) => {
+            tracing::warn!(%message, "base provider failed");
+            with_version(ApiError::internal().into_response())
+        }
+        Ok(Err(BasePackError::Pack(StageError::PackTooLarge { .. }))) => {
+            with_version(ApiError::too_large("base pack too large").into_response())
+        }
+        Ok(Err(BasePackError::Pack(error))) => {
+            tracing::warn!(%error, "could not pack base commit");
+            with_version(ApiError::internal().into_response())
+        }
+        Err(_) => with_version(ApiError::internal().into_response()),
+    }
 }
 
 /// The agent's estimate of when the provider returns, kept within sane bounds, replaces the

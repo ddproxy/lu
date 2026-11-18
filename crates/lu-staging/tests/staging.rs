@@ -1,6 +1,13 @@
-use lu_staging::{ArtifactDir, ArtifactFile, JobId, Source, StageError, StageRequest, Staging};
+use git2::{Repository, Signature};
+use lu_staging::{
+    pack_commit, pack_commit_capped, ArtifactDir, ArtifactFile, JobId, Source, StageError,
+    StageRequest, Staging,
+};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -113,7 +120,6 @@ fn stage_from_local_repository() {
     );
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(staged.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
     }
@@ -355,7 +361,6 @@ fn clean_readonly_file_missing_and_clean_all_except() {
     fs::write(&ro, "x").unwrap();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&ro, fs::Permissions::from_mode(0o400)).unwrap();
     }
     staging.clean("job-ro").unwrap();
@@ -427,7 +432,6 @@ fn artifact_dir_create_write_cap_rename_and_no_partial() {
     assert!(dir.is_dir());
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
     }
@@ -446,7 +450,6 @@ fn artifact_dir_create_write_cap_rename_and_no_partial() {
     assert_eq!(fs::read(dir.join("diff.patch")).unwrap(), b"patch");
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(dir.join("diff.patch"))
             .unwrap()
             .permissions()
@@ -721,7 +724,6 @@ fn artifact_temp_removed_on_failure_modes_checked() {
     let dir = ad.create("job-art2").unwrap();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
     }
@@ -905,4 +907,174 @@ fn a_group_is_found_by_name_or_number() {
     assert!(lu_staging::resolve_group_in(&file, "staff").is_err());
     assert!(lu_staging::resolve_group_in(&file, "nobody-here").is_err());
     let _ = fs::remove_dir_all(dir);
+}
+
+/// A repository with history, nested directories, a symlink, an executable and a binary blob.
+fn make_tree_repo() -> (PathBuf, git2::Oid, git2::Oid) {
+    let dir = unique_temp_dir("packrepo");
+    let repo = Repository::init(&dir).unwrap();
+    fs::create_dir_all(dir.join("nested/deep")).unwrap();
+    fs::write(dir.join("hello.txt"), "hello\n").unwrap();
+    fs::write(dir.join("nested/deep/note.txt"), "note\n").unwrap();
+    fs::write(dir.join("nested/deep/data.bin"), [0u8, 1, 2, 255, 128]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        fs::write(dir.join("run.sh"), "#!/bin/sh\necho ok\n").unwrap();
+        fs::set_permissions(dir.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("hello.txt", dir.join("link")).unwrap();
+    }
+    let sig = Signature::now("Test", "test@example.net").unwrap();
+    let mut index = repo.index().unwrap();
+    let names: &[&str] = if cfg!(unix) {
+        &[
+            "hello.txt",
+            "nested/deep/note.txt",
+            "nested/deep/data.bin",
+            "run.sh",
+            "link",
+        ]
+    } else {
+        &["hello.txt", "nested/deep/note.txt", "nested/deep/data.bin"]
+    };
+    for name in names {
+        index.add_path(Path::new(name)).unwrap();
+    }
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let parent = repo
+        .commit(Some("HEAD"), &sig, &sig, "parent", &tree, &[])
+        .unwrap();
+    fs::write(dir.join("later.txt"), "later\n").unwrap();
+    index.add_path(Path::new("later.txt")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let parent_commit = repo.find_commit(parent).unwrap();
+    let head = repo
+        .commit(Some("HEAD"), &sig, &sig, "head", &tree, &[&parent_commit])
+        .unwrap();
+    (dir, parent, head)
+}
+
+fn tree_contents(root: &Path) -> BTreeMap<String, (u8, Vec<u8>)> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, (u8, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if meta.file_type().is_symlink() {
+                let target = fs::read_link(&path).unwrap();
+                out.insert(rel, (1, target.to_string_lossy().as_bytes().to_vec()));
+            } else if meta.is_dir() {
+                walk(root, &path, out);
+            } else {
+                #[cfg(unix)]
+                let exec = (meta.permissions().mode() & 0o111) != 0;
+                #[cfg(not(unix))]
+                let exec = false;
+                out.insert(rel, (u8::from(exec), fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+#[test]
+fn pack_round_trip_stages_the_tree_without_history() {
+    let (repo_dir, parent, head) = make_tree_repo();
+    let repo = Repository::open(&repo_dir).unwrap();
+    let pack = pack_commit(&repo, head).unwrap();
+    assert!(pack.starts_with(b"PACK"), "not a packfile");
+
+    let root = make_work_root();
+    let staging = Staging::new(&root).unwrap();
+    let staged = staging
+        .stage_from_pack(
+            StageRequest {
+                job_id: "pack-round-trip".to_string(),
+                source: Source::Path(repo_dir.clone()),
+                git_ref: "main".to_string(),
+            },
+            &head.to_string(),
+            &pack,
+        )
+        .unwrap();
+
+    assert_eq!(tree_contents(staged.path()), tree_contents(&repo_dir));
+    let staged_repo = Repository::open(staged.path()).unwrap();
+    let head_tree = staged_repo.find_commit(head).unwrap().tree().unwrap().id();
+    assert_eq!(
+        staged_repo.head().unwrap().peel_to_tree().unwrap().id(),
+        head_tree
+    );
+    assert!(staged_repo.odb().unwrap().exists(head));
+    assert!(!staged_repo.odb().unwrap().exists(parent));
+    assert!(staged.path().join(".git/lu-staged").is_file());
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(staged.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let gid = fs::metadata(staged.path()).unwrap().gid();
+        staging.share_with_group(&staged, gid).unwrap();
+        assert_eq!(
+            fs::metadata(staged.path()).unwrap().permissions().mode() & 0o7777,
+            0o2770
+        );
+    }
+
+    fs::write(staged.path().join("hello.txt"), "changed\n").unwrap();
+    let patch = Staging::export_diff(&staged, 1024 * 1024).unwrap();
+    let patch = String::from_utf8_lossy(&patch);
+    assert!(patch.contains("hello.txt"), "{patch}");
+    assert!(!patch.contains("later.txt"), "{patch}");
+    assert!(!patch.contains("data.bin"), "{patch}");
+    let _ = fs::remove_dir_all(repo_dir);
+    let _ = fs::remove_dir_all(root.parent().unwrap());
+}
+
+#[test]
+fn pack_cap_error_names_the_cap() {
+    let (repo_dir, _parent, head) = make_tree_repo();
+    let repo = Repository::open(&repo_dir).unwrap();
+    let err = pack_commit_capped(&repo, head, 8).unwrap_err();
+    assert!(
+        matches!(err, StageError::PackTooLarge { cap: 8 }),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains('8'), "{err}");
+    assert!(err.to_string().contains("cap"), "{err}");
+    let _ = fs::remove_dir_all(repo_dir);
+}
+
+#[test]
+fn a_bad_commit_id_is_refused_before_writing_the_checkout() {
+    let root = make_work_root();
+    let staging = Staging::new(&root).unwrap();
+    let err = staging
+        .stage_from_pack(
+            StageRequest {
+                job_id: "pack-bad-commit".to_string(),
+                source: Source::Path(root.clone()),
+                git_ref: "main".to_string(),
+            },
+            "not-a-commit",
+            b"PACK",
+        )
+        .unwrap_err();
+    assert!(matches!(err, StageError::InvalidCommit(_)), "{err:?}");
+    assert!(!root.join("pack-bad-commit").exists());
+    let _ = fs::remove_dir_all(root.parent().unwrap());
 }

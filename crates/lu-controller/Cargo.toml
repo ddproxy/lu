@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 axum.workspace = true
+git2 = { version = "0.21", default-features = false }
 lu-auth = { path = "../lu-auth" }
 lu-config = { path = "../lu-config" }
 lu-proto = { path = "../lu-proto" }

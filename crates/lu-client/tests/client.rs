@@ -180,6 +180,7 @@ fn spec() -> JobSpec {
     JobSpec {
         repo: "https://example.net/repo.git".to_owned(),
         git_ref: "main".to_owned(),
+        base_commit: None,
         task: "run the tests".to_owned(),
         harness: "opencode".to_owned(),
         provider: None,
@@ -754,4 +755,41 @@ async fn drain_accepts_the_controllers_empty_object_reply() {
     let server = start(|_| Reply::json(&json!({}))).await;
     let view = client(&server).drain(&node).await.unwrap();
     assert_eq!(view.name.as_str(), "node-a");
+}
+
+#[tokio::test]
+async fn job_base_fetches_the_commit_header_and_pack() {
+    let id = job_id();
+    let commit = "a".repeat(40);
+    let expected_commit = commit.clone();
+    let path = format!("/v1/agent/jobs/{id}/base");
+    let pack = b"PACK\x00\x00\x00\x02".to_vec();
+    let server = start(move |recorded| {
+        assert_eq!(recorded.method, "GET");
+        assert_eq!(recorded.path, path);
+        assert_eq!(recorded.query.as_deref(), Some("epoch=7"));
+        Reply::ok(pack.clone()).with_header("x-lu-base-commit", &commit)
+    })
+    .await;
+    let got = client(&server).job_base(&id, 7).await.unwrap().unwrap();
+    assert_eq!(got.0, expected_commit);
+    assert_eq!(got.1, b"PACK\x00\x00\x00\x02");
+    let records = server.records.lock().unwrap();
+    assert_eq!(
+        records[0].header("authorization"),
+        Some("Bearer operator-token-do-not-print")
+    );
+}
+
+#[tokio::test]
+async fn job_base_treats_404_as_no_base() {
+    let server = start(|_| Reply::status(404)).await;
+    assert_eq!(client(&server).job_base(&job_id(), 3).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn job_base_refuses_a_reply_without_a_commit_header() {
+    let server = start(|_| Reply::ok(b"PACK")).await;
+    let error = client(&server).job_base(&job_id(), 3).await.unwrap_err();
+    assert!(matches!(error, ApiError::Decode { .. }), "{error:?}");
 }

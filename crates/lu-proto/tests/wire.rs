@@ -18,6 +18,7 @@ fn spec() -> JobSpec {
     JobSpec {
         repo: "https://example.net/team/repo.git".to_owned(),
         git_ref: "main".to_owned(),
+        base_commit: None,
         task: "add the missing test".to_owned(),
         harness: "opencode".to_owned(),
         provider: Some("peer-a".to_owned()),

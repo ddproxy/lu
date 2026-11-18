@@ -22,6 +22,8 @@ type Result<T> = std::result::Result<T, ApiError>;
 
 const TOKEN_LIMIT: u64 = 8 * 1024;
 const CA_LIMIT: u64 = 1024 * 1024;
+/// Matches the controller's base-pack cap; kept local so the client needs no git dependency.
+const MAX_BASE_PACK_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Timeouts and caps. The defaults are deliberately finite; a controller URL is not trusted to
 /// answer promptly or with a small body.
@@ -594,6 +596,49 @@ impl Client {
         self.success(reply).map(|_| ())
     }
 
+    /// Fetches a job's base as a git pack and the commit it represents.
+    /// `Ok(None)` means the controller has no base provider configured for the job.
+    pub async fn job_base(&self, id: &JobId, epoch: u64) -> Result<Option<(String, Vec<u8>)>> {
+        let route = format!("v1/agent/jobs/{id}/base");
+        let query = [("epoch".to_owned(), epoch.to_string())];
+        let reply = self
+            .send_capped(
+                Method::GET,
+                &route,
+                SendParts {
+                    body: None,
+                    query: &query,
+                    headers: &[],
+                },
+                false,
+                MAX_BASE_PACK_BYTES,
+            )
+            .await?;
+        if reply.status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let reply = self.success(reply)?;
+        let commit = reply
+            .headers
+            .get("x-lu-base-commit")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .ok_or_else(|| ApiError::Decode {
+                message: "base reply is missing x-lu-base-commit".to_owned(),
+            })?;
+        if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ApiError::Decode {
+                message: "base reply has an invalid x-lu-base-commit".to_owned(),
+            });
+        }
+        if reply.body.is_empty() {
+            return Err(ApiError::Decode {
+                message: "base reply has an empty pack".to_owned(),
+            });
+        }
+        self.scrub(Ok(Some((commit, reply.body))))
+    }
+
     pub async fn complete(&self, completion: &Completion) -> Result<()> {
         completion
             .validate()
@@ -776,6 +821,10 @@ impl Client {
 }
 
 /// The six calls an agent needs. Implemented by [`Client`] and by test fakes.
+/// Boxed future for a base-pack fetch: `(commit id, pack bytes)` when served.
+pub type BasePackFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + Send + 'a>>;
+
 pub trait Controller: Send + Sync {
     fn poll<'a>(
         &'a self,
@@ -802,6 +851,12 @@ pub trait Controller: Send + Sync {
         name: ArtifactName,
         bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    /// Fetches a job's base pack. The default keeps test fakes that do not model base sources
+    /// valid; agents in controller mode still fail if the real client returns `None` unexpectedly.
+    fn job_base<'a>(&'a self, _id: &'a JobId, _epoch: u64) -> BasePackFuture<'a> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn complete<'a>(
         &'a self,
         completion: &'a Completion,
@@ -847,6 +902,10 @@ impl Controller for Client {
         bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move { Client::put_artifact(self, id, epoch, name, bytes).await })
+    }
+
+    fn job_base<'a>(&'a self, id: &'a JobId, epoch: u64) -> BasePackFuture<'a> {
+        Box::pin(async move { Client::job_base(self, id, epoch).await })
     }
 
     fn complete<'a>(

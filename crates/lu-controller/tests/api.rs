@@ -1,3 +1,4 @@
+use git2::{Repository, Signature};
 use lu_auth::sha256_hex;
 use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator};
 use lu_controller::{build_router, run_background, AppState};
@@ -28,6 +29,7 @@ fn controller_cfg(db: &str, artifacts_dir: &str) -> ControllerConfig {
         recovery_grace_secs: 1,
         max_connections: 64,
         max_connections_per_addr: 32,
+        local_repo_roots: Vec::new(),
         agents: vec![
             ControllerAgent {
                 name: "node-a".to_owned(),
@@ -56,12 +58,19 @@ struct TestServer {
 }
 
 async fn start_server() -> TestServer {
+    start_server_with(Vec::new(), None).await
+}
+
+async fn start_server_with(roots: Vec<String>, pack_cap: Option<usize>) -> TestServer {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("lu.db");
     let artifacts_dir = tmp.path().join("artifacts");
-    let cfg = controller_cfg(db.to_str().unwrap(), artifacts_dir.to_str().unwrap());
+    let mut cfg = controller_cfg(db.to_str().unwrap(), artifacts_dir.to_str().unwrap());
+    cfg.local_repo_roots = roots;
     let store = Arc::new(SqliteStore::open(&db).unwrap());
-    let state = Arc::new(AppState::from_config(&cfg, store.clone()).unwrap());
+    let mut state = AppState::from_config(&cfg, store.clone()).unwrap();
+    state.max_pack_bytes = pack_cap.unwrap_or(lu_staging::PACK_CAP_BYTES);
+    let state = Arc::new(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, _) = broadcast::channel::<()>(4);
@@ -148,6 +157,7 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
     JobSpec {
         repo: "https://example.net/repo.git".to_owned(),
         git_ref: "main".to_owned(),
+        base_commit: None,
         task: "run tests".to_owned(),
         harness: "opencode".to_owned(),
         provider: None,
@@ -1372,5 +1382,204 @@ async fn log_append_with_less_room_than_the_marker_keeps_the_marker() {
     );
     let rec = srv.store.get_job(&job_id).unwrap();
     assert_eq!(rec.log_len, MAX_LOG_BYTES);
+    let _ = srv.shutdown.send(());
+}
+
+fn repo_with_two_commits(root: &std::path::Path) -> (String, String) {
+    let dir = root.join("source");
+    std::fs::create_dir_all(&dir).unwrap();
+    let repo = Repository::init(&dir).unwrap();
+    let sig = Signature::now("tester", "tester@example.com").unwrap();
+    let mut index = repo.index().unwrap();
+
+    std::fs::write(dir.join("base.txt"), b"base\n").unwrap();
+    index.add_path(std::path::Path::new("base.txt")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let first = repo
+        .commit(Some("HEAD"), &sig, &sig, "first", &tree, &[])
+        .unwrap();
+
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    std::fs::write(dir.join("nested/child.txt"), b"child\n").unwrap();
+    index
+        .add_path(std::path::Path::new("nested/child.txt"))
+        .unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let second = repo
+        .commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "second",
+            &tree,
+            &[&repo.find_commit(first).unwrap()],
+        )
+        .unwrap();
+    (dir.to_string_lossy().into_owned(), second.to_string())
+}
+
+async fn base_request(addr: SocketAddr, id: &str, epoch: u64, token: &str) -> Vec<u8> {
+    raw_request_bytes(
+        addr,
+        format!(
+            "GET /v1/agent/jobs/{id}/base?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+}
+
+fn split_http(raw: &[u8]) -> (&[u8], &[u8]) {
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("complete HTTP response");
+    (&raw[..end], &raw[end + 4..])
+}
+
+fn response_status(raw: &[u8]) -> u16 {
+    let head = split_http(raw).0;
+    let head = String::from_utf8_lossy(head);
+    let line = head.lines().next().unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+fn response_header(raw: &[u8], name: &str) -> Option<String> {
+    let head = split_http(raw).0;
+    let text = String::from_utf8_lossy(head);
+    let lower = name.to_ascii_lowercase();
+    text.lines().find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        (k.trim().to_ascii_lowercase() == lower).then(|| v.trim().to_owned())
+    })
+}
+
+fn response_body(raw: &[u8]) -> &[u8] {
+    split_http(raw).1
+}
+
+async fn assigned_epoch(srv: &TestServer, spec: &JobSpec) -> (String, u64) {
+    let r = post_job(srv.addr, spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let j: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = j["id"].as_str().unwrap().to_owned();
+    let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let assign = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign")
+        .expect("job should be assigned");
+    (id, assign["epoch"].as_u64().unwrap())
+}
+
+#[tokio::test]
+async fn base_route_serves_a_pack_with_auth_node_and_epoch_fencing() {
+    let root = tempfile::tempdir().unwrap();
+    let (repo, commit) = repo_with_two_commits(root.path());
+    let srv = start_server_with(vec![root.path().to_string_lossy().into_owned()], None).await;
+    let mut spec = sample_spec(None);
+    spec.repo = repo;
+    spec.base_commit = Some(commit.clone());
+    let (id, epoch) = assigned_epoch(&srv, &spec).await;
+
+    let r = raw_request_bytes(
+        srv.addr,
+        format!("GET /v1/agent/jobs/{id}/base?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await;
+    assert_eq!(response_status(&r), 401);
+
+    let r = raw_request_bytes(
+        srv.addr,
+        format!("GET /v1/agent/jobs/{id}/base?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n").as_bytes(),
+    )
+    .await;
+    assert_eq!(response_status(&r), 401);
+
+    let r = base_request(srv.addr, &id, epoch, AGENT_B_TOKEN).await;
+    assert_eq!(
+        response_status(&r),
+        403,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
+
+    let r = base_request(srv.addr, &id, epoch - 1, AGENT_A_TOKEN).await;
+    assert_eq!(
+        response_status(&r),
+        409,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
+    let err: serde_json::Value =
+        serde_json::from_slice(response_body(&r)).expect("stale epoch should return JSON");
+    assert_eq!(err["error"], "stale_epoch", "{err}");
+
+    let r = base_request(srv.addr, &id, epoch, AGENT_A_TOKEN).await;
+    assert_eq!(
+        response_status(&r),
+        200,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
+    assert_eq!(
+        response_header(&r, "content-type").as_deref(),
+        Some("application/x-git-pack")
+    );
+    assert_eq!(
+        response_header(&r, "x-lu-base-commit").as_deref(),
+        Some(commit.as_str())
+    );
+    let body = response_body(&r);
+    assert!(body.starts_with(b"PACK"), "pack header missing");
+    assert!(body.len() > 12, "pack body is too short");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn base_route_is_404_without_a_provider_and_413_over_the_cap() {
+    let srv = start_server().await;
+    let mut spec = sample_spec(None);
+    spec.base_commit = Some("a".repeat(40));
+    let (id, epoch) = assigned_epoch(&srv, &spec).await;
+    let r = base_request(srv.addr, &id, epoch, AGENT_A_TOKEN).await;
+    assert_eq!(
+        response_status(&r),
+        404,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
+    let err: serde_json::Value =
+        serde_json::from_slice(response_body(&r)).expect("missing provider should return JSON");
+    assert_eq!(err["error"], "not_found", "{err}");
+    let _ = srv.shutdown.send(());
+
+    let root = tempfile::tempdir().unwrap();
+    let (repo, commit) = repo_with_two_commits(root.path());
+    let srv = start_server_with(vec![root.path().to_string_lossy().into_owned()], Some(1)).await;
+    let mut spec = sample_spec(None);
+    spec.repo = repo;
+    spec.base_commit = Some(commit);
+    let (id, epoch) = assigned_epoch(&srv, &spec).await;
+    let r = base_request(srv.addr, &id, epoch, AGENT_A_TOKEN).await;
+    assert_eq!(
+        response_status(&r),
+        413,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
     let _ = srv.shutdown.send(());
 }

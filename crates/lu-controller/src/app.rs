@@ -76,6 +76,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // agent routes with specific body limits
     let agent = Router::new()
         .route("/v1/agent/poll", post(agent::poll).layer(op_json))
+        .route("/v1/agent/jobs/{id}/base", get(agent::job_base))
         .route(
             "/v1/agent/jobs/{id}/start",
             post(agent::start_job).layer(op_json),

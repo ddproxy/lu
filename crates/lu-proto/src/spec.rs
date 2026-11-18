@@ -46,6 +46,9 @@ pub struct JobSpec {
     /// A git URL or an absolute local path.
     pub repo: String,
     pub git_ref: String,
+    /// An optional 40-hex commit the agent should use as the base instead of the ref's tip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
     /// The prompt text. Control characters are allowed; they are sanitised for display.
     pub task: String,
     pub harness: String,
@@ -68,6 +71,8 @@ pub struct JobSpec {
 struct RawJobSpec {
     repo: String,
     git_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_commit: Option<String>,
     task: String,
     #[serde(default = "default_harness")]
     harness: String,
@@ -92,6 +97,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
         let spec = JobSpec {
             repo: raw.repo,
             git_ref: raw.git_ref,
+            base_commit: raw.base_commit,
             task: raw.task,
             harness: raw.harness,
             provider: raw.provider,
@@ -121,6 +127,9 @@ impl JobSpec {
     pub fn validate(&self) -> Result<(), JobSpecError> {
         check_repo(&self.repo)?;
         check_len("git_ref", &self.git_ref, MAX_GIT_REF_BYTES)?;
+        if let Some(commit) = &self.base_commit {
+            check_commit_id(commit)?;
+        }
         check_len("task", &self.task, MAX_TASK_BYTES)?;
         check_name("harness", &self.harness)?;
         if let Some(provider) = &self.provider {
@@ -202,6 +211,16 @@ fn check_repo(repo: &str) -> Result<(), JobSpecError> {
     Ok(())
 }
 
+fn check_commit_id(value: &str) -> Result<(), JobSpecError> {
+    if value.len() != 40 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(invalid(
+            "base_commit",
+            "must be 40 hexadecimal characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn check_name(field: &'static str, value: &str) -> Result<(), JobSpecError> {
     if value.is_empty() {
         return Err(invalid(field, "must not be empty"));
@@ -251,6 +270,7 @@ mod tests {
         JobSpec {
             repo: "https://example.net/repo.git".to_owned(),
             git_ref: "main".to_owned(),
+            base_commit: None,
             task: "run the tests".to_owned(),
             harness: "opencode".to_owned(),
             provider: None,
@@ -303,6 +323,13 @@ mod tests {
         spec = sample();
         spec.git_ref = "a".repeat(MAX_GIT_REF_BYTES + 1);
         assert_eq!(error_field(&spec), "git_ref");
+
+        spec = sample();
+        spec.base_commit = Some("abc".to_owned());
+        assert_eq!(error_field(&spec), "base_commit");
+        spec = sample();
+        spec.base_commit = Some(format!("{}z", "a".repeat(39)));
+        assert_eq!(error_field(&spec), "base_commit");
 
         spec = sample();
         spec.task = String::new();
@@ -378,6 +405,7 @@ mod tests {
         assert_eq!(spec.harness, "opencode");
         assert_eq!(spec.timeout_secs, DEFAULT_TIMEOUT_SECS);
         assert_eq!(spec.provider, None);
+        assert_eq!(spec.base_commit, None);
         assert!(spec.after.is_empty());
         assert!(spec.validate().is_ok());
     }
@@ -424,6 +452,18 @@ mod tests {
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{json}");
         assert!(!json.contains("model"), "{json}");
         assert!(!json.contains("idempotency_key"), "{json}");
+    }
+
+    #[test]
+    fn an_optional_base_commit_round_trips_and_is_omitted_when_absent() {
+        let mut spec = sample();
+        assert!(!spec.canonical_json().contains("base_commit"));
+        spec.base_commit = Some("a".repeat(40));
+        let json = spec.canonical_json();
+        let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, spec);
+        assert_eq!(parsed.canonical_json(), json);
+        assert!(parsed.validate().is_ok());
     }
 
     #[test]

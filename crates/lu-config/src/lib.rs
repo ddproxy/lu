@@ -59,6 +59,9 @@ pub struct ControllerConfig {
     pub max_connections: usize,
     #[serde(default = "default_max_connections_per_addr")]
     pub max_connections_per_addr: usize,
+    /// Absolute local repository roots the controller may serve job bases from.
+    #[serde(default)]
+    pub local_repo_roots: Vec<String>,
     #[serde(default)]
     pub agents: Vec<ControllerAgent>,
     #[serde(default)]
@@ -98,6 +101,19 @@ pub struct ControllerOperator {
     pub token_sha256: String,
 }
 
+/// Where the agent obtains a job's base tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BaseSource {
+    /// Always clone from the job's `repo`.
+    Clone,
+    /// Fetch a pack from the controller, failing if it cannot.
+    Controller,
+    /// Try the controller first and clone when it has no base to serve.
+    #[default]
+    Auto,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -107,6 +123,9 @@ pub struct AgentConfig {
     pub ca_file: Option<String>,
     pub work_dir: String,
     pub harness: String,
+    /// How to obtain a job's base tree. Defaults to `auto`.
+    #[serde(default)]
+    pub base_source: BaseSource,
     pub opencode_server: Option<String>,
     /// A group (name or number) given write access to each job's working tree, for a harness
     /// that runs as another account, such as a container. Never covers `.git`.
@@ -291,6 +310,9 @@ impl ControllerConfig {
         }
         validate_abs_no_dotdot("[controller]", "db", &self.db)?;
         validate_abs_no_dotdot("[controller]", "artifacts_dir", &self.artifacts_dir)?;
+        for (i, root) in self.local_repo_roots.iter().enumerate() {
+            validate_abs_no_dotdot(&format!("[controller] local_repo_roots #{i}"), "path", root)?;
+        }
         if !(5..=3600).contains(&self.lease_secs) {
             return invalid(
                 "[controller]",
@@ -882,8 +904,10 @@ heartbeat_secs = 15
         assert_eq!(c.recovery_grace_secs, 30);
         assert_eq!(c.max_connections, 256);
         assert_eq!(c.max_connections_per_addr, 64);
+        assert!(c.local_repo_roots.is_empty());
         let a = Config::parse(&agent_only()).unwrap().agent.unwrap();
         assert_eq!(a.heartbeat_secs, 15);
+        assert_eq!(a.base_source, BaseSource::Auto);
         let cfg = Config::parse(&combined()).unwrap();
         assert_eq!(cfg.log.level, "info");
     }
@@ -1140,6 +1164,38 @@ heartbeat_secs = 15
             "[controller]\nlisten=\"127.0.0.1:1\"\ndb=\"/db\"\nartifacts_dir=\"rel\"\n",
             "[controller]",
         );
+    }
+
+    #[test]
+    fn local_repo_roots_must_be_absolute() {
+        let base = "[controller]\nlisten=\"127.0.0.1:7600\"\ndb=\"/db\"\nartifacts_dir=\"/a\"\n";
+        let ok = format!("{base}local_repo_roots=[\"/srv/git\", \"/srv/mirrors\"]\n");
+        let cfg = Config::parse(&ok).unwrap().controller.unwrap();
+        assert_eq!(cfg.local_repo_roots, ["/srv/git", "/srv/mirrors"]);
+        expect_table(
+            &format!("{base}local_repo_roots=[\"relative\"]\n"),
+            "[controller] local_repo_roots #0",
+        );
+        expect_table(
+            &format!("{base}local_repo_roots=[\"/srv/../git\"]\n"),
+            "[controller] local_repo_roots #0",
+        );
+    }
+
+    #[test]
+    fn base_source_accepts_the_three_modes() {
+        let base = "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n";
+        for (text, want) in [
+            ("clone", BaseSource::Clone),
+            ("controller", BaseSource::Controller),
+            ("auto", BaseSource::Auto),
+        ] {
+            let cfg = Config::parse(&format!("{base}base_source=\"{text}\"\n")).unwrap();
+            assert_eq!(cfg.agent.unwrap().base_source, want, "{text}");
+        }
+        let err = Config::parse(&format!("{base}base_source=\"mirror\"\n")).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "{err}");
+        assert!(err.to_string().contains("mirror"), "{err}");
     }
 
     #[test]

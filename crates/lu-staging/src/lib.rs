@@ -22,6 +22,8 @@ pub enum StageError {
     InvalidJobId(String),
     /// A git ref was refused.
     InvalidRef(String),
+    /// A base commit id was refused.
+    InvalidCommit(String),
     /// The target directory already exists.
     AlreadyExists(PathBuf),
     /// I/O failure.
@@ -30,6 +32,8 @@ pub enum StageError {
     Git { message: String },
     /// The produced diff exceeded the configured cap.
     TooLarge,
+    /// A generated base pack exceeded its size cap.
+    PackTooLarge { cap: usize },
 }
 
 impl fmt::Display for StageError {
@@ -38,10 +42,14 @@ impl fmt::Display for StageError {
             StageError::InvalidWorkRoot(msg) => write!(f, "invalid work root: {msg}"),
             StageError::InvalidJobId(msg) => write!(f, "invalid job id: {msg}"),
             StageError::InvalidRef(msg) => write!(f, "invalid git ref: {msg}"),
+            StageError::InvalidCommit(msg) => write!(f, "invalid base commit: {msg}"),
             StageError::AlreadyExists(p) => write!(f, "directory already exists: {}", p.display()),
             StageError::Io(e) => write!(f, "io error: {e}"),
             StageError::Git { message } => write!(f, "git error: {message}"),
             StageError::TooLarge => write!(f, "output exceeded size cap"),
+            StageError::PackTooLarge { cap } => {
+                write!(f, "base pack exceeded the {cap}-byte cap")
+            }
         }
     }
 }
@@ -181,6 +189,39 @@ impl StagedDir {
     }
 }
 
+/// Largest base pack the controller will generate and the agent will accept.
+pub const PACK_CAP_BYTES: usize = 256 * 1024 * 1024;
+
+fn git_err(error: git2::Error) -> StageError {
+    StageError::Git {
+        message: error.to_string(),
+    }
+}
+
+/// Packs one commit, its tree, and every reachable blob or subtree, but not its parents.
+pub fn pack_commit(repo: &git2::Repository, commit: git2::Oid) -> Result<Vec<u8>, StageError> {
+    pack_commit_capped(repo, commit, PACK_CAP_BYTES)
+}
+
+/// [`pack_commit`] with an explicit cap, mostly so the cap can be tested cheaply.
+pub fn pack_commit_capped(
+    repo: &git2::Repository,
+    commit: git2::Oid,
+    cap: usize,
+) -> Result<Vec<u8>, StageError> {
+    let commit = repo.find_commit(commit).map_err(git_err)?;
+    let tree = commit.tree().map_err(git_err)?;
+    let mut builder = repo.packbuilder().map_err(git_err)?;
+    builder.insert_object(commit.id(), None).map_err(git_err)?;
+    builder.insert_tree(tree.id()).map_err(git_err)?;
+    let mut buf = git2::Buf::new();
+    builder.write_buf(&mut buf).map_err(git_err)?;
+    if buf.len() > cap {
+        return Err(StageError::PackTooLarge { cap });
+    }
+    Ok(buf.to_vec())
+}
+
 /// Manages per-job staging directories under a fixed work root.
 /// The file inside `.git` that says this crate staged the directory.
 const STAGED_MARKER: &str = "lu-staged";
@@ -233,6 +274,77 @@ impl Staging {
             path: target,
             job_id: request.job_id,
         })
+    }
+
+    /// Stages a checkout from a pack made by [`pack_commit`], without invoking `git`.
+    ///
+    /// The pack is indexed into an empty repository, the commit is made the root of a local
+    /// branch via `.git/shallow`, and the tree is checked out. The resulting directory is
+    /// indistinguishable from a clone to [`Staging::export_diff`] and [`Staging::share_with_group`].
+    pub fn stage_from_pack(
+        &self,
+        request: StageRequest,
+        commit_id: &str,
+        pack: &[u8],
+    ) -> Result<StagedDir, StageError> {
+        validate_job_id(&request.job_id).map_err(StageError::InvalidJobId)?;
+        validate_git_ref(&request.git_ref).map_err(StageError::InvalidRef)?;
+        let oid = validate_commit_id(commit_id)?;
+        if pack.len() > PACK_CAP_BYTES {
+            return Err(StageError::PackTooLarge {
+                cap: PACK_CAP_BYTES,
+            });
+        }
+
+        let target = self.work_root.join(&request.job_id);
+        match fs::symlink_metadata(&target) {
+            Ok(_) => return Err(StageError::AlreadyExists(target)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StageError::Io(e)),
+        }
+
+        let result = self.stage_from_pack_inner(&target, oid, pack);
+        if let Err(e) = result {
+            let _ = cleanup_created_path(&target);
+            return Err(e);
+        }
+        set_dir_mode_0700(&target)?;
+        Ok(StagedDir {
+            path: target,
+            job_id: request.job_id,
+        })
+    }
+
+    fn stage_from_pack_inner(
+        &self,
+        target: &Path,
+        oid: git2::Oid,
+        pack: &[u8],
+    ) -> Result<(), StageError> {
+        fs::create_dir(target)?;
+        set_dir_mode_0700(target)?;
+        let repo = git2::Repository::init(target).map_err(git_err)?;
+        let git_dir = repo.path().to_path_buf();
+        let pack_dir = git_dir.join("objects").join("pack");
+        fs::create_dir_all(&pack_dir)?;
+
+        let mut indexer = git2::Indexer::new(None, &pack_dir, 0o600, false).map_err(git_err)?;
+        indexer.write_all(pack)?;
+        indexer.commit().map_err(git_err)?;
+
+        let commit = repo.find_commit(oid).map_err(git_err)?;
+        // A shallow root lets the checkout and diff treat this commit as complete even though
+        // the parent that the commit object names was deliberately left out of the pack.
+        fs::write(git_dir.join("shallow"), format!("{}\n", oid))?;
+        repo.reference("refs/heads/lu-base", oid, true, "base pack")
+            .map_err(git_err)?;
+        repo.set_head("refs/heads/lu-base").map_err(git_err)?;
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout.force();
+        repo.checkout_tree(commit.as_object(), Some(&mut checkout))
+            .map_err(git_err)?;
+        fs::write(git_dir.join(STAGED_MARKER), b"lu-staging\n")?;
+        Ok(())
     }
 
     fn stage_inner(&self, request: &StageRequest, target: &Path) -> Result<(), StageError> {
@@ -552,6 +664,13 @@ fn validate_work_root(work_root: &Path) -> Result<(), StageError> {
         ));
     }
     Ok(())
+}
+
+fn validate_commit_id(commit_id: &str) -> Result<git2::Oid, StageError> {
+    if commit_id.len() != 40 || !commit_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(StageError::InvalidCommit(commit_id.to_owned()));
+    }
+    git2::Oid::from_str(commit_id).map_err(|_| StageError::InvalidCommit(commit_id.to_owned()))
 }
 
 fn validate_git_ref(git_ref: &str) -> Result<(), String> {

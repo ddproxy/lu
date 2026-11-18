@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lu_client::{ApiError, Controller, PollRequest};
+use lu_config::BaseSource;
 use lu_proto::{
     AgentEvent, ArtifactName, Completion, FailureClass, JobId, JobSpec, LogChunk, NodeName,
     Outcome, MAX_LOG_BYTES,
@@ -24,10 +25,16 @@ const IDLE_POLL: Duration = Duration::from_millis(10);
 const JOB_TIMEOUT: Duration = Duration::from_secs(30);
 const EPOCH: u64 = 1;
 
+type BaseReply = Result<Option<(String, Vec<u8>)>, ApiError>;
+
 /// A recorded call to the fake controller.
 #[derive(Debug, Clone, PartialEq)]
 enum Call {
     Poll(PollRequest),
+    JobBase {
+        job_id: JobId,
+        epoch: u64,
+    },
     Start {
         job_id: JobId,
         epoch: u64,
@@ -50,6 +57,7 @@ enum Call {
 struct FakeController {
     calls: Mutex<Vec<Call>>,
     poll_replies: Mutex<VecDeque<Result<Vec<AgentEvent>, ApiError>>>,
+    base_replies: Mutex<VecDeque<BaseReply>>,
     start_replies: Mutex<VecDeque<Result<(), ApiError>>>,
     renew_replies: Mutex<VecDeque<Result<bool, ApiError>>>,
     append_log_replies: Mutex<VecDeque<Result<(), ApiError>>>,
@@ -62,6 +70,7 @@ impl FakeController {
         Self {
             calls: Mutex::new(Vec::new()),
             poll_replies: Mutex::new(VecDeque::new()),
+            base_replies: Mutex::new(VecDeque::new()),
             start_replies: Mutex::new(VecDeque::new()),
             renew_replies: Mutex::new(VecDeque::new()),
             append_log_replies: Mutex::new(VecDeque::new()),
@@ -87,6 +96,10 @@ impl FakeController {
         self.poll_replies.lock().unwrap().push_back(reply);
     }
 
+    fn push_base(&self, reply: Result<Option<(String, Vec<u8>)>, ApiError>) {
+        self.base_replies.lock().unwrap().push_back(reply);
+    }
+
     fn push_start(&self, reply: Result<(), ApiError>) {
         self.start_replies.lock().unwrap().push_back(reply);
     }
@@ -109,6 +122,10 @@ impl FakeController {
 
     fn pop_poll(&self) -> Option<Result<Vec<AgentEvent>, ApiError>> {
         self.poll_replies.lock().unwrap().pop_front()
+    }
+
+    fn pop_base(&self) -> Option<BaseReply> {
+        self.base_replies.lock().unwrap().pop_front()
     }
 
     fn pop_start(&self) -> Option<Result<(), ApiError>> {
@@ -150,6 +167,20 @@ impl Controller for FakeController {
                 }
             }
         })
+    }
+
+    fn job_base<'a>(
+        &'a self,
+        id: &'a JobId,
+        epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>, ApiError>> + Send + 'a>>
+    {
+        let job_id = id.clone();
+        self.record(Call::JobBase {
+            job_id: job_id.clone(),
+            epoch,
+        });
+        Box::pin(async move { self.pop_base().unwrap_or(Ok(None)) })
     }
 
     fn start<'a>(
@@ -220,6 +251,7 @@ fn test_spec(repo: &str) -> JobSpec {
     JobSpec {
         repo: repo.to_owned(),
         git_ref: "main".to_owned(),
+        base_commit: None,
         task: "test task".to_owned(),
         harness: "opencode".to_owned(),
         provider: None,
@@ -243,6 +275,7 @@ fn make_agent(
         node,
         controller,
         staging,
+        base_source: BaseSource::Auto,
         work_dir: work_dir.to_path_buf(),
         heartbeat_secs: TEST_HEARTBEAT_SECS,
         provider_marker_grace: super::PROVIDER_MARKER_GRACE,
@@ -925,6 +958,7 @@ fn job_calls(calls: &[Call]) -> Vec<Call> {
 fn kind(call: &Call) -> &'static str {
     match call {
         Call::Poll(_) => "poll",
+        Call::JobBase { .. } => "job_base",
         Call::Start { .. } => "start",
         Call::Renew { .. } => "renew",
         Call::AppendLog(_) => "append_log",
@@ -1777,4 +1811,87 @@ async fn job_shutdown_while_running_reports_node_failure() {
     let done = completions(&calls);
     assert_eq!(done.len(), 1, "{done:?}");
     assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Node));
+}
+
+#[tokio::test]
+async fn auto_base_source_falls_back_to_clone_when_the_controller_has_no_base() {
+    let tmp = TempDir::new().unwrap();
+    let work_dir = tmp.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir(&repo_dir).unwrap();
+    create_git_repo(&repo_dir);
+
+    let job_id = JobId::new();
+    let mut spec = test_spec(&repo_dir.to_string_lossy());
+    spec.base_commit = Some("a".repeat(40));
+    let controller = controller_with_assign(job_id.clone(), EPOCH, spec);
+    controller.push_base(Err(ApiError::NotFound));
+
+    let agent = make_agent(&work_dir, controller.clone(), success_harness);
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(work_dir.join(job_id.as_str())),
+    )
+    .await;
+    assert!(calls.iter().any(|c| matches!(c, Call::JobBase { .. })));
+    assert!(has_complete(&calls));
+}
+
+#[tokio::test]
+async fn controller_base_source_fails_the_node_when_the_controller_has_no_base() {
+    let tmp = TempDir::new().unwrap();
+    let work_dir = tmp.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir(&repo_dir).unwrap();
+    create_git_repo(&repo_dir);
+
+    let job_id = JobId::new();
+    let mut spec = test_spec(&repo_dir.to_string_lossy());
+    spec.base_commit = Some("a".repeat(40));
+    let controller = controller_with_assign(job_id.clone(), EPOCH, spec);
+    controller.push_base(Err(ApiError::NotFound));
+
+    let mut agent = make_agent(&work_dir, controller.clone(), success_harness);
+    agent.base_source = BaseSource::Controller;
+    let (_shutdown_tx, handle) = run_agent_with_shutdown(agent);
+    let result = tokio::time::timeout(JOB_TIMEOUT, handle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(result, Err(AgentError::Controller(_))),
+        "a controller-mode miss must be a node failure: {result:?}"
+    );
+    let calls = controller.take_calls();
+    assert!(calls.iter().any(|c| matches!(c, Call::JobBase { .. })));
+    assert!(!has_complete(&calls));
+}
+
+#[tokio::test]
+async fn clone_base_source_never_asks_the_controller() {
+    let tmp = TempDir::new().unwrap();
+    let work_dir = tmp.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir(&repo_dir).unwrap();
+    create_git_repo(&repo_dir);
+
+    let job_id = JobId::new();
+    let mut spec = test_spec(&repo_dir.to_string_lossy());
+    spec.base_commit = Some("a".repeat(40));
+    let controller = controller_with_assign(job_id.clone(), EPOCH, spec);
+
+    let mut agent = make_agent(&work_dir, controller.clone(), success_harness);
+    agent.base_source = BaseSource::Clone;
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(work_dir.join(job_id.as_str())),
+    )
+    .await;
+    assert!(!calls.iter().any(|c| matches!(c, Call::JobBase { .. })));
+    assert!(has_complete(&calls));
 }

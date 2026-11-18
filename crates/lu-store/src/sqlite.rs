@@ -1672,6 +1672,7 @@ mod tests {
         let spec = lu_proto::JobSpec {
             repo: "https://example.net/r.git".to_owned(),
             git_ref: "main".to_owned(),
+            base_commit: None,
             task: "t".to_owned(),
             harness: "opencode".to_owned(),
             provider: None,
@@ -1765,7 +1766,7 @@ mod tests {
         };
         // Rewind a current database to the previous schema and drop the new index.
         let conn = rusqlite::Connection::open(&p).unwrap();
-        conn.execute("UPDATE schema_version SET version=2", [])
+        conn.execute("UPDATE schema_version SET version=3", [])
             .unwrap();
         conn.execute("DROP INDEX jobs_idempotency_key", []).unwrap();
         drop(conn);

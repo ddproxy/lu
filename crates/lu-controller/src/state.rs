@@ -1,4 +1,5 @@
 use crate::auth::AuthConfig;
+use crate::repo::{LocalPathProvider, RepoProvider};
 use crate::wait::Waiters;
 use lu_auth::{LoginThrottle, ThrottleSettings};
 use lu_config::ControllerConfig;
@@ -23,6 +24,10 @@ pub struct AppState {
     /// The latest host and job stats from each node's heartbeat. Deliberately in memory only.
     pub stats: Mutex<HashMap<NodeName, NodeStats>>,
     pub artifacts_dir: PathBuf,
+    /// Ordered base providers; the first one that knows the repository wins.
+    pub repo_providers: Vec<Arc<dyn RepoProvider>>,
+    /// Cap applied when generating a base pack.
+    pub max_pack_bytes: usize,
     pub lease_secs: u64,
     pub recovery_grace_secs: u64,
     pub provider_cooldown_secs: u64,
@@ -54,6 +59,10 @@ impl AppState {
             );
         }
         let lease_secs = cfg.lease_secs;
+        let mut repo_providers: Vec<Arc<dyn RepoProvider>> = Vec::new();
+        if !cfg.local_repo_roots.is_empty() {
+            repo_providers.push(Arc::new(LocalPathProvider::new(&cfg.local_repo_roots)?));
+        }
         Ok(Self {
             store,
             db_path: PathBuf::from(&cfg.db),
@@ -64,6 +73,8 @@ impl AppState {
             waiters: Arc::new(Waiters::new()),
             stats: Mutex::new(HashMap::new()),
             artifacts_dir: PathBuf::from(&cfg.artifacts_dir),
+            repo_providers,
+            max_pack_bytes: lu_staging::PACK_CAP_BYTES,
             lease_secs,
             recovery_grace_secs: cfg.recovery_grace_secs,
             provider_cooldown_secs: cfg.provider_cooldown_secs,
