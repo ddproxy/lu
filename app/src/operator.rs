@@ -48,6 +48,9 @@ pub struct SubmitArgs {
     /// Only run after this job is done (repeatable).
     #[arg(long = "after", value_parser = parse_job_id)]
     pub after: Vec<JobId>,
+    /// Only run after the job with this idempotency key (repeatable).
+    #[arg(long = "after-key")]
+    pub after_key: Vec<String>,
     /// Idempotency key.
     #[arg(long)]
     pub key: Option<String>,
@@ -76,6 +79,9 @@ pub struct RetryArgs {
     /// Only run after this job is done (repeatable); replaces the dependency list.
     #[arg(long = "after", value_parser = parse_job_id)]
     pub after: Vec<JobId>,
+    /// Only run after the job with this idempotency key (repeatable).
+    #[arg(long = "after-key")]
+    pub after_key: Vec<String>,
     /// Idempotency key. The new job carries none unless this is given.
     #[arg(long)]
     pub key: Option<String>,
@@ -205,6 +211,10 @@ pub async fn undrain(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
 
 async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
     let task = read_task(&args)?;
+    let client = connect(config)?;
+    let Some(after) = resolve_after(&client, &args.after, &args.after_key).await? else {
+        return Ok(ExitCode::from(EXIT_USAGE));
+    };
     let spec = JobSpec {
         repo: args.repo,
         git_ref: args.git_ref,
@@ -215,12 +225,34 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         timeout_secs: args.timeout,
         idle_timeout_secs: args.idle_timeout,
         idempotency_key: args.key,
-        after: args.after,
+        after,
     };
     spec.validate().map_err(|error| error.to_string())?;
 
-    let client = connect(config)?;
     submit_and_report(&client, &spec, json, args.wait).await
+}
+
+/// Turns `--after-key` values into ids and merges them with explicit `--after` ids, dropping
+/// repeats. `None` means a key was unknown and the usage error has already been printed.
+async fn resolve_after(
+    client: &Client,
+    after: &[JobId],
+    keys: &[String],
+) -> Result<Option<Vec<JobId>>, String> {
+    let mut ids = after.to_vec();
+    for key in keys {
+        let view = match client.job_by_key(key).await.map_err(|e| e.to_string())? {
+            Some(view) => view,
+            None => {
+                eprintln!("lu: no job with idempotency key {key:?}");
+                return Ok(None);
+            }
+        };
+        if !ids.contains(&view.id) {
+            ids.push(view.id);
+        }
+    }
+    Ok(Some(ids))
 }
 
 async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
@@ -245,8 +277,11 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
     if let Some(model) = args.model {
         spec.model = Some(model);
     }
-    if !args.after.is_empty() {
-        spec.after = args.after;
+    if !args.after.is_empty() || !args.after_key.is_empty() {
+        let Some(after) = resolve_after(&client, &args.after, &args.after_key).await? else {
+            return Ok(ExitCode::from(EXIT_USAGE));
+        };
+        spec.after = after;
     }
     // A retry is a new job; only --key gives it an idempotency key.
     spec.idempotency_key = args.key;

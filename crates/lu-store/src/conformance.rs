@@ -55,6 +55,7 @@ pub fn hb(name: &str, harness: HarnessState, providers: Vec<(&str, ProviderState
 /// Runs the same tests against any store implementation.
 pub fn run_all<S: Store>(make: impl Fn() -> S) {
     idempotent_create(&make());
+    job_by_key_hit_and_miss(&make());
     list_jobs_ordering_and_cursor(&make());
     cancel_states(&make());
     cancel_recovering_ends_it_cancelled_immediately(&make());
@@ -373,6 +374,20 @@ fn idempotent_create<S: Store>(s: &S) {
     let (j3, _) = s.create_job(&c, n).unwrap();
     let (j4, _) = s.create_job(&c, n).unwrap();
     assert_ne!(j3.id, j4.id);
+}
+
+// Duplicate keys can only come from legacy data, so the SQLite store test seeds one to check
+// that the newest job wins; this shared test covers the observable hit and miss cases.
+fn job_by_key_hit_and_miss<S: Store>(s: &S) {
+    let n = now(100, 1000);
+    assert!(s.job_by_key("absent").is_none());
+    let (job, _) = s
+        .create_job(&spec("https://example.net/key.git", Some("chain:key")), n)
+        .unwrap();
+    let found = s.job_by_key("chain:key").unwrap();
+    assert_eq!(found.id, job.id);
+    assert_eq!(found.spec.idempotency_key.as_deref(), Some("chain:key"));
+    assert!(found.waiting_on.is_empty());
 }
 
 fn list_jobs_ordering_and_cursor<S: Store>(s: &S) {

@@ -134,7 +134,7 @@ impl JobSpec {
             check_timeout("idle_timeout_secs", idle, MAX_IDLE_TIMEOUT_SECS)?;
         }
         if let Some(key) = &self.idempotency_key {
-            check_idempotency_key(key)?;
+            validate_idempotency_key(key)?;
         }
         if self.after.len() > MAX_AFTER_JOBS {
             return Err(invalid(
@@ -221,7 +221,8 @@ fn check_name(field: &'static str, value: &str) -> Result<(), JobSpecError> {
     Ok(())
 }
 
-fn check_idempotency_key(value: &str) -> Result<(), JobSpecError> {
+/// Checks a submitter-chosen key, using the same rules as a job spec.
+pub fn validate_idempotency_key(value: &str) -> Result<(), JobSpecError> {
     check_len("idempotency_key", value, MAX_IDEMPOTENCY_KEY_BYTES)?;
     if value.bytes().any(|b| !(is_name_byte(b) || b == b':')) {
         return Err(invalid(

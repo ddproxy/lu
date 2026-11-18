@@ -10,6 +10,7 @@ Agents poll; there is no push channel in 0.1.0. Lease expiry is measured on the 
 |---|---|
 | `POST /v1/jobs` body `JobSpec` | Create a job. `201` with `JobView`. `spec.after` lists up to 16 job ids that must be `done` first; the new job starts `blocked` while any are unfinished, otherwise `queued`. An unknown dependency, one that already failed or was cancelled, more than 16, a duplicate, or any other invalid spec gets `422 unprocessable` naming the fault. Same `idempotency_key` and same spec returns the existing job with `200`; same key and a different spec is `409 conflict`. |
 | `GET /v1/jobs?state=&limit=&after=` | List, newest first, `limit` at most 200, `after` is a `JobId` cursor. `{"jobs":[JobView],"next":"<id>|null"}` |
+| `GET /v1/jobs?key=<key>` | Look up an idempotency key: the same envelope with zero or one job and `next: null`; other list filters are ignored. An empty, over-long or malformed key is `400 bad_request`. If legacy data holds several jobs with the key, the newest is returned. |
 | `GET /v1/jobs/{id}` | `JobView` |
 | `POST /v1/jobs/{id}/cancel` | Queued, blocked or recovering: becomes `cancelled` at once. Leased or running: the agent is told on its next poll. Terminal: `409`. Returns `JobView`. |
 | `GET /v1/jobs/{id}/logs?offset=N` | Bytes of the stored log from `offset`, `Content-Type: text/plain`, header `X-Lu-Log-Length` and `X-Lu-State`; `?wait=25` holds the request up to 25 seconds for new bytes or a state change. |

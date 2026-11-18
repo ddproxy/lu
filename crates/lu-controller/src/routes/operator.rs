@@ -9,7 +9,7 @@ use crate::time::now;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use lu_proto::{ArtifactName, JobId, JobSpec, NodeName};
+use lu_proto::{validate_idempotency_key, ArtifactName, JobId, JobSpec, NodeName};
 use lu_serve::PeerAddr;
 use lu_store::{JobRecord, NodeRecord};
 use serde_json::json;
@@ -136,6 +136,28 @@ pub async fn list_jobs(
         return with_version(ApiError::unauthorized().into_response());
     }
     let q = crate::routes::parse_query(&uri);
+    // `key` is a different lookup on the same route, not an extra list filter.
+    if let Some(key) = q.get("key") {
+        if let Err(error) = validate_idempotency_key(key) {
+            return with_version(ApiError::bad_request(error.to_string()).into_response());
+        }
+        let key = key.clone();
+        let res = tokio::task::spawn_blocking({
+            let store = Arc::clone(&state.store);
+            move || store.job_by_key(&key)
+        })
+        .await;
+        let rec = match res {
+            Ok(rec) => rec,
+            Err(_) => return with_version(ApiError::internal().into_response()),
+        };
+        let jobs: Vec<JobRecord> = rec.into_iter().collect();
+        let body = json!({
+            "jobs": jobs.iter().map(job_view).collect::<Vec<_>>(),
+            "next": null,
+        });
+        return with_version(json_value_ok(StatusCode::OK, body));
+    }
     let limit = q
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())

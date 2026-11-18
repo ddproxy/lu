@@ -398,6 +398,179 @@ async fn submit_passes_after_dependencies() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_after_key_chains_three_jobs() {
+    let build = job_id();
+    let test = job_id();
+    let ship = job_id();
+    let keys = [
+        ("build".to_owned(), build.clone()),
+        ("test".to_owned(), test.clone()),
+        ("ship".to_owned(), ship.clone()),
+    ];
+    let server = start(move |record| {
+        if record.method == "GET" {
+            let key = record
+                .query
+                .as_deref()
+                .and_then(|q| q.strip_prefix("key="))
+                .unwrap_or("");
+            let jobs: Vec<Value> = keys
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, id)| job_json(id, "done"))
+                .collect();
+            return Reply::json(&json!({"jobs": jobs, "next": null}));
+        }
+        let spec: Value = serde_json::from_slice(&record.body).unwrap();
+        let key = spec["idempotency_key"].as_str().unwrap_or("");
+        let id = keys
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, id)| id.clone())
+            .unwrap_or_else(job_id);
+        Reply::json(&job_json(&id, "blocked"))
+    })
+    .await;
+    let dir = scratch("submit-after-key-chain");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let env = env_for(&server, &token);
+    for args in [
+        vec![
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--key",
+            "build",
+            "--task",
+            "build",
+        ],
+        vec![
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--key",
+            "test",
+            "--after-key",
+            "build",
+            "--task",
+            "test",
+        ],
+        vec![
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--key",
+            "ship",
+            "--after-key",
+            "build",
+            "--after-key",
+            "test",
+            "--task",
+            "ship",
+        ],
+    ] {
+        let output = run_with_env(&args, &env, None, &dir);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    let records = server.records.lock().unwrap();
+    let submitted: Vec<Value> = records
+        .iter()
+        .filter(|r| r.method == "POST")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(submitted.len(), 3);
+    assert!(submitted[0].get("after").is_none(), "{}", submitted[0]);
+    assert_eq!(submitted[1]["after"], json!([build]));
+    assert_eq!(submitted[2]["after"], json!([build, test]));
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_after_key_unknown_key_is_a_usage_error() {
+    let server = start(|_| Reply::json(&json!({"jobs": [], "next": null}))).await;
+    let dir = scratch("submit-after-key-unknown");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+            "--after-key",
+            "no-such-key",
+        ],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("no-such-key"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(server
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.method == "GET"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_after_and_after_key_resolve_to_one_dependency() {
+    let dep = job_id();
+    let new_id = job_id();
+    let dep_id = dep.clone();
+    let server = start(move |record| {
+        if record.method == "GET" {
+            return Reply::json(&json!({"jobs": [job_json(&dep_id, "done")], "next": null}));
+        }
+        Reply::json(&job_json(&new_id, "blocked"))
+    })
+    .await;
+    let dir = scratch("submit-after-dedup");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+            "--after",
+            &dep,
+            "--after-key",
+            "build",
+        ],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let records = server.records.lock().unwrap();
+    let post = records.iter().find(|r| r.method == "POST").unwrap();
+    let spec: Value = serde_json::from_slice(&post.body).unwrap();
+    assert_eq!(spec["after"], json!([dep]));
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ls_shows_the_waiting_dependency_count() {
     let waiting_id = job_id();
     let free_id = job_id();
@@ -847,7 +1020,7 @@ async fn status_prints_a_summary_and_json_prints_the_raw_body() {
     let body = json!({
         "version": "0.1.10",
         "uptime_secs": 42,
-        "schema_version": 2,
+        "schema_version": 3,
         "db_bytes": 4096,
         "recovered_on_boot": 1,
         "jobs": {"queued": 2, "running": 1},
@@ -869,7 +1042,7 @@ async fn status_prints_a_summary_and_json_prints_the_raw_body() {
     for (key, value) in [
         ("version", "0.1.10"),
         ("uptime_secs", "42"),
-        ("schema_version", "2"),
+        ("schema_version", "3"),
         ("db_bytes", "4096"),
         ("recovered_on_boot", "1"),
         ("oldest_queued_secs", "7"),
@@ -1130,6 +1303,40 @@ async fn retry_keeps_the_old_spec_and_sends_no_idempotency_key_by_default() {
     assert_eq!(spec["provider"], "peer-a");
     assert_eq!(spec["model"], "old-model");
     assert_eq!(spec["after"], json!([id]));
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_resolves_after_key_to_a_dependency() {
+    let old = job_id();
+    let dep = job_id();
+    let new_id = job_id();
+    let finished = finished_job(&old, "failed");
+    let dep_id = dep.clone();
+    let server = start(move |record| {
+        if record.method == "POST" {
+            Reply::json(&job_json(&new_id, "queued"))
+        } else if record.query.is_some() {
+            Reply::json(&json!({"jobs": [job_json(&dep_id, "done")], "next": null}))
+        } else {
+            Reply::json(&finished)
+        }
+    })
+    .await;
+    let dir = scratch("retry-after-key");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &["retry", &old, "--after-key", "build"],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let records = server.records.lock().unwrap();
+    let post = records.iter().find(|r| r.method == "POST").unwrap();
+    let spec: Value = serde_json::from_slice(&post.body).unwrap();
+    assert_eq!(spec["after"], json!([dep]));
     drop(records);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -251,6 +251,63 @@ async fn create_list_get_cancel_job_happy_path_and_idempotency() {
     let _ = srv.shutdown.send(());
 }
 
+#[tokio::test]
+async fn list_jobs_by_key_returns_zero_or_one_job() {
+    let srv = start_server().await;
+    let spec = sample_spec(Some("build"));
+    let payload = serde_json::to_string(&spec).unwrap();
+    let req = format!(
+        "POST /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        payload.len(), payload
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let created: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+
+    for (query, expected) in [("key=build", 200), ("key=missing", 200), ("key=", 400)] {
+        let r = raw_request(
+            srv.addr,
+            &format!("GET /v1/jobs?{query} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status(&r), expected, "{query}: {r}");
+        if expected == 200 {
+            let list: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+            assert_eq!(list["next"], serde_json::Value::Null, "{r}");
+            let jobs = list["jobs"].as_array().unwrap();
+            assert!(jobs.len() <= 1, "{r}");
+            if query == "key=build" {
+                assert_eq!(jobs.len(), 1, "{r}");
+                assert_eq!(jobs[0], created, "{r}");
+            } else {
+                assert!(jobs.is_empty(), "{r}");
+            }
+        } else {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["error"],
+                "bad_request",
+                "{r}"
+            );
+        }
+    }
+
+    let too_long = "k".repeat(lu_proto::MAX_IDEMPOTENCY_KEY_BYTES + 1);
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs?key={too_long} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 400, "{r}");
+
+    // The lookup needs the same operator scope as the rest of the list route.
+    let r = raw_request(
+        srv.addr,
+        "GET /v1/jobs?key=build HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&r), 401, "{r}");
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs?key=build HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 401, "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
 fn heartbeat_json(node: &str) -> serde_json::Value {
     json!({"node": node, "harness": "idle", "providers": []})
 }

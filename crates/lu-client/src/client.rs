@@ -217,6 +217,16 @@ impl Client {
         self.scrub(parse_job_list(&reply.body))
     }
 
+    /// The job submitted with an idempotency key, if the controller knows one.
+    pub async fn job_by_key(&self, key: &str) -> Result<Option<JobView>> {
+        let query = vec![("key".to_owned(), key.to_owned())];
+        let reply = self
+            .send(Method::GET, "v1/jobs", None, &query, &[], true)
+            .await?;
+        let reply = self.success(reply)?;
+        self.scrub(parse_job_list(&reply.body).map(|list| list.jobs.into_iter().next()))
+    }
+
     /// The raw list response, so the operator CLI can print what the controller sent.
     pub async fn list_jobs_raw(
         &self,

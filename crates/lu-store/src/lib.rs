@@ -9,7 +9,7 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 #[cfg(test)]
 pub mod conformance;
@@ -102,6 +102,8 @@ pub trait Store: Send + Sync + 'static {
     /// Creates a job, or returns the existing one for the same key and spec (`false`).
     fn create_job(&self, spec: &JobSpec, now: Now) -> Result<(JobRecord, bool), StoreError>;
     fn get_job(&self, id: &JobId) -> Result<JobRecord, StoreError>;
+    /// The newest job submitted with an idempotency key, if there is one.
+    fn job_by_key(&self, key: &str) -> Option<JobRecord>;
     /// Newest first. `after` is a cursor: jobs strictly older than it.
     fn list_jobs(
         &self,

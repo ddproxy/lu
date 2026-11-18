@@ -29,5 +29,5 @@ pub use node::{
     ProcessStats, ProviderState, ProviderStatus,
 };
 pub use sanitize::{printable, truncate_chars};
-pub use spec::{JobSpec, JobSpecError};
+pub use spec::{validate_idempotency_key, JobSpec, JobSpecError};
 pub use state::{CancelEffect, JobState};

@@ -263,6 +263,43 @@ async fn list_jobs_sends_the_filters_and_reads_a_page() {
 }
 
 #[tokio::test]
+async fn job_by_key_sends_the_key_and_reads_zero_or_one_job() {
+    let id = job_id();
+    let found = json!({"jobs": [job_json(&id, JobState::Done)], "next": null});
+    let missing = json!({"jobs": [], "next": null});
+    let server = start(move |record| {
+        assert_eq!(record.method, "GET");
+        assert_eq!(record.path, "/v1/jobs");
+        if record
+            .query
+            .as_deref()
+            .is_some_and(|q| q.contains("ticket"))
+        {
+            Reply::json(&found)
+        } else {
+            Reply::json(&missing)
+        }
+    })
+    .await;
+    let c = client(&server);
+    let view = c.job_by_key("ticket:42").await.unwrap().unwrap();
+    assert_eq!(view.id, id);
+    assert_eq!(view.state, JobState::Done);
+    assert!(c.job_by_key("unknown").await.unwrap().is_none());
+    let records = server.records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(
+        records[0]
+            .query
+            .as_deref()
+            .is_some_and(|q| q.starts_with("key=") && q.contains("ticket")),
+        "{:?}",
+        records[0].query
+    );
+    assert_eq!(records[1].query.as_deref(), Some("key=unknown"));
+}
+
+#[tokio::test]
 async fn list_jobs_reads_the_documented_envelope() {
     let id = job_id();
     let body = json!({"jobs": [job_json(&id, JobState::Done)], "next": null});

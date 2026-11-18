@@ -209,6 +209,9 @@ impl SqliteStore {
                 if v < 3 {
                     apply_v3(&tx)?;
                 }
+                if v < 4 {
+                    apply_v4(&tx)?;
+                }
                 tx.execute("DELETE FROM schema_version", [])
                     .map_err(internal)?;
                 tx.execute(
@@ -221,6 +224,7 @@ impl SqliteStore {
                 apply_v1(&tx)?;
                 apply_v2(&tx)?;
                 apply_v3(&tx)?;
+                apply_v4(&tx)?;
                 tx.execute(
                     "INSERT INTO schema_version(version) VALUES (?1)",
                     params![CURRENT_SCHEMA_VERSION],
@@ -300,6 +304,16 @@ fn apply_v3(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(
         "ALTER TABLE cordons ADD COLUMN reiki_derived INTEGER NOT NULL DEFAULT 0;
          ALTER TABLE cordons ADD COLUMN healthy_hb_count INTEGER NOT NULL DEFAULT 0;",
+    )
+    .map_err(internal)?;
+    Ok(())
+}
+
+fn apply_v4(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    // The key lives inside spec_json; this index keeps key lookups off a full table scan.
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS jobs_idempotency_key
+             ON jobs(json_extract(spec_json, '$.idempotency_key'));",
     )
     .map_err(internal)?;
     Ok(())
@@ -701,6 +715,44 @@ impl Store for SqliteStore {
             log_len: log_len_i as u64,
             waiting_on: load_waiting(&conn, &id_s)?,
         })
+    }
+
+    fn job_by_key(&self, key: &str) -> Option<JobRecord> {
+        let conn = self.conn.lock().ok()?;
+        // Ids sort by creation time, so DESC picks the newest if a legacy database holds more
+        // than one job with the same key.
+        let t: JobTuple = conn
+            .query_row(
+                "SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len FROM jobs
+                 WHERE json_extract(spec_json, '$.idempotency_key') = ?1
+                 ORDER BY id DESC LIMIT 1",
+                params![key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u32>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<i32>>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, i64>(14)?,
+                        row.get::<_, i64>(15)?,
+                    ))
+                },
+            )
+            .optional()
+            .ok()??;
+        let mut rec = tuple_to_job(t).ok()?;
+        rec.waiting_on = load_waiting(&conn, rec.id.as_str()).ok()?;
+        Some(rec)
     }
 
     fn list_jobs(
@@ -1587,9 +1639,11 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
 mod tests {
     use super::SqliteStore;
     use crate::{Now, Store};
+    use rusqlite::params;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     static CTR: AtomicU64 = AtomicU64::new(0);
 
@@ -1648,6 +1702,90 @@ mod tests {
             assert!(!created2);
             assert_eq!(rec2.id, id);
         }
+    }
+
+    #[test]
+    fn job_by_key_returns_the_newest_of_duplicate_keys() {
+        let p = temp_db("duplicate-key.sqlite");
+        let now = Now {
+            wall_unix: 1,
+            mono_ms: 1,
+        };
+        let (old_id, new_id) = {
+            let s = SqliteStore::open(&p).unwrap();
+            let old = s
+                .create_job(
+                    &crate::conformance::spec("https://x/old.git", Some("dup")),
+                    now,
+                )
+                .unwrap()
+                .0;
+            std::thread::sleep(Duration::from_millis(2));
+            let new = s
+                .create_job(
+                    &crate::conformance::spec("https://x/new.git", Some("other")),
+                    now,
+                )
+                .unwrap()
+                .0;
+            assert!(old.id < new.id);
+            (old.id, new.id)
+        };
+        // A legacy database can hold two jobs whose spec carries the same key.
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.execute(
+            "UPDATE jobs SET spec_json=replace(spec_json, '\"idempotency_key\":\"other\"', '\"idempotency_key\":\"dup\"') WHERE id=?1",
+            params![new_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let s = SqliteStore::open(&p).unwrap();
+        assert_eq!(s.job_by_key("dup").unwrap().id, new_id);
+        assert_ne!(s.job_by_key("dup").unwrap().id, old_id);
+        assert!(s.job_by_key("other").is_none());
+    }
+
+    #[test]
+    fn an_old_database_gains_the_key_index() {
+        let p = temp_db("migrate-key-index.sqlite");
+        let now = Now {
+            wall_unix: 1,
+            mono_ms: 1,
+        };
+        let id = {
+            let s = SqliteStore::open(&p).unwrap();
+            s.create_job(
+                &crate::conformance::spec("https://x/legacy.git", Some("legacy")),
+                now,
+            )
+            .unwrap()
+            .0
+            .id
+        };
+        // Rewind a current database to the previous schema and drop the new index.
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.execute("UPDATE schema_version SET version=2", [])
+            .unwrap();
+        conn.execute("DROP INDEX jobs_idempotency_key", []).unwrap();
+        drop(conn);
+
+        let s = SqliteStore::open(&p).unwrap();
+        let conn = s.conn.lock().unwrap();
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='jobs_idempotency_key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 1);
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::SCHEMA_VERSION);
+        drop(conn);
+        assert_eq!(s.job_by_key("legacy").unwrap().id, id);
     }
 
     #[test]

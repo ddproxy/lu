@@ -10,6 +10,15 @@ uses semantic versioning once it reaches 1.0.
 - A provider failure cordon created from Reiki's `retry_after_secs` now clears after two consecutive healthy provider heartbeats, so a stale outage estimate no longer leaves jobs queued for hours. Non-healthy readings reset the streak; output-marker cordons still wait out their timer. Store schema version is 3; older databases upgrade with their existing cordons unchanged.
 - `lu check`, `lu backup` and `lu restore` read only `[controller] db` and no longer check or load TLS keys and token files, so they work when run as root against a service account's secrets. `lu serve` still validates the whole config and its secret files.
 
+### Added
+
+- `lu submit --after-key <key>` and `lu retry --after-key <key>` resolve a job's idempotency key to a dependency id before submitting. They are repeatable, combinable with `--after`, de-duplicated, and count towards the 16-dependency limit; an unknown key is a usage error (exit 2).
+- `GET /v1/jobs?key=<key>` returns the newest job submitted with that key in the usual list envelope (zero or one job, `next: null`); an empty, over-long or malformed key gets `400 bad_request`. If legacy data holds several jobs with one key, the newest wins.
+
+### Changed
+
+- Schema 3 indexes the spec's idempotency key for the new lookup. Older databases gain the index on open.
+
 ## [0.1.13] - 2026-11-17
 
 ### Changed
