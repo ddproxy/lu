@@ -80,8 +80,21 @@ The `[agent]` table describes an agent host. The operator CLI also reads `contro
 | `opencode_password_file` | no | — | A private file (a regular file owned by the agent's account, no group or other access) whose single line is the opencode server's password. The agent reads it at start and passes it to the harness as `OPENCODE_SERVER_PASSWORD`, the only variable beyond `PATH`, `HOME` and `LANG` the harness gets. |
 | `workspace_group` | no | — | A group name or number, 1 to 32 letters, digits, `_`, `-` or `.`. When set, each job's working tree is given to this group with group read and write and the setgid bit; `.git` is left as git made it. For a harness that runs as another account, such as an opencode server in a container, while the agent runs as the account that can use git. Resolved from `/etc/group` at start; an unknown group stops the agent. |
 | `heartbeat_secs` | no | `15` | Integer `2` to `300`. When a `[controller]` table is also present, `heartbeat_secs * 2` must be strictly less than `lease_secs`. |
+| `labels` | no | `[]` | At most 32 labels. Each is 1 to 64 characters from `A-Z a-z 0-9 . _ - /`, with at most one `=`. Lu never interprets them; a job's `requires` must match every label exactly. |
+| `label_files` | no | `[]` | At most 8 absolute paths without `..`. Each file is read again before every heartbeat; a missing or unreadable file contributes nothing. Each file is capped at 4 KiB, must be UTF-8, and holds one label per line; blank lines and lines starting with `#` are ignored. Invalid labels are dropped with one warning per label. File labels are merged with `labels`, then sorted and de-duplicated. |
 | `reiki_health_url` | no | — | Loopback `http` or `https` URL with no credentials, query or fragment. Requires `reiki_token_file`. The agent reads the local Reiki's peer health (`GET /v1/health`) every 10 seconds and sends each upstream as a provider (`ok`, `cooling` with seconds left, `disabled` or `unknown`) with every heartbeat, plus the document itself. A job that names a `provider` goes only to nodes that report it. After three failed reads the node reports no providers. |
 | `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set. Checked like `token_file` on `load`. |
+
+Labels let one controller route work to particular hosts without a new job field for every
+machine property. For example:
+
+```toml
+[agent]
+# ...
+labels = ["gpu", "php8.3", "region=eu"]
+label_files = ["/etc/lu/labels.d/installed-software"]
+```
+
 
 ## `[tls]`
 
@@ -112,6 +125,7 @@ A `[tls]` table makes the controller serve HTTPS. It is required when `listen` i
 
 - `db`, `artifacts_dir`, `work_dir` and each `local_repo_roots` entry must be absolute and must not contain a `..` component. `[tls]` paths, `token_file`, `ca_file`, `reiki_token_file` and `[log] file` are not required to be absolute.
 - `db`, `artifacts_dir` and `work_dir` must be absolute and must not contain a `..` component. `[tls]` paths, `token_file`, `ca_file`, `reiki_token_file`, `credential_file` and `[log] file` are not required to be absolute.
+- `db`, `artifacts_dir`, `work_dir`, each `local_repo_roots` entry and each `label_files` entry must be absolute and must not contain a `..` component. `[tls]` paths, `token_file`, `ca_file`, `reiki_token_file` and `[log] file` are not required to be absolute.
 - Secret files are opened once with `O_NOFOLLOW` and `O_NONBLOCK`, then checked on the open handle. They must be regular files, owned by the effective user, with no group or other permission bits (mode `0600` or tighter). A file with mode `0640` is refused for a secret.
 - The config file itself has no secret-file mode check; it normally contains only hashes and paths. Protect it anyway because it names the token and TLS key locations.
 

@@ -1033,6 +1033,9 @@ impl Store for SqliteStore {
                     continue;
                 }
             }
+            if !crate::labels_satisfied(&rec.spec.requires, &hb.labels) {
+                continue;
+            }
             check_transition(rec.state, JobState::Leased)?;
             rec.state = JobState::Leased;
             rec.node = Some(node.clone());
@@ -1694,6 +1697,7 @@ mod tests {
             idempotency_key: Some("k".to_owned()),
             after: Vec::new(),
             stack_dependencies: true,
+            requires: Vec::new(),
         };
         let now = Now {
             wall_unix: 1,

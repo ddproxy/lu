@@ -28,6 +28,7 @@ fn spec() -> JobSpec {
         idempotency_key: Some("ticket:42".to_owned()),
         after: vec![JobId::new()],
         stack_dependencies: true,
+        requires: vec!["php8.3".to_owned()],
     }
 }
 
@@ -87,6 +88,7 @@ fn a_heartbeat_carries_a_capped_forwarded_document() {
         reiki: Some(serde_json::json!({"providers": ["peer-a"]})),
         host: None,
         jobs: Vec::new(),
+        labels: vec!["gpu".to_owned()],
     };
     beat.validate().unwrap();
     let wire = serde_json::to_string(&beat).unwrap();

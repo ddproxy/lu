@@ -189,6 +189,8 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         heartbeat_secs: 3,
         reiki_health_url: None,
         reiki_token_file: None,
+        labels: Vec::new(),
+        label_files: Vec::new(),
     };
     let done = Arc::new(AtomicBool::new(false));
     let spec = lu_proto::JobSpec {
@@ -204,6 +206,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         idempotency_key: None,
         after: Vec::new(),
         stack_dependencies: true,
+        requires: Vec::new(),
     };
     let controller = Arc::new(PackController {
         spec,

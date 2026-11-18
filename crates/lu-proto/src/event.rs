@@ -281,6 +281,7 @@ mod tests {
             idempotency_key: None,
             after: Vec::new(),
             stack_dependencies: true,
+            requires: Vec::new(),
         }
     }
 

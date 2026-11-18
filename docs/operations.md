@@ -240,6 +240,7 @@ A job submitted with `after` dependencies starts as `blocked` when at least one 
 A dependent job with `stack_dependencies: true` (the default) stages its base commit and applies every finished dependency's `diff.patch` in `after` order before the harness starts. A dependency with no diff is skipped. A patch that applies cleanly is written directly; otherwise the agent reconstructs the dependency's side from the base and three-way merges it. If conflicts remain, the job stops before the harness with `failure_class: "conflict"` and a summary naming the dependency and up to 20 conflicting paths; it never retries and the failed merge writes nothing. `lu submit --no-stack` sets `stack_dependencies: false` to run on the base tree alone. The dependent's own diff is always against its base and includes the dependency changes, so a consumer merging a chain applies only the last diff.
 
 A job starts as `queued` with `attempt = 1` and `epoch = 0`. When an idle, non-draining node with no held job asks for work, the controller assigns the oldest queued job whose provider is available and not cordoned. A `leased`, `running` or `recovering` job is still held by its node:
+A job starts as `queued` with `attempt = 1` and `epoch = 0`. When an idle, non-draining node with no held job asks for work, the controller assigns the oldest queued job whose provider is available and not cordoned, and whose node advertises every label in the job's `requires` list. Label matching is exact; Lu assigns no meaning to a label. The label rule composes with provider and drain rules. If a queued job's requirements cannot be met by any online node, `lu show` and the `lu top` note column print the first missing label as `no node with label <label>`.
 
 - state becomes `leased`, `node` is set, `epoch` is incremented, and the lease runs for `lease_secs`.
 - the agent calls `start` to move the job to `running`, then renews the lease. In 0.1.0 the controller also best-effort renews on `poll`, `start` and log append.
@@ -313,22 +314,24 @@ prints the raw `GET /v1/status` response.
 
 ## Reading `lu nodes`
 
-Human output has five columns:
+Human output has six columns:
 
 ```text
-NAME    VERSION  HARNESS  LAST_SEEN            DRAINED
-node-a  0.1.10   idle     2026-11-16 09:12:00Z no
+NAME    VERSION  HARNESS  LABELS                     LAST_SEEN            DRAINED
+node-a  0.1.10   idle     gpu,php8.3,region=eu       2026-11-16 09:12:00Z no
 ```
 
 - `NAME` is the node name bound to the agent token.
 - `VERSION` is the agent version from its latest heartbeat, or `-` for an older agent.
 - `HARNESS` is the last reported harness state (`idle`, `busy`, or `-` if unknown).
+- `LABELS` is the comma-separated label list from the latest heartbeat, or `-` for none. A long list is cut to fit the column and ends with `+N` for the hidden labels.
 - `LAST_SEEN` is the last heartbeat time in UTC.
 - `DRAINED` is intended to show the drain flag.
 
-There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `current_job`, `cordons`, `version` and the opaque `reiki` document.
+There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `labels`, `current_job`, `cordons`, `version` and the opaque `reiki` document.
 
 A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, or has a matching provider cordon will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
+A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, lacks a required label, or has a matching provider cordon will not be assigned one.
 
 ## Reading `lu node`
 
@@ -407,6 +410,7 @@ Series:
 | `lu_nodes_online` | gauge | … and seen within two lease periods. |
 | `lu_nodes_drained` | gauge | … with the drain flag set. |
 | `lu_node_providers{node,provider,state}` | gauge | 1 per provider as reported by that node's latest heartbeat, `state` is `ok`, `cooling`, `disabled` or `unknown`. |
+| `lu_node_labels_info{node,label}` | gauge | 1 per label as reported by that node's latest heartbeat. |
 | `lu_controller_up` | gauge | Always 1. |
 | `lu_jobs_completed_total{outcome="done\|failed\|cancelled"}` | counter | Jobs in a terminal state, by outcome, derived from the stored jobs table; survives a restart. |
 | `lu_build_info{version="…"}` | gauge | Always 1; the controller build version. |
@@ -478,7 +482,7 @@ version, size, `leased`/`running` jobs without a lease, and orphan `job_deps` ro
 | TLS key refused | Mode must be `0600` or tighter and the file must be owned by `lu`; symlinks are refused. |
 | `401 unauthorized` | Wrong token, wrong scope, a hash mismatch, or a token file with the wrong contents. Operator commands need an operator token; agent routes need an agent token. |
 | `403 forbidden` | The token is valid but the job or heartbeat belongs to a different node. |
-| Job stays `queued` | No agent is polling, the node is busy or draining, provider missing, or provider cordon. Inspect `lu nodes --json`. |
+| Job stays `queued` | No agent is polling, the node is busy or draining, provider missing, provider cordon, or no online node has every required label. `lu show` prints the missing label; inspect `lu nodes --json`. |
 | `logs --follow` never stops | Known client mismatch; `Ctrl-C` and use `lu show`/`lu logs`. |
 | `lu fetch` exits `1` | No artifacts yet, or the job has not uploaded any; check the job state. |
 

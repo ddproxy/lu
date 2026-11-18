@@ -218,6 +218,21 @@ pub async fn metrics(
         out.push('\n');
     }
 
+    out.push_str("# HELP lu_node_labels_info Node labels advertised in the latest heartbeat\n");
+    out.push_str("# TYPE lu_node_labels_info gauge\n");
+    for node_rec in &nodes {
+        let node_name = escape_label(node_rec.name.as_str());
+        for label in &node_rec.heartbeat.labels {
+            let label = escape_label(label);
+            out.push_str(&gauge(
+                "lu_node_labels_info",
+                &[("node", &node_name), ("label", &label)],
+                1,
+            ));
+            out.push('\n');
+        }
+    }
+
     out.push_str("# HELP lu_node_providers Provider state per node (1 if reported, 0 otherwise)\n");
     out.push_str("# TYPE lu_node_providers gauge\n");
     for node_rec in &nodes {

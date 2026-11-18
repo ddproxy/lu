@@ -30,6 +30,21 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 3_600;
 /// At most this many providers may appear in one heartbeat.
 pub const MAX_PROVIDERS: usize = 64;
 
+/// One node label or job requirement, in bytes.
+pub const MAX_LABEL_BYTES: usize = 64;
+
+/// The most labels one node may advertise.
+pub const MAX_NODE_LABELS: usize = 32;
+
+/// The most labels one job may require.
+pub const MAX_REQUIRES_LABELS: usize = 8;
+
+/// The most label files one agent may watch.
+pub const MAX_LABEL_FILES: usize = 8;
+
+/// One label file's largest accepted size.
+pub const MAX_LABEL_FILE_BYTES: u64 = 4 * 1024;
+
 /// The forwarded Reiki health document, serialized.
 pub const MAX_REIKI_BYTES: usize = 64 * 1024;
 

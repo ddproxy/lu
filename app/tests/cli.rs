@@ -170,6 +170,44 @@ async fn submit_passes_after_dependencies() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_passes_required_labels_and_prints_warnings() {
+    let id = job_id();
+    let mut body = job_json(&id, "queued");
+    body["warnings"] = json!(["no node with label php8.3"]);
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("submit-require");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+            "--require",
+            "php8.3",
+            "--require",
+            "gpu",
+        ],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), id);
+    assert!(
+        stderr(&output).contains("lu: warning: no node with label php8.3"),
+        "{}",
+        stderr(&output)
+    );
+    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap()[0].body).unwrap();
+    assert_eq!(spec["requires"], json!(["php8.3", "gpu"]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_after_key_chains_three_jobs() {
     let build = job_id();
     let test = job_id();
@@ -777,8 +815,15 @@ async fn fetch_writes_the_fixed_private_names_and_needs_force_to_replace() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nodes_and_drain_render_aligned_text() {
     let list = json!([
-        {"name": "node-a", "version": "0.1.10", "harness": "idle", "last_seen": 10, "draining": true},
-        {"name": "node-b", "harness": "busy", "last_seen": 12, "draining": false}
+        {
+            "name": "node-a",
+            "version": "0.1.10",
+            "harness": "idle",
+            "last_seen": 10,
+            "draining": true,
+            "labels": ["gpu", "php8.3", "ubuntu22.04", "x86_64", "region=eu", "tier=gold"]
+        },
+        {"name": "node-b", "harness": "busy", "last_seen": 12, "draining": false, "labels": []}
     ]);
     let server = start(move |record| {
         if record.path == "/v1/nodes" {
@@ -801,8 +846,10 @@ async fn nodes_and_drain_render_aligned_text() {
     assert!(header.starts_with("NAME"), "{text}");
     assert!(header.contains("VERSION"), "{text}");
     assert!(header.contains("HARNESS"), "{text}");
+    assert!(header.contains("LABELS"), "{text}");
     assert!(text.contains("node-a"), "{text}");
     assert!(text.contains("0.1.10"), "{text}");
+    assert!(text.contains("gpu,php8.3,ubuntu22.04,x86_64+2"), "{text}");
     assert!(text.contains("node-b"), "{text}");
     assert!(text.contains("yes"), "{text}");
 
@@ -823,6 +870,11 @@ async fn nodes_and_drain_render_aligned_text() {
         .unwrap()
         .to_owned();
     assert!(undrain_line.ends_with("no"), "{undrain_line:?}");
+
+    let output = run_with_env(&["--json", "nodes"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let raw = stdout(&output);
+    assert!(raw.contains("\"labels\":[\"gpu\""), "{raw}");
 
     let records = server.records.lock().unwrap();
     let paths: Vec<&str> = records.iter().map(|record| record.path.as_str()).collect();
@@ -1103,9 +1155,50 @@ fn finished_job(id: &str, state: &str) -> Value {
         "timeout_secs": 60,
         "idle_timeout_secs": 45,
         "idempotency_key": "ticket:7",
-        "after": [id]
+        "after": [id],
+        "requires": ["old-label"]
     });
     job
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_replaces_or_clears_label_requirements() {
+    let id = job_id();
+    let new_id = job_id();
+    let finished = finished_job(&id, "failed");
+    let created = job_json(&new_id, "queued");
+    let server = start(move |record| {
+        if record.method == "POST" {
+            Reply::json(&created)
+        } else {
+            Reply::json(&finished)
+        }
+    })
+    .await;
+    let dir = scratch("retry-require");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let env = env_for(&server, &token);
+
+    let output = run_with_env(
+        &["retry", &id, "--require", "php8.3", "--require", "gpu"],
+        &env,
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = run_with_env(&["retry", &id, "--no-require"], &env, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let records = server.records.lock().unwrap();
+    let posts: Vec<Value> = records
+        .iter()
+        .filter(|record| record.method == "POST")
+        .map(|record| serde_json::from_slice(&record.body).unwrap())
+        .collect();
+    assert_eq!(posts[0]["requires"], json!(["php8.3", "gpu"]));
+    assert!(posts[1].get("requires").is_none(), "{}", posts[1]);
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

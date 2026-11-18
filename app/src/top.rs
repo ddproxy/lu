@@ -109,6 +109,7 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
                         soonest_secs: p.soonest_secs,
                     })
                     .collect(),
+                labels: node.labels.clone(),
             })
             .collect(),
         jobs: jobs
@@ -132,7 +133,7 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
                     }
                     (Some(_), None) => operator::failure_name(job.failure_class),
                     (None, Some(summary)) => plain_summary(summary),
-                    (None, None) => String::new(),
+                    (None, None) => job.waiting_reason.clone().unwrap_or_default(),
                 },
                 after: job.after.iter().map(ToString::to_string).collect(),
             })
@@ -154,7 +155,7 @@ async fn print_once(client: &Client) -> Result<(), String> {
     let mut dashboard = Dashboard::new();
     let now = Instant::now();
     dashboard.apply(Ok(snapshot), now);
-    println!("{}", dashboard.view(now).table_text());
+    println!("{}", dashboard.view_sized(now, 160).table_text());
     Ok(())
 }
 

@@ -4,8 +4,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{is_name_byte, JobId, NodeName};
+use crate::label::valid_label;
 use crate::limits::{
-    MAX_NAME_BYTES, MAX_PROVIDERS, MAX_REIKI_BYTES, MAX_STATS_BYTES, MAX_VERSION_BYTES,
+    MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_NODE_LABELS, MAX_PROVIDERS, MAX_REIKI_BYTES,
+    MAX_STATS_BYTES, MAX_VERSION_BYTES,
 };
 
 /// Whether the peer's harness is free to take a job.
@@ -103,6 +105,8 @@ pub struct Heartbeat {
     pub host: Option<HostStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobStats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -120,6 +124,8 @@ struct RawHeartbeat {
     pub host: Option<HostStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobStats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 impl TryFrom<RawHeartbeat> for Heartbeat {
@@ -133,6 +139,7 @@ impl TryFrom<RawHeartbeat> for Heartbeat {
             reiki: raw.reiki,
             host: raw.host,
             jobs: raw.jobs,
+            labels: raw.labels,
         };
         hb.trim_stats();
         hb.validate()?;
@@ -209,6 +216,18 @@ impl Heartbeat {
                 });
             }
         }
+        if self.labels.len() > MAX_NODE_LABELS {
+            return Err(HeartbeatError::TooManyLabels {
+                got: self.labels.len(),
+            });
+        }
+        for label in &self.labels {
+            if !valid_label(label) {
+                return Err(HeartbeatError::Label {
+                    value: label.clone(),
+                });
+            }
+        }
         if let Some(reiki) = &self.reiki {
             let size = serde_json::to_vec(reiki)
                 .map_err(|_| HeartbeatError::ReikiNotSerializable)?
@@ -227,6 +246,8 @@ pub enum HeartbeatError {
     Version { value: String },
     TooManyProviders { got: usize },
     ProviderName { index: usize, name: String },
+    TooManyLabels { got: usize },
+    Label { value: String },
     ReikiTooLarge { got: usize },
     ReikiNotSerializable,
 }
@@ -245,6 +266,14 @@ impl std::fmt::Display for HeartbeatError {
             Self::ProviderName { index, name } => write!(
                 f,
                 "provider #{index} has an invalid name {name:?}; it must be 1 to {MAX_NAME_BYTES} characters from A-Z a-z 0-9 . _ -"
+            ),
+            Self::TooManyLabels { got } => write!(
+                f,
+                "a heartbeat may carry at most {MAX_NODE_LABELS} labels (got {got})"
+            ),
+            Self::Label { value } => write!(
+                f,
+                "invalid node label {value:?}; it must be 1 to {MAX_LABEL_BYTES} characters from A-Z a-z 0-9 . _ - / with at most one '='"
             ),
             Self::ReikiTooLarge { got } => write!(
                 f,
@@ -282,6 +311,7 @@ mod tests {
             reiki: None,
             host: None,
             jobs: Vec::new(),
+            labels: Vec::new(),
         }
     }
 
@@ -402,6 +432,51 @@ mod tests {
             beat.validate().unwrap_err(),
             HeartbeatError::ProviderName { .. }
         ));
+    }
+
+    #[test]
+    fn node_labels_round_trip_and_are_omitted_when_empty() {
+        let mut beat = heartbeat();
+        assert!(!serde_json::to_string(&beat).unwrap().contains("labels"));
+        beat.labels = vec!["php8.3".to_owned(), "region=eu".to_owned()];
+        let json = serde_json::to_string(&beat).unwrap();
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.labels, beat.labels);
+        assert!(beat.validate().is_ok());
+    }
+
+    #[test]
+    fn too_many_or_invalid_node_labels_are_refused() {
+        let mut beat = heartbeat();
+        beat.labels = (0..=MAX_NODE_LABELS)
+            .map(|i| format!("label-{i}"))
+            .collect();
+        assert_eq!(
+            beat.validate().unwrap_err(),
+            HeartbeatError::TooManyLabels {
+                got: MAX_NODE_LABELS + 1
+            }
+        );
+        for label in [
+            "",
+            "bad label",
+            "café",
+            "a=b=c",
+            &"a".repeat(MAX_LABEL_BYTES + 1),
+        ] {
+            beat.labels = vec![label.to_owned()];
+            assert!(
+                matches!(beat.validate().unwrap_err(), HeartbeatError::Label { .. }),
+                "{label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn old_heartbeats_without_labels_still_parse() {
+        let beat: Heartbeat =
+            serde_json::from_str(r#"{"node":"peer-a","harness":"idle","providers":[]}"#).unwrap();
+        assert!(beat.labels.is_empty());
     }
 
     #[test]

@@ -42,6 +42,12 @@ pub struct JobView {
     pub after: Vec<JobId>,
     #[serde(default)]
     pub waiting_on: Vec<JobId>,
+    /// Why a queued job cannot be placed, when no online node has all its labels.
+    #[serde(default)]
+    pub waiting_reason: Option<String>,
+    /// Advice from a submit the controller accepted, such as an unknown label.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl JobView {
@@ -61,6 +67,8 @@ impl JobView {
             summary: None,
             after: Vec::new(),
             waiting_on: Vec::new(),
+            waiting_reason: None,
+            warnings: Vec::new(),
         }
     }
 }
@@ -106,6 +114,8 @@ pub struct NodeView {
     pub mem_total_kb: Option<u64>,
     #[serde(default)]
     pub stuck: u64,
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 impl NodeView {
@@ -122,6 +132,7 @@ impl NodeView {
             mem_available_kb: None,
             mem_total_kb: None,
             stuck: 0,
+            labels: Vec::new(),
         }
     }
 }
@@ -197,6 +208,8 @@ pub struct PollRequest {
     pub host: Option<HostStats>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobStats>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     #[serde(alias = "wait", skip_serializing_if = "Option::is_none")]
     pub wait_secs: Option<u64>,
 }
@@ -211,6 +224,7 @@ impl From<Heartbeat> for PollRequest {
             reiki: beat.reiki,
             host: beat.host,
             jobs: beat.jobs,
+            labels: beat.labels,
             wait_secs: None,
         }
     }
@@ -364,6 +378,7 @@ fn empty_spec() -> JobSpec {
         idempotency_key: None,
         after: Vec::new(),
         stack_dependencies: true,
+        requires: Vec::new(),
     }
 }
 
@@ -408,6 +423,32 @@ mod tests {
     }
 
     #[test]
+    fn job_views_carry_waiting_reasons_and_warnings() {
+        let id = JobId::new();
+        let json = format!(
+            r#"{{"id":"{id}","state":"queued","waiting_reason":"no node with label php8.3","warnings":["no node with label php8.3"]}}"#
+        );
+        let view: JobView = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            view.waiting_reason.as_deref(),
+            Some("no node with label php8.3")
+        );
+        assert_eq!(view.warnings, vec!["no node with label php8.3".to_owned()]);
+    }
+
+    #[test]
+    fn poll_requests_carry_node_labels() {
+        let request = PollRequest {
+            labels: vec!["gpu".to_owned()],
+            ..PollRequest::default()
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"labels":["gpu"]}"#);
+        let parsed: PollRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.labels, vec!["gpu"]);
+    }
+
+    #[test]
     fn a_minimal_job_view_still_deserialises() {
         let id = JobId::new();
         let json = format!(r#"{{"id":"{id}","state":"queued"}}"#);
@@ -447,6 +488,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(node.version.as_deref(), Some("0.1.10"));
+
+        let node: NodeView =
+            serde_json::from_str(r#"{"name":"node-a","labels":["gpu","php8.3"]}"#).unwrap();
+        assert_eq!(node.labels, vec!["gpu".to_owned(), "php8.3".to_owned()]);
     }
 
     #[test]

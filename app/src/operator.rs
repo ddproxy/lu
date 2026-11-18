@@ -56,6 +56,9 @@ pub struct SubmitArgs {
     /// Do not apply dependency diffs to this job's tree.
     #[arg(long)]
     pub no_stack: bool,
+    /// Run only on a node with this label (repeatable).
+    #[arg(long = "require")]
+    pub require: Vec<String>,
     /// Idempotency key.
     #[arg(long)]
     pub key: Option<String>,
@@ -87,6 +90,12 @@ pub struct RetryArgs {
     /// Only run after the job with this idempotency key (repeatable).
     #[arg(long = "after-key")]
     pub after_key: Vec<String>,
+    /// Replace the label requirements (repeatable).
+    #[arg(long = "require", conflicts_with = "no_require")]
+    pub require: Vec<String>,
+    /// Clear the label requirements.
+    #[arg(long = "no-require")]
+    pub no_require: bool,
     /// Idempotency key. The new job carries none unless this is given.
     #[arg(long)]
     pub key: Option<String>,
@@ -250,6 +259,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         idempotency_key: args.key,
         after,
         stack_dependencies: !args.no_stack,
+        requires: args.require,
     };
     spec.validate().map_err(|error| error.to_string())?;
 
@@ -307,6 +317,11 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
         };
         spec.after = after;
     }
+    if !args.require.is_empty() {
+        spec.requires = args.require;
+    } else if args.no_require {
+        spec.requires.clear();
+    }
     // A retry is a new job; only --key gives it an idempotency key.
     spec.idempotency_key = args.key;
     spec.validate().map_err(|error| error.to_string())?;
@@ -324,6 +339,10 @@ async fn submit_and_report(
         .submit_with_raw(spec)
         .await
         .map_err(|error| error.to_string())?;
+
+    for warning in &view.warnings {
+        eprintln!("lu: warning: {warning}");
+    }
 
     if json && !wait {
         print_raw(&raw);
@@ -545,13 +564,21 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
                     .map(display_field)
                     .unwrap_or_else(|| "-".to_owned()),
                 harness_name(node.harness),
+                labels_cell(&node.labels, 40),
                 time(node.last_seen),
                 if node.draining { "yes" } else { "no" }.to_owned(),
             ]
         })
         .collect();
     print_table(
-        &["NAME", "VERSION", "HARNESS", "LAST_SEEN", "DRAINED"],
+        &[
+            "NAME",
+            "VERSION",
+            "HARNESS",
+            "LABELS",
+            "LAST_SEEN",
+            "DRAINED",
+        ],
         rows,
     );
     Ok(ExitCode::SUCCESS)
@@ -928,6 +955,13 @@ fn print_job(view: &JobView) {
         ("finished_at", optional_time(view.finished_at)),
         ("failure", failure_name(view.failure_class)),
         (
+            "waiting",
+            view.waiting_reason
+                .as_deref()
+                .map(display_field)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        (
             "summary",
             view.summary
                 .as_deref()
@@ -1166,6 +1200,45 @@ fn display_field(text: &str) -> String {
     printable(&truncate_chars(text, SUMMARY_CHARS))
 }
 
+/// Joins labels for a table cell, dropping the tail and appending `+N` when the column is full.
+fn labels_cell(labels: &[String], width: usize) -> String {
+    if labels.is_empty() {
+        return "-".to_owned();
+    }
+    let mut cell = String::new();
+    let mut shown = 0;
+    for (index, label) in labels.iter().enumerate() {
+        let suffix = labels.len() - index - 1;
+        let suffix_len = if suffix > 0 {
+            format!("+{suffix}").chars().count()
+        } else {
+            0
+        };
+        let separator = usize::from(shown > 0);
+        let needed = separator + label.chars().count() + suffix_len;
+        if index == 0 {
+            if needed > width && width > suffix_len {
+                cell.push_str(&truncate_chars(label, width - suffix_len));
+                shown = 1;
+                break;
+            }
+        } else if cell.chars().count() + needed > width {
+            break;
+        }
+        if shown > 0 {
+            cell.push(',');
+        }
+        cell.push_str(label);
+        shown = index + 1;
+    }
+    let remaining = labels.len() - shown;
+    if remaining > 0 {
+        cell.push('+');
+        cell.push_str(&remaining.to_string());
+    }
+    cell
+}
+
 /// Unix seconds as `YYYY-MM-DD HH:MM:SSZ`, computed by hand to avoid a date dependency.
 fn time(value: u64) -> String {
     if value == 0 {
@@ -1299,6 +1372,26 @@ fn finish(result: Result<ExitCode, String>) -> ExitCode {
             eprintln!("lu: {message}");
             ExitCode::from(EXIT_ERROR)
         }
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::labels_cell;
+
+    fn labels(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn labels_render_comma_separated_and_cut_with_a_count() {
+        assert_eq!(labels_cell(&[], 40), "-");
+        assert_eq!(labels_cell(&labels(&["php8.3", "gpu"]), 40), "php8.3,gpu");
+        assert_eq!(
+            labels_cell(&labels(&["php8.3", "gpu", "region=eu"]), 13),
+            "php8.3,gpu+1"
+        );
+        assert_eq!(labels_cell(&labels(&["a-very-long-label"]), 8), "a-very-l");
     }
 }
 

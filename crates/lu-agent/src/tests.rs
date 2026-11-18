@@ -320,6 +320,7 @@ fn test_spec(repo: &str) -> JobSpec {
         idempotency_key: None,
         after: Vec::new(),
         stack_dependencies: true,
+        requires: Vec::new(),
     }
 }
 
@@ -338,6 +339,7 @@ fn make_agent(
         base_source: BaseSource::Auto,
         work_dir: work_dir.to_path_buf(),
         heartbeat_secs: TEST_HEARTBEAT_SECS,
+        labels: Arc::new(super::labels::LabelSource::new(Vec::new(), Vec::new())),
         provider_marker_grace: super::PROVIDER_MARKER_GRACE,
         reiki_watch_period: super::REIKI_WATCH_PERIOD,
         opencode_server: None,

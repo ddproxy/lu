@@ -24,6 +24,7 @@ pub struct NodeRow {
     /// Seconds since the node's last heartbeat, when it has sent one.
     pub seen_secs_ago: Option<u64>,
     pub providers: Vec<ProviderCell>,
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,6 +446,11 @@ impl Dashboard {
     }
 
     pub fn view(&self, now: Instant) -> ViewModel {
+        self.view_sized(now, 0)
+    }
+
+    /// The same view, told how wide the terminal is so it can drop or add columns.
+    pub fn view_sized(&self, now: Instant, width: usize) -> ViewModel {
         let (snapshot, history, live_status) = match &self.frozen {
             Some((snapshot, history, taken)) => (
                 snapshot,
@@ -471,6 +477,7 @@ impl Dashboard {
             self.selection,
             self.log.as_ref(),
             !self.graph_hidden,
+            width,
         )
     }
 }
@@ -548,6 +555,11 @@ fn worst(tones: impl Iterator<Item = Tone>) -> Tone {
     })
 }
 
+/// A node table narrower than this hides the labels column.
+const LABELS_MIN_WIDTH: usize = 100;
+/// Width of the labels column when it is shown.
+const LABELS_WIDTH: usize = 28;
+
 fn charts(history: &[Sample]) -> Vec<Chart> {
     let series = |title: &str, pick: fn(&Sample) -> u64| {
         let values: Vec<u64> = history.iter().map(pick).collect();
@@ -573,11 +585,22 @@ impl ViewModel {
         selection: Selection,
         log: Option<&LogPane>,
         show_graph: bool,
+        width: usize,
     ) -> Self {
-        let mut lines = vec![Line::new(
-            format!("{:<12} {:<8} {:<8} PROVIDERS", "NODE", "STATE", "SEEN"),
-            Tone::Heading,
-        )];
+        let show_labels = width >= LABELS_MIN_WIDTH;
+        let node_header = if show_labels {
+            format!(
+                "{:<12} {:<8} {:<8} {:<label_width$} PROVIDERS",
+                "NODE",
+                "STATE",
+                "SEEN",
+                "LABELS",
+                label_width = LABELS_WIDTH
+            )
+        } else {
+            format!("{:<12} {:<8} {:<8} PROVIDERS", "NODE", "STATE", "SEEN")
+        };
+        let mut lines = vec![Line::new(node_header, Tone::Heading)];
         if snapshot.nodes.is_empty() {
             lines.push(Line::new("no nodes have reported", Tone::Dim));
         }
@@ -591,6 +614,20 @@ impl ViewModel {
                 (printable(&node.harness), Tone::Plain)
             };
             let seen = node.seen_secs_ago.map_or("-".to_owned(), short_age);
+            let label_text = if node.labels.is_empty() {
+                "-".to_owned()
+            } else {
+                node.labels.join(",")
+            };
+            let labels = if show_labels {
+                format!(
+                    "{:<label_width$} ",
+                    clip(&label_text, LABELS_WIDTH),
+                    label_width = LABELS_WIDTH
+                )
+            } else {
+                String::new()
+            };
             let cells: Vec<(String, Tone)> = node.providers.iter().map(provider_text).collect();
             let providers: Vec<&str> = cells.iter().map(|(text, _)| text.as_str()).collect();
             let tone = if tone == Tone::Plain && !cells.is_empty() {
@@ -600,10 +637,11 @@ impl ViewModel {
             };
             lines.push(Line::new(
                 format!(
-                    "{:<12} {:<8} {:<8} {}",
+                    "{:<12} {:<8} {:<8} {}{}",
                     clip(&node.name, 12),
                     state,
                     seen,
+                    labels,
                     providers.join("   ")
                 ),
                 tone,
@@ -764,6 +802,7 @@ mod tests {
                     soonest_secs: None,
                 },
             ],
+            labels: vec!["gpu".to_owned(), "php8.3".to_owned()],
         }
     }
 
@@ -1018,6 +1057,30 @@ mod tests {
                 .is_some(),
             "the second prompt was in time"
         );
+    }
+
+    #[test]
+    fn labels_appear_only_when_the_terminal_is_wide_enough() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        dashboard.apply(Ok(snapshot()), t0);
+        assert!(!dashboard.view_sized(t0, 90).plain_text().contains("LABELS"));
+        let wide = dashboard.view_sized(t0, 120).plain_text();
+        assert!(wide.contains("LABELS"), "{wide}");
+        assert!(wide.contains("gpu,php8.3"), "{wide}");
+    }
+
+    #[test]
+    fn a_queued_job_note_carries_its_waiting_reason() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        let mut snap = snapshot();
+        snap.jobs[1].note = "no node with label php8.3".to_owned();
+        dashboard.apply(Ok(snap), t0);
+        assert!(dashboard
+            .view(t0)
+            .plain_text()
+            .contains("no node with label php8.3"));
     }
 
     #[test]
