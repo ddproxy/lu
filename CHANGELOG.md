@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-18
+
 ### Added
 
 - Job fallback choices. `JobSpec.fallbacks` lists up to 4 alternate `{provider, model}` choices. Dispatch applies labels first, then tries the primary `provider`/`model` and each fallback in order, assigning the first provider the node reports healthy and uncordoned; a fallback without a model reuses the primary model. The chosen pair is stored as `assigned_provider`/`assigned_model`, exposed in `JobView` and printed by `lu show`. The `Assign` event carries additive `provider`/`model` fields; older agents ignore them and run the primary choice. A provider failure cordons the assigned pair and requeues the job, so the next dispatch can choose another fallback, node, or provider on the same node. The agent builds the harness command and `report.json` from the assigned model.
