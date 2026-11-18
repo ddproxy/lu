@@ -1,6 +1,6 @@
 # Operations
 
-This page covers a packaged controller deployment, upgrades, backup and restore, restart behaviour, leases and retries, provider cordons, how to read `lu status` and `lu nodes`, monitoring, and the dependency-graph display.
+This page covers a packaged controller deployment, upgrades, backup and restore, restart behaviour, leases and retries, provider cordons, how to read `lu status` and `lu nodes`, monitoring, disk housekeeping, and the dependency-graph display.
 
 **0.1.0 status:** controller, agent (`lu agent`) and operator CLI work end to end. Read the agent limitation in `docs/security.md` before running an agent next to anything sensitive.
 
@@ -345,7 +345,9 @@ load15            0.12
 mem_total_kb      8192
 mem_available_kb  4096
 swap_used_kb      12
-disk_free_bytes   -
+disk_free_bytes   10737418240
+disk_total_bytes  53687091200
+disk_free_percent 20
 uptime_secs       600
 
 job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
@@ -353,13 +355,46 @@ job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
   4242  1     S      7      1024    90     3      opencode run
 ```
 
-- Host numbers come from the agent's `/proc` sample. `disk_free_bytes` is currently always `-`; the documented optional field is reserved for a later filesystem stat primitive.
+- Load, memory and uptime come from the agent's `/proc` sample. `disk_free_bytes`, `disk_total_bytes` and `disk_free_percent` describe the filesystem holding the agent's `work_dir`; each is `-` when the agent cannot read it.
 - Each job is a running job owned by that node. `pgid` is the harness process group, and the process table is capped at the 64 busiest members. `COMMAND` is the first 80 characters of the command line with control characters replaced.
 - `output_idle` is seconds since the harness last wrote output; `cpu_idle` is seconds since any process in the job tree last used CPU. `stuck yes` means both are above 300 seconds while the job is still running.
 - A node that has not sent stats prints `host  -` and `jobs  -`. An unknown node is a 404 and exits `1`.
 - `lu node <name> --json` prints the exact `GET /v1/nodes/{name}/stats` body, including an empty `{}` for a known node with no stats.
 
 Stats are sampled on the agent at heartbeat time, which may be slower than `lu top`'s two-second refresh. They describe the agent's view, not live controller state.
+
+## Disk housekeeping
+
+Long-running harness builds can leave gigabytes behind in directories outside the agent's
+`work_dir`. An optional `[agent.housekeeping]` table removes those directories between jobs:
+
+```toml
+[agent.housekeeping]
+scratch_globs = ["/srv/work/target-*"]
+min_age_hours = 6
+min_free_percent = 15
+max_remove_per_pass = 10
+```
+
+A pass runs at agent start and after each finished job, never while a job is running, and at
+most once every 10 minutes. It acts only when the filesystem holding a pattern's parent is
+below `min_free_percent`, and stops when free space is back above `min_free_percent + 5` or
+`max_remove_per_pass` directories have been removed. `min_free_percent = 0` always acts on
+entries old enough by `min_age_hours`.
+
+Safety rules:
+
+- Only directories matching the final path component of a `scratch_globs` pattern are
+  candidates. Only `*` and `?` are supported, and only in that final component.
+- An entry is removed only if it is a direct child of the pattern's canonical parent and its
+  whole tree's newest modification time is at least `min_age_hours` old.
+- Symlinks are never followed or removed, files are never removed, and the pattern's parent
+  is never removed.
+- The agent's `work_dir`, and anything inside it, is never removed.
+- Removal is oldest first. Each removal logs the path, a size estimate and the age at info;
+  the pass logs a summary.
+- Every error is logged or ignored. Housekeeping never fails a job or stops the agent.
+
 ## Display
 
 `lu top` draws the dependency graph below the job list when the terminal is at least 24 rows tall and a component has an unfinished job. Press `g` to hide or show it. A component is a set of jobs linked by `after`, including finished jobs that connect unfinished ones; a component whose jobs are all terminal is left out.
@@ -411,6 +446,7 @@ Series:
 | `lu_nodes_drained` | gauge | … with the drain flag set. |
 | `lu_node_providers{node,provider,state}` | gauge | 1 per provider as reported by that node's latest heartbeat, `state` is `ok`, `cooling`, `disabled` or `unknown`. |
 | `lu_node_labels_info{node,label}` | gauge | 1 per label as reported by that node's latest heartbeat. |
+| `lu_node_disk_free_percent{node}` | gauge | Free space percentage on the node's work filesystem, when its latest heartbeat reported disk totals. |
 | `lu_controller_up` | gauge | Always 1. |
 | `lu_jobs_completed_total{outcome="done\|failed\|cancelled"}` | counter | Jobs in a terminal state, by outcome, derived from the stored jobs table; survives a restart. |
 | `lu_build_info{version="…"}` | gauge | Always 1; the controller build version. |

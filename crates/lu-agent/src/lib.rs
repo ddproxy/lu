@@ -6,6 +6,7 @@
 //! running job.
 
 mod health;
+pub mod housekeeping;
 mod labels;
 mod logs;
 mod proc;
@@ -152,6 +153,7 @@ pub struct Agent {
     harness: String,
     harness_wrapper: Vec<String>,
     builder: Arc<CommandBuilder>,
+    housekeeper: Option<housekeeping::Housekeeper>,
 }
 
 impl Agent {
@@ -191,6 +193,7 @@ impl Agent {
             None => None,
         };
         let labels = Arc::new(labels::LabelSource::new(config.labels, config.label_files));
+        let housekeeper = config.housekeeping.map(housekeeping::Housekeeper::new);
         let reiki_probe = match (
             config.reiki_health_url.as_deref(),
             config.reiki_token_file.as_deref(),
@@ -230,6 +233,7 @@ impl Agent {
                 lu_supervise::opencode_command(task_file, model, server, message)
                     .map_err(|error| error.to_string())
             }),
+            housekeeper,
         })
     }
 
@@ -263,27 +267,41 @@ impl Agent {
         &self.work_dir
     }
 
+    fn housekeep(&mut self, job_running: bool) {
+        if let Some(housekeeper) = self.housekeeper.as_mut() {
+            housekeeper.run(&self.work_dir, job_running);
+        }
+    }
+
+    /// Exposes the housekeeping seam to tests without running a job loop.
+    #[doc(hidden)]
+    pub fn housekeeper_for_tests(&mut self) -> Option<&mut housekeeping::Housekeeper> {
+        self.housekeeper.as_mut()
+    }
+
     /// Runs until `shutdown` resolves. A shutdown while a job is running stops the harness,
     /// reports a node failure, and resolves successfully.
     pub async fn run<F>(self, shutdown: F) -> Result<(), AgentError>
     where
         F: Future<Output = ()> + Send,
     {
+        let mut this = self;
         let mut shutdown = Box::pin(shutdown);
         let mut backoff = Backoff::new();
         // Ends with the agent: the guard aborts the task when `run` returns.
-        let _health_task = self.reiki_probe.as_ref().map(|(url, token)| {
+        let _health_task = this.reiki_probe.as_ref().map(|(url, token)| {
             AbortOnDrop(health::spawn_refresher(
                 url.clone(),
                 Arc::clone(token),
-                Arc::clone(&self.health),
+                Arc::clone(&this.health),
             ))
         });
-        info!(node = %self.node, work_dir = %self.work_dir.display(), "agent started");
+        info!(node = %this.node, work_dir = %this.work_dir.display(), "agent started");
+        this.housekeep(false);
         loop {
-            let request = self.poll_request(HarnessState::Idle, POLL_WAIT_SECS);
+            let request = this.poll_request(HarnessState::Idle, POLL_WAIT_SECS);
             let polled = {
-                let poll = self.controller.poll(&request);
+                let poll = this.controller.poll(&request);
                 tokio::select! {
                     biased;
                     () = shutdown.as_mut() => return Ok(()),
@@ -304,12 +322,12 @@ impl Agent {
                             } => {
                                 backoff.reset();
                                 info!(job = %job_id, epoch, "assigned");
-                                match self.run_job(job_id, epoch, spec, shutdown.as_mut()).await? {
+                                match this.run_job(job_id, epoch, spec, shutdown.as_mut()).await? {
                                     JobEnd::Shutdown => return Ok(()),
                                     JobEnd::Finished
                                     | JobEnd::Cancelled
                                     | JobEnd::Stale
-                                    | JobEnd::Provider => {}
+                                    | JobEnd::Provider => this.housekeep(false),
                                 }
                             }
                             AgentEvent::Cancel { job_id, .. } => {
@@ -355,7 +373,7 @@ impl Agent {
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             providers: current.providers,
             reiki: current.reiki,
-            host: proc::host_stats(),
+            host: proc::host_stats(&self.work_dir),
             jobs: Vec::new(),
             labels: self.labels.current(),
         };
@@ -653,6 +671,7 @@ impl Agent {
                 shared_health: Arc::clone(&self.health),
                 labels: Arc::clone(&self.labels),
                 observation: observation.clone(),
+                work_dir: self.work_dir.clone(),
             },
             control_tx,
         ));
@@ -1152,6 +1171,7 @@ struct ControlTask {
     shared_health: health::Shared,
     labels: Arc<labels::LabelSource>,
     observation: Option<Arc<Mutex<proc::JobObservation>>>,
+    work_dir: PathBuf,
 }
 
 async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
@@ -1164,6 +1184,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
         shared_health,
         labels,
         observation,
+        work_dir,
     } = task;
     let mut renew = tokio::time::interval(RENEW_PERIOD);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1208,7 +1229,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
             }
             _ = heartbeat.tick() => {
                 let current = health::snapshot(&shared_health);
-                let host = proc::host_stats();
+                let host = proc::host_stats(&work_dir);
                 let jobs: Vec<JobStats> = observation
                     .as_ref()
                     .map(|observation| {

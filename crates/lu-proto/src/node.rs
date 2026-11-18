@@ -38,7 +38,7 @@ pub struct ProviderStatus {
     pub soonest_secs: Option<u64>,
 }
 
-/// The host numbers sampled from `/proc`. `disk_free_bytes` is optional because a portable
+/// The host numbers sampled from `/proc`. The disk fields are optional because a portable
 /// answer is not available without a platform filesystem call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +51,8 @@ pub struct HostStats {
     pub swap_used_kb: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_total_bytes: Option<u64>,
     pub uptime_secs: u64,
 }
 
@@ -324,6 +326,7 @@ mod tests {
             mem_available_kb: 8_192,
             swap_used_kb: 0,
             disk_free_bytes: Some(1_000_000),
+            disk_total_bytes: Some(8_000_000),
             uptime_secs: 42,
         }
     }
@@ -498,6 +501,27 @@ mod tests {
         let json = serde_json::to_string(&beat).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, beat);
+    }
+
+    #[test]
+    fn disk_stats_round_trip_and_stay_optional() {
+        let mut beat = heartbeat();
+        let mut host = host();
+        beat.host = Some(host.clone());
+        let json = serde_json::to_string(&beat).unwrap();
+        assert!(json.contains("\"disk_free_bytes\":1000000"), "{json}");
+        assert!(json.contains("\"disk_total_bytes\":8000000"), "{json}");
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.host, Some(host.clone()));
+
+        host.disk_free_bytes = None;
+        host.disk_total_bytes = None;
+        beat.host = Some(host);
+        let json = serde_json::to_string(&beat).unwrap();
+        assert!(!json.contains("disk_"), "{json}");
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert!(parsed.host.is_some());
+        assert!(parsed.host.unwrap().disk_free_bytes.is_none());
     }
 
     #[test]

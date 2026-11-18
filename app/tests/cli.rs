@@ -1023,6 +1023,8 @@ async fn node_prints_host_numbers_and_indented_process_tree() {
             "mem_total_kb": 8192,
             "mem_available_kb": 4096,
             "swap_used_kb": 12,
+            "disk_free_bytes": 250,
+            "disk_total_bytes": 1000,
             "uptime_secs": 600
         },
         "jobs": [{
@@ -1061,6 +1063,7 @@ async fn node_prints_host_numbers_and_indented_process_tree() {
     ));
     assert!(text.contains(&format!("job {id}")), "{text}");
     assert!(text.contains("stuck yes"), "{text}");
+    assert!(text.contains("disk_free_percent  25"), "{text}");
     let process_line = text
         .lines()
         .find(|line| line.trim_start().starts_with("4242"))

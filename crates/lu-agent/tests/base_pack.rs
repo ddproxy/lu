@@ -191,6 +191,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         reiki_token_file: None,
         labels: Vec::new(),
         label_files: Vec::new(),
+        housekeeping: None,
     };
     let done = Arc::new(AtomicBool::new(false));
     let spec = lu_proto::JobSpec {

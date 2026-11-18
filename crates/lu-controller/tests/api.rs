@@ -1394,7 +1394,7 @@ async fn metrics_series_after_job_lifecycle() {
     );
 
     // register a heartbeat with providers incl. escaping-provoked names later
-    let poll_body = serde_json::to_string(&serde_json::json!({"heartbeat": {"node": "node-a", "harness": "idle", "providers": [{"name": "prov-a", "state": "ok"}]}, "wait_secs": 0})).unwrap();
+    let poll_body = serde_json::to_string(&serde_json::json!({"heartbeat": {"node": "node-a", "harness": "idle", "providers": [{"name": "prov-a", "state": "ok"}], "host": {"load1": 0.5, "load5": 0.25, "load15": 0.1, "mem_total_kb": 100, "mem_available_kb": 50, "swap_used_kb": 0, "disk_free_bytes": 250, "disk_total_bytes": 1000, "uptime_secs": 10}}, "wait_secs": 0})).unwrap();
     let r = raw_request(srv.addr, &format!(
         "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         poll_body.len(), poll_body
@@ -1409,6 +1409,10 @@ async fn metrics_series_after_job_lifecycle() {
     assert!(b.contains("lu_nodes_drained 0"), "{b}");
     assert!(
         b.contains("lu_node_providers{node=\"node-a\",provider=\"prov-a\",state=\"ok\"} 1"),
+        "{b}"
+    );
+    assert!(
+        b.contains("lu_node_disk_free_percent{node=\"node-a\"} 25"),
         "{b}"
     );
     assert!(

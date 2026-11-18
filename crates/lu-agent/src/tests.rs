@@ -352,6 +352,7 @@ fn make_agent(
         builder: Arc::new(move |task_file, _model, _server, _message| {
             Ok(harness_script(task_file))
         }),
+        housekeeper: None,
     }
 }
 

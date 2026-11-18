@@ -36,7 +36,7 @@ Agents poll; there is no push channel in 0.1.0. Lease expiry is measured on the 
 
 `NodeStats`: `{"host": HostStats|null, "jobs": [JobStats]}`. Both fields are omitted when empty, so a node that reports neither is `{}`.
 
-`HostStats`: `load1`, `load5`, `load15`, `mem_total_kb`, `mem_available_kb`, `swap_used_kb`, `disk_free_bytes` (optional and currently always omitted), `uptime_secs`. Values are read from `/proc`; non-Linux agents report no host stats.
+`HostStats`: `load1`, `load5`, `load15`, `mem_total_kb`, `mem_available_kb`, `swap_used_kb`, `disk_free_bytes` and `disk_total_bytes` (both optional; they describe the agent's work filesystem and are omitted when it cannot be read), `uptime_secs`. Host numbers are read from `/proc`; non-Linux agents report no host stats.
 
 `JobStats`: `job_id`, `pgid`, `output_idle_secs` (since the harness last wrote output), `cpu_idle_secs` (since any process in the job tree last used CPU), `stuck` (running, with both idle values above 300 seconds), and `processes`. `ProcessStats` entries carry `pid`, `ppid`, `state`, `cpu_secs` (clock ticks divided by 100), `rss_kb`, `age_secs`, `cmdline` (first 80 characters, control characters replaced) and `open_files`. A job tree lists at most the 64 busiest processes, so it is a bounded sample rather than a complete process list.
 

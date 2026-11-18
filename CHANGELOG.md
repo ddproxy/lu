@@ -8,6 +8,7 @@ uses semantic versioning once it reaches 1.0.
 ### Added
 
 - Node labels and job requirements. Agents advertise up to 32 opaque labels from `[agent].labels` and `[agent].label_files` (re-read before each heartbeat); jobs require up to 8 with `JobSpec.requires` and dispatch gives a job only to a node that has every required label. `lu submit --require` and `lu retry --require`/`--no-require` set them, `lu nodes` shows a `LABELS` column, and `lu show`/`lu top` explain a stalled queued job as `no node with label <label>`. Submitting an unknown label succeeds with a warning. Metrics add `lu_node_labels_info{node,label}`. No schema change: labels live in the stored heartbeat.
+- Opt-in agent disk housekeeping. `[agent.housekeeping]` removes old scratch directories matching `scratch_globs` between jobs, oldest first, when the filesystem holding their parent is below `min_free_percent`; `min_age_hours` and `max_remove_per_pass` bound each pass. It never follows symlinks, removes files, escapes a pattern's parent, or touches the agent's `work_dir`. Host stats now report `disk_total_bytes` alongside `disk_free_bytes`, `lu node` prints `disk_free_bytes`, `disk_total_bytes` and `disk_free_percent`, and `lu_node_disk_free_percent{node}` is exported.
 
 ## [0.1.14] - 2026-11-18
 
