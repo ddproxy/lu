@@ -64,6 +64,9 @@ pub struct JobSpec {
     /// Jobs that must be `done` before this one may run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<JobId>,
+    /// Whether dependency diffs are applied to this job's base tree.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub stack_dependencies: bool,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +91,8 @@ struct RawJobSpec {
     idempotency_key: Option<String>,
     #[serde(default)]
     after: Vec<JobId>,
+    #[serde(default = "default_true")]
+    stack_dependencies: bool,
 }
 
 impl TryFrom<RawJobSpec> for JobSpec {
@@ -106,6 +111,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
             idle_timeout_secs: raw.idle_timeout_secs,
             idempotency_key: raw.idempotency_key,
             after: raw.after,
+            stack_dependencies: raw.stack_dependencies,
         };
         spec.validate()?;
         Ok(spec)
@@ -175,6 +181,14 @@ fn default_harness() -> String {
 
 fn default_timeout_secs() -> u64 {
     DEFAULT_TIMEOUT_SECS
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn invalid(field: &'static str, reason: impl Into<String>) -> JobSpecError {
@@ -279,6 +293,7 @@ mod tests {
             idle_timeout_secs: None,
             idempotency_key: None,
             after: Vec::new(),
+            stack_dependencies: true,
         }
     }
 
@@ -407,6 +422,7 @@ mod tests {
         assert_eq!(spec.provider, None);
         assert_eq!(spec.base_commit, None);
         assert!(spec.after.is_empty());
+        assert!(spec.stack_dependencies);
         assert!(spec.validate().is_ok());
     }
 
@@ -476,6 +492,20 @@ mod tests {
         let parsed: JobSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, spec);
         assert_eq!(parsed.canonical_json(), json);
+    }
+
+    #[test]
+    fn stacking_defaults_true_and_is_omitted_only_when_true() {
+        let mut spec = sample();
+        assert!(spec.stack_dependencies);
+        assert!(!spec.canonical_json().contains("stack_dependencies"));
+
+        spec.stack_dependencies = false;
+        let json = spec.canonical_json();
+        assert!(json.contains("\"stack_dependencies\":false"), "{json}");
+        let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.stack_dependencies);
+        assert_eq!(parsed, spec);
     }
 
     #[test]

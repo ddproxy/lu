@@ -97,6 +97,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/agent/jobs/{id}/artifacts/report.json",
             put(agent::put_report_artifact).layer(report_body),
         )
+        .route("/v1/agent/jobs/{id}/deps", get(agent::list_deps))
+        .route(
+            "/v1/agent/jobs/{id}/deps/{dep}/diff",
+            get(agent::get_dep_diff),
+        )
         .route(
             "/v1/agent/jobs/{id}/complete",
             post(agent::complete_job).layer(op_json),

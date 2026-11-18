@@ -22,7 +22,7 @@ use lu_proto::{
     Heartbeat, JobId, JobSpec, JobStats, NodeName, Outcome, ProviderState, MAX_DIFF_BYTES,
     MAX_SUMMARY_BYTES,
 };
-use lu_staging::{Source, StageRequest, StagedDir, Staging};
+use lu_staging::{ApplyError, Source, StageRequest, StagedDir, Staging};
 use lu_supervise::{CommandSpec, Limits, Outcome as SuperviseOutcome, Supervisor};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -453,6 +453,38 @@ impl Agent {
             }
         };
 
+        let mut applied = Vec::new();
+        if spec.stack_dependencies {
+            match self.apply_dependencies(&job_id, epoch, &staged).await? {
+                DependencyApply::Applied(deps) => applied = deps,
+                DependencyApply::Stale => return Ok(JobEnd::Stale),
+                DependencyApply::Conflict {
+                    dependency,
+                    paths,
+                    applied: done,
+                    detail,
+                } => {
+                    let summary =
+                        dependency_conflict_summary(&dependency, &paths, detail.as_deref());
+                    self.finish(&Finish {
+                        job_id: &job_id,
+                        epoch,
+                        spec: &spec,
+                        staged: &staged,
+                        started,
+                        outcome: Outcome::Failed(FailureClass::Conflict),
+                        exit_code: None,
+                        summary,
+                        cancelled: false,
+                        retry_after_secs: None,
+                        applied_dependencies: &done,
+                    })
+                    .await?;
+                    return Ok(JobEnd::Finished);
+                }
+            }
+        }
+
         if let Some(gid) = self.workspace_gid {
             if let Err(error) = self.staging.share_with_group(&staged, gid) {
                 let summary = format!("could not share the workspace with its group: {error}");
@@ -525,6 +557,7 @@ impl Agent {
                 summary,
                 cancelled: false,
                 retry_after_secs: None,
+                applied_dependencies: &applied,
             })
             .await?;
             return Ok(JobEnd::Finished);
@@ -563,6 +596,7 @@ impl Agent {
                     summary,
                     cancelled: false,
                     retry_after_secs: None,
+                    applied_dependencies: &applied,
                 })
                 .await?;
                 return Ok(JobEnd::Finished);
@@ -827,6 +861,7 @@ impl Agent {
                 summary,
                 cancelled: false,
                 retry_after_secs: reiki_retry_after,
+                applied_dependencies: &applied,
             })
             .await?;
             return Ok(JobEnd::Finished);
@@ -848,6 +883,7 @@ impl Agent {
             summary,
             cancelled: false,
             retry_after_secs: None,
+            applied_dependencies: &applied,
         })
         .await?;
         Ok(JobEnd::Finished)
@@ -884,6 +920,64 @@ impl Agent {
         }
     }
 
+    async fn apply_dependencies(
+        &self,
+        job_id: &JobId,
+        epoch: u64,
+        staged: &StagedDir,
+    ) -> Result<DependencyApply, AgentError> {
+        let deps = match self.controller.deps(job_id, epoch).await {
+            Ok(deps) => deps,
+            Err(ApiError::StaleEpoch) => return Ok(DependencyApply::Stale),
+            Err(ApiError::Unauthorized) => return Err(AgentError::Unauthorized),
+            Err(ApiError::Forbidden) => return Err(AgentError::Forbidden),
+            Err(error) => {
+                return Err(AgentError::Controller(format!(
+                    "could not list dependencies: {error}"
+                )))
+            }
+        };
+        let mut applied = Vec::new();
+        for dep in deps {
+            if dep.diff_bytes == 0 {
+                continue;
+            }
+            let bytes = match self.controller.dep_diff(job_id, &dep.job_id, epoch).await {
+                Ok(bytes) => bytes,
+                Err(ApiError::NotFound) => continue,
+                Err(ApiError::StaleEpoch) => return Ok(DependencyApply::Stale),
+                Err(ApiError::Unauthorized) => return Err(AgentError::Unauthorized),
+                Err(ApiError::Forbidden) => return Err(AgentError::Forbidden),
+                Err(error) => {
+                    return Err(AgentError::Controller(format!(
+                        "could not fetch dependency {} diff: {error}",
+                        dep.job_id
+                    )))
+                }
+            };
+            match Staging::apply_dependency_diff(staged, &bytes) {
+                Ok(()) => applied.push(dep.job_id.to_string()),
+                Err(ApplyError::Conflict(paths)) => {
+                    return Ok(DependencyApply::Conflict {
+                        dependency: dep.job_id.to_string(),
+                        paths,
+                        applied,
+                        detail: None,
+                    })
+                }
+                Err(error) => {
+                    return Ok(DependencyApply::Conflict {
+                        dependency: dep.job_id.to_string(),
+                        paths: Vec::new(),
+                        applied,
+                        detail: Some(error.to_string()),
+                    })
+                }
+            }
+        }
+        Ok(DependencyApply::Applied(applied))
+    }
+
     async fn finish(&self, finish: &Finish<'_>) -> Result<JobEnd, AgentError> {
         let diff = match Staging::export_diff(finish.staged, MAX_DIFF_BYTES as usize) {
             Ok(diff) => Some(diff),
@@ -917,6 +1011,7 @@ impl Agent {
             finish.started.elapsed(),
             &finish.spec.harness,
             finish.spec.model.as_deref(),
+            finish.applied_dependencies,
         );
         if let Ok(report) = report {
             match self
@@ -999,6 +1094,31 @@ struct Finish<'a> {
     summary: String,
     cancelled: bool,
     retry_after_secs: Option<u64>,
+    applied_dependencies: &'a [String],
+}
+
+enum DependencyApply {
+    Applied(Vec<String>),
+    Conflict {
+        dependency: String,
+        paths: Vec<String>,
+        applied: Vec<String>,
+        detail: Option<String>,
+    },
+    Stale,
+}
+
+fn dependency_conflict_summary(dependency: &str, paths: &[String], detail: Option<&str>) -> String {
+    let mut summary = format!("dependency {dependency} could not be applied");
+    if !paths.is_empty() {
+        summary.push_str("; conflicts: ");
+        summary.push_str(&paths.join(", "));
+    }
+    if let Some(detail) = detail {
+        summary.push_str(": ");
+        summary.push_str(detail);
+    }
+    summary
 }
 
 /// Removes the checkout even when the job is cancelled, the future is aborted, or it panics.
@@ -1359,6 +1479,7 @@ fn report_json(
     duration: Duration,
     harness: &str,
     model: Option<&str>,
+    applied_dependencies: &[String],
 ) -> Result<Vec<u8>, serde_json::Error> {
     let report = Report {
         exit_code,
@@ -1366,6 +1487,7 @@ fn report_json(
         outcome,
         harness,
         model,
+        applied_dependencies,
     };
     serde_json::to_vec(&report)
 }
@@ -1377,6 +1499,7 @@ struct Report<'a> {
     outcome: Outcome,
     harness: &'a str,
     model: Option<&'a str>,
+    applied_dependencies: &'a [String],
 }
 
 fn create_work_dir(path: &Path) -> Result<(), AgentError> {

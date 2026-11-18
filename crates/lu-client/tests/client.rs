@@ -9,7 +9,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
 use axum::Router;
-use lu_client::{ApiError, Client, ClientOptions, Controller, LogPage, PollRequest};
+use lu_client::{
+    ApiError, Client, ClientOptions, Controller, DependencyView, LogPage, PollRequest,
+};
 use lu_proto::{
     AgentEvent, ArtifactName, Completion, FailureClass, JobId, JobSpec, JobState, LogChunk,
     NodeName, Outcome,
@@ -189,6 +191,7 @@ fn spec() -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: Some("ticket:42".to_owned()),
         after: Vec::new(),
+        stack_dependencies: true,
     }
 }
 
@@ -701,6 +704,23 @@ impl Controller for FakeController {
         _bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn deps<'a>(
+        &'a self,
+        _id: &'a JobId,
+        _epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyView>, ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn dep_diff<'a>(
+        &'a self,
+        _id: &'a JobId,
+        _dep: &'a JobId,
+        _epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
     fn complete<'a>(

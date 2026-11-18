@@ -108,6 +108,28 @@ impl From<io::Error> for ArtifactError {
     }
 }
 
+/// Why a dependency patch did not apply to a staged checkout.
+#[derive(Debug)]
+pub enum ApplyError {
+    /// The patch was malformed or git could not read or write the tree.
+    Git(String),
+    /// A clean apply failed and the three-way merge left these paths in conflict.
+    Conflict(Vec<String>),
+}
+
+impl fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ApplyError::Git(message) => write!(f, "apply error: {message}"),
+            ApplyError::Conflict(paths) => {
+                write!(f, "apply conflict in {}", paths.join(", "))
+            }
+        }
+    }
+}
+
+impl std::error::Error for ApplyError {}
+
 /// A validated job identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JobId(String);
@@ -452,6 +474,83 @@ impl Staging {
         Ok(out)
     }
 
+    /// Apply a dependency's `diff.patch` to a staged checkout.
+    ///
+    /// A clean apply is tried first. If the patch no longer matches because earlier dependencies
+    /// changed the same file, a three-way merge reconstructs the dependency's side from the base
+    /// tree and merges it with the checkout. A failed merge changes nothing.
+    pub fn apply_dependency_diff(staged: &StagedDir, patch: &[u8]) -> Result<(), ApplyError> {
+        let repo = git2::Repository::open(staged.path())
+            .map_err(|e| ApplyError::Git(format!("failed to open repository: {e}")))?;
+        let diff = git2::Diff::from_buffer(patch)
+            .map_err(|e| ApplyError::Git(format!("invalid diff: {e}")))?;
+
+        let mut check = git2::ApplyOptions::new();
+        check.check(true);
+        if repo
+            .apply(&diff, git2::ApplyLocation::WorkDir, Some(&mut check))
+            .is_ok()
+        {
+            // Keep the pre-patch tree so a write failure cannot leave half a patch behind.
+            let before = worktree_tree(&repo)?;
+            if let Err(e) = repo.apply(&diff, git2::ApplyLocation::WorkDir, None) {
+                restore_tree(&repo, &before)?;
+                return Err(ApplyError::Git(format!("failed to apply diff: {e}")));
+            }
+            return Ok(());
+        }
+
+        let base = head_tree(&repo)?;
+        let ours = worktree_tree(&repo)?;
+        let mut theirs_index = repo
+            .apply_to_tree(&base, &diff, None)
+            .map_err(|e| ApplyError::Git(format!("failed to prepare three-way merge: {e}")))?;
+        let theirs_oid = theirs_index
+            .write_tree_to(&repo)
+            .map_err(|e| ApplyError::Git(format!("failed to write merge tree: {e}")))?;
+        let theirs = repo
+            .find_tree(theirs_oid)
+            .map_err(|e| ApplyError::Git(format!("failed to read merge tree: {e}")))?;
+        let mut merged = repo
+            .merge_trees(&base, &ours, &theirs, None)
+            .map_err(|e| ApplyError::Git(format!("failed to merge trees: {e}")))?;
+
+        let mut paths = Vec::new();
+        {
+            let conflicts = merged
+                .conflicts()
+                .map_err(|e| ApplyError::Git(format!("failed to inspect merge: {e}")))?;
+            for conflict in conflicts {
+                let conflict = conflict
+                    .map_err(|e| ApplyError::Git(format!("failed to inspect merge: {e}")))?;
+                if let Some(entry) = conflict.our.or(conflict.their).or(conflict.ancestor) {
+                    let path = String::from_utf8_lossy(&entry.path).into_owned();
+                    if !paths.contains(&path) {
+                        paths.push(path);
+                        if paths.len() == 20 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !paths.is_empty() {
+            return Err(ApplyError::Conflict(paths));
+        }
+
+        let merged_oid = merged
+            .write_tree_to(&repo)
+            .map_err(|e| ApplyError::Git(format!("failed to write merged tree: {e}")))?;
+        let merged = repo
+            .find_tree(merged_oid)
+            .map_err(|e| ApplyError::Git(format!("failed to read merged tree: {e}")))?;
+        let mut checkout = git2::build::CheckoutBuilder::new();
+        checkout.force().remove_untracked(true);
+        repo.checkout_tree(merged.as_object(), Some(&mut checkout))
+            .map_err(|e| ApplyError::Git(format!("failed to check out merge: {e}")))?;
+        Ok(())
+    }
+
     /// Remove `<work_root>/<job_id>` safely.
     ///
     /// A missing directory is not an error.
@@ -587,6 +686,41 @@ impl Staging {
         remove_dir_all_robust(&canon_target)?;
         Ok(())
     }
+}
+
+fn head_tree(repo: &git2::Repository) -> Result<git2::Tree<'_>, ApplyError> {
+    repo.head()
+        .and_then(|head| head.peel_to_tree())
+        .map_err(|e| ApplyError::Git(format!("failed to resolve HEAD tree: {e}")))
+}
+
+/// The checkout's current state as a tree, built without touching the real index.
+fn worktree_tree(repo: &git2::Repository) -> Result<git2::Tree<'_>, ApplyError> {
+    let base = head_tree(repo)?;
+    let mut opts = git2::DiffOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true)
+        .show_binary(true)
+        .ignore_submodules(true);
+    let diff = repo
+        .diff_tree_to_workdir_with_index(Some(&base), Some(&mut opts))
+        .map_err(|e| ApplyError::Git(format!("failed to compute working tree: {e}")))?;
+    let mut index = repo
+        .apply_to_tree(&base, &diff, None)
+        .map_err(|e| ApplyError::Git(format!("failed to capture working tree: {e}")))?;
+    let oid = index
+        .write_tree_to(repo)
+        .map_err(|e| ApplyError::Git(format!("failed to write working tree: {e}")))?;
+    repo.find_tree(oid)
+        .map_err(|e| ApplyError::Git(format!("failed to read working tree: {e}")))
+}
+
+fn restore_tree(repo: &git2::Repository, tree: &git2::Tree<'_>) -> Result<(), ApplyError> {
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.force().remove_untracked(true);
+    repo.checkout_tree(tree.as_object(), Some(&mut checkout))
+        .map_err(|e| ApplyError::Git(format!("failed to restore working tree: {e}")))
 }
 
 /// The numeric id of a group, given its name or the number itself, read from `/etc/group`.
@@ -1013,4 +1147,104 @@ fn temp_path_in(dir: &Path, final_name: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     dir.join(format!(".{final_name}.tmp.{pid}.{nanos}.{n}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("lu-staging-{name}-{}-{n}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn source_repo(root: &Path) -> PathBuf {
+        let repo = root.join("source");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("README.md"), "test\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.email=test@test",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        repo
+    }
+
+    fn patch_from(repo: &Path, content: &str) -> Vec<u8> {
+        fs::write(repo.join("README.md"), content).unwrap();
+        let out = Command::new("git")
+            .args(["diff", "--no-color", "--binary", "HEAD", "--", "README.md"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        fs::write(repo.join("README.md"), "test\n").unwrap();
+        out.stdout
+    }
+
+    #[test]
+    fn a_failed_merge_leaves_the_worktree_unchanged() {
+        let tmp = TestDir::new("conflict");
+        let repo = source_repo(&tmp.path);
+        let patch = patch_from(&repo, "two\n");
+        let work = tmp.path.join("work");
+        fs::create_dir(&work).unwrap();
+        let staging = Staging::new(&work).unwrap();
+        let staged = staging
+            .stage(StageRequest {
+                job_id: "job".to_owned(),
+                source: Source::Path(repo),
+                git_ref: "main".to_owned(),
+            })
+            .unwrap();
+        fs::write(staged.path().join("README.md"), "one\n").unwrap();
+
+        let error = Staging::apply_dependency_diff(&staged, &patch).unwrap_err();
+        match error {
+            ApplyError::Conflict(paths) => assert_eq!(paths, ["README.md"]),
+            other => panic!("expected a conflict, got {other}"),
+        }
+        assert_eq!(
+            fs::read_to_string(staged.path().join("README.md")).unwrap(),
+            "one\n"
+        );
+    }
 }

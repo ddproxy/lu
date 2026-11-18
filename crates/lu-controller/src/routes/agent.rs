@@ -607,6 +607,136 @@ pub async fn complete_job(
     }
 }
 
+async fn owned_job(
+    state: &Arc<AppState>,
+    node: &lu_proto::NodeName,
+    job_id: &JobId,
+) -> Result<lu_store::JobRecord, Box<Response>> {
+    let jid = job_id.clone();
+    let store = Arc::clone(&state.store);
+    let rec = match tokio::task::spawn_blocking(move || store.get_job(&jid)).await {
+        Ok(Ok(rec)) => rec,
+        Ok(Err(e)) => return Err(Box::new(with_version(store_err(e).into_response()))),
+        Err(_) => return Err(Box::new(with_version(ApiError::internal().into_response()))),
+    };
+    if rec.node.as_ref() != Some(node) {
+        return Err(Box::new(with_version(
+            ApiError::forbidden("forbidden").into_response(),
+        )));
+    }
+    Ok(rec)
+}
+
+fn epoch_from_uri(uri: &axum::http::Uri) -> Result<u64, Box<Response>> {
+    let q = crate::routes::parse_query(uri);
+    q.get("epoch")
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| {
+            Box::new(with_version(
+                ApiError::bad_request("missing or invalid epoch").into_response(),
+            ))
+        })
+}
+
+fn dependency_diff_path(state: &AppState, dep: &JobId) -> std::path::PathBuf {
+    state.artifacts_dir.join(dep.to_string()).join("diff.patch")
+}
+
+pub async fn list_deps(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    uri: axum::http::Uri,
+) -> Response {
+    let node = match authenticate_agent(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(n) => n,
+        Err(e) => return with_version(e.into_response()),
+    };
+    let job_id = match JobId::parse(&id) {
+        Ok(i) => i,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let rec = match owned_job(&state, &node, &job_id).await {
+        Ok(rec) => rec,
+        Err(res) => return *res,
+    };
+    let epoch = match epoch_from_uri(&uri) {
+        Ok(epoch) => epoch,
+        Err(res) => return *res,
+    };
+    if rec.epoch != epoch {
+        return with_version(ApiError::stale_epoch().into_response());
+    }
+    let mut deps = Vec::with_capacity(rec.spec.after.len());
+    for dep in &rec.spec.after {
+        let jid = dep.clone();
+        let store = Arc::clone(&state.store);
+        let dep_rec = match tokio::task::spawn_blocking(move || store.get_job(&jid)).await {
+            Ok(Ok(rec)) => rec,
+            Ok(Err(e)) => return with_version(store_err(e).into_response()),
+            Err(_) => return with_version(ApiError::internal().into_response()),
+        };
+        let diff_bytes = tokio::fs::metadata(dependency_diff_path(&state, dep))
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        deps.push(json!({
+            "job_id": dep.to_string(),
+            "state": crate::routes::job_state_str(dep_rec.state),
+            "diff_bytes": diff_bytes,
+        }));
+    }
+    with_version(json_ok(StatusCode::OK, &deps))
+}
+
+pub async fn get_dep_diff(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path((id, dep)): Path<(String, String)>,
+    uri: axum::http::Uri,
+) -> Response {
+    let node = match authenticate_agent(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(n) => n,
+        Err(e) => return with_version(e.into_response()),
+    };
+    let job_id = match JobId::parse(&id) {
+        Ok(i) => i,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let dep_id = match JobId::parse(&dep) {
+        Ok(i) => i,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let rec = match owned_job(&state, &node, &job_id).await {
+        Ok(rec) => rec,
+        Err(res) => return *res,
+    };
+    let epoch = match epoch_from_uri(&uri) {
+        Ok(epoch) => epoch,
+        Err(res) => return *res,
+    };
+    if rec.epoch != epoch {
+        return with_version(ApiError::stale_epoch().into_response());
+    }
+    if !rec.spec.after.contains(&dep_id) {
+        return with_version(ApiError::forbidden("forbidden").into_response());
+    }
+    match tokio::fs::read(dependency_diff_path(&state, &dep_id)).await {
+        Ok(bytes) => {
+            let res = (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                bytes,
+            )
+                .into_response();
+            with_version(res)
+        }
+        Err(_) => with_version(ApiError::not_found("not found").into_response()),
+    }
+}
+
 pub async fn put_diff_artifact(
     State(state): State<Arc<AppState>>,
     peer: axum::Extension<PeerAddr>,

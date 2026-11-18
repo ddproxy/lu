@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use git2::{Repository, Signature};
 use lu_agent::Agent;
-use lu_client::{ApiError, Controller, PollRequest};
+use lu_client::{ApiError, Controller, DependencyView, PollRequest};
 use lu_config::{AgentConfig, BaseSource};
 use lu_proto::{AgentEvent, ArtifactName, Completion, JobId, LogChunk};
 use lu_staging::pack_commit;
@@ -38,6 +38,23 @@ struct PackController {
 }
 
 impl Controller for PackController {
+    fn deps<'a>(
+        &'a self,
+        _id: &'a lu_proto::JobId,
+        _epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyView>, ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn dep_diff<'a>(
+        &'a self,
+        _id: &'a lu_proto::JobId,
+        _dep: &'a lu_proto::JobId,
+        _epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ApiError>> + Send + 'a>> {
+        Box::pin(async { Err(ApiError::NotFound) })
+    }
+
     fn poll<'a>(
         &'a self,
         _request: &'a PollRequest,
@@ -186,6 +203,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         idle_timeout_secs: None,
         idempotency_key: None,
         after: Vec::new(),
+        stack_dependencies: true,
     };
     let controller = Arc::new(PackController {
         spec,

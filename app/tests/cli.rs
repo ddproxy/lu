@@ -343,6 +343,52 @@ async fn submit_after_and_after_key_resolve_to_one_dependency() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_no_stack_sets_and_default_omits_the_field() {
+    let id = job_id();
+    let body = job_json(&id, "queued");
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("submit-no-stack");
+    let token = write_token(&dir, "operator.token", TOKEN);
+
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--no-stack",
+        ],
+        &env_for(&server, &token),
+        Some("run the tests\n"),
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap()[0].body).unwrap();
+    assert_eq!(spec["stack_dependencies"], json!(false));
+
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+        ],
+        &env_for(&server, &token),
+        Some("run the tests\n"),
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap()[1].body).unwrap();
+    assert!(
+        spec.get("stack_dependencies").is_none(),
+        "the default must be omitted: {spec}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ls_shows_the_waiting_dependency_count() {
     let waiting_id = job_id();
     let free_id = job_id();

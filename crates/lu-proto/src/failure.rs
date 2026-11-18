@@ -15,6 +15,8 @@ pub enum FailureClass {
     Execution,
     /// A dependency finished unsuccessfully; a dependent cannot retry into a different outcome.
     Dependency,
+    /// A dependency diff could not be applied cleanly to the dependent's base tree.
+    Conflict,
 }
 
 /// A provider outage is not the job's fault, so it does not use the retry budget: the job goes
@@ -29,7 +31,7 @@ impl FailureClass {
         match self {
             Self::Node => attempt <= max_retries,
             Self::Provider => attempt <= PROVIDER_ATTEMPT_LIMIT,
-            Self::Execution | Self::Dependency => false,
+            Self::Execution | Self::Dependency | Self::Conflict => false,
         }
     }
 }
@@ -64,6 +66,19 @@ mod tests {
         }
         assert!(!FailureClass::Execution.retryable(1, 0));
         assert!(!FailureClass::Dependency.retryable(5, 5));
+        assert!(!FailureClass::Conflict.retryable(1, 5));
+    }
+
+    #[test]
+    fn classes_from_older_agents_still_deserialize() {
+        for (json, class) in [
+            ("\"node\"", FailureClass::Node),
+            ("\"provider\"", FailureClass::Provider),
+            ("\"execution\"", FailureClass::Execution),
+            ("\"dependency\"", FailureClass::Dependency),
+        ] {
+            assert_eq!(serde_json::from_str::<FailureClass>(json).unwrap(), class);
+        }
     }
 
     #[test]
@@ -73,6 +88,7 @@ mod tests {
             FailureClass::Provider,
             FailureClass::Execution,
             FailureClass::Dependency,
+            FailureClass::Conflict,
         ] {
             let json = serde_json::to_string(&class).unwrap();
             assert_eq!(serde_json::from_str::<FailureClass>(&json).unwrap(), class);

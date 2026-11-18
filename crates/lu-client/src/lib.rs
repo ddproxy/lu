@@ -15,8 +15,8 @@ mod types;
 pub use client::{Client, ClientOptions, Controller};
 pub use error::ApiError;
 pub use types::{
-    CompletionBody, HostStats, JobStats, JobView, ListJobs, ListNodes, LogPage, NodeStats,
-    NodeView, PollReply, PollRequest, ProcessStats, StatusView, MAX_JSON_BYTES,
+    CompletionBody, DependencyView, HostStats, JobStats, JobView, ListJobs, ListNodes, LogPage,
+    NodeStats, NodeView, PollReply, PollRequest, ProcessStats, StatusView, MAX_JSON_BYTES,
 };
 
 /// Canonical paths, exactly as documented in docs/api.md; the client sends each of these and
@@ -36,5 +36,7 @@ pub mod routes {
     pub const RENEW: &str = "/v1/agent/jobs/{id}/renew";
     pub const APPEND_LOG: &str = "/v1/agent/jobs/{id}/log";
     pub const PUT_ARTIFACT: &str = "/v1/agent/jobs/{id}/artifacts/{name}";
+    pub const DEPS: &str = "/v1/agent/jobs/{id}/deps";
+    pub const DEP_DIFF: &str = "/v1/agent/jobs/{id}/deps/{dep}/diff";
     pub const COMPLETE: &str = "/v1/agent/jobs/{id}/complete";
 }

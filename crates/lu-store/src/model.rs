@@ -482,6 +482,7 @@ impl<S: Store> Model<S> {
             idempotency_key: None,
             after: Vec::new(),
             base_commit: None,
+            stack_dependencies: true,
         }
     }
 

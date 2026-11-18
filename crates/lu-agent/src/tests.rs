@@ -7,14 +7,15 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lu_client::{ApiError, Controller, PollRequest};
+use lu_client::{ApiError, Controller, DependencyView, PollRequest};
 use lu_config::BaseSource;
 use lu_proto::{
-    AgentEvent, ArtifactName, Completion, FailureClass, JobId, JobSpec, LogChunk, NodeName,
-    Outcome, MAX_LOG_BYTES,
+    AgentEvent, ArtifactName, Completion, FailureClass, JobId, JobSpec, JobState, LogChunk,
+    NodeName, Outcome, MAX_LOG_BYTES,
 };
 use lu_staging::Staging;
 use lu_supervise::CommandSpec;
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
@@ -50,6 +51,15 @@ enum Call {
         name: ArtifactName,
         bytes: Vec<u8>,
     },
+    Deps {
+        job_id: JobId,
+        epoch: u64,
+    },
+    DepDiff {
+        job_id: JobId,
+        dep: JobId,
+        epoch: u64,
+    },
     Complete(Completion),
 }
 
@@ -62,6 +72,8 @@ struct FakeController {
     renew_replies: Mutex<VecDeque<Result<bool, ApiError>>>,
     append_log_replies: Mutex<VecDeque<Result<(), ApiError>>>,
     put_artifact_replies: Mutex<VecDeque<Result<(), ApiError>>>,
+    deps_replies: Mutex<VecDeque<Result<Vec<DependencyView>, ApiError>>>,
+    dep_diff_replies: Mutex<VecDeque<Result<Vec<u8>, ApiError>>>,
     complete_replies: Mutex<VecDeque<Result<(), ApiError>>>,
 }
 
@@ -75,6 +87,8 @@ impl FakeController {
             renew_replies: Mutex::new(VecDeque::new()),
             append_log_replies: Mutex::new(VecDeque::new()),
             put_artifact_replies: Mutex::new(VecDeque::new()),
+            deps_replies: Mutex::new(VecDeque::new()),
+            dep_diff_replies: Mutex::new(VecDeque::new()),
             complete_replies: Mutex::new(VecDeque::new()),
         }
     }
@@ -116,6 +130,14 @@ impl FakeController {
         self.put_artifact_replies.lock().unwrap().push_back(reply);
     }
 
+    fn push_deps(&self, reply: Result<Vec<DependencyView>, ApiError>) {
+        self.deps_replies.lock().unwrap().push_back(reply);
+    }
+
+    fn push_dep_diff(&self, reply: Result<Vec<u8>, ApiError>) {
+        self.dep_diff_replies.lock().unwrap().push_back(reply);
+    }
+
     fn push_complete(&self, reply: Result<(), ApiError>) {
         self.complete_replies.lock().unwrap().push_back(reply);
     }
@@ -142,6 +164,14 @@ impl FakeController {
 
     fn pop_put_artifact(&self) -> Option<Result<(), ApiError>> {
         self.put_artifact_replies.lock().unwrap().pop_front()
+    }
+
+    fn pop_deps(&self) -> Option<Result<Vec<DependencyView>, ApiError>> {
+        self.deps_replies.lock().unwrap().pop_front()
+    }
+
+    fn pop_dep_diff(&self) -> Option<Result<Vec<u8>, ApiError>> {
+        self.dep_diff_replies.lock().unwrap().pop_front()
     }
 
     fn pop_complete(&self) -> Option<Result<(), ApiError>> {
@@ -236,6 +266,35 @@ impl Controller for FakeController {
         Box::pin(async move { self.pop_put_artifact().unwrap_or(Ok(())) })
     }
 
+    fn deps<'a>(
+        &'a self,
+        id: &'a JobId,
+        epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyView>, ApiError>> + Send + 'a>> {
+        let job_id = id.clone();
+        self.record(Call::Deps {
+            job_id: job_id.clone(),
+            epoch,
+        });
+        Box::pin(async move { self.pop_deps().unwrap_or(Ok(Vec::new())) })
+    }
+
+    fn dep_diff<'a>(
+        &'a self,
+        id: &'a JobId,
+        dep: &'a JobId,
+        epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ApiError>> + Send + 'a>> {
+        let job_id = id.clone();
+        let dep = dep.clone();
+        self.record(Call::DepDiff {
+            job_id: job_id.clone(),
+            dep: dep.clone(),
+            epoch,
+        });
+        Box::pin(async move { self.pop_dep_diff().unwrap_or(Ok(Vec::new())) })
+    }
+
     fn complete<'a>(
         &'a self,
         completion: &'a Completion,
@@ -260,6 +319,7 @@ fn test_spec(repo: &str) -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: None,
         after: Vec::new(),
+        stack_dependencies: true,
     }
 }
 
@@ -345,6 +405,40 @@ fn create_git_repo(path: &std::path::Path) {
         .current_dir(path)
         .status()
         .unwrap();
+}
+
+/// A patch from the repository's committed `before` content to `after`, with the worktree
+/// restored afterwards so several dependencies can be generated against the same base.
+fn make_diff(repo_dir: &Path, path: &str, before: &str, after: &str) -> Vec<u8> {
+    std::fs::write(repo_dir.join(path), after).unwrap();
+    let output = std::process::Command::new("git")
+        .args([
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--binary",
+            "HEAD",
+            "--",
+            path,
+        ])
+        .current_dir(repo_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git diff failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::write(repo_dir.join(path), before).unwrap();
+    output.stdout
+}
+
+fn dependency(id: &JobId, diff: &[u8]) -> DependencyView {
+    DependencyView {
+        job_id: id.clone(),
+        state: JobState::Done,
+        diff_bytes: diff.len() as u64,
+    }
 }
 
 fn run_agent_with_shutdown(
@@ -963,6 +1057,8 @@ fn kind(call: &Call) -> &'static str {
         Call::Renew { .. } => "renew",
         Call::AppendLog(_) => "append_log",
         Call::PutArtifact { .. } => "put_artifact",
+        Call::Deps { .. } => "deps",
+        Call::DepDiff { .. } => "dep_diff",
         Call::Complete(_) => "complete",
     }
 }
@@ -1020,20 +1116,20 @@ async fn job_happy_path_calls_in_order() {
 
     let job = job_calls(&calls);
     let kinds: Vec<&str> = job.iter().map(kind).collect();
-    assert_eq!(kinds.first(), Some(&"start"), "{kinds:?}");
+    assert_eq!(&kinds[..2], ["deps", "start"], "{kinds:?}");
     let n = kinds.len();
-    assert!(n > 4, "{kinds:?}");
+    assert!(n > 5, "{kinds:?}");
     assert_eq!(
         &kinds[n - 3..],
         ["put_artifact", "put_artifact", "complete"]
     );
     assert!(
-        kinds[1..n - 3].iter().all(|k| *k == "append_log"),
+        kinds[2..n - 3].iter().all(|k| *k == "append_log"),
         "{kinds:?}"
     );
 
     assert!(matches!(
-        &job[0],
+        &job[1],
         Call::Start { job_id: started, epoch: EPOCH } if *started == job_id
     ));
     let names: Vec<ArtifactName> = job
@@ -1062,6 +1158,203 @@ async fn job_happy_path_calls_in_order() {
     assert_eq!(done[0].job_id, job_id);
     assert_eq!(done[0].epoch, EPOCH);
     assert!(log_text(&calls).contains("working"));
+}
+
+#[tokio::test]
+async fn dependency_diffs_stack_in_after_order() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let dep1 = JobId::new();
+    let dep2 = JobId::new();
+    let first = make_diff(&f.repo_dir, "README.md", "test\n", "test\nfirst\n");
+    let both = make_diff(&f.repo_dir, "README.md", "test\n", "test\nfirst\nsecond\n");
+
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = vec![dep1.clone(), dep2.clone()];
+    let controller = assigned_controller(&job_id, spec);
+    controller.push_deps(Ok(vec![
+        dependency(&dep1, &first),
+        dependency(&dep2, &both),
+    ]));
+    controller.push_dep_diff(Ok(first));
+    controller.push_dep_diff(Ok(both));
+
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("grep -q '^first$' README.md && grep -q '^second$' README.md"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let diff_calls: Vec<JobId> = calls
+        .iter()
+        .filter_map(|c| match c {
+            Call::DepDiff { dep, .. } => Some(dep.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(diff_calls, [dep1.clone(), dep2.clone()]);
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+    let diff = String::from_utf8(artifact(&calls, ArtifactName::DiffPatch)).unwrap();
+    assert!(diff.contains("+first"), "{diff}");
+    assert!(diff.contains("+second"), "{diff}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    assert_eq!(
+        report["applied_dependencies"],
+        json!([dep1.to_string(), dep2.to_string()])
+    );
+}
+
+#[tokio::test]
+async fn compatible_dependency_changes_to_one_file_merge_in_order() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let dep1 = JobId::new();
+    let dep2 = JobId::new();
+    let first = make_diff(&f.repo_dir, "README.md", "test\n", "first\ntest\n");
+    let second = make_diff(&f.repo_dir, "README.md", "test\n", "test\nsecond\n");
+
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = vec![dep1.clone(), dep2.clone()];
+    let controller = assigned_controller(&job_id, spec);
+    controller.push_deps(Ok(vec![
+        dependency(&dep1, &first),
+        dependency(&dep2, &second),
+    ]));
+    controller.push_dep_diff(Ok(first));
+    controller.push_dep_diff(Ok(second));
+
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("grep -q '^first$' README.md && grep -q '^second$' README.md"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    assert_eq!(
+        report["applied_dependencies"],
+        json!([dep1.to_string(), dep2.to_string()])
+    );
+}
+
+#[tokio::test]
+async fn conflicting_dependency_fails_before_the_harness() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let dep1 = JobId::new();
+    let dep2 = JobId::new();
+    let first = make_diff(&f.repo_dir, "README.md", "test\n", "one\n");
+    let second = make_diff(&f.repo_dir, "README.md", "test\n", "two\n");
+
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = vec![dep1.clone(), dep2.clone()];
+    let controller = assigned_controller(&job_id, spec);
+    controller.push_deps(Ok(vec![
+        dependency(&dep1, &first),
+        dependency(&dep2, &second),
+    ]));
+    controller.push_dep_diff(Ok(first));
+    controller.push_dep_diff(Ok(second));
+
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo harness-ran"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Start { .. })),
+        "a conflict must stop before the harness: {calls:?}"
+    );
+    assert!(!log_text(&calls).contains("harness-ran"));
+    let done = completions(&calls);
+    assert_eq!(
+        done[0].outcome,
+        Outcome::Failed(FailureClass::Conflict),
+        "{done:?}"
+    );
+    let summary = done[0].summary.as_deref().unwrap_or("");
+    assert!(summary.contains(dep2.as_str()), "{summary}");
+    assert!(summary.contains("README.md"), "{summary}");
+}
+
+#[tokio::test]
+async fn dependency_without_a_diff_is_skipped() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let dep = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = vec![dep.clone()];
+    let controller = assigned_controller(&job_id, spec);
+    controller.push_deps(Ok(vec![dependency(&dep, b"")]));
+
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("grep -q '^test$' README.md && ! grep -q '^dep$' README.md"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::DepDiff { .. })),
+        "{calls:?}"
+    );
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    assert_eq!(report["applied_dependencies"], json!([]));
+}
+
+#[tokio::test]
+async fn no_stack_leaves_the_base_tree_alone() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let dep = JobId::new();
+    let diff = make_diff(&f.repo_dir, "README.md", "test\n", "test\ndep\n");
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = vec![dep.clone()];
+    spec.stack_dependencies = false;
+    let controller = assigned_controller(&job_id, spec);
+    controller.push_deps(Ok(vec![dependency(&dep, &diff)]));
+
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("grep -q '^test$' README.md && ! grep -q '^dep$' README.md"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Deps { .. })),
+        "{calls:?}"
+    );
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
 }
 
 #[tokio::test]

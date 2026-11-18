@@ -65,6 +65,16 @@ impl JobView {
     }
 }
 
+/// One of a job's `after` dependencies, as the agent sees it before staging its own tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyView {
+    pub job_id: JobId,
+    pub state: JobState,
+    /// The size of the dependency's `diff.patch`; zero means it changed nothing.
+    #[serde(default)]
+    pub diff_bytes: u64,
+}
+
 /// A page of jobs. The controller may add fields later; unknown ones are ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListJobs {
@@ -333,6 +343,7 @@ fn empty_spec() -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: None,
         after: Vec::new(),
+        stack_dependencies: true,
     }
 }
 
