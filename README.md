@@ -189,17 +189,9 @@ Write tools: `lu_submit`, `lu_submit_many`, `lu_result`, `lu_cancel`, `lu_retry`
 - Submissions (`lu_submit`, `lu_submit_many` and `lu_retry`) are limited to 30 per rolling minute per server process. Over the limit, the call returns `isError` with the number of seconds to wait.
 - `lu_cancel`, `lu_drain` and `lu_undrain` are marked destructive; all write tools report `readOnlyHint: false`.
 
-## What it is not
-
-- No web UI and no interactive attach to a running harness in 0.1.0.
-- No push channel: agents poll the controller.
-- No controller-side provider credentials; provider authentication stays on the leaf in 0.1.0.
-
 ## Known gaps
 
 - The agent runs the harness as its own user; see `docs/security.md`.
-- The agent sends no provider health, so the controller does not yet steer around a cooling provider.
-- The agent still clones from the forge and ignores the controller's pinned `base_commit`; only jobs for a configured `[[controller.repos]]` entry are pinned.
 
 ## Crates
 
