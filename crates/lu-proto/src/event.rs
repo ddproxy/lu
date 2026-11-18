@@ -275,6 +275,7 @@ mod tests {
             idle_timeout_secs: None,
             idempotency_key: None,
             after: Vec::new(),
+            stack_dependencies: true,
         }
     }
 

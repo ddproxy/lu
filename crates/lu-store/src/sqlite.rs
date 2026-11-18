@@ -56,6 +56,7 @@ fn failure_str(f: FailureClass) -> &'static str {
         FailureClass::Provider => "provider",
         FailureClass::Execution => "execution",
         FailureClass::Dependency => "dependency",
+        FailureClass::Conflict => "conflict",
     }
 }
 
@@ -65,6 +66,7 @@ fn parse_failure(s: &str) -> Result<FailureClass, StoreError> {
         "provider" => FailureClass::Provider,
         "execution" => FailureClass::Execution,
         "dependency" => FailureClass::Dependency,
+        "conflict" => FailureClass::Conflict,
         _ => return Err(internal(format!("unknown failure class {s}"))),
     })
 }
@@ -1565,6 +1567,7 @@ mod tests {
             idle_timeout_secs: None,
             idempotency_key: Some("k".to_owned()),
             after: Vec::new(),
+            stack_dependencies: true,
         };
         let now = Now {
             wall_unix: 1,

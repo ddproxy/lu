@@ -217,6 +217,7 @@ stateDiagram-v2
     leased --> recovering: lease expires
     running --> done: success
     running --> failed: failure with no retry left
+    running --> failed: dependency diff conflict
     running --> queued: node or provider failure, retry
     running --> recovering: lease expires or the controller restarts
     running --> cancelled: cancel
@@ -232,7 +233,9 @@ stateDiagram-v2
 
 A `needs_input` state is reserved for interactive harnesses and unreachable in 0.1.0.
 
-A job submitted with `after` dependencies starts as `blocked` when at least one dependency is not `done`; if all are already `done`, it starts as `queued`. When a dependency finishes `done`, all blocked dependents whose remaining dependencies are `done` move to `queued` and waiter polls wake. When a dependency finishes `failed` or `cancelled`, blocked dependents fail with `failure_class: "dependency"`, a summary naming the dependency and its state, and the failure cascades through their own dependents. Dependency failures never retry, and dependencies do not transfer results or artifacts to the dependent job.
+A job submitted with `after` dependencies starts as `blocked` when at least one dependency is not `done`; if all are already `done`, it starts as `queued`. When a dependency finishes `done`, all blocked dependents whose remaining dependencies are `done` move to `queued` and waiter polls wake. When a dependency finishes `failed` or `cancelled`, blocked dependents fail with `failure_class: "dependency"`, a summary naming the dependency and its state, and the failure cascades through their own dependents. Dependency failures never retry.
+
+A dependent job with `stack_dependencies: true` (the default) stages its base commit and applies every finished dependency's `diff.patch` in `after` order before the harness starts. A dependency with no diff is skipped. A patch that applies cleanly is written directly; otherwise the agent reconstructs the dependency's side from the base and three-way merges it. If conflicts remain, the job stops before the harness with `failure_class: "conflict"` and a summary naming the dependency and up to 20 conflicting paths; it never retries and the failed merge writes nothing. `lu submit --no-stack` sets `stack_dependencies: false` to run on the base tree alone. The dependent's own diff is always against its base and includes the dependency changes, so a consumer merging a chain applies only the last diff.
 
 A job starts as `queued` with `attempt = 1` and `epoch = 0`. When an idle, non-draining node with no held job asks for work, the controller assigns the oldest queued job whose provider is available and not cordoned:
 
@@ -246,6 +249,7 @@ On completion:
 
 - `Done` moves the job to `done` and records `finished_at`; newly unblocked dependents move to `queued`.
 - `Failed(Execution)` moves it to `failed` immediately. Execution failures never retry. `lu retry <id>` resubmits a finished job's spec as a new job (`--provider`, `--model` and `--after` replace those fields); the new job is independent of the old one.
+- `Failed(Conflict)` means a dependency diff could not be applied to the base tree. It moves the job to `failed` immediately and never retries.
 - `Failed(Node)` retries while `attempt <= max_retries`: the job returns to `queued`, the attempt is incremented, and the node is cleared. Beyond the cap it becomes `failed` with that failure class. `Failed(Provider)` does not use that budget: a provider outage is not the job's fault, so the job returns to `queued` and waits until a node can serve the provider again (the node must report it healthy and have no cordon). Only 100 provider failures in a row fail the job. A terminal `failed` or `cancelled` job fails its blocked dependents.
 
 A failure before the harness produced a verdict is classified by the agent, one row per case:
@@ -255,6 +259,7 @@ A failure before the harness produced a verdict is classified by the agent, one 
 | The harness process could not be started (command not found, exec refused, no pid) | `node` | within `max_retries` |
 | Staging or preparing the tree failed in a way the node controls (disk, filesystem, clone transport, permissions, leftover directory) | `node` | within `max_retries` |
 | A staging error that names a missing ref, an authentication failure or an unknown repository | `execution` | never |
+| A dependency diff could not be applied and the three-way merge left conflicts (or the patch was unreadable) | `conflict` | never |
 
 `max_retries` is the number of node-failure retries, not the total number of attempts. With the default `1`, an initial attempt plus one retry is allowed. A provider failure also cordons the `(node, provider)` pair for `provider_cooldown_secs`.
 

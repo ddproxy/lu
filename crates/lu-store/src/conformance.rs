@@ -26,6 +26,7 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: key.map(|s| s.to_owned()),
         after: Vec::new(),
+        stack_dependencies: true,
     }
 }
 
@@ -61,6 +62,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     assignment_and_epoch(&make());
     start_renew_log_artifact(&make());
     complete_and_retry_cordon(&make());
+    conflict_failure_class_round_trips(&make());
     stale_epoch_rejected(&make());
     expire_and_recover(&make());
     recover_on_boot(&make());
@@ -130,6 +132,42 @@ fn finish_failed<S: Store>(s: &S, id: &JobId, node_name: &str, wall: i64, mono: 
         1000,
     )
     .unwrap();
+}
+
+fn conflict_failure_class_round_trips<S: Store>(s: &S) {
+    let (job, _) = s
+        .create_job(&spec("https://x/conflict.git", None), now(1, 1))
+        .unwrap();
+    s.heartbeat(&hb("conflict-node", HarnessState::Idle, vec![]), now(2, 2))
+        .unwrap();
+    let a = s
+        .next_assignment(&node("conflict-node"), now(3, 3), 60_000)
+        .unwrap()
+        .unwrap();
+    s.start_job(&job.id, a.epoch, now(4, 4)).unwrap();
+    let comp = Completion {
+        job_id: job.id.clone(),
+        epoch: a.epoch,
+        outcome: Outcome::Failed(FailureClass::Conflict),
+        exit_code: None,
+        summary: Some("dependency dep-1 conflict in a.txt".into()),
+        retry_after_secs: None,
+    };
+    s.complete(
+        &comp,
+        Some((FailureClass::Conflict, None)),
+        now(5, 5),
+        1,
+        1000,
+    )
+    .unwrap();
+    let rec = s.get_job(&job.id).unwrap();
+    assert_eq!(rec.state, JobState::Failed);
+    assert_eq!(rec.failure_class, Some(FailureClass::Conflict));
+    assert_eq!(
+        rec.summary.as_deref(),
+        Some("dependency dep-1 conflict in a.txt")
+    );
 }
 
 fn blocked_on_submit_and_unblocked_on_done<S: Store>(s: &S) {

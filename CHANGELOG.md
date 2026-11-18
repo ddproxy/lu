@@ -5,6 +5,23 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Dependent jobs now stack their dependencies by default: the agent applies each finished
+  dependency's `diff.patch` to the dependent's base tree in `after` order before starting the
+  harness. A patch that no longer applies is reconstructed from the base and three-way merged;
+  if conflicts remain the job fails with the new `conflict` class (never retried), naming the
+  dependency and up to 20 conflicting paths. The dependent's diff stays against its base and
+  includes the dependency changes, so a consumer merging a chain applies only the last diff.
+  `lu submit --no-stack` opts out. `report.json` records the applied dependency ids.
+
+### Changed
+
+- New agent routes `GET /v1/agent/jobs/{id}/deps` and
+  `GET /v1/agent/jobs/{id}/deps/{dep}/diff` serve the ordered dependency list and their diffs.
+  `JobSpec.stack_dependencies` defaults to `true` and is omitted from JSON when true, so older
+  agents keep working against a new controller.
+
 ## [0.1.13] - 2026-11-17
 
 ### Changed

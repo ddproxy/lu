@@ -14,8 +14,8 @@ use serde_json::Value;
 
 use crate::error::{body_excerpt, ApiError};
 use crate::types::{
-    CompletionBody, JobView, ListJobs, ListNodes, LogPage, NodeStats, NodeView, PollRequest,
-    StatusView, MAX_JSON_BYTES,
+    CompletionBody, DependencyView, JobView, ListJobs, ListNodes, LogPage, NodeStats, NodeView,
+    PollRequest, StatusView, MAX_JSON_BYTES,
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -584,6 +584,46 @@ impl Client {
         self.success(reply).map(|_| ())
     }
 
+    /// The job's `after` dependencies in order, with the size of each dependency diff.
+    pub async fn deps(&self, id: &JobId, epoch: u64) -> Result<Vec<DependencyView>> {
+        let route = format!("v1/agent/jobs/{id}/deps");
+        let query = [("epoch".to_owned(), epoch.to_string())];
+        let reply = self
+            .send(Method::GET, &route, None, &query, &[], true)
+            .await?;
+        let reply = self.success(reply)?;
+        self.scrub(
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode the dependency list: {error}"),
+            }),
+        )
+    }
+
+    /// A dependency's `diff.patch`. [`ApiError::NotFound`] means the dependency changed nothing.
+    pub async fn dep_diff(&self, id: &JobId, dep: &JobId, epoch: u64) -> Result<Vec<u8>> {
+        let route = format!("v1/agent/jobs/{id}/deps/{dep}/diff");
+        let query = [("epoch".to_owned(), epoch.to_string())];
+        let cap = ArtifactName::DiffPatch.max_bytes();
+        let reply = self
+            .send_capped(
+                Method::GET,
+                &route,
+                SendParts {
+                    body: None,
+                    query: &query,
+                    headers: &[],
+                },
+                true,
+                cap,
+            )
+            .await?;
+        let reply = self.success(reply)?;
+        if reply.body.len() as u64 > cap {
+            return Err(ApiError::TooLarge { limit: cap });
+        }
+        Ok(reply.body)
+    }
+
     pub async fn complete(&self, completion: &Completion) -> Result<()> {
         completion
             .validate()
@@ -792,6 +832,17 @@ pub trait Controller: Send + Sync {
         name: ArtifactName,
         bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    fn deps<'a>(
+        &'a self,
+        id: &'a JobId,
+        epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyView>>> + Send + 'a>>;
+    fn dep_diff<'a>(
+        &'a self,
+        id: &'a JobId,
+        dep: &'a JobId,
+        epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
     fn complete<'a>(
         &'a self,
         completion: &'a Completion,
@@ -837,6 +888,23 @@ impl Controller for Client {
         bytes: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move { Client::put_artifact(self, id, epoch, name, bytes).await })
+    }
+
+    fn deps<'a>(
+        &'a self,
+        id: &'a JobId,
+        epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyView>>> + Send + 'a>> {
+        Box::pin(async move { Client::deps(self, id, epoch).await })
+    }
+
+    fn dep_diff<'a>(
+        &'a self,
+        id: &'a JobId,
+        dep: &'a JobId,
+        epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move { Client::dep_diff(self, id, dep, epoch).await })
     }
 
     fn complete<'a>(

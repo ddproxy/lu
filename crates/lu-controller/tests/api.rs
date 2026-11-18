@@ -156,6 +156,7 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: key.map(|s| s.to_owned()),
         after: Vec::new(),
+        stack_dependencies: true,
     }
 }
 
@@ -718,6 +719,168 @@ async fn dependency_views_and_validation() {
         err["message"].as_str().unwrap().contains("duplicate"),
         "{r}"
     );
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn agent_dependency_routes_list_and_serve_diffs() {
+    let srv = start_server().await;
+
+    // Finish a dependency so the dependent is runnable.
+    let r = post_job(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let dep: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let dep_id = dep["id"].as_str().unwrap().to_string();
+
+    let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let dep_epoch = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign" && e["job_id"] == dep_id)
+        .and_then(|e| e["epoch"].as_u64())
+        .expect("dependency should be assigned");
+
+    let b = json!({"epoch": dep_epoch}).to_string();
+    let req = format!("POST /v1/agent/jobs/{dep_id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", b.len(), b);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let comp = json!({"job_id": dep_id, "epoch": dep_epoch, "outcome": "done", "exit_code": 0})
+        .to_string();
+    let req = format!("POST /v1/agent/jobs/{dep_id}/complete HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", comp.len(), comp);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let mut spec = sample_spec(None);
+    spec.after = vec![JobId::parse(&dep_id).unwrap()];
+    let r = post_job(srv.addr, &spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let job_id = job["id"].as_str().unwrap().to_string();
+    assert_eq!(job["state"], "queued", "{r}");
+
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let epoch = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign" && e["job_id"] == job_id)
+        .and_then(|e| e["epoch"].as_u64())
+        .expect("dependent should be assigned");
+
+    let deps = |token: &str, epoch: u64| {
+        format!("GET /v1/agent/jobs/{job_id}/deps?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n\r\n")
+    };
+    let diff = |token: &str, epoch: u64| {
+        format!("GET /v1/agent/jobs/{job_id}/deps/{dep_id}/diff?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n\r\n")
+    };
+
+    // No diff stored yet: the list reports zero bytes and the diff is 404.
+    let r = raw_request(srv.addr, &deps(AGENT_A_TOKEN, epoch)).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let list: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(
+        list,
+        json!([{"job_id": dep_id, "state": "done", "diff_bytes": 0}])
+    );
+    let r = raw_request(srv.addr, &diff(AGENT_A_TOKEN, epoch)).await;
+    assert_eq!(status(&r), 404, "{r}");
+
+    let patch = b"--- a/README.md\n+++ b/README.md\n";
+    let dep_dir = srv._artifacts_dir.join(&dep_id);
+    std::fs::create_dir_all(&dep_dir).unwrap();
+    std::fs::write(dep_dir.join("diff.patch"), patch).unwrap();
+
+    let r = raw_request(srv.addr, &deps(AGENT_A_TOKEN, epoch)).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let list: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(
+        list,
+        json!([{"job_id": dep_id, "state": "done", "diff_bytes": patch.len()}])
+    );
+
+    let r = raw_request(srv.addr, &diff(AGENT_A_TOKEN, epoch)).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(body_str(&r).as_bytes(), patch);
+
+    // Wrong scope, wrong node and epoch fencing are refused.
+    assert_eq!(
+        status(&raw_request(srv.addr, &deps(OP_TOKEN, epoch)).await),
+        401
+    );
+    assert_eq!(
+        status(&raw_request(srv.addr, &deps(AGENT_B_TOKEN, epoch)).await),
+        403
+    );
+    assert_eq!(
+        status(&raw_request(srv.addr, &deps(AGENT_A_TOKEN, epoch + 1)).await),
+        409
+    );
+    assert_eq!(
+        status(&raw_request(srv.addr, &diff(AGENT_B_TOKEN, epoch)).await),
+        403
+    );
+
+    // A job that is not in `after` is not readable.
+    let other = JobId::new();
+    let req = format!("GET /v1/agent/jobs/{job_id}/deps/{other}/diff?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\n\r\n");
+    assert_eq!(status(&raw_request(srv.addr, &req).await), 403);
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn an_older_agent_sees_no_new_fields_and_reports_old_classes() {
+    let srv = start_server().await;
+    let r = post_job(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = job["id"].as_str().unwrap().to_string();
+
+    let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let assign = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign")
+        .expect("job should be assigned");
+    let epoch = assign["epoch"].as_u64().unwrap();
+    assert!(
+        assign["spec"].get("stack_dependencies").is_none(),
+        "the default must not reach an older agent: {assign}"
+    );
+
+    let b = json!({"epoch": epoch}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", b.len(), b);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let comp =
+        json!({"job_id": id, "epoch": epoch, "outcome": {"failed": "execution"}, "exit_code": 1})
+            .to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/complete HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", comp.len(), comp);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    let got: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(got["failure_class"], "execution", "{r}");
     let _ = srv.shutdown.send(());
 }
 

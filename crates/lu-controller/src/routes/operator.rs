@@ -24,6 +24,7 @@ pub fn job_view(r: &JobRecord) -> serde_json::Value {
         lu_proto::FailureClass::Provider => "provider",
         lu_proto::FailureClass::Execution => "execution",
         lu_proto::FailureClass::Dependency => "dependency",
+        lu_proto::FailureClass::Conflict => "conflict",
     });
     json!({
         "id": r.id.to_string(),

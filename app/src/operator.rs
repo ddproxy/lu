@@ -48,6 +48,9 @@ pub struct SubmitArgs {
     /// Only run after this job is done (repeatable).
     #[arg(long = "after", value_parser = parse_job_id)]
     pub after: Vec<JobId>,
+    /// Do not apply dependency diffs to this job's tree.
+    #[arg(long)]
+    pub no_stack: bool,
     /// Idempotency key.
     #[arg(long)]
     pub key: Option<String>,
@@ -216,6 +219,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         idle_timeout_secs: args.idle_timeout,
         idempotency_key: args.key,
         after: args.after,
+        stack_dependencies: !args.no_stack,
     };
     spec.validate().map_err(|error| error.to_string())?;
 
@@ -1099,6 +1103,7 @@ pub(crate) fn failure_name(value: Option<FailureClass>) -> String {
         Some(FailureClass::Provider) => "provider".to_owned(),
         Some(FailureClass::Execution) => "execution".to_owned(),
         Some(FailureClass::Dependency) => "dependency".to_owned(),
+        Some(FailureClass::Conflict) => "conflict".to_owned(),
         None => "-".to_owned(),
     }
 }
