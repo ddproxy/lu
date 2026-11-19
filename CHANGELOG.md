@@ -9,6 +9,7 @@ uses semantic versioning once it reaches 1.0.
 
 - `lu mcp` write tools now accept the CLI's scheduling fields: `require`, `fallbacks`, `after_keys`, `no_stack`, `harness`, `timeout`/`timeout_secs` and `idle_timeout`/`idle_timeout_secs` on `lu_submit`, `lu_submit_many` and `lu_retry`. Bounds appear in `tools/list` and are enforced by the shared `JobSpec::validate`, so MCP returns the CLI's validation text.
 - `lu_nodes` and the new `lu_node` tool report node labels, version and disk-free stats from each node's stats endpoint.
+- Done jobs with an empty stored diff get `outcome_note: "no_changes"` in `JobView`, printed as `no changes` by `lu ls`/`lu show` and marked in the TUI job list. `JobSpec.allow_empty` (`lu submit --allow-empty`) suppresses the note. `lu_jobs_no_changes_total` exports the count since controller start. Schema 6 adds a nullable `diff_bytes` job column; older databases upgrade with it empty, so pre-existing jobs are not noted.
 
 ### Changed
 

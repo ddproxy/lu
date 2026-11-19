@@ -495,13 +495,14 @@ async fn put_artifact_impl(
         Ok(b) => b,
         Err(e) => return with_version(e.into_response()),
     };
+    let nbytes = bytes.len() as u64;
     // Record first: the store checks the epoch inside its transaction, so a holder that lost its
     // lease writes nothing. A failed write after this leaves the record without a file, which a
     // fetch treats as missing and the agent's retry replaces.
     let rec_res = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         let jid = job_id.clone();
-        move || store.record_artifact(&jid, epoch, art)
+        move || store.record_artifact(&jid, epoch, art, nbytes)
     })
     .await;
     match rec_res {
@@ -602,6 +603,9 @@ pub async fn complete_job(
     .await;
     match res {
         Ok(Ok(rec)) => {
+            if crate::routes::operator::outcome_note(&rec) == Some("no_changes") {
+                state.count_no_changes();
+            }
             state.waiters.notify_job(rec.id.as_ref());
             state.waiters.notify_work();
             with_version(json_ok(

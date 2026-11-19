@@ -9,7 +9,7 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 #[cfg(test)]
 pub mod conformance;
@@ -48,6 +48,9 @@ pub struct JobRecord {
     pub artifacts: Vec<ArtifactName>,
     pub cancel_requested: bool,
     pub log_len: u64,
+    /// Size of the stored `diff.patch` in bytes when recorded. Jobs from before schema 6, or
+    /// without a diff, have no size.
+    pub diff_bytes: Option<u64>,
     /// Dependencies that are not yet `done`; empty once the job may run.
     pub waiting_on: Vec<JobId>,
 }
@@ -182,8 +185,14 @@ pub trait Store: Send + Sync + 'static {
     /// Reserves `n` log bytes at `offset`; conflicts with the stored length when they differ.
     /// Returns the new length. The caller then writes the bytes to the log file.
     fn reserve_log(&self, id: &JobId, epoch: u64, offset: u64, n: u64) -> Result<u64, StoreError>;
-    fn record_artifact(&self, id: &JobId, epoch: u64, name: ArtifactName)
-        -> Result<(), StoreError>;
+    /// Records an artifact name and its byte size, used for diff-based outcome notes.
+    fn record_artifact(
+        &self,
+        id: &JobId,
+        epoch: u64,
+        name: ArtifactName,
+        bytes: u64,
+    ) -> Result<(), StoreError>;
     /// Finishes the attempt. Success is `done`; a node or provider failure with attempts left
     /// returns the job to `queued` (attempt + 1) and cordons `(node, provider)` for a provider
     /// failure; anything else is `failed`. `cordon_ms` and `max_retries` come from config.

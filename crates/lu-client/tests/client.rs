@@ -192,6 +192,7 @@ fn spec() -> JobSpec {
         idempotency_key: Some("ticket:42".to_owned()),
         after: Vec::new(),
         stack_dependencies: true,
+        allow_empty: false,
         requires: Vec::new(),
         fallbacks: Vec::new(),
     }

@@ -42,6 +42,9 @@ pub struct JobView {
     pub failure_class: Option<FailureClass>,
     #[serde(default)]
     pub summary: Option<String>,
+    /// `no_changes` when a done job stored an empty diff without `allow_empty`.
+    #[serde(default)]
+    pub outcome_note: Option<String>,
     #[serde(default)]
     pub after: Vec<JobId>,
     #[serde(default)]
@@ -71,6 +74,7 @@ impl JobView {
             finished_at: None,
             failure_class: None,
             summary: None,
+            outcome_note: None,
             after: Vec::new(),
             waiting_on: Vec::new(),
             waiting_reason: None,
@@ -384,6 +388,7 @@ fn empty_spec() -> JobSpec {
         idempotency_key: None,
         after: Vec::new(),
         stack_dependencies: true,
+        allow_empty: false,
         requires: Vec::new(),
         fallbacks: Vec::new(),
     }

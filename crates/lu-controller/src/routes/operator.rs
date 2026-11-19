@@ -17,6 +17,20 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
+/// A `done` job whose recorded `diff.patch` is empty changed nothing. `allow_empty` opts out.
+/// The patch format emits no bytes for a tree with no changes, so its byte size is the signal.
+pub fn outcome_note(r: &JobRecord) -> Option<&'static str> {
+    if r.state == lu_proto::JobState::Done
+        && !r.spec.allow_empty
+        && r.artifacts.contains(&ArtifactName::DiffPatch)
+        && r.diff_bytes == Some(0)
+    {
+        Some("no_changes")
+    } else {
+        None
+    }
+}
+
 pub fn job_view(r: &JobRecord) -> serde_json::Value {
     job_view_with(r, None)
 }
@@ -30,7 +44,7 @@ fn job_view_with(r: &JobRecord, reason: Option<String>) -> serde_json::Value {
         lu_proto::FailureClass::Dependency => "dependency",
         lu_proto::FailureClass::Conflict => "conflict",
     });
-    json!({
+    let mut view = json!({
         "id": r.id.to_string(),
         "state": match r.state {
             lu_proto::JobState::Blocked => "blocked",
@@ -61,7 +75,11 @@ fn job_view_with(r: &JobRecord, reason: Option<String>) -> serde_json::Value {
         "after": r.spec.after.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
         "waiting_on": r.waiting_on.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
         "waiting_reason": reason,
-    })
+    });
+    if let Some(note) = outcome_note(r) {
+        view["outcome_note"] = json!(note);
+    }
+    view
 }
 
 async fn all_nodes(state: &Arc<AppState>, at: Now) -> Result<Vec<NodeRecord>, ApiError> {
@@ -631,4 +649,91 @@ pub async fn undrain_node(
     path: Path<String>,
 ) -> Response {
     set_drain(s, p, h, path, false).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lu_proto::{JobState, DEFAULT_TIMEOUT_SECS};
+
+    fn record(
+        state: JobState,
+        allow_empty: bool,
+        diff_bytes: Option<u64>,
+        artifacts: Vec<ArtifactName>,
+    ) -> JobRecord {
+        JobRecord {
+            id: JobId::new(),
+            state,
+            spec: JobSpec {
+                repo: "https://example.net/repo.git".to_owned(),
+                git_ref: "main".to_owned(),
+                base_commit: None,
+                task: "run tests".to_owned(),
+                harness: "opencode".to_owned(),
+                provider: None,
+                model: None,
+                timeout_secs: DEFAULT_TIMEOUT_SECS,
+                idle_timeout_secs: None,
+                idempotency_key: None,
+                after: Vec::new(),
+                stack_dependencies: true,
+                allow_empty,
+                requires: Vec::new(),
+                fallbacks: Vec::new(),
+            },
+            attempt: 1,
+            node: None,
+            assigned_provider: None,
+            assigned_model: None,
+            epoch: 1,
+            created_at: 1,
+            updated_at: 2,
+            started_at: None,
+            finished_at: None,
+            failure_class: None,
+            summary: None,
+            exit_code: Some(0),
+            artifacts,
+            cancel_requested: false,
+            log_len: 0,
+            diff_bytes,
+            waiting_on: Vec::new(),
+        }
+    }
+
+    fn diff() -> Vec<ArtifactName> {
+        vec![ArtifactName::DiffPatch]
+    }
+
+    #[test]
+    fn an_empty_diff_on_a_done_job_gets_the_note() {
+        let r = record(JobState::Done, false, Some(0), diff());
+        assert_eq!(outcome_note(&r), Some("no_changes"));
+        assert_eq!(job_view(&r)["outcome_note"], json!("no_changes"));
+    }
+
+    #[test]
+    fn a_nonempty_diff_has_no_note() {
+        let r = record(JobState::Done, false, Some(1), diff());
+        assert_eq!(outcome_note(&r), None);
+        assert!(job_view(&r).get("outcome_note").is_none());
+    }
+
+    #[test]
+    fn allow_empty_suppresses_the_note() {
+        let r = record(JobState::Done, true, Some(0), diff());
+        assert_eq!(outcome_note(&r), None);
+        assert!(job_view(&r).get("outcome_note").is_none());
+    }
+
+    #[test]
+    fn no_diff_artifact_and_nondone_states_have_no_note() {
+        let no_diff = record(JobState::Done, false, Some(0), Vec::new());
+        assert_eq!(outcome_note(&no_diff), None);
+        let legacy = record(JobState::Done, false, None, diff());
+        assert_eq!(outcome_note(&legacy), None);
+        let running = record(JobState::Running, false, Some(0), diff());
+        assert_eq!(outcome_note(&running), None);
+    }
 }

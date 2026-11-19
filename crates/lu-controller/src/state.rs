@@ -19,6 +19,8 @@ pub struct AppState {
     pub db_path: PathBuf,
     pub started: Instant,
     pub recovered_on_boot: AtomicU64,
+    /// Jobs completed `done` with an empty diff and no `allow_empty` opt-out.
+    pub no_changes_total: AtomicU64,
     pub auth: AuthConfig,
     pub throttle: LoginThrottle,
     pub waiters: Arc<Waiters>,
@@ -73,6 +75,7 @@ impl AppState {
             db_path: PathBuf::from(&cfg.db),
             started: Instant::now(),
             recovered_on_boot: AtomicU64::new(0),
+            no_changes_total: AtomicU64::new(0),
             auth,
             throttle,
             waiters: Arc::new(Waiters::new()),
@@ -101,5 +104,13 @@ impl AppState {
 
     pub fn recovered_on_boot(&self) -> u64 {
         self.recovered_on_boot.load(Ordering::Relaxed)
+    }
+
+    pub fn count_no_changes(&self) {
+        self.no_changes_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn no_changes_total(&self) -> u64 {
+        self.no_changes_total.load(Ordering::Relaxed)
     }
 }

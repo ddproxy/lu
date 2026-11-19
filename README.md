@@ -107,9 +107,9 @@ put `target/release` on `PATH` or run `make install` first.
    lu fetch <job-id> --out results
    ```
 
-   `lu ls` uses the header `ID STATE NODE ATTEMPT AFTER CREATED`. `lu show` prints key/value
+   `lu ls` uses the header `ID STATE NODE ATTEMPT AFTER CREATED NOTE`. `lu show` prints key/value
    rows (`id`, `state`, `node`, `attempt`, `epoch`, `created_at`, `started_at`, `finished_at`,
-   `failure`, `waiting`, `summary`). `lu logs --follow` streams stored output and stops when the
+   `failure`, `waiting`, `summary`, `outcome_note`). `lu logs --follow` streams stored output and stops when the
    job reaches a terminal state. `lu fetch` prints one `saved <path>` line per file:
    `results/diff.patch`, `results/run.log` and `results/report.json`.
 
@@ -143,10 +143,10 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu serve` | Run the HTTP(S) controller. This is the default when no subcommand is given. |
 | `lu top [--once]` | Live view of the nodes and recent jobs, refreshed every two seconds. `--once` prints one snapshot as text and exits; global `--json` prints one snapshot as JSON and cannot be combined with `--once`. Only in a build with `--features tui`. |
 | `lu agent` | Run the node agent loop. It needs an `[agent]` config. |
-| `lu submit` | Submit a job. `--repo` and `--ref` are required. The task comes from `--task`, `--task-file` or stdin. Flags: `--harness` (default `opencode`), `--provider`, `--model`, `--timeout` (default `3600`), `--idle-timeout` (1 to 86400 seconds), `--after`, `--after-key`, `--no-stack`, `--require`, `--fallback`, `--key` and `--wait`. `--fallback provider:model` is repeatable, at most 4; a fallback with only a provider keeps the job's model. `--after` and `--after-key` are repeatable, at most 16 dependencies in total; a key resolves to the newest job submitted with it. `--require` is repeatable, at most 8 labels. `--wait` polls until the job is terminal. |
+| `lu submit` | Submit a job. `--repo` and `--ref` are required. The task comes from `--task`, `--task-file` or stdin. Flags: `--harness` (default `opencode`), `--provider`, `--model`, `--timeout` (default `3600`), `--idle-timeout` (1 to 86400 seconds), `--after`, `--after-key`, `--no-stack`, `--allow-empty`, `--require`, `--fallback`, `--key` and `--wait`. `--allow-empty` suppresses the `no changes` outcome note. `--fallback provider:model` is repeatable, at most 4; a fallback with only a provider keeps the job's model. `--after` and `--after-key` are repeatable, at most 16 dependencies in total; a key resolves to the newest job submitted with it. `--require` is repeatable, at most 8 labels. `--wait` polls until the job is terminal. |
 | `lu retry <id>` | Resubmit a finished job's spec as a new job. `--provider` and `--model` replace those fields; `--after` and `--after-key` replace the dependency list; `--require` replaces the label requirements and `--no-require` clears them; `--fallback` replaces the provider choices and `--no-fallbacks` clears them. `--key` gives the new job an idempotency key, and `--wait` polls until it is terminal. A nonterminal job or an unknown `--after-key` is a usage error. |
-| `lu ls [--state <state>] [--limit <n>]` | List jobs, newest first. `--state` accepts the nine job states. `AFTER` counts dependencies still unfinished. |
-| `lu show <id>` | Show one job, including each dependency and its state. |
+| `lu ls [--state <state>] [--limit <n>]` | List jobs, newest first. `--state` accepts the nine job states. `AFTER` counts dependencies still unfinished; `NOTE` shows `no changes` for a done job with an empty diff. |
+| `lu show <id>` | Show one job, including each dependency and its state. The `outcome_note` row shows `no changes` when noted. |
 | `lu graph [job]` | Draw the dependency graph of unfinished jobs, newest component first. With a job id, show only its component. `--json` prints a `nodes` array instead. |
 | `lu logs <id> [--follow]` | Print a job's stored log. `--follow` reads until the job reaches a terminal state. |
 | `lu fetch <id> [--out <dir>] [--force]` | Save `diff.patch`, `run.log` and `report.json` into `--out` (default `.`). Missing artifacts are skipped; existing files need `--force`. |

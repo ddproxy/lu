@@ -217,6 +217,9 @@ impl SqliteStore {
                 if v < 5 {
                     apply_v5(&tx)?;
                 }
+                if v < 6 {
+                    apply_v6(&tx)?;
+                }
                 tx.execute("DELETE FROM schema_version", [])
                     .map_err(internal)?;
                 tx.execute(
@@ -231,6 +234,7 @@ impl SqliteStore {
                 apply_v3(&tx)?;
                 apply_v4(&tx)?;
                 apply_v5(&tx)?;
+                apply_v6(&tx)?;
                 tx.execute(
                     "INSERT INTO schema_version(version) VALUES (?1)",
                     params![CURRENT_SCHEMA_VERSION],
@@ -335,6 +339,13 @@ fn apply_v5(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn apply_v6(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    // Nullable: a job from before this schema has no recorded size, even with a diff file.
+    tx.execute_batch("ALTER TABLE jobs ADD COLUMN diff_bytes INTEGER;")
+        .map_err(internal)?;
+    Ok(())
+}
+
 fn load_waiting(conn: &Connection, id: &str) -> Result<Vec<JobId>, StoreError> {
     let mut stmt = conn
         .prepare(
@@ -396,7 +407,7 @@ fn get_job_tx(
     id: &str,
 ) -> Result<(JobRecord, Option<u64>, Option<u64>), StoreError> {
     let mut stmt = tx
-        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model FROM jobs WHERE id=?1")
+        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model FROM jobs WHERE id=?1")
         .map_err(internal)?;
     let row = stmt
         .query_row(params![id], |r| {
@@ -417,6 +428,7 @@ fn get_job_tx(
                 r.get::<_, String>("artifacts_json")?,
                 r.get::<_, i64>("cancel_requested")?,
                 r.get::<_, i64>("log_len")?,
+                r.get::<_, Option<i64>>("diff_bytes")?,
                 r.get::<_, Option<i64>>("lease_until_mono_ms")?,
                 r.get::<_, Option<i64>>("recovering_since_mono_ms")?,
                 r.get::<_, Option<String>>("assigned_provider")?,
@@ -444,6 +456,7 @@ fn get_job_tx(
         artifacts_json,
         cancel_i,
         log_len_i,
+        diff_bytes,
         lease_until,
         recovering_since,
         assigned_provider,
@@ -480,6 +493,7 @@ fn get_job_tx(
         artifacts,
         cancel_requested: cancel_i != 0,
         log_len: log_len_i as u64,
+        diff_bytes: diff_bytes.map(|v| v as u64),
         waiting_on: load_waiting(tx, &id_s)?,
     };
     Ok((
@@ -496,7 +510,7 @@ fn update_job_tx(
     recovering_since: Option<u64>,
 ) -> Result<(), StoreError> {
     tx.execute(
-        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20 WHERE id=?1",
+        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20,diff_bytes=?21 WHERE id=?1",
         params![
             rec.id.as_str(),
             state_str(rec.state),
@@ -518,6 +532,7 @@ fn update_job_tx(
             recovering_since.map(|v| v as i64),
             rec.assigned_provider,
             rec.assigned_model,
+            rec.diff_bytes.map(|v| v as i64),
         ],
     ).map_err(internal)?;
     Ok(())
@@ -638,6 +653,7 @@ impl Store for SqliteStore {
             artifacts: Vec::new(),
             cancel_requested: false,
             log_len: 0,
+            diff_bytes: None,
             waiting_on: Vec::new(),
         };
         tx.execute(
@@ -672,7 +688,7 @@ impl Store for SqliteStore {
     fn get_job(&self, id: &JobId) -> Result<JobRecord, StoreError> {
         let conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let mut stmt = conn
-            .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,assigned_provider,assigned_model FROM jobs WHERE id=?1")
+            .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model FROM jobs WHERE id=?1")
             .map_err(internal)?;
         let rec = stmt
             .query_row(params![id.as_str()], |row| {
@@ -693,8 +709,9 @@ impl Store for SqliteStore {
                     row.get::<_, String>(13)?,
                     row.get::<_, i64>(14)?,
                     row.get::<_, i64>(15)?,
-                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<i64>>(16)?,
                     row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
                 ))
             })
             .optional()
@@ -717,6 +734,7 @@ impl Store for SqliteStore {
             artifacts_json,
             cancel_i,
             log_len_i,
+            diff_bytes,
             assigned_provider,
             assigned_model,
         ) = rec;
@@ -745,6 +763,7 @@ impl Store for SqliteStore {
             artifacts: decode_artifacts(&artifacts_json)?,
             cancel_requested: cancel_i != 0,
             log_len: log_len_i as u64,
+            diff_bytes: diff_bytes.map(|v| v as u64),
             waiting_on: load_waiting(&conn, &id_s)?,
         })
     }
@@ -755,7 +774,7 @@ impl Store for SqliteStore {
         // than one job with the same key.
         let t: JobTuple = conn
             .query_row(
-                "SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,assigned_provider,assigned_model FROM jobs
+                "SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model FROM jobs
                  WHERE json_extract(spec_json, '$.idempotency_key') = ?1
                  ORDER BY id DESC LIMIT 1",
                 params![key],
@@ -777,8 +796,9 @@ impl Store for SqliteStore {
                         row.get::<_, String>(13)?,
                         row.get::<_, i64>(14)?,
                         row.get::<_, i64>(15)?,
-                        row.get::<_, Option<String>>(16)?,
+                        row.get::<_, Option<i64>>(16)?,
                         row.get::<_, Option<String>>(17)?,
+                        row.get::<_, Option<String>>(18)?,
                     ))
                 },
             )
@@ -797,7 +817,7 @@ impl Store for SqliteStore {
     ) -> Result<Vec<JobRecord>, StoreError> {
         let conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let mut out = Vec::new();
-        let base = "SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,assigned_provider,assigned_model FROM jobs";
+        let base = "SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model FROM jobs";
         let mut sql = base.to_string();
         // build query per case to keep bound parameters simple.
 
@@ -824,8 +844,9 @@ impl Store for SqliteStore {
                             row.get::<_, String>(13)?,
                             row.get::<_, i64>(14)?,
                             row.get::<_, i64>(15)?,
-                            row.get::<_, Option<String>>(16)?,
+                            row.get::<_, Option<i64>>(16)?,
                             row.get::<_, Option<String>>(17)?,
+                            row.get::<_, Option<String>>(18)?,
                         ))
                     })
                     .map_err(internal)?;
@@ -858,8 +879,9 @@ impl Store for SqliteStore {
                             row.get::<_, String>(13)?,
                             row.get::<_, i64>(14)?,
                             row.get::<_, i64>(15)?,
-                            row.get::<_, Option<String>>(16)?,
+                            row.get::<_, Option<i64>>(16)?,
                             row.get::<_, Option<String>>(17)?,
+                            row.get::<_, Option<String>>(18)?,
                         ))
                     })
                     .map_err(internal)?;
@@ -892,8 +914,9 @@ impl Store for SqliteStore {
                             row.get::<_, String>(13)?,
                             row.get::<_, i64>(14)?,
                             row.get::<_, i64>(15)?,
-                            row.get::<_, Option<String>>(16)?,
+                            row.get::<_, Option<i64>>(16)?,
                             row.get::<_, Option<String>>(17)?,
+                            row.get::<_, Option<String>>(18)?,
                         ))
                     })
                     .map_err(internal)?;
@@ -926,8 +949,9 @@ impl Store for SqliteStore {
                             row.get::<_, String>(13)?,
                             row.get::<_, i64>(14)?,
                             row.get::<_, i64>(15)?,
-                            row.get::<_, Option<String>>(16)?,
+                            row.get::<_, Option<i64>>(16)?,
                             row.get::<_, Option<String>>(17)?,
+                            row.get::<_, Option<String>>(18)?,
                         ))
                     })
                     .map_err(internal)?;
@@ -1238,6 +1262,7 @@ impl Store for SqliteStore {
         id: &JobId,
         epoch: u64,
         name: ArtifactName,
+        bytes: u64,
     ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let tx = conn
@@ -1249,6 +1274,9 @@ impl Store for SqliteStore {
         }
         if !rec.artifacts.contains(&name) {
             rec.artifacts.push(name);
+        }
+        if name == ArtifactName::DiffPatch {
+            rec.diff_bytes = Some(bytes);
         }
         update_job_tx(&tx, &rec, lease, recov)?;
         tx.commit().map_err(internal)?;
@@ -1664,6 +1692,7 @@ type JobTuple = (
     String,
     i64,
     i64,
+    Option<i64>,
     Option<String>,
     Option<String>,
 );
@@ -1685,6 +1714,7 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         artifacts_json,
         cancel_i,
         log_len_i,
+        diff_bytes,
         assigned_provider,
         assigned_model,
     ) = t;
@@ -1713,6 +1743,7 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         artifacts: decode_artifacts(&artifacts_json)?,
         cancel_requested: cancel_i != 0,
         log_len: log_len_i as u64,
+        diff_bytes: diff_bytes.map(|v| v as u64),
         waiting_on: Vec::new(),
     })
 }
@@ -1773,6 +1804,7 @@ mod tests {
             idempotency_key: Some("k".to_owned()),
             after: Vec::new(),
             stack_dependencies: true,
+            allow_empty: false,
             requires: Vec::new(),
             fallbacks: Vec::new(),
         };
@@ -1863,6 +1895,7 @@ mod tests {
         conn.execute_batch(
             "ALTER TABLE jobs DROP COLUMN assigned_provider;
              ALTER TABLE jobs DROP COLUMN assigned_model;
+             ALTER TABLE jobs DROP COLUMN diff_bytes;
              UPDATE schema_version SET version=3;
              DROP INDEX jobs_idempotency_key;",
         )
@@ -1909,6 +1942,7 @@ mod tests {
         conn.execute_batch(
             "ALTER TABLE jobs DROP COLUMN assigned_provider;
              ALTER TABLE jobs DROP COLUMN assigned_model;
+             ALTER TABLE jobs DROP COLUMN diff_bytes;
              UPDATE schema_version SET version=4;",
         )
         .unwrap();
@@ -1933,6 +1967,49 @@ mod tests {
         let rec = s.get_job(&id).unwrap();
         assert_eq!(rec.spec.fallbacks.len(), 1);
         assert_eq!(rec.assigned_provider, None);
+    }
+
+    #[test]
+    fn an_old_database_gains_the_diff_bytes_column() {
+        let p = temp_db("migrate-diff-bytes.sqlite");
+        let now = Now {
+            wall_unix: 1,
+            mono_ms: 1,
+        };
+        let id = {
+            let s = SqliteStore::open(&p).unwrap();
+            s.create_job(
+                &crate::conformance::spec("https://x/legacy-diff.git", None),
+                now,
+            )
+            .unwrap()
+            .0
+            .id
+        };
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE jobs DROP COLUMN diff_bytes;
+             UPDATE schema_version SET version=5;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let s = SqliteStore::open(&p).unwrap();
+        let conn = s.conn.lock().unwrap();
+        let column: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('jobs') WHERE name='diff_bytes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(column, 1);
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::SCHEMA_VERSION);
+        drop(conn);
+        assert_eq!(s.get_job(&id).unwrap().diff_bytes, None);
     }
 
     #[test]

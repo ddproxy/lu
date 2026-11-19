@@ -825,6 +825,7 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
             .get("no_stack")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        allow_empty: false,
         requires: field_strings(args, "require"),
         fallbacks: spec_fallbacks(args),
     };

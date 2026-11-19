@@ -36,7 +36,7 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_build_info{version}` | gauge | Always `1`; controller build version. |
 | `lu_uptime_seconds` | gauge | Seconds since the controller process started. |
 | `lu_db_bytes` | gauge | SQLite file size, excluding `-wal` and `-shm`. |
-| `lu_schema_version` | gauge | Schema version the binary expects; currently `4`. |
+| `lu_schema_version` | gauge | Schema version the binary expects; currently `6`. |
 | `lu_recovered_on_boot` | gauge | Jobs moved to `recovering` by this process's boot recovery. |
 | `lu_queue_oldest_seconds` | gauge | Age of the oldest `queued` or `blocked` job, or `0` when none. |
 | `lu_jobs{state}` | gauge | Jobs in each of nine zero-filled states: `blocked`, `queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`. |
@@ -46,6 +46,7 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_controller_up` | gauge | Always `1` when the route answers. |
 | `lu_repo_last_sync_seconds{repo}` | gauge | Seconds since that configured mirror synced; `0` before its first sync. |
 | `lu_jobs_completed_total{outcome}` | counter | Terminal jobs by `outcome`: `done`, `failed`, `cancelled`; derived from stored jobs and kept across restarts. |
+| `lu_jobs_no_changes_total` | counter | `done` jobs whose stored diff was empty and `allow_empty` was false, summed since this controller process started. |
 | `lu_node_last_seen_seconds{node}` | gauge | Seconds since that node's last heartbeat. |
 | `lu_node_labels_info{node,label}` | gauge | `1` per label in the node's latest heartbeat. |
 | `lu_node_providers{node,provider,state}` | gauge | `1` per reported provider; `state` is `ok`, `cooling`, `disabled` or `unknown`. |
@@ -66,7 +67,7 @@ lu status --json
 {
   "version": "0.1.10",
   "uptime_secs": 3600,
-  "schema_version": 4,
+  "schema_version": 6,
   "db_bytes": 81920,
   "recovered_on_boot": 2,
   "jobs": {"blocked": 0, "queued": 1, "leased": 1, "running": 2, "recovering": 0, "needs_input": 0, "done": 12, "failed": 1, "cancelled": 0},

@@ -28,6 +28,7 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         idempotency_key: key.map(|s| s.to_owned()),
         after: Vec::new(),
         stack_dependencies: true,
+        allow_empty: false,
         requires: Vec::new(),
         fallbacks: Vec::new(),
     }
@@ -831,10 +832,11 @@ fn start_renew_log_artifact<S: Store>(s: &S) {
     let len4 = s.reserve_log(&j.id, a.epoch, cap, 10).unwrap();
     assert_eq!(len4, cap);
 
-    s.record_artifact(&j.id, a.epoch, ArtifactName::DiffPatch)
+    s.record_artifact(&j.id, a.epoch, ArtifactName::DiffPatch, 42)
         .unwrap();
     let rec = s.get_job(&j.id).unwrap();
     assert!(rec.artifacts.contains(&ArtifactName::DiffPatch));
+    assert_eq!(rec.diff_bytes, Some(42));
 }
 
 fn complete_and_retry_cordon<S: Store>(s: &S) {
@@ -1019,7 +1021,7 @@ fn stale_epoch_rejected<S: Store>(s: &S) {
         StoreError::StaleEpoch
     );
     assert_eq!(
-        s.record_artifact(&j.id, a.epoch - 1, ArtifactName::RunLog)
+        s.record_artifact(&j.id, a.epoch - 1, ArtifactName::RunLog, 1)
             .unwrap_err(),
         StoreError::StaleEpoch
     );

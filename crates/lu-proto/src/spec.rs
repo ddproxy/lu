@@ -76,6 +76,9 @@ pub struct JobSpec {
     /// Whether dependency diffs are applied to this job's base tree.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub stack_dependencies: bool,
+    /// Whether an empty `diff.patch` is expected, so no `no_changes` note is added.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_empty: bool,
     /// Labels a node must advertise before this job may run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<String>,
@@ -108,6 +111,8 @@ struct RawJobSpec {
     #[serde(default = "default_true")]
     stack_dependencies: bool,
     #[serde(default)]
+    allow_empty: bool,
+    #[serde(default)]
     requires: Vec<String>,
     #[serde(default)]
     fallbacks: Vec<Choice>,
@@ -130,6 +135,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
             idempotency_key: raw.idempotency_key,
             after: raw.after,
             stack_dependencies: raw.stack_dependencies,
+            allow_empty: raw.allow_empty,
             requires: raw.requires,
             fallbacks: raw.fallbacks,
         };
@@ -258,6 +264,10 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn invalid(field: &'static str, reason: impl Into<String>) -> JobSpecError {
     JobSpecError {
         field,
@@ -361,6 +371,7 @@ mod tests {
             idempotency_key: None,
             after: Vec::new(),
             stack_dependencies: true,
+            allow_empty: false,
             requires: Vec::new(),
             fallbacks: Vec::new(),
         }
@@ -654,6 +665,22 @@ mod tests {
         let parsed: JobSpec = serde_json::from_str(&json).unwrap();
         assert!(!parsed.stack_dependencies);
         assert_eq!(parsed, spec);
+    }
+
+    #[test]
+    fn allow_empty_defaults_false_and_is_omitted_when_false() {
+        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let spec: JobSpec = serde_json::from_str(json).unwrap();
+        assert!(!spec.allow_empty);
+        assert!(!spec.canonical_json().contains("allow_empty"));
+
+        let mut spec = sample();
+        spec.allow_empty = true;
+        let json = spec.canonical_json();
+        assert!(json.contains("\"allow_empty\":true"), "{json}");
+        let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, spec);
+        assert!(parsed.validate().is_ok());
     }
 
     #[test]
