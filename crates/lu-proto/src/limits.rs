@@ -42,6 +42,12 @@ pub const MAX_NODE_LABELS: usize = 32;
 /// The most labels one job may require.
 pub const MAX_REQUIRES_LABELS: usize = 8;
 
+/// The most taints one node may advertise.
+pub const MAX_TAINTS: usize = 8;
+
+/// The most taints one job may tolerate.
+pub const MAX_TOLERATES: usize = 8;
+
 /// The most label files one agent may watch.
 pub const MAX_LABEL_FILES: usize = 8;
 

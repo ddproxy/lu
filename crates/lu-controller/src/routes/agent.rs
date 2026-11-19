@@ -63,6 +63,8 @@ pub async fn poll(
     let stats = NodeStats {
         host: body.heartbeat.host.clone(),
         jobs: body.heartbeat.jobs.clone(),
+        labels: body.heartbeat.labels.clone(),
+        label_sources: body.heartbeat.label_sources.clone(),
     };
     state
         .stats

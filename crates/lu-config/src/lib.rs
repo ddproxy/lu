@@ -4,6 +4,7 @@
 mod error;
 mod secret;
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
@@ -28,6 +29,12 @@ pub struct ParsedUrl {
 
 /// A config is a few KiB. The cap stops a runaway or hostile file from being read whole.
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// Limits for operator-declared label probes; lu ships no built-in toolchain knowledge.
+pub const MAX_DETECT_ENTRIES: usize = 16;
+pub const MAX_DETECT_ARGV: usize = 8;
+pub const MAX_DETECT_TIMEOUT_SECS: u64 = 30;
+pub const MIN_DETECT_EVERY_SECS: u64 = 30;
 
 const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
 
@@ -173,9 +180,15 @@ pub struct AgentConfig {
     /// Labels this node always advertises. Lu never interprets them.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Taints this node advertises; jobs must tolerate all of them to run here.
+    #[serde(default)]
+    pub taints: Vec<String>,
     /// Files re-read before each heartbeat; one label per line.
     #[serde(default)]
     pub label_files: Vec<String>,
+    /// Commands that publish a label only while they exit successfully.
+    #[serde(default)]
+    pub detect: Vec<DetectConfig>,
     /// Opt-in removal of leftover build directories between jobs.
     #[serde(default)]
     pub housekeeping: Option<HousekeepingConfig>,
@@ -183,6 +196,27 @@ pub struct AgentConfig {
 
 fn default_heartbeat_secs() -> u64 {
     15
+}
+
+/// One probe: a command run off the heartbeat path that publishes `label` on exit 0.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetectConfig {
+    pub label: String,
+    /// argv, never a shell string: program plus at most 7 arguments.
+    pub command: Vec<String>,
+    #[serde(default = "default_detect_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_detect_every_secs")]
+    pub every_secs: u64,
+}
+
+fn default_detect_timeout_secs() -> u64 {
+    5
+}
+
+fn default_detect_every_secs() -> u64 {
+    300
 }
 
 /// Removes old scratch directories between jobs. Every field has the documented default.
@@ -571,6 +605,23 @@ impl AgentConfig {
                 );
             }
         }
+        if self.taints.len() > 8 {
+            return invalid(
+                "[agent]",
+                format!(
+                    "taints must name at most 8 taints (got {})",
+                    self.taints.len()
+                ),
+            );
+        }
+        for taint in &self.taints {
+            if !valid_label(taint) {
+                return invalid(
+                    "[agent]",
+                    format!("invalid taint {taint:?}; it must be 1 to 64 characters from A-Z a-z 0-9 . _ - / with at most one '='"),
+                );
+            }
+        }
         if self.label_files.len() > 8 {
             return invalid(
                 "[agent]",
@@ -582,6 +633,80 @@ impl AgentConfig {
         }
         for (index, file) in self.label_files.iter().enumerate() {
             validate_abs_no_dotdot(&format!("[agent] label_files #{index}"), "path", file)?;
+        }
+        if self.detect.len() > MAX_DETECT_ENTRIES {
+            return invalid(
+                "[agent]",
+                format!(
+                    "detect must name at most {MAX_DETECT_ENTRIES} probes (got {})",
+                    self.detect.len()
+                ),
+            );
+        }
+        let mut seen = HashSet::new();
+        for (index, probe) in self.detect.iter().enumerate() {
+            let table = format!("[agent.detect] #{}", index + 1);
+            if !valid_label(&probe.label) {
+                return invalid(
+                    &table,
+                    format!("invalid label {:?}; it must be 1 to 64 characters from A-Z a-z 0-9 . _ - / with at most one '='", probe.label),
+                );
+            }
+            if !seen.insert(probe.label.as_str()) {
+                return invalid(
+                    &table,
+                    format!("label {:?} duplicates an earlier probe", probe.label),
+                );
+            }
+            if probe.command.is_empty() || probe.command.len() > MAX_DETECT_ARGV {
+                return invalid(
+                    &table,
+                    format!(
+                        "command must hold 1 to {MAX_DETECT_ARGV} argv entries (got {})",
+                        probe.command.len()
+                    ),
+                );
+            }
+            if probe
+                .command
+                .iter()
+                .any(|arg| arg.is_empty() || arg.chars().any(char::is_control))
+            {
+                return invalid(
+                    &table,
+                    "command entries must be non-empty text without control characters".to_owned(),
+                );
+            }
+            let program = &probe.command[0];
+            let bare = !program.contains('/') && program != "." && program != "..";
+            let absolute = program.starts_with('/')
+                && !Path::new(program)
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir));
+            if !bare && !absolute {
+                return invalid(
+                    &table,
+                    "command[0] must be an absolute path without '..' or a bare program name resolved against the agent's PATH".to_owned(),
+                );
+            }
+            if !(1..=MAX_DETECT_TIMEOUT_SECS).contains(&probe.timeout_secs) {
+                return invalid(
+                    &table,
+                    format!(
+                        "timeout_secs must be 1 to {MAX_DETECT_TIMEOUT_SECS} (got {})",
+                        probe.timeout_secs
+                    ),
+                );
+            }
+            if probe.every_secs < MIN_DETECT_EVERY_SECS {
+                return invalid(
+                    &table,
+                    format!(
+                        "every_secs must be at least {MIN_DETECT_EVERY_SECS} (got {})",
+                        probe.every_secs
+                    ),
+                );
+            }
         }
         match (&self.reiki_health_url, &self.reiki_token_file) {
             (Some(url), Some(file)) => {
@@ -1149,6 +1274,7 @@ heartbeat_secs = 15
         assert_eq!(a.heartbeat_secs, 15);
         assert_eq!(a.base_source, BaseSource::Auto);
         assert!(a.labels.is_empty());
+        assert!(a.taints.is_empty());
         assert!(a.label_files.is_empty());
         let cfg = Config::parse(&combined()).unwrap();
         assert_eq!(cfg.log.level, "info");
@@ -1336,9 +1462,109 @@ heartbeat_secs = 15
                 .join(",")
         );
         expect_table(&base("label_files", &too_many_files), "[agent]");
+        for bad in [r#"["bad label"]"#, r#"["a=b=c"]"#, r#"[""]"#] {
+            expect_table(&base("taints", bad), "[agent]");
+        }
+        let too_many_taints = format!(
+            "[{}]",
+            (0..=8)
+                .map(|i| format!("\"taint-{i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        expect_table(&base("taints", &too_many_taints), "[agent]");
+        assert!(Config::parse(&base("taints", r#"["homelab"]"#)).is_ok());
         for bad in [r#"["relative/labels"]"#, r#"["/srv/../labels"]"#] {
             expect_table(&base("label_files", bad), "[agent] label_files #0");
         }
+    }
+
+    #[test]
+    fn detect_entries_are_validated() {
+        let base = |table: &str| {
+            format!(
+                "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n{table}"
+            )
+        };
+        let entry = |label: &str, command: &str| {
+            format!("[[agent.detect]]\nlabel={label}\ncommand={command}\n")
+        };
+        assert!(Config::parse(&base(&entry(
+            "\"rust\"",
+            "[\"/usr/bin/cargo\", \"--version\"]"
+        )))
+        .is_ok());
+        assert!(Config::parse(&base(&entry("\"rust\"", "[\"cargo\", \"--version\"]"))).is_ok());
+
+        for bad in ["\"bad label\"", "\"a=b=c\"", "\"\""] {
+            expect_table(&base(&entry(bad, "[\"/bin/true\"]")), "[agent.detect] #1");
+        }
+        for bad in [
+            "[]",
+            "[\"\"]",
+            "[\"/bin/true\", \"\"]",
+            "[\"/bin/true\", \"bad\\narg\"]",
+            "[\"../bin/true\"]",
+            "[\"/srv/../bin/true\"]",
+        ] {
+            expect_table(&base(&entry("\"rust\"", bad)), "[agent.detect] #1");
+        }
+        let too_many_args = format!(
+            "[{}]",
+            (0..=8).map(|_| "\"arg\"").collect::<Vec<_>>().join(",")
+        );
+        expect_table(
+            &base(&entry("\"rust\"", &too_many_args)),
+            "[agent.detect] #1",
+        );
+        for bad in ["0", "31"] {
+            expect_table(
+                &base(&format!(
+                    "{}timeout_secs={bad}\n",
+                    entry("\"rust\"", "[\"/bin/true\"]")
+                )),
+                "[agent.detect] #1",
+            );
+        }
+        expect_table(
+            &base(&format!(
+                "{}every_secs=29\n",
+                entry("\"rust\"", "[\"/bin/true\"]")
+            )),
+            "[agent.detect] #1",
+        );
+        assert!(Config::parse(&base(&format!(
+            "{}timeout_secs=30\nevery_secs=30\n",
+            entry("\"rust\"", "[\"/bin/true\"]")
+        )))
+        .is_ok());
+
+        let duplicate = format!(
+            "{}{}",
+            entry("\"rust\"", "[\"/bin/true\"]"),
+            entry("\"rust\"", "[\"/bin/false\"]")
+        );
+        expect_table(&base(&duplicate), "[agent.detect] #2");
+        let too_many = (0..=16)
+            .map(|i| entry(&format!("\"probe-{i}\""), "[\"/bin/true\"]"))
+            .collect::<String>();
+        expect_table(&base(&too_many), "[agent]");
+        let unknown = format!("{}surprise=true\n", entry("\"rust\"", "[\"/bin/true\"]"));
+        assert!(Config::parse(&base(&unknown)).is_err());
+    }
+
+    #[test]
+    fn detect_defaults_are_applied() {
+        let text = "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n[[agent.detect]]\nlabel=\"rust\"\ncommand=[\"/bin/true\"]\n";
+        let agent = Config::parse(text).unwrap().agent.unwrap();
+        assert!(!agent.detect.is_empty());
+        assert_eq!(agent.detect[0].timeout_secs, 5);
+        assert_eq!(agent.detect[0].every_secs, 300);
+        assert!(agent_only_defaults().detect.is_empty());
+    }
+
+    fn agent_only_defaults() -> AgentConfig {
+        Config::parse(&agent_only()).unwrap().agent.unwrap()
     }
 
     #[test]

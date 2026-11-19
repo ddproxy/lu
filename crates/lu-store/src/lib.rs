@@ -98,6 +98,11 @@ pub fn labels_satisfied(required: &[String], node_labels: &[String]) -> bool {
         .all(|label| node_labels.iter().any(|node| node == label))
 }
 
+/// Every taint on the node is tolerated by the job. An untainted node always passes.
+pub fn taints_tolerated(node_taints: &[String], tolerates: &[String]) -> bool {
+    node_taints.iter().all(|taint| tolerates.contains(taint))
+}
+
 /// The required labels no online node advertises, in the job's order.
 pub fn missing_labels<'a>(required: &'a [String], nodes: &[NodeRecord]) -> Vec<&'a str> {
     let online = || {
@@ -113,14 +118,33 @@ pub fn missing_labels<'a>(required: &'a [String], nodes: &[NodeRecord]) -> Vec<&
         .collect()
 }
 
-/// Why a queued job cannot be placed, when no online node carries all of its labels.
+/// Why a queued job cannot be placed: first a missing label, then a taint no matching node is
+/// tolerated for.
 pub fn waiting_reason(job: &JobRecord, nodes: &[NodeRecord]) -> Option<String> {
     if job.state != JobState::Queued {
         return None;
     }
-    missing_labels(&job.spec.requires, nodes)
-        .first()
-        .map(|label| format!("no node with label {label}"))
+    if let Some(label) = missing_labels(&job.spec.requires, nodes).first() {
+        return Some(format!("no node with label {label}"));
+    }
+    // Only online nodes that already satisfy the label rules matter here: the taint reason is a
+    // more specific explanation than the label one and must not replace it.
+    let eligible: Vec<&NodeRecord> = nodes
+        .iter()
+        .filter(|node| node.online && labels_satisfied(&job.spec.requires, &node.heartbeat.labels))
+        .collect();
+    if !eligible.is_empty()
+        && eligible
+            .iter()
+            .all(|node| !taints_tolerated(&node.heartbeat.taints, &job.spec.tolerates))
+    {
+        let taint = eligible
+            .iter()
+            .flat_map(|node| node.heartbeat.taints.iter())
+            .find(|taint| !job.spec.tolerates.contains(taint))?;
+        return Some(format!("only tainted nodes are free: {taint}"));
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,8 +186,8 @@ pub trait Store: Send + Sync + 'static {
     /// Records the heartbeat and the time it was seen.
     fn heartbeat(&self, hb: &Heartbeat, now: Now) -> Result<(), StoreError>;
     /// Leases the oldest queued job this node may run (not draining, harness usable, no job
-    /// held, labels satisfied, and able to serve the primary or one fallback provider choice),
-    /// bumping the epoch.
+    /// held, labels satisfied, taints tolerated, and able to serve the primary or one fallback
+    /// provider choice), bumping the epoch.
     fn next_assignment(
         &self,
         node: &NodeName,

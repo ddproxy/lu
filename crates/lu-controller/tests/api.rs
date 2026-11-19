@@ -4,6 +4,7 @@ use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator, Controlle
 use lu_controller::{build_router, run_background, AppState};
 use lu_proto::{
     Choice, JobId, JobSpec, MAX_AFTER_JOBS, MAX_FALLBACKS, MAX_LOG_BYTES, MAX_REQUIRES_LABELS,
+    MAX_TOLERATES,
 };
 use lu_serve::{serve, ServeOptions};
 use lu_store::sqlite::SqliteStore;
@@ -189,6 +190,7 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         stack_dependencies: true,
         allow_empty: false,
         requires: Vec::new(),
+        tolerates: Vec::new(),
         fallbacks: Vec::new(),
     }
 }
@@ -296,6 +298,66 @@ async fn create_list_get_cancel_job_happy_path_and_idempotency() {
 }
 
 #[tokio::test]
+async fn tolerations_are_validated() {
+    let srv = start_server().await;
+    for tolerates in [
+        (0..=MAX_TOLERATES)
+            .map(|index| format!("taint-{index}"))
+            .collect::<Vec<_>>(),
+        vec!["homelab".to_owned(), "homelab".to_owned()],
+        vec!["bad taint".to_owned()],
+    ] {
+        let mut spec = sample_spec(None);
+        spec.tolerates = tolerates.clone();
+        let r = submit_spec(srv.addr, &spec).await;
+        assert_eq!(status(&r), 422, "{tolerates:?}: {r}");
+    }
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn tainted_nodes_are_shown_and_explained() {
+    let srv = start_server().await;
+    let mut spec = sample_spec(None);
+    spec.requires = vec!["gpu".to_owned()];
+    let r = submit_spec(srv.addr, &spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let created: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["waiting_reason"], "no node with label gpu", "{r}");
+
+    let hb = json!({
+        "node": "node-a",
+        "harness": "idle",
+        "labels": ["gpu"],
+        "taints": ["homelab"],
+    });
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &hb).await;
+    assert_eq!(status(&r), 204, "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(
+        job["waiting_reason"], "only tainted nodes are free: homelab",
+        "{r}"
+    );
+
+    let r = raw_request(srv.addr, &format!("GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let nodes: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let node = nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "node-a")
+        .unwrap();
+    assert_eq!(node["taints"], json!(["homelab"]), "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
 async fn label_requirements_are_validated_and_explained() {
     let srv = start_server().await;
 
@@ -333,6 +395,7 @@ async fn label_requirements_are_validated_and_explained() {
         "harness": "idle",
         "providers": [],
         "labels": ["gpu", "php8.3", "region=eu"],
+        "label_sources": {"php8.3": "probed"},
     });
     let r = poll_with(srv.addr, AGENT_A_TOKEN, &hb).await;
     assert_eq!(status(&r), 200, "{r}");
@@ -353,6 +416,7 @@ async fn label_requirements_are_validated_and_explained() {
         .find(|node| node["name"] == "node-a")
         .unwrap();
     assert_eq!(node["labels"], json!(["gpu", "php8.3", "region=eu"]), "{r}");
+    assert_eq!(node["label_sources"], json!({"php8.3": "probed"}), "{r}");
 
     let r = raw_request(srv.addr, &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
     assert_eq!(status(&r), 200, "{r}");

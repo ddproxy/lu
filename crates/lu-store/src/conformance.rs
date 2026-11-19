@@ -30,6 +30,7 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         stack_dependencies: true,
         allow_empty: false,
         requires: Vec::new(),
+        tolerates: Vec::new(),
         fallbacks: Vec::new(),
     }
 }
@@ -55,6 +56,8 @@ pub fn hb(name: &str, harness: HarnessState, providers: Vec<(&str, ProviderState
         host: None,
         jobs: Vec::new(),
         labels: Vec::new(),
+        label_sources: std::collections::BTreeMap::new(),
+        taints: Vec::new(),
     }
 }
 
@@ -70,6 +73,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     primary_choice_is_preferred(&make());
     recovering_job_blocks_new_assignment_on_its_node(&make());
     label_requirements_route_and_explain(&make());
+    taint_tolerations_route_and_explain(&make());
     start_renew_log_artifact(&make());
     complete_and_retry_cordon(&make());
     reiki_cordon_yields_to_live_health(&make());
@@ -802,6 +806,131 @@ fn label_requirements_route_and_explain<S: Store>(s: &S) {
         .unwrap()
         .unwrap();
     assert_eq!(assigned.job_id, waiting.id);
+}
+
+fn taint_tolerations_route_and_explain<S: Store>(s: &S) {
+    let plain = node("plain");
+    let tainted = node("tainted");
+    s.heartbeat(&hb("plain", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let mut beat = hb("tainted", HarnessState::Idle, vec![]);
+    beat.taints = vec!["homelab".to_owned()];
+    s.heartbeat(&beat, now(1, 1)).unwrap();
+
+    // A job tolerating nothing skips the tainted node; the untainted node is unaffected.
+    let (j, _) = s
+        .create_job(&spec("https://x/taints.git", None), now(2, 2))
+        .unwrap();
+    assert!(s
+        .next_assignment(&tainted, now(3, 3), 60_000)
+        .unwrap()
+        .is_none());
+    let assigned = s
+        .next_assignment(&plain, now(3, 3), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.job_id, j.id);
+
+    // Tolerating the taint makes the node eligible.
+    let mut tolerant = spec("https://x/tolerant.git", None);
+    tolerant.tolerates = vec!["homelab".to_owned()];
+    let (tol, _) = s.create_job(&tolerant, now(4, 4)).unwrap();
+    let assigned = s
+        .next_assignment(&tainted, now(5, 5), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.job_id, tol.id);
+
+    // A later heartbeat that removes the taint lets an untolerating job through.
+    let changing = node("changing");
+    let mut beat = hb("changing", HarnessState::Idle, vec![]);
+    beat.taints = vec!["garage".to_owned()];
+    s.heartbeat(&beat, now(6, 6)).unwrap();
+    let (changed, _) = s
+        .create_job(&spec("https://x/changed.git", None), now(7, 7))
+        .unwrap();
+    assert!(s
+        .next_assignment(&changing, now(8, 8), 60_000)
+        .unwrap()
+        .is_none());
+    s.heartbeat(&hb("changing", HarnessState::Idle, vec![]), now(9, 9))
+        .unwrap();
+    let assigned = s
+        .next_assignment(&changing, now(10, 10), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.job_id, changed.id);
+
+    // Every taint must be tolerated; tolerating only one is not enough.
+    let multi = node("multi");
+    let mut beat = hb("multi", HarnessState::Idle, vec![]);
+    beat.taints = vec!["rack".to_owned(), "homelab".to_owned()];
+    s.heartbeat(&beat, now(11, 11)).unwrap();
+    let mut partial = spec("https://x/partial.git", None);
+    partial.tolerates = vec!["rack".to_owned()];
+    let (part, _) = s.create_job(&partial, now(12, 12)).unwrap();
+    assert!(s
+        .next_assignment(&multi, now(13, 13), 60_000)
+        .unwrap()
+        .is_none());
+    let mut both = spec("https://x/both.git", None);
+    both.tolerates = vec!["rack".to_owned(), "homelab".to_owned()];
+    let (all, _) = s.create_job(&both, now(14, 14)).unwrap();
+    let assigned = s
+        .next_assignment(&multi, now(15, 15), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.job_id, all.id);
+    assert_eq!(s.get_job(&part.id).unwrap().state, JobState::Queued);
+
+    // Absorb the partially tolerant job so it cannot mask later queue assertions.
+    let absorber = node("absorber");
+    s.heartbeat(&hb("absorber", HarnessState::Idle, vec![]), now(15, 16))
+        .unwrap();
+    let assigned = s
+        .next_assignment(&absorber, now(15, 16), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.job_id, part.id);
+
+    // Composition with label rules: a taint reason is only reported when labels already match.
+    let special = node("special");
+    let plain2 = node("plain2");
+    s.heartbeat(&hb("plain2", HarnessState::Idle, vec![]), now(16, 16))
+        .unwrap();
+    let mut beat = hb("special", HarnessState::Idle, vec![]);
+    beat.labels = vec!["gpu".to_owned()];
+    beat.taints = vec!["homelab".to_owned()];
+    s.heartbeat(&beat, now(16, 16)).unwrap();
+    let mut labelled = spec("https://x/tainted-label.git", None);
+    labelled.requires = vec!["gpu".to_owned()];
+    let (waiting, _) = s.create_job(&labelled, now(17, 17)).unwrap();
+    assert!(s
+        .next_assignment(&plain2, now(18, 18), 60_000)
+        .unwrap()
+        .is_none());
+    assert!(s
+        .next_assignment(&special, now(18, 18), 60_000)
+        .unwrap()
+        .is_none());
+    let nodes = s.nodes(now(18, 18), 60_000).unwrap();
+    assert_eq!(
+        crate::waiting_reason(&waiting, &nodes).as_deref(),
+        Some("only tainted nodes are free: homelab")
+    );
+    let mut labelled_tolerant = labelled.clone();
+    labelled_tolerant.tolerates = vec!["homelab".to_owned()];
+    let (tol_labelled, _) = s.create_job(&labelled_tolerant, now(19, 19)).unwrap();
+    let assigned = s
+        .next_assignment(&special, now(20, 20), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.job_id, tol_labelled.id);
+    let mut beat = hb("plain2", HarnessState::Idle, vec![]);
+    beat.labels = vec!["gpu".to_owned()];
+    s.heartbeat(&beat, now(21, 21)).unwrap();
+    let nodes = s.nodes(now(21, 21), 60_000).unwrap();
+    assert_eq!(crate::waiting_reason(&waiting, &nodes), None);
 }
 
 fn start_renew_log_artifact<S: Store>(s: &S) {

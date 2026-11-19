@@ -485,6 +485,7 @@ impl<S: Store> Model<S> {
             stack_dependencies: true,
             allow_empty: false,
             requires: Vec::new(),
+            tolerates: Vec::new(),
             fallbacks: Vec::new(),
         }
     }

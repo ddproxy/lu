@@ -827,6 +827,7 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
             .unwrap_or(false),
         allow_empty: false,
         requires: field_strings(args, "require"),
+        tolerates: Vec::new(),
         fallbacks: spec_fallbacks(args),
     };
     validate_spec(&spec)?;

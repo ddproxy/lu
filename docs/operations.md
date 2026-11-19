@@ -240,7 +240,7 @@ A job submitted with `after` dependencies starts as `blocked` when at least one 
 
 A dependent job with `stack_dependencies: true` (the default) stages its base commit and applies every finished dependency's `diff.patch` in `after` order before the harness starts. A dependency with no diff is skipped. A patch that applies cleanly is written directly; otherwise the agent reconstructs the dependency's side from the base and three-way merges it. If conflicts remain, the job stops before the harness with `failure_class: "conflict"` and a summary naming the dependency and up to 20 conflicting paths; it never retries and the failed merge writes nothing. `lu submit --no-stack` sets `stack_dependencies: false` to run on the base tree alone. The dependent's own diff is always against its base and includes the dependency changes, so a consumer merging a chain applies only the last diff.
 
-A job starts as `queued` with `attempt = 1` and `epoch = 0`. Dispatch first applies labels: when an idle, non-draining node with no held job asks for work, it is eligible only if it advertises every label in the job's `requires` list. Label matching is exact; Lu assigns no meaning to a label. If the job names no provider, it runs on that node. Otherwise the controller tries the primary `provider`/`model`, then each `fallbacks` entry in list order, and assigns the first choice whose provider the node reports healthy with no unexpired cordon. A fallback without a model reuses the primary model. The chosen pair is stored as `assigned_provider` and `assigned_model`; `lu show` prints the fallbacks and `assigned_provider`. The agent builds the harness command and `report.json` from that assigned model. A requeued job is dispatched afresh and may use another pair, including on the same node. If a queued job's requirements cannot be met by any online node, `lu show` and the `lu top` note column print the first missing label as `no node with label <label>`. A `leased`, `running` or `recovering` job is still held by its node:
+A job starts as `queued` with `attempt = 1` and `epoch = 0`. Dispatch first applies labels and taints: when an idle, non-draining node with no held job asks for work, it is eligible only if it advertises every label in the job's `requires` list and the job tolerates every taint the node reports. Label and taint matching is exact; Lu assigns no meaning to either. A node with no taints takes any job; a job tolerating nothing avoids all tainted nodes. If the job names no provider, it runs on that node. Otherwise the controller tries the primary `provider`/`model`, then each `fallbacks` entry in list order, and assigns the first choice whose provider the node reports healthy with no unexpired cordon. A fallback without a model reuses the primary model. The chosen pair is stored as `assigned_provider` and `assigned_model`; `lu show` prints the fallbacks and `assigned_provider`. The agent builds the harness command and `report.json` from that assigned model. A requeued job is dispatched afresh and may use another pair, including on the same node. If a queued job's requirements cannot be met by any online node, `lu show` and the `lu top` note column print the first missing label as `no node with label <label>`, or, when only tainted nodes could run it, `only tainted nodes are free: <taint>`. A `leased`, `running` or `recovering` job is still held by its node:
 
 - state becomes `leased`, `node` is set, `epoch` is incremented, and the lease runs for `lease_secs`.
 - the agent calls `start` to move the job to `running`; `start` and each log append extend the lease. `poll` renews jobs that have pending cancellations.
@@ -251,7 +251,7 @@ Maintenance runs every `max(1, lease_secs / 3)` seconds. An expired lease moves 
 On completion:
 
 - `Done` moves the job to `done` and records `finished_at`; newly unblocked dependents move to `queued`.
-- `Failed(Execution)` moves it to `failed` immediately. Execution failures never retry. `lu retry <id>` resubmits a finished job's spec as a new job (`--provider`, `--model`, `--fallback`/`--no-fallbacks`, `--after` and `--require`/`--no-require` replace those fields); the new job is independent of the old one.
+- `Failed(Execution)` moves it to `failed` immediately. Execution failures never retry. `lu retry <id>` resubmits a finished job's spec as a new job (`--provider`, `--model`, `--fallback`/`--no-fallbacks`, `--after`, `--require`/`--no-require` and `--tolerate`/`--no-tolerate` replace those fields); the new job is independent of the old one.
 - `Failed(Conflict)` means a dependency diff could not be applied to the base tree. It moves the job to `failed` immediately and never retries.
 - `Failed(Node)` retries while `attempt <= max_retries`: the job returns to `queued`, the attempt is incremented, and the node is cleared. Beyond the cap it becomes `failed` with that failure class. `Failed(Provider)` does not use that budget: a provider outage is not the job's fault, so the job returns to `queued` and waits until a node can serve one of its choices (the provider healthy and not cordoned). Only 100 provider failures in a row fail the job. A terminal `failed` or `cancelled` job fails its blocked dependents.
 
@@ -317,20 +317,20 @@ prints the raw `GET /v1/status` response.
 Human output has six columns:
 
 ```text
-NAME    VERSION  HARNESS  LABELS                     LAST_SEEN            DRAINED
-node-a  0.1.10   idle     gpu,php8.3,region=eu       2026-11-16 09:12:00Z no
+NAME    VERSION  HARNESS  LABELS                        LAST_SEEN            DRAINED
+node-a  0.1.10   idle     !homelab,gpu,php8.3,region=eu   2026-11-16 09:12:00Z no
 ```
 
 - `NAME` is the node name bound to the agent token.
 - `VERSION` is the agent version from its latest heartbeat, or `-` for an older agent.
 - `HARNESS` is the last reported harness state (`idle`, `busy`, or `-` if unknown).
-- `LABELS` is the comma-separated label list from the latest heartbeat, or `-` for none. A long list is cut to fit the column and ends with `+N` for the hidden labels.
+- `LABELS` is the comma-separated label list from the latest heartbeat, with each taint shown first with a `!` prefix, or `-` for none. A label published by a probe is followed by ` (probed)`. A long list is cut to fit the column and ends with `+N` for the hidden entries.
 - `LAST_SEEN` is the last heartbeat time in UTC.
 - `DRAINED` shows the drain flag from the controller's node view.
 
-There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `labels`, `current_job`, `cordons`, `version` and the opaque `reiki` document.
+There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `labels`, `label_sources`, `taints`, `current_job`, `cordons`, `version` and the opaque `reiki` document. `label_sources` maps a probed label to `probed`; other labels have no entry.
 
-A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, lacks a required label, or (when the job names a provider) cannot serve any of its provider/model choices, including a matching provider cordon, will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
+A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, lacks a required label, reports a taint the job does not tolerate, or (when the job names a provider) cannot serve any of its provider/model choices, including a matching provider cordon, will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
 
 ## Reading `lu node`
 
@@ -338,6 +338,7 @@ A node with no current job and `harness: idle` can take work. A node that is `bu
 
 ```text
 node  node-a
+labels gpu php8.3 (probed)
 load1             0.50
 load5             0.25
 load15            0.12
@@ -354,6 +355,7 @@ job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
   4242  1     S      7      1024    90     3      opencode run
 ```
 
+- `labels` lists the node's current labels; a probed one is followed by ` (probed)`. `lu node <name> --json` includes `labels` and `label_sources` in the stats body.
 - Load, memory and uptime come from the agent's `/proc` sample. `disk_free_bytes`, `disk_total_bytes` and `disk_free_percent` describe the filesystem holding the agent's `work_dir`; each is `-` when the agent cannot read it.
 - Each job is a running job owned by that node. `pgid` is the harness process group, and the process table is capped at the 64 busiest members. `COMMAND` is the first 80 characters of the command line with control characters replaced.
 - `output_idle` is seconds since the harness last wrote output; `cpu_idle` is seconds since any process in the job tree last used CPU. `stuck yes` means both are above 300 seconds while the job is still running.
@@ -361,6 +363,33 @@ job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
 - `lu node <name> --json` prints the exact `GET /v1/nodes/{name}/stats` body, including an empty `{}` for a known node with no stats.
 
 Stats are sampled on the agent at heartbeat time, which may be slower than `lu top`'s two-second refresh. They describe the agent's view, not live controller state.
+
+### Probe labels
+
+An operator can declare `[[agent.detect]]` entries so a node advertises a label only while a
+command succeeds. The agent runs each probe at start and then every `every_secs`, off the
+heartbeat path; heartbeat reads the last result. Exit 0 publishes the label, and any other result,
+a timeout or a spawn failure removes it with one log line on change. A probe runs as the agent
+account with only `PATH`, `HOME` and `LANG`, null stdin, discarded output capped at 4 KiB and its
+own process group, killed on timeout. It never overlaps itself.
+
+```toml
+[[agent.detect]]          # Rust
+label = "rust/cargo"
+command = ["cargo", "--version"]
+
+[[agent.detect]]          # Go
+label = "go/toolchain"
+command = ["go", "version"]
+
+[[agent.detect]]          # PHP
+label = "php/cli"
+command = ["php", "-v"]
+```
+
+`lu nodes` and `lu node <name>` mark these labels with ` (probed)`; the JSON views carry the same
+information in `label_sources` as `{ "rust/cargo": "probed" }`. Probe labels are merged with
+static and file labels under the 32-label cap, and are dropped last when the cap is full.
 
 ## Disk housekeeping
 
@@ -546,7 +575,7 @@ version, size, `leased`/`running` jobs without a lease, and orphan `job_deps` ro
 | TLS key refused | Mode must be `0600` or tighter and the file must be owned by `lu`; symlinks are refused. |
 | `401 unauthorized` | Wrong token, wrong scope, a hash mismatch, or a token file with the wrong contents. Operator commands need an operator token; agent routes need an agent token. |
 | `403 forbidden` | The token is valid but the job or heartbeat belongs to a different node. |
-| Job stays `queued` | No agent is polling, the node is busy or draining, provider missing, provider cordon, or no online node has every required label. `lu show` prints the missing label; inspect `lu nodes --json`. |
+| Job stays `queued` | No agent is polling, the node is busy or draining, provider missing, provider cordon, no online node has every required label, or only tainted nodes are free and the job tolerates them not. `lu show` prints the missing label or taint; inspect `lu nodes --json`. |
 | `logs --follow` exited `3` | The job ended in `failed` or `cancelled`; check `lu show <id>`. |
 | `lu fetch` exits `1` | No artifacts yet, or the job has not uploaded any; check the job state. |
 

@@ -11,7 +11,8 @@ use crate::label::valid_label;
 use crate::limits::{
     DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_FALLBACKS, MAX_GIT_REF_BYTES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS, MAX_MODEL_BYTES, MAX_NAME_BYTES,
-    MAX_REPO_BYTES, MAX_REQUIRES_LABELS, MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
+    MAX_REPO_BYTES, MAX_REQUIRES_LABELS, MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MAX_TOLERATES,
+    MIN_TIMEOUT_SECS,
 };
 
 /// A field of [`JobSpec`] that failed validation.
@@ -82,6 +83,9 @@ pub struct JobSpec {
     /// Labels a node must advertise before this job may run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<String>,
+    /// Node taints this job tolerates. Every taint on a node must appear here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerates: Vec<String>,
     /// Alternatives to the primary provider and model, tried in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<Choice>,
@@ -115,6 +119,8 @@ struct RawJobSpec {
     #[serde(default)]
     requires: Vec<String>,
     #[serde(default)]
+    tolerates: Vec<String>,
+    #[serde(default)]
     fallbacks: Vec<Choice>,
 }
 
@@ -137,6 +143,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
             stack_dependencies: raw.stack_dependencies,
             allow_empty: raw.allow_empty,
             requires: raw.requires,
+            tolerates: raw.tolerates,
             fallbacks: raw.fallbacks,
         };
         spec.validate()?;
@@ -206,6 +213,23 @@ impl JobSpec {
             }
             if self.requires[..i].contains(label) {
                 return Err(invalid("requires", format!("duplicate label {label}")));
+            }
+        }
+        if self.tolerates.len() > MAX_TOLERATES {
+            return Err(invalid(
+                "tolerates",
+                format!(
+                    "must name at most {MAX_TOLERATES} taints (got {})",
+                    self.tolerates.len()
+                ),
+            ));
+        }
+        for (i, taint) in self.tolerates.iter().enumerate() {
+            if !valid_label(taint) {
+                return Err(invalid("tolerates", format!("invalid label {taint:?}")));
+            }
+            if self.tolerates[..i].contains(taint) {
+                return Err(invalid("tolerates", format!("duplicate label {taint}")));
             }
         }
         if self.fallbacks.len() > MAX_FALLBACKS {
@@ -373,6 +397,7 @@ mod tests {
             stack_dependencies: true,
             allow_empty: false,
             requires: Vec::new(),
+            tolerates: Vec::new(),
             fallbacks: Vec::new(),
         }
     }
@@ -498,6 +523,18 @@ mod tests {
         assert_eq!(error_field(&spec), "requires");
 
         spec = sample();
+        spec.tolerates = (0..=MAX_TOLERATES).map(|i| format!("taint-{i}")).collect();
+        assert_eq!(error_field(&spec), "tolerates");
+
+        spec = sample();
+        spec.tolerates = vec!["bad label".to_owned()];
+        assert_eq!(error_field(&spec), "tolerates");
+
+        spec = sample();
+        spec.tolerates = vec!["homelab".to_owned(), "homelab".to_owned()];
+        assert_eq!(error_field(&spec), "tolerates");
+
+        spec = sample();
         spec.fallbacks = (0..=MAX_FALLBACKS)
             .map(|i| Choice {
                 provider: format!("peer-{i}"),
@@ -562,6 +599,7 @@ mod tests {
         assert!(spec.after.is_empty());
         assert!(spec.stack_dependencies);
         assert!(spec.requires.is_empty());
+        assert!(spec.tolerates.is_empty());
         assert!(spec.fallbacks.is_empty());
         assert!(spec.validate().is_ok());
     }
@@ -690,6 +728,19 @@ mod tests {
         spec.requires = vec!["php8.3".to_owned(), "region=eu".to_owned()];
         let json = spec.canonical_json();
         assert!(json.contains("\"requires\""));
+        let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, spec);
+        assert_eq!(parsed.canonical_json(), json);
+    }
+
+    #[test]
+    fn tolerations_round_trip_and_are_omitted_when_empty() {
+        let mut spec = sample();
+        assert!(!spec.canonical_json().contains("tolerates"));
+        spec.tolerates = vec!["homelab".to_owned(), "region=eu".to_owned()];
+        assert!(spec.validate().is_ok());
+        let json = spec.canonical_json();
+        assert!(json.contains("\"tolerates\""));
         let parsed: JobSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, spec);
         assert_eq!(parsed.canonical_json(), json);

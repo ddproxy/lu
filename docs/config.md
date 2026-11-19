@@ -82,6 +82,8 @@ The `[agent]` table describes an agent host. The operator CLI also reads `contro
 | `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set, and rejected when set alone. Checked like `token_file` on `load`; the agent reads at most 4 KiB. |
 | `labels` | no | `[]` | At most 32 labels. Each is 1 to 64 characters from `A-Z a-z 0-9 . _ - /`, with at most one `=`. Lu never interprets them; a job's `requires` must match every label exactly. |
 | `label_files` | no | `[]` | At most 8 absolute paths without `..`. Each file is read again before every heartbeat; a missing or unreadable file contributes nothing. Each file is capped at 4 KiB, must be UTF-8, and holds one label per line; blank lines and lines starting with `#` are ignored. Invalid labels are dropped with one warning per label. File labels are merged with `labels`, then sorted and de-duplicated. |
+| `detect` | no | `[]` | Up to 16 `[[agent.detect]]` entries; labels must be valid and unique. See below. |
+| `taints` | no | `[]` | At most 8 taints. Each is a label with the same syntax as `labels`. A tainted node takes only jobs that tolerate every taint. Sent with every heartbeat and replaced on change. |
 | `housekeeping` | no | — | Optional `[agent.housekeeping]` table. Without it the agent removes nothing. |
 | `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set. Checked like `token_file` on `load`. |
 
@@ -93,6 +95,39 @@ machine property. For example:
 # ...
 labels = ["gpu", "php8.3", "region=eu"]
 label_files = ["/etc/lu/labels.d/installed-software"]
+taints = ["homelab"]
+```
+
+### `[[agent.detect]]`
+
+Each entry runs a probe that publishes its label while the command exits 0.
+
+| Key | Required | Default | Validation |
+| --- | --- | --- | --- |
+| `label` | yes | — | A valid label, unique across all probe entries. |
+| `command` | yes | — | argv array of 1 to 8 entries: an absolute program path without `..`, or a bare name resolved against the agent's own `PATH`. Arguments must be non-empty text without control characters. No shell. |
+| `timeout_secs` | no | `5` | Integer `1` to `30`. The process group is terminated, then killed, on timeout. |
+| `every_secs` | no | `300` | Integer at least `30`. |
+
+Probes start with the agent, then run at `every_secs`. A run never overlaps itself; heartbeats
+use the last result and never wait. The child runs as the agent account with only `PATH`, `HOME`
+and `LANG` inherited, null stdin, at most 4 KiB of discarded output, and its own process group.
+Exit 0 publishes the label; any other result or a spawn failure removes it, with one log line on
+change. Probe labels join static and file labels under the same 32-label cap; probe labels are
+dropped last when the cap is full and are marked `probed` in the node's `label_sources`.
+
+```toml
+[[agent.detect]]          # Rust
+label = "rust/cargo"
+command = ["cargo", "--version"]
+
+[[agent.detect]]          # Go
+label = "go/toolchain"
+command = ["go", "version"]
+
+[[agent.detect]]          # PHP
+label = "php/cli"
+command = ["php", "-v"]
 ```
 
 ### `[agent.housekeeping]`

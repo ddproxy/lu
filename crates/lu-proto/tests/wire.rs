@@ -30,6 +30,7 @@ fn spec() -> JobSpec {
         stack_dependencies: true,
         allow_empty: false,
         requires: vec!["php8.3".to_owned()],
+        tolerates: Vec::new(),
         fallbacks: vec![lu_proto::Choice {
             provider: "peer-b".to_owned(),
             model: Some("other-model".to_owned()),
@@ -96,6 +97,8 @@ fn a_heartbeat_carries_a_capped_forwarded_document() {
         host: None,
         jobs: Vec::new(),
         labels: vec!["gpu".to_owned()],
+        label_sources: std::collections::BTreeMap::new(),
+        taints: Vec::new(),
     };
     beat.validate().unwrap();
     let wire = serde_json::to_string(&beat).unwrap();

@@ -11,7 +11,7 @@ use lu_client::{
 };
 use lu_proto::{
     printable, truncate_chars, ArtifactName, FailureClass, HarnessState, JobId, JobSpec, JobState,
-    NodeName, MAX_TASK_BYTES,
+    NodeName, LABEL_SOURCE_PROBED, MAX_TASK_BYTES,
 };
 use lu_tui::graph::{self, Graph};
 use lu_tui::model::Tone;
@@ -65,6 +65,9 @@ pub struct SubmitArgs {
     /// Run only on a node with this label (repeatable).
     #[arg(long = "require")]
     pub require: Vec<String>,
+    /// Tolerate this node taint (repeatable).
+    #[arg(long = "tolerate")]
+    pub tolerate: Vec<String>,
     /// Idempotency key.
     #[arg(long)]
     pub key: Option<String>,
@@ -108,6 +111,12 @@ pub struct RetryArgs {
     /// Clear the label requirements.
     #[arg(long = "no-require")]
     pub no_require: bool,
+    /// Replace the tolerated taints (repeatable).
+    #[arg(long = "tolerate", conflicts_with = "no_tolerate")]
+    pub tolerate: Vec<String>,
+    /// Clear the tolerated taints.
+    #[arg(long = "no-tolerate")]
+    pub no_tolerate: bool,
     /// Idempotency key. The new job carries none unless this is given.
     #[arg(long)]
     pub key: Option<String>,
@@ -273,6 +282,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         stack_dependencies: !args.no_stack,
         allow_empty: args.allow_empty,
         requires: args.require,
+        tolerates: args.tolerate,
         fallbacks: args.fallbacks,
     };
     spec.validate().map_err(|error| error.to_string())?;
@@ -335,6 +345,11 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
         spec.requires = args.require;
     } else if args.no_require {
         spec.requires.clear();
+    }
+    if !args.tolerate.is_empty() {
+        spec.tolerates = args.tolerate;
+    } else if args.no_tolerate {
+        spec.tolerates.clear();
     }
     if !args.fallbacks.is_empty() {
         spec.fallbacks = args.fallbacks;
@@ -577,6 +592,19 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
         .nodes
         .iter()
         .map(|node| {
+            // Taints first: they decide dispatch eligibility, so keep them visible when labels overflow.
+            let mut labels: Vec<String> = node
+                .taints
+                .iter()
+                .map(|taint| format!("!{taint}"))
+                .collect();
+            labels.extend(node.labels.iter().map(|label| {
+                if node.label_sources.get(label).map(String::as_str) == Some(LABEL_SOURCE_PROBED) {
+                    format!("{label} (probed)")
+                } else {
+                    label.clone()
+                }
+            }));
             vec![
                 node.name.to_string(),
                 node.version
@@ -584,7 +612,7 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
                     .map(display_field)
                     .unwrap_or_else(|| "-".to_owned()),
                 harness_name(node.harness),
-                labels_cell(&node.labels, 40),
+                labels_cell(&labels, 40),
                 time(node.last_seen),
                 if node.draining { "yes" } else { "no" }.to_owned(),
             ]
@@ -997,6 +1025,19 @@ fn print_job(view: &JobView) {
                 fallbacks
             },
         ),
+        (
+            "tolerates",
+            if view.spec.tolerates.is_empty() {
+                "-".to_owned()
+            } else {
+                view.spec
+                    .tolerates
+                    .iter()
+                    .map(|taint| display_field(taint))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        ),
         ("attempt", view.attempt.to_string()),
         ("epoch", view.epoch.to_string()),
         ("created_at", time(view.created_at)),
@@ -1107,6 +1148,26 @@ fn print_node(node: &NodeView) {
 
 fn print_node_stats(node: &NodeName, stats: &NodeStats) {
     println!("node  {node}");
+    let labels: Vec<String> = stats
+        .labels
+        .iter()
+        .map(|label| {
+            let shown = printable(label);
+            if stats.label_sources.get(label).map(String::as_str) == Some(LABEL_SOURCE_PROBED) {
+                format!("{shown} (probed)")
+            } else {
+                shown
+            }
+        })
+        .collect();
+    println!(
+        "labels {}",
+        if labels.is_empty() {
+            "-".to_owned()
+        } else {
+            labels.join(" ")
+        }
+    );
     match &stats.host {
         Some(host) => print_pairs(&[
             ("load1", format!("{:.2}", host.load1)),

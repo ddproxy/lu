@@ -3,6 +3,9 @@
 
 use crate::limits::MAX_LABEL_BYTES;
 
+/// The only label source marker an agent sends: an operator-declared probe published the label.
+pub const LABEL_SOURCE_PROBED: &str = "probed";
+
 /// Whether `value` may appear as a node label or a job requirement.
 pub fn valid_label(value: &str) -> bool {
     !value.is_empty()

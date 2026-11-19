@@ -1081,6 +1081,9 @@ impl Store for SqliteStore {
             if !crate::labels_satisfied(&rec.spec.requires, &hb.labels) {
                 continue;
             }
+            if !crate::taints_tolerated(&hb.taints, &rec.spec.tolerates) {
+                continue;
+            }
             // A job that names no provider runs anywhere, as before. Otherwise the primary is
             // tried first and the fallbacks in order, each needing this node to be able to serve
             // it. A fallback without a model keeps the primary model.
@@ -1806,6 +1809,7 @@ mod tests {
             stack_dependencies: true,
             allow_empty: false,
             requires: Vec::new(),
+            tolerates: Vec::new(),
             fallbacks: Vec::new(),
         };
         let now = Now {
