@@ -196,6 +196,8 @@ pub trait Store: Send + Sync + 'static {
     ) -> Result<Option<Assignment>, StoreError>;
     /// Jobs held by `node` whose cancel was requested, with the epoch to name.
     fn pending_cancels(&self, node: &NodeName) -> Result<Vec<(JobId, u64)>, StoreError>;
+    /// Jobs currently held by `node` (leased, running or recovering), with the epoch to name.
+    fn held_jobs(&self, node: &NodeName) -> Result<Vec<(JobId, u64)>, StoreError>;
     /// Leased to running.
     fn start_job(&self, id: &JobId, epoch: u64, now: Now) -> Result<JobRecord, StoreError>;
     /// Extends the lease; returns whether a cancel is pending.
@@ -209,6 +211,10 @@ pub trait Store: Send + Sync + 'static {
     /// Reserves `n` log bytes at `offset`; conflicts with the stored length when they differ.
     /// Returns the new length. The caller then writes the bytes to the log file.
     fn reserve_log(&self, id: &JobId, epoch: u64, offset: u64, n: u64) -> Result<u64, StoreError>;
+    /// Releases a reservation that was not written. `length` is the reservation's returned
+    /// length and `n` the bytes it reserved; conflicts when either no longer matches.
+    fn unreserve_log(&self, id: &JobId, epoch: u64, length: u64, n: u64)
+        -> Result<u64, StoreError>;
     /// Records an artifact name and its byte size, used for diff-based outcome notes.
     fn record_artifact(
         &self,

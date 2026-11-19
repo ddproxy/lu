@@ -595,6 +595,30 @@ async fn poll_with(addr: SocketAddr, token: &str, hb: &serde_json::Value) -> Str
     raw_request(addr, &req).await
 }
 
+async fn assign_and_start(srv: &TestServer) -> (String, JobId, u64) {
+    let r = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let j: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = j["id"].as_str().unwrap().to_owned();
+    let job_id = JobId::parse(&id).unwrap();
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let epoch = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign")
+        .unwrap_or_else(|| panic!("no assignment: {events}"))["epoch"]
+        .as_u64()
+        .unwrap();
+    let b = json!({"epoch": epoch}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", b.len(), b);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    (id, job_id, epoch)
+}
+
 async fn cordons_for(addr: SocketAddr, node: &str) -> Vec<String> {
     let r = raw_request(addr, &format!("GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
     assert_eq!(status(&r), 200, "{r}");
@@ -1962,6 +1986,65 @@ async fn log_append_with_less_room_than_the_marker_keeps_the_marker() {
     );
     let rec = srv.store.get_job(&job_id).unwrap();
     assert_eq!(rec.log_len, MAX_LOG_BYTES);
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn failed_log_write_rolls_back_the_reservation() {
+    let srv = start_server().await;
+    let (id, job_id, epoch) = assign_and_start(&srv).await;
+    let job_dir = srv._artifacts_dir.join(&id);
+    std::fs::create_dir_all(&job_dir).unwrap();
+    let log_path = job_dir.join("run.log");
+    // A directory at the log path makes the write fail after the store reserved the bytes.
+    std::fs::create_dir(&log_path).unwrap();
+
+    let chunk = b"hello\n";
+    let append = format!("POST /v1/agent/jobs/{id}/log?epoch={epoch}&offset=0 HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n", chunk.len());
+    let mut packet = append.into_bytes();
+    packet.extend_from_slice(chunk);
+    let r = String::from_utf8_lossy(&raw_request_bytes(srv.addr, &packet).await).into_owned();
+    assert_eq!(status(&r), 500, "{r}");
+    assert_eq!(srv.store.get_job(&job_id).unwrap().log_len, 0);
+
+    // The retry at the same offset succeeds and the log has exactly the retried bytes.
+    std::fs::remove_dir(&log_path).unwrap();
+    let r = String::from_utf8_lossy(&raw_request_bytes(srv.addr, &packet).await).into_owned();
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(
+        srv.store.get_job(&job_id).unwrap().log_len,
+        chunk.len() as u64
+    );
+    assert_eq!(std::fs::read(&log_path).unwrap(), chunk);
+    let logs = raw_request(
+        srv.addr,
+        &format!("GET /v1/jobs/{id}/logs?offset=0 HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(body_str(&logs), "hello\n", "{logs}");
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn get_logs_stops_at_the_stored_length() {
+    let srv = start_server().await;
+    let (id, job_id, epoch) = assign_and_start(&srv).await;
+    let job_dir = srv._artifacts_dir.join(&id);
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(job_dir.join("run.log"), b"0123456789").unwrap();
+    // The stored length is shorter than the file; only the stored bytes are visible.
+    srv.store.reserve_log(&job_id, epoch, 0, 4).unwrap();
+
+    for (offset, expected) in [(0, "0123"), (2, "23")] {
+        let r = raw_request(
+            srv.addr,
+            &format!("GET /v1/jobs/{id}/logs?offset={offset} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status(&r), 200, "{r}");
+        assert_eq!(body_str(&r), expected, "{r}");
+        assert_eq!(header_value(&r, "x-lu-log-length"), Some("4"), "{r}");
+    }
     let _ = srv.shutdown.send(());
 }
 

@@ -34,12 +34,22 @@ impl DiskSpace {
     }
 }
 
+/// A fixed absolute path to `df`, so a reading never depends on the caller's `PATH`.
+#[cfg(unix)]
+fn df_binary() -> Option<&'static Path> {
+    const CANDIDATES: [&str; 4] = ["/usr/bin/df", "/bin/df", "/usr/sbin/df", "/sbin/df"];
+    CANDIDATES
+        .iter()
+        .map(Path::new)
+        .find(|candidate| candidate.is_file())
+}
+
 /// Reads the filesystem holding `path`.
 #[cfg(unix)]
 pub fn disk_space(path: &Path) -> Option<DiskSpace> {
     // `std` has no statvfs and this workspace forbids unsafe, so ask the system `df` for the
     // POSIX 1024-byte totals. A failure only costs the optional disk fields.
-    let output = std::process::Command::new("df")
+    let output = std::process::Command::new(df_binary()?)
         .arg("-Pk")
         .arg("--")
         .arg(path)

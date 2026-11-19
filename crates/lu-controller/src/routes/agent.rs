@@ -14,9 +14,9 @@ use lu_serve::PeerAddr;
 use lu_staging::{pack_commit_capped, StageError};
 use serde::Deserialize;
 use serde_json::json;
-use std::io::Cursor;
+use std::io::{Cursor, SeekFrom};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,31 +140,25 @@ pub async fn poll(
         }
 
         if !events.is_empty() {
-            // renew implied by poll on assigned job? assignment created lease; cancels returned are pending.
-            // "Extends the lease by `lease_secs`. Also implied by `poll`, `log` and `start`."
-            // Any active leased/running job held by node should be renewed by poll - but store API doesn't give direct "renew by node".
-            // However next_assignment/pending_cancels operate on held jobs; renew is per job+epoch endpoint. Poll implying renew is important.
-            // Without a store method, we can't perfectly implement; but we can attempt to renew known held jobs if we can discover them.
-            // As a pragmatic approach: if assignment made, lease already set. If cancels exist, those jobs are held - try renew for each? need epoch from pending_cancels (we have it).
-            // Best effort: renew each cancel job epoch.
-            // (Not perfect but better than nothing.)
-            for ev in &events {
-                if ev.get("kind").and_then(|k| k.as_str()) == Some("cancel") {
-                    if let (Some(id), Some(epoch)) = (
-                        ev.get("job_id").and_then(|v| v.as_str()),
-                        ev.get("epoch").and_then(|v| v.as_u64()),
-                    ) {
-                        if let Ok(jid) = JobId::parse(id) {
-                            let store = Arc::clone(&state.store);
-                            let lease_ms = state.lease_ms;
-                            let n3 = now();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                store.renew_lease(&jid, epoch, n3, lease_ms)
-                            })
-                            .await;
-                        }
-                    }
+            // Poll implies renewal for every job this node holds, not just jobs with a pending
+            // cancel. A job that missed its renew still has a live lease while the node polls.
+            let held = {
+                let store = Arc::clone(&state.store);
+                let node_c = node.clone();
+                match tokio::task::spawn_blocking(move || store.held_jobs(&node_c)).await {
+                    Ok(Ok(held)) => held,
+                    Ok(Err(e)) => return with_version(store_err(e).into_response()),
+                    Err(_) => return with_version(ApiError::internal().into_response()),
                 }
+            };
+            for (jid, epoch) in held {
+                let store = Arc::clone(&state.store);
+                let lease_ms = state.lease_ms;
+                let n3 = now();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.renew_lease(&jid, epoch, n3, lease_ms)
+                })
+                .await;
             }
             return with_version(json_ok(StatusCode::OK, &events));
         }
@@ -302,7 +296,7 @@ pub async fn renew_job(
     }
 }
 
-async fn append_log_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+async fn write_log_chunk(path: &std::path::Path, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         // Private from the first byte, not narrowed after creation.
         tokio::fs::DirBuilder::new()
@@ -313,10 +307,17 @@ async fn append_log_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Resu
     }
     let mut f = tokio::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .truncate(false)
+        .write(true)
         .mode(0o600)
         .open(path)
         .await?;
+    // A partial write that failed may have left bytes past the stored length. Trim them so a
+    // retry lands exactly at the reserved offset.
+    if f.metadata().await?.len() > offset {
+        f.set_len(offset).await?;
+    }
+    f.seek(SeekFrom::Start(offset)).await?;
     f.write_all(bytes).await?;
     f.flush().await?;
     Ok(())
@@ -387,13 +388,29 @@ pub async fn append_log(
             move || store.reserve_log(&jid, epoch, offset, actual_append)
         })
         .await;
-        match res {
-            Ok(Ok(_new_len)) => {}
+        let new_len = match res {
+            Ok(Ok(new_len)) => new_len,
             Ok(Err(e)) => return with_version(store_err(e).into_response()),
             Err(_) => return with_version(ApiError::internal().into_response()),
-        }
+        };
         let path = state.artifacts_dir.join(job_id.to_string()).join("run.log");
-        if append_log_bytes(&path, &to_write).await.is_err() {
+        if let Err(error) = write_log_chunk(&path, offset, &to_write).await {
+            tracing::warn!(%error, job = %job_id, "log write failed; releasing the reservation");
+            let rollback = tokio::task::spawn_blocking({
+                let store = Arc::clone(&state.store);
+                let jid = job_id.clone();
+                move || store.unreserve_log(&jid, epoch, new_len, actual_append)
+            })
+            .await;
+            match rollback {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(?e, job = %job_id, "could not release the log reservation")
+                }
+                Err(e) => {
+                    tracing::warn!(%e, job = %job_id, "log rollback task failed")
+                }
+            }
             return with_version(ApiError::internal().into_response());
         }
     } else if marker_only {
@@ -905,5 +922,201 @@ mod cordon_tests {
         let e = Outcome::Failed(FailureClass::Execution);
         assert_eq!(cordon_ms_for(&completion(e, Some(150)), 42), 42);
         assert_eq!(cordon_ms_for(&completion(Outcome::Done, Some(150)), 42), 42);
+    }
+}
+
+#[cfg(test)]
+mod poll_renewal_tests {
+    use super::*;
+    use axum::extract::State;
+    use lu_auth::sha256_hex;
+    use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator};
+    use lu_proto::{ArtifactName, Completion, Heartbeat, JobSpec, NodeName};
+    use lu_store::{JobCounts, JobRecord, Now, Store, StoreError};
+    use std::net::SocketAddr;
+    use std::sync::Mutex;
+
+    const TOKEN: &str = "poll-renewal-token";
+
+    #[derive(Default)]
+    struct RecordingStore {
+        cancels: Vec<(JobId, u64)>,
+        held: Vec<(JobId, u64)>,
+        renewed: Mutex<Vec<(JobId, u64)>>,
+    }
+
+    impl Store for RecordingStore {
+        fn create_job(&self, _spec: &JobSpec, _now: Now) -> Result<(JobRecord, bool), StoreError> {
+            unimplemented!()
+        }
+        fn get_job(&self, _id: &JobId) -> Result<JobRecord, StoreError> {
+            unimplemented!()
+        }
+        fn job_by_key(&self, _key: &str) -> Option<JobRecord> {
+            None
+        }
+        fn list_jobs(
+            &self,
+            _state: Option<lu_proto::JobState>,
+            _limit: usize,
+            _after: Option<&JobId>,
+        ) -> Result<Vec<JobRecord>, StoreError> {
+            unimplemented!()
+        }
+        fn cancel_job(&self, _id: &JobId, _now: Now) -> Result<JobRecord, StoreError> {
+            unimplemented!()
+        }
+        fn heartbeat(&self, _hb: &Heartbeat, _now: Now) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn next_assignment(
+            &self,
+            _node: &NodeName,
+            _now: Now,
+            _lease_ms: u64,
+        ) -> Result<Option<lu_store::Assignment>, StoreError> {
+            Ok(None)
+        }
+        fn pending_cancels(&self, _node: &NodeName) -> Result<Vec<(JobId, u64)>, StoreError> {
+            Ok(self.cancels.clone())
+        }
+        fn held_jobs(&self, _node: &NodeName) -> Result<Vec<(JobId, u64)>, StoreError> {
+            Ok(self.held.clone())
+        }
+        fn start_job(&self, _id: &JobId, _epoch: u64, _now: Now) -> Result<JobRecord, StoreError> {
+            unimplemented!()
+        }
+        fn renew_lease(
+            &self,
+            id: &JobId,
+            epoch: u64,
+            _now: Now,
+            _lease_ms: u64,
+        ) -> Result<bool, StoreError> {
+            self.renewed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((id.clone(), epoch));
+            Ok(false)
+        }
+        fn reserve_log(
+            &self,
+            _id: &JobId,
+            _epoch: u64,
+            _offset: u64,
+            _n: u64,
+        ) -> Result<u64, StoreError> {
+            unimplemented!()
+        }
+        fn unreserve_log(
+            &self,
+            _id: &JobId,
+            _epoch: u64,
+            _length: u64,
+            _n: u64,
+        ) -> Result<u64, StoreError> {
+            unimplemented!()
+        }
+        fn record_artifact(
+            &self,
+            _id: &JobId,
+            _epoch: u64,
+            _name: ArtifactName,
+            _bytes: u64,
+        ) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn complete(
+            &self,
+            _completion: &Completion,
+            _failure: Option<(lu_proto::FailureClass, Option<String>)>,
+            _now: Now,
+            _max_retries: u32,
+            _cordon_ms: u64,
+        ) -> Result<JobRecord, StoreError> {
+            unimplemented!()
+        }
+        fn expire_leases(&self, _now: Now) -> Result<Vec<JobId>, StoreError> {
+            unimplemented!()
+        }
+        fn requeue_recovering(
+            &self,
+            _now: Now,
+            _grace_ms: u64,
+            _max_retries: u32,
+        ) -> Result<Vec<JobId>, StoreError> {
+            unimplemented!()
+        }
+        fn recover_on_boot(&self, _now: Now) -> Result<u64, StoreError> {
+            unimplemented!()
+        }
+        fn set_draining(&self, _node: &NodeName, _draining: bool) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn nodes(
+            &self,
+            _now: Now,
+            _lease_ms: u64,
+        ) -> Result<Vec<lu_store::NodeRecord>, StoreError> {
+            unimplemented!()
+        }
+        fn job_counts(&self, _now: Now, _lease_ms: u64) -> Result<JobCounts, StoreError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_with_pending_cancels_renews_every_held_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cancel = JobId::new();
+        let other = JobId::new();
+        let store = Arc::new(RecordingStore {
+            cancels: vec![(cancel.clone(), 3)],
+            held: vec![(cancel.clone(), 3), (other.clone(), 7)],
+            renewed: Mutex::new(Vec::new()),
+        });
+        let cfg = ControllerConfig {
+            listen: "127.0.0.1:0".to_owned(),
+            db: tmp.path().join("lu.db").display().to_string(),
+            artifacts_dir: tmp.path().join("artifacts").display().to_string(),
+            lease_secs: 6,
+            max_retries: 1,
+            provider_cooldown_secs: 60,
+            recovery_grace_secs: 1,
+            max_connections: 8,
+            max_connections_per_addr: 4,
+            local_repo_roots: Vec::new(),
+            agents: vec![ControllerAgent {
+                name: "node-a".to_owned(),
+                token_sha256: sha256_hex(TOKEN),
+            }],
+            operators: vec![ControllerOperator {
+                name: "ops".to_owned(),
+                token_sha256: sha256_hex("unused-operator-token"),
+            }],
+            repos: Vec::new(),
+        };
+        let state = Arc::new(AppState::from_config(&cfg, store.clone()).unwrap());
+        let body = json!({"heartbeat": {"node": "node-a", "harness": "idle", "providers": []}, "wait_secs": 0}).to_string();
+        let req = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/v1/agent/poll")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let headers = req.headers().clone();
+        let peer = axum::Extension(PeerAddr("127.0.0.1:4000".parse::<SocketAddr>().unwrap()));
+
+        let res = poll(State(state), peer, headers, req).await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            store
+                .renewed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            vec![(cancel, 3), (other, 7)]
+        );
     }
 }

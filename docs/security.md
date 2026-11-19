@@ -120,7 +120,7 @@ commit, so an agent no longer needs forge access or its credential. A mirror is 
 under `<artifacts_dir>/../mirrors`, mode `0700`; fetching uses `https` only, no terminal prompts,
 no system or global config, no hooks and no inherited askpass or ssh command, with a 5-minute
 timeout and a size cap. A repository credential is read at fetch time, passed through a
-short-lived private askpass helper, and scrubbed from any stderr before it becomes an error.
+short-lived private askpass helper, and scrubbed from any stderr before it becomes an error. A restart clears helpers left by a crash.
 
 Staging invokes `git` directly with prompts disabled, a restricted transport allowlist
 (`file`, `https`, `ssh`), and system config skipped. The harness is launched directly in its own

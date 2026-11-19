@@ -124,12 +124,36 @@ impl Mirror {
         std::fs::create_dir_all(&root)
             .map_err(|e| format!("cannot create mirror root {}: {e}", root.display()))?;
         set_mode(&root, 0o700);
+        Self::remove_stale_askpass_dirs(&root);
         Ok(Self {
             root,
             repos,
             state: Mutex::new(HashMap::new()),
             sync_lock: Mutex::new(()),
         })
+    }
+
+    /// Removes askpass helpers left behind when an earlier controller stopped mid-fetch.
+    fn remove_stale_askpass_dirs(root: &Path) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        let own_prefix = format!(".askpass-{}-", std::process::id());
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !name.starts_with(".askpass-")
+                || name.starts_with(&own_prefix)
+                || !entry.file_type().is_ok_and(|t| t.is_dir())
+            {
+                continue;
+            }
+            let path = entry.path();
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                tracing::warn!(path = %path.display(), %e, "could not remove stale askpass directory");
+            }
+        }
     }
 
     pub fn repos(&self) -> &[ControllerRepo] {
@@ -831,6 +855,26 @@ mod tests {
         let error = mirror.sync("local").unwrap_err().to_string();
         assert!(!error.contains("super-secret-token"), "{error}");
         assert!(!error.contains("user:super-secret-token"), "{error}");
+    }
+
+    #[test]
+    fn stale_askpass_directories_are_removed_on_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifacts = tmp.path().join("artifacts");
+        let root = tmp.path().join("mirrors");
+        let stale = root.join(".askpass-0-0");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("pass"), b"secret").unwrap();
+        let mirror_data = root.join("repo.git");
+        std::fs::create_dir_all(&mirror_data).unwrap();
+
+        let _mirror = Mirror::new(vec![], &artifacts).unwrap();
+
+        assert!(
+            !stale.exists(),
+            "leftover askpass directory survived startup"
+        );
+        assert!(mirror_data.exists(), "mirror data must be kept");
     }
 
     #[test]

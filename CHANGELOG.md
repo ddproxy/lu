@@ -19,6 +19,14 @@ uses semantic versioning once it reaches 1.0.
 - MCP submissions reserve rate-limit budget only after arguments and the resolved spec validate.
 - Mirror sync errors now name the failing step (creating or fetching a mirror) and add a hint for two recognisable causes: a failed stat of a config file under the service account's home directory ("the service account needs a readable HOME") and a failing `git` command ("the controller runs `git` as its own account; it must be able to run git and reach the remote"). The original error text is kept; systemd units should set `Environment=HOME=<state dir>` and a `PATH` that contains `git`.
 
+### Fixed
+
+- Failed log writes release the reserved length, so retries append at the right offset.
+- Log reads stop at the stored length, even when the file is longer.
+- Polls with pending cancellations renew every job held by the polling node.
+- Controller start removes leftover `.askpass-*` directories under the mirror root.
+- Agent disk readings locate `df` at fixed absolute paths, independent of `PATH`.
+
 ## [0.2.0] - 2026-11-18
 
 ### Added
