@@ -963,6 +963,14 @@ mod poll_renewal_tests {
         ) -> Result<Vec<JobRecord>, StoreError> {
             unimplemented!()
         }
+        fn edit_job(
+            &self,
+            _id: &JobId,
+            _edit: &lu_proto::JobEdit,
+            _now: Now,
+        ) -> Result<JobRecord, StoreError> {
+            unimplemented!()
+        }
         fn cancel_job(&self, _id: &JobId, _now: Now) -> Result<JobRecord, StoreError> {
             unimplemented!()
         }
