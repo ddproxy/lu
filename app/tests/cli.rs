@@ -431,6 +431,116 @@ async fn submit_no_stack_sets_and_default_omits_the_field() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_allow_empty_sets_and_default_omits_the_field() {
+    let id = job_id();
+    let body = job_json(&id, "queued");
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("submit-allow-empty");
+    let token = write_token(&dir, "operator.token", TOKEN);
+
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--allow-empty",
+        ],
+        &env_for(&server, &token),
+        Some("run the tests\n"),
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap()[0].body).unwrap();
+    assert_eq!(spec["allow_empty"], json!(true));
+
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+        ],
+        &env_for(&server, &token),
+        Some("run the tests\n"),
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap()[1].body).unwrap();
+    assert!(
+        spec.get("allow_empty").is_none(),
+        "the default must be omitted: {spec}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ls_prints_the_no_changes_note_column() {
+    let noted_id = job_id();
+    let plain_id = job_id();
+    let mut noted = job_json(&noted_id, "done");
+    noted["outcome_note"] = json!("no_changes");
+    let plain = job_json(&plain_id, "done");
+    let body = json!({"jobs": [noted, plain]});
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("ls-note");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(&["ls"], &env_for(&server, &token), None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    let header: Vec<&str> = text.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(header[6], "NOTE", "{text}");
+    let noted_line = text.lines().find(|line| line.contains(&noted_id)).unwrap();
+    assert!(noted_line.trim_end().ends_with("no changes"), "{text}");
+    let plain_line = text.lines().find(|line| line.contains(&plain_id)).unwrap();
+    assert!(plain_line.trim_end().ends_with('-'), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ls_json_keeps_the_outcome_note_field() {
+    let id = job_id();
+    let mut job = job_json(&id, "done");
+    job["outcome_note"] = json!("no_changes");
+    let body = json!({"jobs": [job]});
+    let expected = body.to_string();
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("ls-note-json");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(&["--json", "ls"], &env_for(&server, &token), None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{expected}\n"));
+    assert!(stdout(&output).contains("\"outcome_note\":\"no_changes\""));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_prints_the_no_changes_outcome_note() {
+    let id = job_id();
+    let main_id = id.clone();
+    let server = start(move |_| {
+        let mut view = job_json(&main_id, "done");
+        view["outcome_note"] = json!("no_changes");
+        Reply::json(&view)
+    })
+    .await;
+    let dir = scratch("show-note");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(&["show", &id], &env_for(&server, &token), None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.lines()
+            .any(|line| line.trim_start().starts_with("outcome_note")
+                && line.trim_end().ends_with("no changes")),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ls_shows_the_waiting_dependency_count() {
     let waiting_id = job_id();
     let free_id = job_id();

@@ -5,6 +5,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Done jobs with an empty stored diff get `outcome_note: "no_changes"` in `JobView`, printed as `no changes` by `lu ls`/`lu show` and marked in the TUI job list. `JobSpec.allow_empty` (`lu submit --allow-empty`) suppresses the note. `lu_jobs_no_changes_total` exports the count since controller start. Schema 6 adds a nullable `diff_bytes` job column; older databases upgrade with it empty, so pre-existing jobs are not noted.
+
 ## [0.2.0] - 2026-11-18
 
 ### Added

@@ -192,6 +192,17 @@ pub async fn metrics(
     ));
     out.push('\n');
 
+    out.push_str(
+        "# HELP lu_jobs_no_changes_total Done jobs with an empty diff and no allow_empty opt-out\n",
+    );
+    out.push_str("# TYPE lu_jobs_no_changes_total counter\n");
+    out.push_str(&counter(
+        "lu_jobs_no_changes_total",
+        &[],
+        state.no_changes_total(),
+    ));
+    out.push('\n');
+
     // lu_node_providers{node,provider,state} - need to query nodes with providers
     // Get node records
     let nodes = match tokio::task::spawn_blocking({

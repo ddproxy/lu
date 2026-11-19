@@ -443,6 +443,7 @@ mod tests {
             idempotency_key: None,
             after: Vec::new(),
             stack_dependencies: true,
+            allow_empty: false,
             requires: Vec::new(),
             fallbacks: Vec::new(),
         }

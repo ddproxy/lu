@@ -132,17 +132,18 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
                 attempt: job.attempt,
                 age_secs: now.saturating_sub(job.created_at),
                 model: job.spec.model.clone(),
-                note: match (&job.failure_class, &job.summary) {
-                    (Some(_), Some(summary)) => {
-                        format!(
+                note: match job.outcome_note.as_deref() {
+                    Some("no_changes") => "no changes".to_owned(),
+                    _ => match (&job.failure_class, &job.summary) {
+                        (Some(_), Some(summary)) => format!(
                             "{}: {}",
                             operator::failure_name(job.failure_class),
                             plain_summary(summary)
-                        )
-                    }
-                    (Some(_), None) => operator::failure_name(job.failure_class),
-                    (None, Some(summary)) => plain_summary(summary),
-                    (None, None) => String::new(),
+                        ),
+                        (Some(_), None) => operator::failure_name(job.failure_class),
+                        (None, Some(summary)) => plain_summary(summary),
+                        (None, None) => String::new(),
+                    },
                 },
                 after: job.after.iter().map(ToString::to_string).collect(),
             })

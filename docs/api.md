@@ -45,6 +45,7 @@ Agents poll; the controller has no push channel. Lease expiry uses the controlle
 | `stack_dependencies` | boolean | no | Defaults to `true`; omitted when `true`. When true, dependency diffs are applied to the job's base tree. |
 | `requires` | array of labels | no | At most 8 labels; omitted when empty. |
 | `fallbacks` | array of objects | Up to 4 alternative `{provider, model}` choices, tried in order when the primary provider is unavailable on a node. Omitted when empty. |
+| `allow_empty` | boolean | No | Defaults to `false`; omitted when `false`. When true, a successful job with no diff gets no `outcome_note`. |
 
 An unknown `git_ref` for a configured repository is `422 unprocessable` and names the ref. A job for an unlisted repository has no `base_commit` unless one is supplied by the client.
 
@@ -72,6 +73,7 @@ An unknown `git_ref` for a configured repository is `422 unprocessable` and name
 | `waiting_reason` | string or null | Why a queued job cannot be placed, such as `no node with label php8.3`. |
 | `assigned_provider` | string or null | The provider choice the job was assigned with, when it has fallbacks. |
 | `assigned_model` | string or null | The model of that choice. |
+| `outcome_note` | string or null | Omitted when absent. `no_changes` when the job is `done` and its stored diff is empty and `allow_empty` is false. |
 | `warnings` | array of strings | Submit replies only. |
 `HostStats`: `load1`, `load5`, `load15`, `mem_total_kb`, `mem_available_kb`, `swap_used_kb`, `disk_free_bytes` and `disk_total_bytes` (both optional; they describe the agent's work filesystem and are omitted when it cannot be read), `uptime_secs`. Host numbers are read from `/proc`; non-Linux agents report no host stats.
 

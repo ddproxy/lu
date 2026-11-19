@@ -108,9 +108,16 @@ are retried. The next failure past the limit ends the job.
 | `leased`, `running`, `needs_input` | `cancel_requested` is set. The job stays in its state until the agent stops the harness and reports `Cancelled`; then it becomes `cancelled` and dependents fail. |
 | `done`, `failed`, `cancelled` | Refused with `409 conflict`. |
 
+## Empty diffs
+
+A `done` job whose stored diff is empty gets `outcome_note: "no_changes"` in its `JobView`. It
+prints as `no changes` in `lu ls` and `lu show` and is marked in the TUI job list. Set
+`allow_empty: true` (`lu submit --allow-empty`) to suppress the note. The controller counts noted
+jobs in `lu_jobs_no_changes_total`, reset on restart.
+
 ## Observing progress
 
-`lu show` prints the current row, including `attempt`, `epoch`, `failure`, `waiting` and `summary`.
+`lu show` prints the current row, including `attempt`, `epoch`, `failure`, `waiting`, `summary` and `outcome_note`.
 `lu logs --follow` streams log chunks and stops when the controller reports a terminal state in
 the log response; it exits `0` for `done` and `3` for `failed` or `cancelled`. `lu submit --wait`
 uses the same exit convention.

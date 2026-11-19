@@ -59,6 +59,9 @@ pub struct SubmitArgs {
     /// Do not apply dependency diffs to this job's tree.
     #[arg(long)]
     pub no_stack: bool,
+    /// Expect an empty diff, so no `no changes` note is added when the job is done.
+    #[arg(long)]
+    pub allow_empty: bool,
     /// Run only on a node with this label (repeatable).
     #[arg(long = "require")]
     pub require: Vec<String>,
@@ -268,6 +271,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         idempotency_key: args.key,
         after,
         stack_dependencies: !args.no_stack,
+        allow_empty: args.allow_empty,
         requires: args.require,
         fallbacks: args.fallbacks,
     };
@@ -418,11 +422,12 @@ async fn ls_inner(args: LsArgs, config: &Path, json: bool) -> Result<ExitCode, S
                     job.waiting_on.len().to_string()
                 },
                 time(job.created_at),
+                outcome_text(job.outcome_note.as_deref()),
             ]
         })
         .collect();
     print_table(
-        &["ID", "STATE", "NODE", "ATTEMPT", "AFTER", "CREATED"],
+        &["ID", "STATE", "NODE", "ATTEMPT", "AFTER", "CREATED", "NOTE"],
         rows,
     );
     Ok(ExitCode::SUCCESS)
@@ -1012,6 +1017,7 @@ fn print_job(view: &JobView) {
                 .map(display_field)
                 .unwrap_or_else(|| "-".to_owned()),
         ),
+        ("outcome_note", outcome_text(view.outcome_note.as_deref())),
     ];
     print_pairs(&rows);
 }
@@ -1360,6 +1366,14 @@ pub(crate) fn failure_name(value: Option<FailureClass>) -> String {
         Some(FailureClass::Dependency) => "dependency".to_owned(),
         Some(FailureClass::Conflict) => "conflict".to_owned(),
         None => "-".to_owned(),
+    }
+}
+
+/// The controller sends a small fixed set of notes; only display the one we understand.
+pub(crate) fn outcome_text(note: Option<&str>) -> String {
+    match note {
+        Some("no_changes") => "no changes".to_owned(),
+        _ => "-".to_owned(),
     }
 }
 

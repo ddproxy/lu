@@ -483,6 +483,7 @@ impl<S: Store> Model<S> {
             after: Vec::new(),
             base_commit: None,
             stack_dependencies: true,
+            allow_empty: false,
             requires: Vec::new(),
             fallbacks: Vec::new(),
         }
@@ -907,7 +908,7 @@ impl<S: Store> Model<S> {
             name.file_name()
         ));
         self.dirty.insert(id.clone());
-        let result = self.store.record_artifact(&id, epoch, name);
+        let result = self.store.record_artifact(&id, epoch, name, 0);
         if stale {
             assert_eq!(result.unwrap_err(), StoreError::StaleEpoch);
             return;

@@ -185,6 +185,7 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         idempotency_key: key.map(|s| s.to_owned()),
         after: Vec::new(),
         stack_dependencies: true,
+        allow_empty: false,
         requires: Vec::new(),
         fallbacks: Vec::new(),
     }
@@ -714,6 +715,82 @@ async fn agent_happy_path_and_forbidden_cross_node_and_stale_epoch() {
     assert_eq!(status(&r), 200, "{r}");
     let r = raw_request(srv.addr, &format!("POST /v1/nodes/node-a/undrain HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n")).await;
     assert_eq!(status(&r), 200, "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+async fn finish_with_empty_diff(srv: &TestServer, allow_empty: bool) -> (String, String) {
+    let mut spec = sample_spec(None);
+    spec.allow_empty = allow_empty;
+    let r = submit_spec(srv.addr, &spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let j: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = j["id"].as_str().unwrap().to_owned();
+
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let assign = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign")
+        .unwrap();
+    assert_eq!(assign["job_id"], id);
+    let epoch = assign["epoch"].as_u64().unwrap();
+    let start = json!({"epoch": epoch}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", start.len(), start);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let req = format!("PUT /v1/agent/jobs/{id}/artifacts/diff.patch?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: 0\r\n\r\n");
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let r = complete_as(srv, AGENT_A_TOKEN, &id, epoch, json!("done"), None).await;
+    assert_eq!(status(&r), 200, "{r}");
+    (id, body_str(&r).to_owned())
+}
+
+async fn no_changes_metric(srv: &TestServer) -> String {
+    let r = raw_request(srv.addr, &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    body_str(&r)
+        .lines()
+        .find(|line| line.starts_with("lu_jobs_no_changes_total "))
+        .unwrap_or_else(|| panic!("missing counter: {}", body_str(&r)))
+        .to_owned()
+}
+
+#[tokio::test]
+async fn an_empty_diff_on_done_sets_the_note_and_counts_it() {
+    let srv = start_server().await;
+    let (id, completed) = finish_with_empty_diff(&srv, false).await;
+    let view: serde_json::Value = serde_json::from_str(&completed).unwrap();
+    assert_eq!(view["state"], "done", "{completed}");
+    assert_eq!(view["outcome_note"], "no_changes", "{completed}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let view: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(view["outcome_note"], "no_changes", "{r}");
+    assert_eq!(no_changes_metric(&srv).await, "lu_jobs_no_changes_total 1");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn allow_empty_suppresses_the_note_and_the_count() {
+    let srv = start_server().await;
+    let (id, completed) = finish_with_empty_diff(&srv, true).await;
+    let view: serde_json::Value = serde_json::from_str(&completed).unwrap();
+    assert!(view.get("outcome_note").is_none(), "{completed}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let view: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert!(view.get("outcome_note").is_none(), "{r}");
+    assert_eq!(no_changes_metric(&srv).await, "lu_jobs_no_changes_total 0");
 
     let _ = srv.shutdown.send(());
 }

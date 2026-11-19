@@ -698,6 +698,7 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
         idempotency_key: optional_string(args, "key"),
         after,
         stack_dependencies: true,
+        allow_empty: false,
         requires: Vec::new(),
         fallbacks: Vec::new(),
     };

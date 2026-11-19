@@ -28,6 +28,7 @@ fn spec() -> JobSpec {
         idempotency_key: Some("ticket:42".to_owned()),
         after: vec![JobId::new()],
         stack_dependencies: true,
+        allow_empty: false,
         requires: vec!["php8.3".to_owned()],
         fallbacks: vec![lu_proto::Choice {
             provider: "peer-b".to_owned(),
