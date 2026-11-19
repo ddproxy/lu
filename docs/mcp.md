@@ -23,8 +23,8 @@ sequenceDiagram
 | Versions | `2024-11-05`, `2025-03-26`, `2025-06-18` (default). An unknown requested version falls back to the newest. |
 | Methods | `initialize`, `ping`, `tools/list`, `tools/call`. Calls before `initialize` get `-32002`. |
 | Notifications | Requests without `id` get no reply, including `notifications/initialized`. |
-| Argument faults | JSON-RPC `-32602` (unknown argument, missing argument, bad type or bound). |
-| Tool failures | A normal result with `isError: true`; the text and `structuredContent` carry the reason. |
+| Argument faults | JSON-RPC `-32602` (unknown argument, missing argument, bad type or shape). |
+| Tool failures | A normal result with `isError: true`; the text and `structuredContent` carry the reason. Spec bounds use the CLI's validation text. |
 | Other errors | `-32601` unknown method, `-32600` invalid request, `-32700` parse error. |
 
 A successful reply has this shape:
@@ -42,7 +42,9 @@ Worked example — initialize and list tools:
 
 ## Tools
 
-`readOnlyHint: true` is set on the seven read tools. Only `lu_cancel`, `lu_drain` and `lu_undrain` carry `destructiveHint: true`.
+`readOnlyHint: true` is set on the eight read tools. Only `lu_cancel`, `lu_drain` and `lu_undrain` carry `destructiveHint: true`.
+
+Every argument is listed below; `?` marks an optional argument.
 
 | Tool | Arguments | Effect |
 | --- | --- | --- |
@@ -50,17 +52,20 @@ Worked example — initialize and list tools:
 | `lu_jobs` | `state?`, `limit?` 1–100, default 20 | Compact newest-first job list. |
 | `lu_job` | `id` | Full job detail, spec and artifacts. |
 | `lu_logs` | `id`, `lines?` 1–400, default 80 | Log tail with escape sequences removed. |
-| `lu_nodes` | none | Node states, providers, load and cordons. |
+| `lu_nodes` | none | Node states, providers, load, labels, version and disk-free stats. |
+| `lu_node` | `node` | One node's state, labels, version, providers, load, uptime and disk-free stats. |
 | `lu_graph` | none | Dependency graph of unfinished jobs. |
 | `lu_result` | `id`, `offset?`, `max_bytes?` 1–32768, default 24576 | Summary, report, diff stats and a page of diff text. |
-| `lu_submit` | `repo`, `ref`, `task`; `provider?`, `model?`, `after?`, `after_keys?`, `timeout_secs?`, `idle_timeout_secs?`, `key?` | Submit one job. |
-| `lu_submit_many` | `jobs[]` 1–12; each with `name`, `repo`, `ref`, `task`, optional `provider`, `model`, `timeout_secs`, `idle_timeout_secs`, `key`, `after_names?` | Submit named jobs in order. |
+| `lu_submit` | `repo`, `ref`, `task`; `provider?`, `model?`, `require?`, `fallbacks?`, `no_stack?`, `after?`, `after_keys?`, `timeout?`, `timeout_secs?`, `idle_timeout?`, `idle_timeout_secs?`, `harness?`, `key?` | Submit one job. |
+| `lu_submit_many` | `jobs[]` 1–12; each with `name`, `repo`, `ref`, `task`, `provider?`, `model?`, `require?`, `fallbacks?`, `no_stack?`, `timeout?`, `timeout_secs?`, `idle_timeout?`, `idle_timeout_secs?`, `harness?`, `key?`, `after_names?`, `after_keys?` | Submit named jobs in order. |
 | `lu_cancel` | `id` | Ask the controller to cancel a job. Destructive. |
-| `lu_retry` | `id`; `provider?`, `model?`, `after?`, `key?` | Resubmit a terminal job's spec as a new job. |
+| `lu_retry` | `id`; `provider?`, `model?`, `require?`, `fallbacks?`, `no_stack?`, `after?`, `after_keys?`, `timeout?`, `timeout_secs?`, `idle_timeout?`, `idle_timeout_secs?`, `harness?`, `key?` | Resubmit a terminal job's spec as a new job. |
 | `lu_drain` | `node` | Stop assigning new jobs to a node. Destructive. |
 | `lu_undrain` | `node` | Allow a drained node to take jobs again. Destructive. |
 
-Arrays `after`, `after_keys` and `after_names` hold at most 16 entries. `timeout_secs` is 1–86400 (default 3600); `idle_timeout_secs` is 1–86400. `task` is inline text, never a path.
+`require` holds at most 8 node labels. `fallbacks` holds at most 4 objects with a `provider` and optional `model`. `after`, `after_keys` and `after_names` hold at most 16 entries; `after_keys` resolves existing jobs by their idempotency key. Timeouts are 1–86400 seconds: `timeout_secs` defaults to 3600, and `timeout` wins when both spellings are present. `idle_timeout` wins over `idle_timeout_secs` likewise. `no_stack: true` sets `stack_dependencies` to false, and `harness` defaults to `opencode`. `task` is inline text, never a path.
+
+On `lu_retry`, absent fields inherit the source spec. Empty `require` or `fallbacks` clear those lists, and any `after` or `after_keys` argument replaces the dependencies.
 
 Worked example — submit one job:
 

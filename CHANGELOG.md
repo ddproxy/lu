@@ -5,6 +5,16 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- `lu mcp` write tools now accept the CLI's scheduling fields: `require`, `fallbacks`, `after_keys`, `no_stack`, `harness`, `timeout`/`timeout_secs` and `idle_timeout`/`idle_timeout_secs` on `lu_submit`, `lu_submit_many` and `lu_retry`. Bounds appear in `tools/list` and are enforced by the shared `JobSpec::validate`, so MCP returns the CLI's validation text.
+- `lu_nodes` and the new `lu_node` tool report node labels, version and disk-free stats from each node's stats endpoint.
+
+### Changed
+
+- `lu_retry` inherits absent fields from the source spec; empty `require` or `fallbacks` clear them and any `after` or `after_keys` replaces the dependencies.
+- MCP submissions reserve rate-limit budget only after arguments and the resolved spec validate.
+
 ## [0.2.0] - 2026-11-18
 
 ### Added

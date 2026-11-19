@@ -2,10 +2,11 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use lu_client::{ApiError, Client, JobView, ListNodes};
+use lu_client::{ApiError, Client, JobView, ListNodes, NodeStats, NodeView};
 use lu_proto::{
-    truncate_chars, ArtifactName, HarnessState, JobId, JobSpec, JobState, NodeName, ProviderState,
-    DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS,
+    truncate_chars, ArtifactName, Choice, HarnessState, JobId, JobSpec, JobState, NodeName,
+    ProviderState, DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_FALLBACKS, MAX_IDLE_TIMEOUT_SECS,
+    MAX_REQUIRES_LABELS, MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
 };
 use lu_tui::graph::{self, Graph};
 use serde_json::{json, Map, Value};
@@ -76,6 +77,8 @@ struct Field {
     max: Option<i64>,
     item: Option<&'static Field>,
     fields: Option<&'static [Field]>,
+    /// Bounds are advertised in the schema but enforced by `JobSpec::validate`.
+    spec_bounds: bool,
 }
 
 const fn required(key: &'static str, kind: &'static str, description: &'static str) -> Field {
@@ -90,6 +93,7 @@ const fn required(key: &'static str, kind: &'static str, description: &'static s
         max: None,
         item: None,
         fields: None,
+        spec_bounds: false,
     }
 }
 
@@ -105,6 +109,7 @@ const fn optional(key: &'static str, kind: &'static str, description: &'static s
         max: None,
         item: None,
         fields: None,
+        spec_bounds: false,
     }
 }
 
@@ -140,6 +145,7 @@ const fn array(
         max: Some(max),
         item: Some(item),
         fields: None,
+        spec_bounds: false,
     }
 }
 
@@ -155,7 +161,13 @@ const fn object_item(fields: &'static [Field]) -> Field {
         max: None,
         item: None,
         fields: Some(fields),
+        spec_bounds: false,
     }
+}
+
+const fn spec_bounds(mut field: Field) -> Field {
+    field.spec_bounds = true;
+    field
 }
 
 struct ToolDef {
@@ -167,6 +179,7 @@ struct ToolDef {
 }
 
 const ID_FIELD: Field = required("id", "string", "Job id");
+const NODE_FIELD: Field = required("node", "string", "Node name");
 static STRING_ITEM: Field = required("", "string", "");
 const AFTER_NAMES_FIELD: Field = array(
     "after_names",
@@ -176,6 +189,73 @@ const AFTER_NAMES_FIELD: Field = array(
     0,
     MAX_AFTER_JOBS as i64,
 );
+const fn with_default(mut field: Field, default: i64) -> Field {
+    field.default_int = Some(default);
+    field
+}
+
+const fn timeout_field(key: &'static str, default: bool) -> Field {
+    let field = spec_bounds(limited(
+        optional(key, "integer", "Job timeout in seconds"),
+        MIN_TIMEOUT_SECS as i64,
+        MAX_TIMEOUT_SECS as i64,
+    ));
+    if default {
+        with_default(field, DEFAULT_TIMEOUT_SECS as i64)
+    } else {
+        field
+    }
+}
+
+const fn idle_timeout_field(key: &'static str) -> Field {
+    spec_bounds(limited(
+        optional(
+            key,
+            "integer",
+            "Stop the harness after this many seconds without output",
+        ),
+        MIN_TIMEOUT_SECS as i64,
+        MAX_IDLE_TIMEOUT_SECS as i64,
+    ))
+}
+
+const TIMEOUT_SECS_FIELD: Field = timeout_field("timeout_secs", true);
+const TIMEOUT_FIELD: Field = timeout_field("timeout", false);
+const RETRY_TIMEOUT_SECS_FIELD: Field = timeout_field("timeout_secs", false);
+const RETRY_TIMEOUT_FIELD: Field = timeout_field("timeout", false);
+const IDLE_TIMEOUT_SECS_FIELD: Field = idle_timeout_field("idle_timeout_secs");
+const IDLE_TIMEOUT_FIELD: Field = idle_timeout_field("idle_timeout");
+const NO_STACK_FIELD: Field = optional(
+    "no_stack",
+    "boolean",
+    "Do not apply dependency diffs to this job's tree",
+);
+const HARNESS_FIELD: Field = optional("harness", "string", "Harness name");
+const REQUIRE_FIELD: Field = spec_bounds(array(
+    "require",
+    "Node labels required by this job, at most 8",
+    &STRING_ITEM,
+    false,
+    0,
+    MAX_REQUIRES_LABELS as i64,
+));
+static FALLBACK_FIELDS: &[Field] = &[
+    required("provider", "string", "Provider name"),
+    optional(
+        "model",
+        "string",
+        "Model name; reuses the primary model when absent",
+    ),
+];
+static FALLBACK_ITEM: Field = object_item(FALLBACK_FIELDS);
+const FALLBACKS_FIELD: Field = spec_bounds(array(
+    "fallbacks",
+    "Alternate providers in order, at most 4",
+    &FALLBACK_ITEM,
+    false,
+    0,
+    MAX_FALLBACKS as i64,
+));
 static JOB_FIELDS: &[Field] = &[
     required("name", "string", "Name used by later after_names entries"),
     required("repo", "string", "Repository URL or absolute local path"),
@@ -183,45 +263,39 @@ static JOB_FIELDS: &[Field] = &[
     required("task", "string", "Task text, never a path"),
     optional("provider", "string", "Provider name"),
     optional("model", "string", "Model name"),
-    bounded(
-        optional("timeout_secs", "integer", "Job timeout in seconds"),
-        1,
-        86_400,
-        DEFAULT_TIMEOUT_SECS as i64,
-    ),
-    limited(
-        optional(
-            "idle_timeout_secs",
-            "integer",
-            "Stop the harness after this many seconds without output",
-        ),
-        1,
-        86_400,
-    ),
+    REQUIRE_FIELD,
+    FALLBACKS_FIELD,
+    NO_STACK_FIELD,
+    TIMEOUT_SECS_FIELD,
+    TIMEOUT_FIELD,
+    IDLE_TIMEOUT_SECS_FIELD,
+    IDLE_TIMEOUT_FIELD,
+    HARNESS_FIELD,
     optional(
         "key",
         "string",
         "Idempotency key; derived from the spec when absent",
     ),
     AFTER_NAMES_FIELD,
+    AFTER_KEYS_FIELD,
 ];
 static JOB_ITEM: Field = object_item(JOB_FIELDS);
-const AFTER_FIELD: Field = array(
+const AFTER_FIELD: Field = spec_bounds(array(
     "after",
     "Job ids that must finish first",
     &STRING_ITEM,
     false,
     0,
     MAX_AFTER_JOBS as i64,
-);
-const AFTER_KEYS_FIELD: Field = array(
+));
+const AFTER_KEYS_FIELD: Field = spec_bounds(array(
     "after_keys",
     "Idempotency keys of jobs that must finish first",
     &STRING_ITEM,
     false,
     0,
     MAX_AFTER_JOBS as i64,
-);
+));
 
 const TOOLS: &[ToolDef] = &[
     ToolDef {
@@ -270,8 +344,15 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "lu_nodes",
-        description: "Node states, providers, load and cordons.",
+        description: "Node states, providers, load, labels and cordons.",
         fields: &[],
+        read_only: true,
+        destructive: false,
+    },
+    ToolDef {
+        name: "lu_node",
+        description: "One node's version, labels, providers and disk stats.",
+        fields: &[NODE_FIELD],
         read_only: true,
         destructive: false,
     },
@@ -291,23 +372,16 @@ const TOOLS: &[ToolDef] = &[
             required("task", "string", "Task text, never a path"),
             optional("provider", "string", "Provider name"),
             optional("model", "string", "Model name"),
+            REQUIRE_FIELD,
+            FALLBACKS_FIELD,
+            NO_STACK_FIELD,
             AFTER_FIELD,
             AFTER_KEYS_FIELD,
-            bounded(
-                optional("timeout_secs", "integer", "Job timeout in seconds"),
-                1,
-                86_400,
-                DEFAULT_TIMEOUT_SECS as i64,
-            ),
-            limited(
-                optional(
-                    "idle_timeout_secs",
-                    "integer",
-                    "Stop the harness after this many seconds without output",
-                ),
-                1,
-                86_400,
-            ),
+            TIMEOUT_SECS_FIELD,
+            TIMEOUT_FIELD,
+            IDLE_TIMEOUT_SECS_FIELD,
+            IDLE_TIMEOUT_FIELD,
+            HARNESS_FIELD,
             optional(
                 "key",
                 "string",
@@ -370,7 +444,16 @@ const TOOLS: &[ToolDef] = &[
             ID_FIELD,
             optional("provider", "string", "Replace the provider name"),
             optional("model", "string", "Replace the model name"),
+            REQUIRE_FIELD,
+            FALLBACKS_FIELD,
+            NO_STACK_FIELD,
             AFTER_FIELD,
+            AFTER_KEYS_FIELD,
+            RETRY_TIMEOUT_SECS_FIELD,
+            RETRY_TIMEOUT_FIELD,
+            IDLE_TIMEOUT_SECS_FIELD,
+            IDLE_TIMEOUT_FIELD,
+            HARNESS_FIELD,
             optional("key", "string", "Idempotency key for the new job"),
         ],
         read_only: false,
@@ -379,14 +462,14 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "lu_drain",
         description: "Stop assigning new jobs to a node.",
-        fields: &[required("node", "string", "Node name")],
+        fields: &[NODE_FIELD],
         read_only: false,
         destructive: true,
     },
     ToolDef {
         name: "lu_undrain",
         description: "Allow a drained node to take jobs again.",
-        fields: &[required("node", "string", "Node name")],
+        fields: &[NODE_FIELD],
         read_only: false,
         destructive: true,
     },
@@ -476,18 +559,24 @@ fn validate_value(field: &Field, value: &Value, label: &str) -> Result<Value, To
             .as_str()
             .map(|text| Value::String(text.to_owned()))
             .ok_or_else(|| ToolError::Args(format!("{label} must be a string"))),
+        "boolean" => value
+            .as_bool()
+            .map(Value::Bool)
+            .ok_or_else(|| ToolError::Args(format!("{label} must be a boolean"))),
         "integer" => {
             let number = value
                 .as_i64()
                 .ok_or_else(|| ToolError::Args(format!("{label} must be an integer")))?;
-            if let Some(min) = field.min {
-                if number < min {
-                    return Err(ToolError::Args(format!("{label} must be at least {min}")));
+            if !field.spec_bounds {
+                if let Some(min) = field.min {
+                    if number < min {
+                        return Err(ToolError::Args(format!("{label} must be at least {min}")));
+                    }
                 }
-            }
-            if let Some(max) = field.max {
-                if number > max {
-                    return Err(ToolError::Args(format!("{label} must be at most {max}")));
+                if let Some(max) = field.max {
+                    if number > max {
+                        return Err(ToolError::Args(format!("{label} must be at most {max}")));
+                    }
                 }
             }
             Ok(json!(number))
@@ -496,18 +585,20 @@ fn validate_value(field: &Field, value: &Value, label: &str) -> Result<Value, To
             let items = value
                 .as_array()
                 .ok_or_else(|| ToolError::Args(format!("{label} must be an array")))?;
-            if let Some(min) = field.min {
-                if (items.len() as i64) < min {
-                    return Err(ToolError::Args(format!(
-                        "{label} must have at least {min} items"
-                    )));
+            if !field.spec_bounds {
+                if let Some(min) = field.min {
+                    if (items.len() as i64) < min {
+                        return Err(ToolError::Args(format!(
+                            "{label} must have at least {min} items"
+                        )));
+                    }
                 }
-            }
-            if let Some(max) = field.max {
-                if items.len() as i64 > max {
-                    return Err(ToolError::Args(format!(
-                        "{label} must have at most {max} items"
-                    )));
+                if let Some(max) = field.max {
+                    if items.len() as i64 > max {
+                        return Err(ToolError::Args(format!(
+                            "{label} must have at most {max} items"
+                        )));
+                    }
                 }
             }
             let item = field.item.expect("array fields declare an item schema");
@@ -522,7 +613,7 @@ fn validate_value(field: &Field, value: &Value, label: &str) -> Result<Value, To
             value,
             label,
         ),
-        _ => unreachable!("tool fields are declared as string, integer, array or object"),
+        _ => unreachable!("tool fields are declared as string, boolean, integer, array or object"),
     }
 }
 
@@ -587,6 +678,7 @@ pub async fn call(host: &Host, name: &str, args: &Value) -> Result<ToolOutput, T
         "lu_job" => job(host, &args).await?,
         "lu_logs" => logs(host, &args).await?,
         "lu_nodes" => nodes(host).await?,
+        "lu_node" => node(host, &args).await?,
         "lu_graph" => graph(host).await?,
         "lu_submit" => submit(host, &args).await?,
         "lu_submit_many" => submit_many(host, &args).await?,
@@ -680,29 +772,63 @@ async fn resolve_after(
     Ok(out)
 }
 
-fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
-    let timeout = args
-        .get("timeout_secs")
+/// The CLI spelling wins when both names are present. Negative values become zero so that the
+/// shared validator reports the timeout range with the same text as the CLI.
+fn spec_timeout(args: &Value) -> Option<u64> {
+    args.get("timeout")
+        .or_else(|| args.get("timeout_secs"))
         .and_then(Value::as_i64)
-        .unwrap_or(DEFAULT_TIMEOUT_SECS as i64) as u64;
+        .map(|secs| u64::try_from(secs).unwrap_or(0))
+}
+
+fn spec_idle_timeout(args: &Value) -> Option<u64> {
+    args.get("idle_timeout")
+        .or_else(|| args.get("idle_timeout_secs"))
+        .and_then(Value::as_i64)
+        .map(|secs| u64::try_from(secs).unwrap_or(0))
+}
+
+fn spec_fallbacks(args: &Value) -> Vec<Choice> {
+    args.get("fallbacks")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| Choice {
+                    provider: item["provider"].as_str().unwrap_or_default().to_owned(),
+                    model: item.get("model").and_then(Value::as_str).map(str::to_owned),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn validate_spec(spec: &JobSpec) -> Result<(), ToolError> {
+    spec.validate()
+        .map_err(|error| ToolError::Failed(error.to_string()))
+}
+
+fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
     let spec = JobSpec {
         repo: args["repo"].as_str().unwrap_or_default().to_owned(),
         git_ref: args["ref"].as_str().unwrap_or_default().to_owned(),
         base_commit: None,
         task: args["task"].as_str().unwrap_or_default().to_owned(),
-        harness: "opencode".to_owned(),
+        harness: optional_string(args, "harness").unwrap_or_else(|| "opencode".to_owned()),
         provider: optional_string(args, "provider"),
         model: optional_string(args, "model"),
-        timeout_secs: timeout,
-        idle_timeout_secs: args.get("idle_timeout_secs").and_then(Value::as_u64),
+        timeout_secs: spec_timeout(args).unwrap_or(DEFAULT_TIMEOUT_SECS),
+        idle_timeout_secs: spec_idle_timeout(args),
         idempotency_key: optional_string(args, "key"),
         after,
-        stack_dependencies: true,
-        requires: Vec::new(),
-        fallbacks: Vec::new(),
+        stack_dependencies: !args
+            .get("no_stack")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        requires: field_strings(args, "require"),
+        fallbacks: spec_fallbacks(args),
     };
-    spec.validate()
-        .map_err(|error| ToolError::Failed(format!("invalid job spec: {error}")))?;
+    validate_spec(&spec)?;
     Ok(spec)
 }
 
@@ -782,6 +908,13 @@ fn submit_output(view: &JobView) -> ToolOutput {
                 "task": cap_chars(&clean(&view.spec.task), 2000),
                 "provider": view.spec.provider.as_deref().map(clean),
                 "model": view.spec.model.as_deref().map(clean),
+                "harness": clean(&view.spec.harness),
+                "requires": view.spec.requires.iter().map(|label| clean(label)).collect::<Vec<_>>(),
+                "fallbacks": view.spec.fallbacks.iter().map(|choice| json!({
+                    "provider": clean(&choice.provider),
+                    "model": choice.model.as_deref().map(clean)
+                })).collect::<Vec<_>>(),
+                "stack_dependencies": view.spec.stack_dependencies,
                 "timeout_secs": view.spec.timeout_secs,
                 "idle_timeout_secs": view.spec.idle_timeout_secs,
                 "idempotency_key": view.spec.idempotency_key.as_deref().map(clean)
@@ -794,7 +927,6 @@ fn submit_output(view: &JobView) -> ToolOutput {
 }
 
 async fn submit(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
-    reserve(host, 1)?;
     let client = connected(host)?;
     let ids = parse_ids(&field_strings(args, "after"))?;
     let keys = field_strings(args, "after_keys");
@@ -803,6 +935,7 @@ async fn submit(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     if spec.idempotency_key.is_none() {
         spec.idempotency_key = Some(derived_key(&spec));
     }
+    reserve(host, 1)?;
     let view = client.submit(&spec).await.map_err(failure)?;
     Ok(submit_output(&view))
 }
@@ -810,6 +943,7 @@ async fn submit(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
 struct BatchEntry {
     name: String,
     after_names: Vec<String>,
+    after_keys: Vec<String>,
     spec: JobSpec,
 }
 
@@ -889,16 +1023,21 @@ async fn submit_many(host: &Host, args: &Value) -> Result<ToolOutput, ToolError>
     for entry in jobs {
         let name = entry["name"].as_str().unwrap_or_default().to_owned();
         let after_names = field_strings(entry, "after_names");
+        let after_keys = field_strings(entry, "after_keys");
         let spec = build_spec(entry, Vec::new())?;
         entries.push(BatchEntry {
             name,
             after_names,
+            after_keys,
             spec,
         });
     }
     preflight(&entries)?;
-    reserve(host, entries.len())?;
     let client = connected(host)?;
+    for entry in &mut entries {
+        entry.spec.after = resolve_after(client, &entry.spec.after, &entry.after_keys).await?;
+    }
+    reserve(host, entries.len())?;
     let mut ids_by_name: std::collections::HashMap<String, JobId> =
         std::collections::HashMap::new();
     let mut submitted = Vec::new();
@@ -915,12 +1054,15 @@ async fn submit_many(host: &Host, args: &Value) -> Result<ToolOutput, ToolError>
             }
         }
         let mut spec = entry.spec.clone();
-        spec.after = after;
+        for id in after {
+            if !spec.after.contains(&id) {
+                spec.after.push(id);
+            }
+        }
         if spec.idempotency_key.is_none() {
             spec.idempotency_key = Some(derived_key(&spec));
         }
-        spec.validate()
-            .map_err(|error| ToolError::Failed(format!("invalid job spec: {error}")))?;
+        validate_spec(&spec)?;
         match client.submit(&spec).await {
             Ok(view) => {
                 ids_by_name.insert(entry.name.clone(), view.id.clone());
@@ -1114,7 +1256,6 @@ async fn cancel(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
 }
 
 async fn retry(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
-    reserve(host, 1)?;
     let id = job_id(args)?;
     let client = connected(host)?;
     let view = client.get_job(&id).await.map_err(failure)?;
@@ -1132,12 +1273,31 @@ async fn retry(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     if let Some(model) = optional_string(args, "model") {
         spec.model = Some(model);
     }
-    if args.get("after").is_some() {
-        spec.after = parse_ids(&field_strings(args, "after"))?;
+    if args.get("require").is_some() {
+        spec.requires = field_strings(args, "require");
+    }
+    if args.get("fallbacks").is_some() {
+        spec.fallbacks = spec_fallbacks(args);
+    }
+    if let Some(no_stack) = args.get("no_stack").and_then(Value::as_bool) {
+        spec.stack_dependencies = !no_stack;
+    }
+    if args.get("after").is_some() || args.get("after_keys").is_some() {
+        let ids = parse_ids(&field_strings(args, "after"))?;
+        spec.after = resolve_after(client, &ids, &field_strings(args, "after_keys")).await?;
+    }
+    if let Some(timeout) = spec_timeout(args) {
+        spec.timeout_secs = timeout;
+    }
+    if args.get("idle_timeout").is_some() || args.get("idle_timeout_secs").is_some() {
+        spec.idle_timeout_secs = spec_idle_timeout(args);
+    }
+    if let Some(harness) = optional_string(args, "harness") {
+        spec.harness = harness;
     }
     spec.idempotency_key = optional_string(args, "key");
-    spec.validate()
-        .map_err(|error| ToolError::Failed(format!("invalid job spec: {error}")))?;
+    validate_spec(&spec)?;
+    reserve(host, 1)?;
     let view = client.submit(&spec).await.map_err(failure)?;
     Ok(submit_output(&view))
 }
@@ -1372,17 +1532,90 @@ async fn logs(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     })
 }
 
+/// Disk fields live in the node's host stats. Older controllers omit them entirely.
+fn disk_numbers(value: &Value) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let host = value.get("host");
+    let number = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .or_else(|| host.and_then(|host| host.get(key)).and_then(Value::as_u64))
+    };
+    let free = number("disk_free_bytes");
+    let total = number("disk_total_bytes");
+    let percent = number("disk_free_percent").or_else(|| {
+        free.zip(total)
+            .and_then(|(free, total)| free.saturating_mul(100).checked_div(total))
+    });
+    (free, total, percent)
+}
+
+fn parse_node_stats(raw: &str) -> Result<NodeStats, ToolError> {
+    let value: Value = serde_json::from_str(raw).map_err(|error| {
+        ToolError::Failed(one_line(&format!("bad controller node stats: {error}")))
+    })?;
+    if value.is_null() {
+        return Ok(NodeStats::default());
+    }
+    serde_json::from_value(value).map_err(|error| {
+        ToolError::Failed(one_line(&format!("bad controller node stats: {error}")))
+    })
+}
+
+fn stats_value(stats: &NodeStats) -> Value {
+    stats
+        .host
+        .as_ref()
+        .map(|host| serde_json::to_value(host).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null)
+}
+
+/// Prefer the stats endpoint; older node-list replies may carry the disk fields directly.
+fn disk_numbers_for(
+    stats: Option<&NodeStats>,
+    item: Option<&Value>,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    stats
+        .map(|stats| disk_numbers(&stats_value(stats)))
+        .filter(|numbers| numbers.0.is_some() || numbers.1.is_some())
+        .or_else(|| item.map(disk_numbers))
+        .unwrap_or_default()
+}
+
+/// Accepts the bare array the controller sends and the older `{"nodes": [...]}` wrapper.
+fn node_items(body: &Value) -> Vec<Value> {
+    match body {
+        Value::Array(items) => items.clone(),
+        other => other["nodes"].as_array().cloned().unwrap_or_default(),
+    }
+}
+
+fn provider_rows(node: &NodeView) -> Vec<Value> {
+    node.providers
+        .iter()
+        .map(|provider| {
+            let state = match provider.state {
+                ProviderState::Ok => "ok",
+                ProviderState::Cooling => "cooling",
+                ProviderState::Disabled => "disabled",
+                ProviderState::Unknown => "unknown",
+            };
+            json!({
+                "name": clean(&provider.name),
+                "state": state,
+                "cooling_secs": provider.soonest_secs
+            })
+        })
+        .collect()
+}
+
 async fn nodes(host: &Host) -> Result<ToolOutput, ToolError> {
     let client = connected(host)?;
     let raw = client.nodes_raw().await.map_err(failure)?;
     let body: Value = serde_json::from_str(&raw).map_err(|error| {
         ToolError::Failed(one_line(&format!("bad controller node reply: {error}")))
     })?;
-    // The controller answers with a bare array; older fixtures wrapped it in {"nodes": [...]}.
-    let items: Vec<Value> = match &body {
-        Value::Array(items) => items.clone(),
-        other => other["nodes"].as_array().cloned().unwrap_or_default(),
-    };
+    let items = node_items(&body);
     let list: ListNodes = serde_json::from_value(json!({ "nodes": items })).map_err(|error| {
         ToolError::Failed(one_line(&format!("bad controller node reply: {error}")))
     })?;
@@ -1390,9 +1623,10 @@ async fn nodes(host: &Host) -> Result<ToolOutput, ToolError> {
     let mut rows = Vec::new();
     let mut lines = Vec::new();
     for node in &list.nodes {
-        let cordons = items
+        let item = items
             .iter()
-            .find(|item| item["name"].as_str() == Some(node.name.as_str()))
+            .find(|item| item["name"].as_str() == Some(node.name.as_str()));
+        let cordons = item
             .and_then(|item| item["cordons"].as_array())
             .map(|items| {
                 items
@@ -1402,6 +1636,12 @@ async fn nodes(host: &Host) -> Result<ToolOutput, ToolError> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let stats = client
+            .node_stats_raw(&node.name)
+            .await
+            .ok()
+            .and_then(|raw| parse_node_stats(&raw).ok());
+        let (disk_free, disk_total, disk_percent) = disk_numbers_for(stats.as_ref(), item);
         let state = if node.draining {
             "drained"
         } else if now.saturating_sub(node.last_seen) > STALE_AFTER_SECS {
@@ -1411,41 +1651,33 @@ async fn nodes(host: &Host) -> Result<ToolOutput, ToolError> {
         } else {
             "idle"
         };
-        let providers = node
-            .providers
-            .iter()
-            .map(|provider| {
-                let state = match provider.state {
-                    ProviderState::Ok => "ok",
-                    ProviderState::Cooling => "cooling",
-                    ProviderState::Disabled => "disabled",
-                    ProviderState::Unknown => "unknown",
-                };
-                json!({
-                    "name": clean(&provider.name),
-                    "state": state,
-                    "cooling_secs": provider.soonest_secs
-                })
-            })
-            .collect::<Vec<_>>();
+        let providers = provider_rows(node);
         let row = json!({
             "name": clean(node.name.as_str()),
             "state": state,
             "age_secs": now.saturating_sub(node.last_seen),
             "version": node.version.as_deref().map(clean),
+            "labels": node.labels.iter().map(|label| clean(label)).collect::<Vec<_>>(),
             "providers": providers,
             "load1": node.load1,
             "mem_available_kb": node.mem_available_kb,
             "mem_total_kb": node.mem_total_kb,
+            "disk_free_bytes": disk_free,
+            "disk_total_bytes": disk_total,
+            "disk_free_percent": disk_percent,
             "stuck": node.stuck,
             "cordons": cordons
         });
         lines.push(format!(
-            "{} {} age={}s version={} providers={} load1={} mem={}/{} stuck={} cordons={}",
+            "{} {} age={}s version={} labels={} disk_free={}/{} ({}%) providers={} load1={} mem={}/{} stuck={} cordons={}",
             row["name"],
             row["state"],
             row["age_secs"],
             row["version"],
+            row["labels"],
+            row["disk_free_bytes"],
+            row["disk_total_bytes"],
+            row["disk_free_percent"],
             row["providers"],
             row["load1"],
             row["mem_available_kb"],
@@ -1459,6 +1691,96 @@ async fn nodes(host: &Host) -> Result<ToolOutput, ToolError> {
         text: lines.join("\n"),
         structured: json!({"nodes": rows}),
     })
+}
+
+async fn node(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
+    let client = connected(host)?;
+    let name = NodeName::parse(args["node"].as_str().unwrap_or_default())
+        .map_err(|error| ToolError::Args(format!("bad node name: {error}")))?;
+    let raw = client.nodes_raw().await.map_err(failure)?;
+    let body: Value = serde_json::from_str(&raw).map_err(|error| {
+        ToolError::Failed(one_line(&format!("bad controller node reply: {error}")))
+    })?;
+    let items = node_items(&body);
+    let list: ListNodes = serde_json::from_value(json!({ "nodes": items })).map_err(|error| {
+        ToolError::Failed(one_line(&format!("bad controller node reply: {error}")))
+    })?;
+    let view = list
+        .nodes
+        .iter()
+        .find(|node| node.name == name)
+        .ok_or_else(|| ToolError::Failed(format!("unknown node: {}", clean(name.as_str()))))?;
+    let item = items
+        .iter()
+        .find(|item| item["name"].as_str() == Some(name.as_str()));
+    let cordons = item
+        .and_then(|item| item["cordons"].as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(clean)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let stats_raw = client.node_stats_raw(&name).await.map_err(failure)?;
+    let stats = parse_node_stats(&stats_raw)?;
+    let (disk_free, disk_total, disk_percent) = disk_numbers_for(Some(&stats), item);
+
+    let now = unix_now();
+    let state = if view.draining {
+        "drained"
+    } else if now.saturating_sub(view.last_seen) > STALE_AFTER_SECS {
+        "stale"
+    } else if view.harness == Some(HarnessState::Busy) {
+        "busy"
+    } else {
+        "idle"
+    };
+    let row = json!({
+        "name": clean(name.as_str()),
+        "state": state,
+        "age_secs": now.saturating_sub(view.last_seen),
+        "version": view.version.as_deref().map(clean),
+        "labels": view.labels.iter().map(|label| clean(label)).collect::<Vec<_>>(),
+        "providers": provider_rows(view),
+        "load1": stats.host.as_ref().map(|host| host.load1),
+        "mem_available_kb": stats.host.as_ref().map(|host| host.mem_available_kb),
+        "mem_total_kb": stats.host.as_ref().map(|host| host.mem_total_kb),
+        "uptime_secs": stats.host.as_ref().map(|host| host.uptime_secs),
+        "disk_free_bytes": disk_free,
+        "disk_total_bytes": disk_total,
+        "disk_free_percent": disk_percent,
+        "running_jobs": stats.jobs.len(),
+        "stuck": view.stuck,
+        "cordons": cordons
+    });
+    let mut structured = row.clone();
+    structured
+        .as_object_mut()
+        .expect("row is an object")
+        .insert("node".into(), row.clone());
+    let text = format!(
+        "{} {} age={}s version={} labels={} disk_free={}/{} ({}%) providers={} load1={} mem={}/{} uptime={}s jobs={} stuck={} cordons={}",
+        row["name"],
+        row["state"],
+        row["age_secs"],
+        row["version"],
+        row["labels"],
+        row["disk_free_bytes"],
+        row["disk_total_bytes"],
+        row["disk_free_percent"],
+        row["providers"],
+        row["load1"],
+        row["mem_available_kb"],
+        row["mem_total_kb"],
+        row["uptime_secs"],
+        row["running_jobs"],
+        row["stuck"],
+        row["cordons"]
+    );
+    Ok(ToolOutput { text, structured })
 }
 
 async fn graph(host: &Host) -> Result<ToolOutput, ToolError> {

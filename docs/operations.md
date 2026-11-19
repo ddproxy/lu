@@ -421,21 +421,20 @@ The job list uses the same colours. The graph shows at most 6 components and 40 
 
 `lu mcp` serves newline-delimited JSON-RPC 2.0 on stdio, using the same operator connection settings as the CLI. A controller that is unreachable at startup does not stop the server: every call returns an `isError` result with the connection error. The operator token is used only for controller requests and is never included in tool results.
 
-Read-only tools are `lu_status`, `lu_jobs`, `lu_job`, `lu_logs`, `lu_nodes` and `lu_graph`. They are advertised with `readOnlyHint: true`.
+Read-only tools are `lu_status`, `lu_jobs`, `lu_job`, `lu_logs`, `lu_nodes`, `lu_node`, `lu_graph` and `lu_result`. They are advertised with `readOnlyHint: true`. `lu_nodes` and `lu_node` include labels, version and disk-free stats; `lu_result` returns a finished job's summary, report, diff stats and one page of the diff.
 
 Write tools:
 
 | Tool | Effect |
 | --- | --- |
-| `lu_submit` | Submit one job. Takes `repo`, `ref`, inline `task`, and optional `provider`, `model`, `after`, `after_keys`, `timeout_secs`, `idle_timeout_secs`, `key`. |
-| `lu_submit_many` | Submit up to 12 named jobs in order. Each job may use `after_names` to depend on earlier jobs in the same call. |
-| `lu_result` | Return a finished job's summary, report, diff stats and one page of the diff. |
+| `lu_submit` | Submit one job. Takes `repo`, `ref`, inline `task`, and optional `provider`, `model`, `require`, `fallbacks`, `after`, `after_keys`, `no_stack`, `harness`, `timeout`/`timeout_secs`, `idle_timeout`/`idle_timeout_secs`, `key`. |
+| `lu_submit_many` | Submit up to 12 named jobs in order. Each job accepts the same spec fields and may use `after_names` to depend on earlier jobs in the same call. |
 | `lu_cancel` | Ask the controller to cancel a job. Destructive. |
-| `lu_retry` | Resubmit a terminal job's spec as a new job. Optional `provider`, `model`, `after` and `key`. |
+| `lu_retry` | Resubmit a terminal job's spec as a new job. Optional `provider`, `model`, `require`, `fallbacks`, `after`, `after_keys`, `no_stack`, `harness`, `timeout`/`timeout_secs`, `idle_timeout`/`idle_timeout_secs`, `key`. |
 | `lu_drain` | Stop assigning new jobs to a node. Destructive. |
 | `lu_undrain` | Let a drained node take jobs again. Destructive. |
 
-`lu_submit` derives an idempotency key when `key` is absent: `mcp-` plus 16 hex characters of SHA-256 over the spec without its key. Repeating the same submission therefore targets the same job. `lu_retry` copies the old spec but does not derive a key; supply `key` to make the retry idempotent.
+`lu_submit` derives an idempotency key when `key` is absent: `mcp-` plus 16 hex characters of SHA-256 over the spec without its key. Repeating the same submission therefore targets the same job. `lu_retry` copies absent fields from the old spec but does not derive a key; empty `require` or `fallbacks` clear them, and any `after` or `after_keys` replaces the dependencies. Supply `key` to make the retry idempotent.
 
 `lu_submit_many` validates every name before sending anything. Empty or duplicate names, unknown `after_names`, references to later jobs and cycles are rejected without a partial submission. If the controller fails partway through, the error result lists the jobs that were submitted and those that were not.
 

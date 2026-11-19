@@ -177,12 +177,12 @@ claude mcp add lu -- lu mcp
 
 The server uses the operator connection settings above. A connection failure at startup is reported by each tool call as an `isError` result, so an agent can see why the controller is unavailable.
 
-Read tools: `lu_status`, `lu_jobs`, `lu_job`, `lu_logs`, `lu_nodes`, `lu_graph`.
+Read tools: `lu_status`, `lu_jobs`, `lu_job`, `lu_logs`, `lu_nodes`, `lu_node`, `lu_graph`, `lu_result`.
 
-Write tools: `lu_submit`, `lu_submit_many`, `lu_result`, `lu_cancel`, `lu_retry`, `lu_drain`, `lu_undrain`.
+Write tools: `lu_submit`, `lu_submit_many`, `lu_cancel`, `lu_retry`, `lu_drain`, `lu_undrain`.
 
-- `lu_submit` takes `repo`, `ref` and inline `task` text, plus optional `provider`, `model`, `after`, `after_keys`, `timeout_secs`, `idle_timeout_secs` and `key`. When `key` is absent the server derives `mcp-` followed by 16 hex characters of the spec's SHA-256, so repeating the same submission is idempotent.
-- `lu_submit_many` submits up to 12 named jobs in order. A job's `after_names` may refer only to earlier jobs in the same call; duplicate, unknown, forward or cyclic names are rejected before any request is sent. A failure partway through reports which jobs were submitted and which were not.
+- `lu_submit` takes `repo`, `ref` and inline `task` text, plus optional `provider`, `model`, `require`, `fallbacks`, `after`, `after_keys`, `no_stack`, `harness`, `timeout`/`timeout_secs`, `idle_timeout`/`idle_timeout_secs` and `key`. When `key` is absent the server derives `mcp-` followed by 16 hex characters of the spec's SHA-256, so repeating the same submission is idempotent.
+- `lu_submit_many` submits up to 12 named jobs in order. Each job accepts the same spec fields as `lu_submit`, plus `name` and `after_names`. A job's `after_names` may refer only to earlier jobs in the same call; duplicate, unknown, forward or cyclic names are rejected before any request is sent. A failure partway through reports which jobs were submitted and which were not.
 - `lu_result` returns a finished job's summary, report, diff stats and a page of the diff. It defaults to 24 KiB and accepts `offset` and `max_bytes` (at most 32 KiB); follow `next_offset` until `done` is true.
 - Submissions (`lu_submit`, `lu_submit_many` and `lu_retry`) are limited to 30 per rolling minute per server process. Over the limit, the call returns `isError` with the number of seconds to wait.
 - `lu_cancel`, `lu_drain` and `lu_undrain` are marked destructive; all write tools report `readOnlyHint: false`.

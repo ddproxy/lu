@@ -253,14 +253,24 @@ mod tests {
         let log = format!("?[31mstart\u{7}\n{}tail\n", "filler ".repeat(14_000));
         let nodes = json!({"nodes": [{
             "name": "node-a", "version": "1.2.3", "harness": "busy",
+            "labels": ["gpu", "linux"],
             "providers": [{"name": "opencode", "state": "cooling", "soonest_secs": 7}],
             "last_seen": 12, "draining": false, "cordons": ["copilot"],
             "load1": 0.5, "mem_available_kb": 1000, "mem_total_kb": 2000, "stuck": 1
         }, {
             "name": "node-old", "version": "1.2.3", "harness": "idle",
+            "labels": [],
             "providers": [], "last_seen": 0, "draining": false, "cordons": [],
             "load1": null, "mem_available_kb": null, "mem_total_kb": null, "stuck": 0
         }]});
+        let node_stats = json!({
+            "host": {
+                "load1": 0.75, "load5": 0.5, "load15": 0.25,
+                "mem_total_kb": 2000, "mem_available_kb": 1000, "swap_used_kb": 0,
+                "disk_free_bytes": 400, "disk_total_bytes": 1000, "uptime_secs": 123
+            },
+            "jobs": []
+        });
         let job_reply = hostile.clone();
         let job_path = id.clone();
         let log_reply = log.clone();
@@ -274,6 +284,8 @@ mod tests {
             "/v1/status" => Reply::json(&status_reply),
             "/v1/jobs" => Reply::json(&list_reply),
             "/v1/nodes" => Reply::json(&nodes),
+            "/v1/nodes/node-a/stats" => Reply::json(&node_stats),
+            "/v1/nodes/node-old/stats" => Reply::json(&Value::Null),
             path if path.ends_with("/logs") => Reply::json(&json!({
                 "data": log_reply, "offset": log_reply.len(), "terminal": true
             })),
@@ -381,7 +393,7 @@ mod tests {
         assert!(replies[0]["result"]["serverInfo"]["version"].is_string());
         assert!(replies[0]["result"]["instructions"].is_string());
         assert_eq!(replies[1]["result"], json!({}));
-        assert_eq!(replies[2]["result"]["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(replies[2]["result"]["tools"].as_array().unwrap().len(), 14);
         assert_eq!(replies[3]["result"]["protocolVersion"], "2025-06-18");
         for (reply, id) in replies.iter().zip([json!(1), json!(2), json!(3), json!(4)]) {
             assert_eq!(reply["id"], id);
@@ -451,7 +463,7 @@ mod tests {
         let lines = vec![request("tools/list", json!({}), json!(1))];
         let replies = exchange(&script(&initialize_then(&lines)), &host).await;
         let tools = replies[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
         let mut names = Vec::new();
         for tool in tools {
             let name = tool["name"].as_str().unwrap();
@@ -464,6 +476,7 @@ mod tests {
                     | "lu_job"
                     | "lu_logs"
                     | "lu_nodes"
+                    | "lu_node"
                     | "lu_graph"
                     | "lu_result"
             );
@@ -494,6 +507,7 @@ mod tests {
                 "lu_job",
                 "lu_logs",
                 "lu_nodes",
+                "lu_node",
                 "lu_graph",
                 "lu_submit",
                 "lu_submit_many",
@@ -521,6 +535,45 @@ mod tests {
             jobs["items"]["required"],
             json!(["name", "repo", "ref", "task"])
         );
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            if !matches!(name, "lu_submit" | "lu_submit_many" | "lu_retry") {
+                continue;
+            }
+            let props = if name == "lu_submit_many" {
+                &tool["inputSchema"]["properties"]["jobs"]["items"]["properties"]
+            } else {
+                &tool["inputSchema"]["properties"]
+            };
+            for key in [
+                "require",
+                "fallbacks",
+                "after_keys",
+                "no_stack",
+                "timeout",
+                "timeout_secs",
+                "idle_timeout",
+                "idle_timeout_secs",
+                "harness",
+            ] {
+                assert!(props.get(key).is_some(), "{name} is missing {key}");
+            }
+            assert_eq!(props["require"]["maxItems"], 8);
+            assert_eq!(props["fallbacks"]["maxItems"], 4);
+            assert_eq!(props["after_keys"]["maxItems"], 16);
+            assert_eq!(props["timeout"]["minimum"], 1);
+            assert_eq!(props["timeout"]["maximum"], 86400);
+            assert_eq!(props["idle_timeout"]["minimum"], 1);
+            assert_eq!(props["idle_timeout"]["maximum"], 86400);
+            assert_eq!(props["no_stack"]["type"], "boolean");
+            assert_eq!(props["harness"]["type"], "string");
+            if name == "lu_submit_many" || name == "lu_submit" {
+                assert_eq!(props["timeout_secs"]["default"], 3600);
+            } else {
+                assert!(props["timeout_secs"].get("default").is_none());
+            }
+            assert!(props["timeout"].get("default").is_none());
+        }
     }
 
     fn initialize_then(lines: &[String]) -> Vec<String> {
@@ -540,6 +593,7 @@ mod tests {
             ("lu_job", json!({"id": id})),
             ("lu_logs", json!({"id": id, "lines": 80})),
             ("lu_nodes", json!({})),
+            ("lu_node", json!({"node": "node-a"})),
             ("lu_graph", json!({})),
         ];
         for (index, (name, args)) in calls.iter().enumerate() {
@@ -556,6 +610,42 @@ mod tests {
             assert!(!text.is_empty(), "{name}");
             assert!(structured.is_object(), "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn node_tools_report_labels_version_and_disk_stats() {
+        let (server, _) = fixture().await;
+        let client = Client::new(&server.url, TOKEN, None).unwrap();
+        let host = Host::connected(client);
+        let (_, structured, failed) = tool_result(&call_tool(&host, "lu_nodes", json!({})).await);
+        assert!(!failed);
+        let rows = structured["nodes"].as_array().unwrap();
+        assert_eq!(rows[0]["labels"], json!(["gpu", "linux"]));
+        assert_eq!(rows[0]["version"], "1.2.3");
+        assert_eq!(rows[0]["disk_free_bytes"], 400);
+        assert_eq!(rows[0]["disk_total_bytes"], 1000);
+        assert_eq!(rows[0]["disk_free_percent"], 40);
+        assert_eq!(rows[1]["disk_free_bytes"], Value::Null);
+
+        let (_, structured, failed) =
+            tool_result(&call_tool(&host, "lu_node", json!({"node": "node-a"})).await);
+        assert!(!failed);
+        assert_eq!(structured["node"]["labels"], json!(["gpu", "linux"]));
+        assert_eq!(structured["labels"], structured["node"]["labels"]);
+        assert_eq!(structured["version"], "1.2.3");
+        assert_eq!(structured["disk_free_bytes"], 400);
+        assert_eq!(structured["disk_total_bytes"], 1000);
+        assert_eq!(structured["disk_free_percent"], 40);
+        assert_eq!(structured["uptime_secs"], 123);
+        assert_eq!(structured["running_jobs"], 0);
+
+        let reply = call_tool(&host, "lu_node", json!({"node": "node-missing"})).await;
+        let (text, structured, failed) = tool_result(&reply);
+        assert!(failed);
+        assert!(text.contains("unknown node"), "{text}");
+        assert_eq!(structured["error"], text);
+        let reply = call_tool(&host, "lu_node", json!({"node": "bad name"})).await;
+        assert_eq!(reply["error"]["code"], -32602);
     }
 
     #[tokio::test]
@@ -834,6 +924,335 @@ mod tests {
         assert_eq!(structured["not_submitted"], json!(["b", "c"]));
         assert_eq!(structured["submitted"][0]["name"], "a");
         assert_eq!(post_bodies(&server).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn submit_maps_all_new_fields_to_the_wire() {
+        let dependency = job_id();
+        let dep_job = job_json(&dependency, "done");
+        let server = start(
+            move |record| match (record.method.as_str(), record.path.as_str()) {
+                ("GET", "/v1/jobs") => {
+                    Reply::json(&json!({"jobs": [dep_job.clone()], "next": null}))
+                }
+                ("POST", "/v1/jobs") => {
+                    let spec: Value = serde_json::from_slice(&record.body).unwrap();
+                    Reply::json(&submitted_job(&spec, "queued"))
+                }
+                _ => Reply::status(404),
+            },
+        )
+        .await;
+        let client = Client::new(&server.url, TOKEN, None).unwrap();
+        let host = Host::connected(client);
+        let (_, structured, failed) = tool_result(
+            &call_tool(
+                &host,
+                "lu_submit",
+                json!({
+                    "repo": "/srv/repo", "ref": "main", "task": "all fields",
+                    "require": ["gpu", "linux"],
+                    "fallbacks": [
+                        {"provider": "copilot", "model": "gpt"},
+                        {"provider": "codex"}
+                    ],
+                    "no_stack": true,
+                    "after": [dependency],
+                    "after_keys": ["dep-key"],
+                    "timeout": 120,
+                    "timeout_secs": 999,
+                    "idle_timeout": 60,
+                    "idle_timeout_secs": 888,
+                    "harness": "claude"
+                }),
+            )
+            .await,
+        );
+        assert!(!failed);
+        let body = &post_bodies(&server)[0];
+        assert_eq!(body["requires"], json!(["gpu", "linux"]));
+        assert_eq!(
+            body["fallbacks"],
+            json!([
+                {"provider": "copilot", "model": "gpt"},
+                {"provider": "codex"}
+            ])
+        );
+        assert_eq!(body["stack_dependencies"], false);
+        assert_eq!(body["after"], json!([dependency]));
+        assert_eq!(body["timeout_secs"], 120);
+        assert_eq!(body["idle_timeout_secs"], 60);
+        assert_eq!(body["harness"], "claude");
+        assert_eq!(structured["spec"]["requires"], body["requires"]);
+        assert_eq!(
+            structured["spec"]["fallbacks"],
+            json!([
+                {"provider": "copilot", "model": "gpt"},
+                {"provider": "codex", "model": null}
+            ])
+        );
+        assert_eq!(structured["spec"]["stack_dependencies"], false);
+        assert_eq!(structured["spec"]["timeout_secs"], 120);
+        assert_eq!(structured["spec"]["idle_timeout_secs"], 60);
+        assert_eq!(structured["spec"]["harness"], "claude");
+    }
+
+    #[tokio::test]
+    async fn submit_many_maps_all_new_fields_to_the_wire() {
+        let dependency = job_id();
+        let dep_job = job_json(&dependency, "done");
+        let server = start(
+            move |record| match (record.method.as_str(), record.path.as_str()) {
+                ("GET", "/v1/jobs") => {
+                    Reply::json(&json!({"jobs": [dep_job.clone()], "next": null}))
+                }
+                ("POST", "/v1/jobs") => {
+                    let spec: Value = serde_json::from_slice(&record.body).unwrap();
+                    Reply::json(&submitted_job(&spec, "queued"))
+                }
+                _ => Reply::status(404),
+            },
+        )
+        .await;
+        let client = Client::new(&server.url, TOKEN, None).unwrap();
+        let host = Host::connected(client);
+        let mut job = batch_job("a", json!([]));
+        job["require"] = json!(["gpu"]);
+        job["fallbacks"] = json!([{"provider": "copilot", "model": "gpt"}]);
+        job["no_stack"] = json!(true);
+        job["after_keys"] = json!(["dep-key"]);
+        job["timeout"] = json!(90);
+        job["timeout_secs"] = json!(999);
+        job["idle_timeout"] = json!(30);
+        job["idle_timeout_secs"] = json!(888);
+        job["harness"] = json!("claude");
+        let (text, structured, failed) =
+            tool_result(&call_tool(&host, "lu_submit_many", json!({"jobs": [job]})).await);
+        assert!(!failed, "{text}");
+        assert_eq!(structured["submitted_count"], 1);
+        let body = &post_bodies(&server)[0];
+        assert_eq!(body["requires"], json!(["gpu"]));
+        assert_eq!(
+            body["fallbacks"],
+            json!([{"provider": "copilot", "model": "gpt"}])
+        );
+        assert_eq!(body["stack_dependencies"], false);
+        assert_eq!(body["after"], json!([dependency]));
+        assert_eq!(body["timeout_secs"], 90);
+        assert_eq!(body["idle_timeout_secs"], 30);
+        assert_eq!(body["harness"], "claude");
+    }
+
+    #[tokio::test]
+    async fn retry_new_fields_override_or_clear_the_source_spec() {
+        let done = job_id();
+        let dependency = job_id();
+        let mut source = job_json(&done, "done");
+        source["spec"] = json!({
+            "repo": "/srv/repo", "git_ref": "main", "task": "go",
+            "provider": "primary", "harness": "opencode",
+            "requires": ["gpu"], "fallbacks": [{"provider": "copilot"}],
+            "stack_dependencies": false, "timeout_secs": 500, "idle_timeout_secs": 250,
+            "after": [dependency], "idempotency_key": "old-key"
+        });
+        let done_path = format!("/v1/jobs/{done}");
+        let source_reply = source.clone();
+        let server = start(
+            move |record| match (record.method.as_str(), record.path.as_str()) {
+                (_, path) if path == done_path.as_str() => Reply::json(&source_reply),
+                ("POST", "/v1/jobs") => {
+                    let spec: Value = serde_json::from_slice(&record.body).unwrap();
+                    Reply::json(&submitted_job(&spec, "queued"))
+                }
+                _ => Reply::status(404),
+            },
+        )
+        .await;
+        let client = Client::new(&server.url, TOKEN, None).unwrap();
+        let host = Host::connected(client);
+
+        let (text, structured, failed) =
+            tool_result(&call_tool(&host, "lu_retry", json!({"id": done})).await);
+        assert!(!failed, "{text}");
+        assert_eq!(structured["spec"]["requires"], json!(["gpu"]));
+        assert_eq!(
+            structured["spec"]["fallbacks"],
+            json!([{"provider": "copilot", "model": null}])
+        );
+        assert_eq!(structured["spec"]["stack_dependencies"], false);
+        assert_eq!(structured["spec"]["timeout_secs"], 500);
+        assert_eq!(structured["spec"]["idle_timeout_secs"], 250);
+        assert_eq!(structured["spec"]["harness"], "opencode");
+
+        let (text, structured, failed) = tool_result(
+            &call_tool(
+                &host,
+                "lu_retry",
+                json!({
+                    "id": done,
+                    "require": [],
+                    "fallbacks": [],
+                    "no_stack": false,
+                    "after": [],
+                    "timeout": 90,
+                    "idle_timeout": 30,
+                    "harness": "claude"
+                }),
+            )
+            .await,
+        );
+        assert!(!failed, "{text}");
+        assert_eq!(structured["spec"]["requires"], json!([]));
+        assert_eq!(structured["spec"]["fallbacks"], json!([]));
+        assert_eq!(structured["spec"]["stack_dependencies"], true);
+        assert_eq!(structured["after"], json!([]));
+        assert_eq!(structured["spec"]["timeout_secs"], 90);
+        assert_eq!(structured["spec"]["idle_timeout_secs"], 30);
+        assert_eq!(structured["spec"]["harness"], "claude");
+        let bodies = post_bodies(&server);
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[1].get("stack_dependencies").is_none());
+    }
+
+    #[tokio::test]
+    async fn new_spec_fields_report_cli_validation_errors() {
+        let labels = (0..9).map(|i| format!("label-{i}")).collect::<Vec<_>>();
+        let choices = (0..5)
+            .map(|i| json!({"provider": format!("provider-{i}")}))
+            .collect::<Vec<_>>();
+        let keys = (0..17).map(|i| format!("dep-{i}")).collect::<Vec<_>>();
+        let done = job_id();
+        let done_job = job_json(&done, "done");
+        let done_path = format!("/v1/jobs/{done}");
+        let ids = (0..17).map(|_| job_id()).collect::<Vec<_>>();
+        let by_key = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (format!("dep-{i}"), id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let server = start(
+            move |record| match (record.method.as_str(), record.path.as_str()) {
+                ("GET", "/v1/jobs") => {
+                    let key = record
+                        .query
+                        .as_deref()
+                        .unwrap_or_default()
+                        .strip_prefix("key=")
+                        .unwrap_or_default();
+                    let id = by_key.get(key).cloned().unwrap_or_else(job_id);
+                    Reply::json(&json!({"jobs": [job_json(&id, "done")], "next": null}))
+                }
+                ("POST", "/v1/jobs") => {
+                    let spec: Value = serde_json::from_slice(&record.body).unwrap();
+                    Reply::json(&submitted_job(&spec, "queued"))
+                }
+                (_, path) if path == done_path.as_str() => Reply::json(&done_job),
+                _ => Reply::status(404),
+            },
+        )
+        .await;
+        let client = Client::new(&server.url, TOKEN, None).unwrap();
+        let host = Host::connected(client);
+        let base = json!({"repo": "/srv/repo", "ref": "main", "task": "go"});
+
+        let mut cases = vec![
+            (
+                "lu_submit",
+                json!({"require": labels}),
+                "requires: must name at most 8 labels (got 9)",
+            ),
+            (
+                "lu_submit",
+                json!({"fallbacks": choices}),
+                "fallbacks: must name at most 4 choices (got 5)",
+            ),
+            (
+                "lu_submit",
+                json!({"timeout": 0}),
+                "timeout_secs: must be 1 to 86400 seconds (got 0)",
+            ),
+            (
+                "lu_submit",
+                json!({"timeout_secs": 86401}),
+                "timeout_secs: must be 1 to 86400 seconds (got 86401)",
+            ),
+            (
+                "lu_submit",
+                json!({"idle_timeout": 0}),
+                "idle_timeout_secs: must be 1 to 86400 seconds (got 0)",
+            ),
+            (
+                "lu_submit",
+                json!({"idle_timeout_secs": 86401}),
+                "idle_timeout_secs: must be 1 to 86400 seconds (got 86401)",
+            ),
+            (
+                "lu_submit",
+                json!({"harness": "bad harness"}),
+                "harness: must only use A-Z a-z 0-9 . _ -",
+            ),
+            (
+                "lu_submit",
+                json!({"after_keys": keys}),
+                "after: must name at most 16 jobs (got 17)",
+            ),
+            (
+                "lu_submit_many",
+                json!({"jobs": [{
+                    "name": "a", "repo": "/srv/repo", "ref": "main", "task": "go",
+                    "require": (0..9).map(|i| format!("label-{i}")).collect::<Vec<_>>()
+                }]}),
+                "requires: must name at most 8 labels (got 9)",
+            ),
+            (
+                "lu_retry",
+                json!({"id": done, "idle_timeout": 0}),
+                "idle_timeout_secs: must be 1 to 86400 seconds (got 0)",
+            ),
+        ];
+        for (name, extra, expected) in cases.drain(..) {
+            let mut args = match name {
+                "lu_retry" => json!({"id": done}),
+                "lu_submit_many" => json!({}),
+                _ => base.clone(),
+            };
+            args.as_object_mut().unwrap().extend(
+                extra
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            let reply = call_tool(&host, name, args).await;
+            assert!(!reply["result"].is_null(), "{name}: {reply}");
+            let (text, structured, failed) = tool_result(&reply);
+            assert!(failed, "{name}: {text}");
+            assert_eq!(structured["error"], text);
+            assert_eq!(text, expected, "{name}");
+        }
+
+        for (args, fragment) in [
+            (json!({"no_stack": "yes"}), "no_stack must be a boolean"),
+            (
+                json!({"fallbacks": [{"model": "gpt"}]}),
+                "fallbacks[0].provider",
+            ),
+        ] {
+            let mut call = base.clone();
+            call.as_object_mut().unwrap().extend(
+                args.as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            let reply = call_tool(&host, "lu_submit", call).await;
+            assert_eq!(reply["error"]["code"], -32602);
+            assert!(reply["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(fragment));
+        }
+        assert_eq!(posts(&server), 0);
     }
 
     #[tokio::test]
