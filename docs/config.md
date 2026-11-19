@@ -80,6 +80,7 @@ The `[agent]` table describes an agent host. The operator CLI also reads `contro
 | `heartbeat_secs` | no | `15` | Integer `2` to `300`. When a `[controller]` table is also present, `heartbeat_secs * 2` must be strictly less than `lease_secs`. |
 | `reiki_health_url` | no | — | Loopback `http` or `https` URL with no credentials, query or fragment. Requires `reiki_token_file`. The agent reads the local Reiki's peer health (`GET /v1/health`) every 10 seconds and sends each upstream as a provider (`ok`, `cooling` with seconds left, `disabled` or `unknown`) with every heartbeat, plus the document itself. A job that names a `provider` goes only to nodes that report it. After three failed reads the node reports no providers. |
 | `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set, and rejected when set alone. Checked like `token_file` on `load`; the agent reads at most 4 KiB. |
+| `provider_models` | no | `[]` | Up to 64 `[[agent.provider_models]]` pairs, in preference order. Each provider is 1 to 64 characters from `A-Z a-z 0-9 . _ -`; each model is 1 to 128 characters; provider names are unique. See below. |
 | `labels` | no | `[]` | At most 32 labels. Each is 1 to 64 characters from `A-Z a-z 0-9 . _ - /`, with at most one `=`. Lu never interprets them; a job's `requires` must match every label exactly. |
 | `label_files` | no | `[]` | At most 8 absolute paths without `..`. Each file is read again before every heartbeat; a missing or unreadable file contributes nothing. Each file is capped at 4 KiB, must be UTF-8, and holds one label per line; blank lines and lines starting with `#` are ignored. Invalid labels are dropped with one warning per label. File labels are merged with `labels`, then sorted and de-duplicated. |
 | `detect` | no | `[]` | Up to 16 `[[agent.detect]]` entries; labels must be valid and unique. See below. |
@@ -96,6 +97,25 @@ machine property. For example:
 labels = ["gpu", "php8.3", "region=eu"]
 label_files = ["/etc/lu/labels.d/installed-software"]
 taints = ["homelab"]
+```
+
+### `[[agent.provider_models]]`
+
+| Key | Required | Default | Validation |
+| --- | --- | --- | --- |
+| `provider` | yes | — | 1 to 64 characters from `A-Z a-z 0-9 . _ -`; unique among pairs. |
+| `model` | yes | — | 1 to 128 characters. |
+
+Pairs are published with every heartbeat only while Reiki reports the named provider healthy. Dispatch tries them in configuration order for jobs submitted with `--provider any`. No schema change: pairs live in the stored heartbeat.
+
+```toml
+[[agent.provider_models]]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+
+[[agent.provider_models]]
+provider = "openai"
+model = "gpt-5"
 ```
 
 ### `[[agent.detect]]`

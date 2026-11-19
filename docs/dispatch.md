@@ -21,6 +21,10 @@ lu submit --repo /path/to/repository --ref main --task "run the test suite" \
 
 Dispatch first applies the label rule, then gives the job to the first choice the node can serve (provider healthy and not cordoned). A fallback with no model reuses the primary model; a fallback that names a model uses it. The job view records both `assigned_provider` and `assigned_model`, and `lu show` prints the fallback list and `assigned_provider`; `lu ls` is unchanged. A job with no primary provider ignores its fallback list. An older agent that does not read the assignment fields runs the primary choice.
 
+## Provider from the node
+
+Use `--provider any` to choose from the node's `[[agent.provider_models]]` pairs, tried in agent configuration order. The job names no model or fallback; either with `--provider any` is a validation error. Each agent publishes a pair with its heartbeat when Reiki reports that provider healthy. Dispatch skips cordoned providers and gives the job to the first healthy pair on an otherwise eligible node. The job records that pair as `assigned_provider`/`assigned_model`, so the agent runs that provider's model. With no healthy pair on any eligible node the job stays `queued` and `lu show` reports `no node has a healthy provider for provider "any"`.
+
 5. Run an agent on the same machine. Write `$HOME/lu-demo/agent.toml` with an `[agent]` table (`name = "node-a"`, `controller_url = "http://127.0.0.1:7600"`, `token_file` pointing at `agent.token`, a `work_dir` under `lu-demo`, `harness = "opencode"`), then:
 
 ```sh

@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use lu_proto::{
-    ArtifactName, Choice, Completion, FailureClass, HarnessState, Heartbeat, JobId, JobSpec,
-    JobState, NodeName, Outcome, ProviderState, ProviderStatus, MAX_LOG_BYTES,
+    ArtifactName, Choice, Completion, FailureClass, HarnessState, Heartbeat, JobEdit, JobId,
+    JobSpec, JobState, NodeName, Outcome, ProviderState, ProviderStatus, MAX_LOG_BYTES,
 };
 
 use crate::{Now, Store, StoreError};
@@ -52,6 +52,7 @@ pub fn hb(name: &str, harness: HarnessState, providers: Vec<(&str, ProviderState
                 soonest_secs: None,
             })
             .collect(),
+        provider_models: Vec::new(),
         reiki: None,
         host: None,
         jobs: Vec::new(),
@@ -59,6 +60,23 @@ pub fn hb(name: &str, harness: HarnessState, providers: Vec<(&str, ProviderState
         label_sources: std::collections::BTreeMap::new(),
         taints: Vec::new(),
     }
+}
+
+fn hb_with_provider_models(
+    name: &str,
+    harness: HarnessState,
+    providers: Vec<(&str, ProviderState)>,
+    pairs: Vec<(&str, &str)>,
+) -> Heartbeat {
+    let mut beat = hb(name, harness, providers);
+    beat.provider_models = pairs
+        .into_iter()
+        .map(|(provider, model)| lu_proto::ProviderModel {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        })
+        .collect();
+    beat
 }
 
 /// Runs the same tests against any store implementation.
@@ -71,6 +89,14 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     assignment_and_epoch(&make());
     fallback_choices_route_and_clear(&make());
     primary_choice_is_preferred(&make());
+    any_provider_uses_a_healthy_published_pair(&make());
+    any_provider_skips_cordoned_and_unhealthy_pairs(&make());
+    any_provider_without_a_healthy_pair_waits(&make());
+    edit_job_changes_spec_and_dependency_state(&make());
+    edit_job_keeps_the_id_and_its_dependents(&make());
+    edit_job_rejects_terminal_states(&make());
+    edit_job_rejects_cycles_dead_and_unknown_dependencies(&make());
+    edit_job_rejects_more_than_sixteen_dependencies(&make());
     recovering_job_blocks_new_assignment_on_its_node(&make());
     label_requirements_route_and_explain(&make());
     taint_tolerations_route_and_explain(&make());
@@ -707,6 +733,294 @@ fn primary_choice_is_preferred<S: Store>(s: &S) {
     assert_eq!(a.job_id, job.id);
     assert_eq!(a.provider.as_deref(), Some("p1"));
     assert_eq!(a.model.as_deref(), Some("primary-model"));
+}
+
+fn any_job() -> JobSpec {
+    let mut sp = spec("https://x/any.git", None);
+    sp.provider = Some("any".to_owned());
+    sp
+}
+
+fn any_provider_uses_a_healthy_published_pair<S: Store>(s: &S) {
+    let n = node("any-node");
+    s.heartbeat(
+        &hb_with_provider_models(
+            "any-node",
+            HarnessState::Idle,
+            vec![("p1", ProviderState::Ok), ("p2", ProviderState::Ok)],
+            vec![("p1", "p1-model"), ("p2", "p2-model")],
+        ),
+        now(1, 1),
+    )
+    .unwrap();
+    let (job, _) = s.create_job(&any_job(), now(1, 1)).unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    assert_eq!(a.job_id, job.id);
+    assert_eq!(a.provider.as_deref(), Some("p1"));
+    assert_eq!(a.model.as_deref(), Some("p1-model"));
+    let rec = s.get_job(&job.id).unwrap();
+    assert_eq!(rec.assigned_provider.as_deref(), Some("p1"));
+    assert_eq!(rec.assigned_model.as_deref(), Some("p1-model"));
+}
+
+fn any_provider_skips_cordoned_and_unhealthy_pairs<S: Store>(s: &S) {
+    let n = node("any-cordon");
+    s.heartbeat(
+        &hb_with_provider_models(
+            "any-cordon",
+            HarnessState::Idle,
+            vec![
+                ("p1", ProviderState::Ok),
+                ("p2", ProviderState::Ok),
+                ("p3", ProviderState::Cooling),
+            ],
+            vec![("p1", "m1"), ("p2", "m2"), ("p3", "m3")],
+        ),
+        now(1, 1),
+    )
+    .unwrap();
+    let (job, _) = s.create_job(&any_job(), now(1, 1)).unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    assert_eq!(a.provider.as_deref(), Some("p1"));
+    s.start_job(&job.id, a.epoch, now(3, 3)).unwrap();
+    let completion = Completion {
+        job_id: job.id.clone(),
+        epoch: a.epoch,
+        outcome: Outcome::Failed(FailureClass::Provider),
+        exit_code: None,
+        summary: None,
+        retry_after_secs: None,
+    };
+    s.complete(
+        &completion,
+        Some((FailureClass::Provider, Some("p1".to_owned()))),
+        now(4, 4),
+        1,
+        10_000,
+    )
+    .unwrap();
+    let a = s.next_assignment(&n, now(5, 5), 60_000).unwrap().unwrap();
+    assert_eq!(a.provider.as_deref(), Some("p2"));
+    assert_eq!(a.model.as_deref(), Some("m2"));
+}
+
+fn any_provider_without_a_healthy_pair_waits<S: Store>(s: &S) {
+    let n = node("any-wait");
+    s.heartbeat(
+        &hb_with_provider_models(
+            "any-wait",
+            HarnessState::Idle,
+            vec![
+                ("p1", ProviderState::Cooling),
+                ("p2", ProviderState::Disabled),
+            ],
+            vec![("p1", "m1"), ("p2", "m2")],
+        ),
+        now(1, 1),
+    )
+    .unwrap();
+    let (job, _) = s.create_job(&any_job(), now(1, 1)).unwrap();
+    assert!(s.next_assignment(&n, now(2, 2), 60_000).unwrap().is_none());
+    let rec = s.get_job(&job.id).unwrap();
+    assert_eq!(rec.state, JobState::Queued);
+    let nodes = s.nodes(now(2, 2), 60_000).unwrap();
+    let reason = crate::waiting_reason(&rec, &nodes);
+    assert!(
+        reason.as_deref().is_some_and(|r| r.contains("provider")),
+        "{reason:?}"
+    );
+}
+
+fn edit_job_changes_spec_and_dependency_state<S: Store>(s: &S) {
+    let (blocker, _) = s
+        .create_job(&spec("https://x/blocker.git", None), now(1, 1))
+        .unwrap();
+    let mut sp = spec("https://x/edit.git", None);
+    sp.provider = Some("p1".to_owned());
+    sp.model = Some("m1".to_owned());
+    sp.after = vec![blocker.id.clone()];
+    let (job, _) = s.create_job(&sp, now(1, 1)).unwrap();
+    assert_eq!(job.state, JobState::Blocked);
+
+    let edit = JobEdit {
+        provider: Some("p2".to_owned()),
+        model: Some("m2".to_owned()),
+        fallbacks: Some(vec![Choice {
+            provider: "p3".to_owned(),
+            model: Some("m3".to_owned()),
+        }]),
+        requires: Some(vec!["gpu".to_owned()]),
+        tolerates: Some(vec!["spot".to_owned()]),
+        after: Some(Vec::new()),
+    };
+    let rec = s.edit_job(&job.id, &edit, now(2, 2)).unwrap();
+    assert_eq!(rec.id, job.id);
+    assert_eq!(rec.state, JobState::Queued);
+    assert_eq!(rec.spec.provider.as_deref(), Some("p2"));
+    assert_eq!(rec.spec.model.as_deref(), Some("m2"));
+    assert_eq!(rec.spec.fallbacks.len(), 1);
+    assert_eq!(rec.spec.requires, vec!["gpu".to_owned()]);
+    assert_eq!(rec.spec.tolerates, vec!["spot".to_owned()]);
+    assert!(rec.spec.after.is_empty());
+    assert!(rec.waiting_on.is_empty());
+    assert_eq!(rec.assigned_provider, None);
+    assert_eq!(rec.assigned_model, None);
+
+    let rec = s
+        .edit_job(
+            &job.id,
+            &JobEdit {
+                after: Some(vec![blocker.id.clone()]),
+                ..Default::default()
+            },
+            now(3, 3),
+        )
+        .unwrap();
+    assert_eq!(rec.state, JobState::Blocked);
+    assert_eq!(rec.waiting_on, vec![blocker.id.clone()]);
+    let rec = s
+        .edit_job(
+            &job.id,
+            &JobEdit {
+                after: Some(Vec::new()),
+                ..Default::default()
+            },
+            now(4, 4),
+        )
+        .unwrap();
+    assert_eq!(rec.state, JobState::Queued);
+}
+
+fn edit_job_keeps_the_id_and_its_dependents<S: Store>(s: &S) {
+    let (parent, _) = s
+        .create_job(&spec("https://x/parent.git", None), now(1, 1))
+        .unwrap();
+    let mut child_sp = spec("https://x/child.git", None);
+    child_sp.after = vec![parent.id.clone()];
+    let (child, _) = s.create_job(&child_sp, now(1, 1)).unwrap();
+    assert_eq!(child.state, JobState::Blocked);
+    let rec = s
+        .edit_job(
+            &parent.id,
+            &JobEdit {
+                provider: Some("p9".to_owned()),
+                ..Default::default()
+            },
+            now(2, 2),
+        )
+        .unwrap();
+    assert_eq!(rec.id, parent.id);
+    assert_eq!(rec.spec.provider.as_deref(), Some("p9"));
+    let child = s.get_job(&child.id).unwrap();
+    assert_eq!(child.spec.after, vec![parent.id.clone()]);
+    assert_eq!(child.waiting_on, vec![parent.id]);
+}
+
+fn edit_job_rejects_terminal_states<S: Store>(s: &S) {
+    let (job, _) = s
+        .create_job(&spec("https://x/terminal.git", None), now(1, 1))
+        .unwrap();
+    let n = node("edit-terminal");
+    s.heartbeat(&hb("edit-terminal", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    s.start_job(&job.id, a.epoch, now(3, 3)).unwrap();
+    let completion = Completion {
+        job_id: job.id.clone(),
+        epoch: a.epoch,
+        outcome: Outcome::Done,
+        exit_code: Some(0),
+        summary: None,
+        retry_after_secs: None,
+    };
+    s.complete(&completion, None, now(4, 4), 1, 1000).unwrap();
+    assert!(matches!(
+        s.edit_job(&job.id, &JobEdit::default(), now(5, 5)),
+        Err(StoreError::Conflict { .. })
+    ));
+}
+
+fn edit_job_rejects_cycles_dead_and_unknown_dependencies<S: Store>(s: &S) {
+    let (a, _) = s
+        .create_job(&spec("https://x/a.git", None), now(1, 1))
+        .unwrap();
+    let mut bsp = spec("https://x/b.git", None);
+    bsp.after = vec![a.id.clone()];
+    let (b, _) = s.create_job(&bsp, now(1, 1)).unwrap();
+    assert!(matches!(
+        s.edit_job(
+            &a.id,
+            &JobEdit {
+                after: Some(vec![b.id.clone()]),
+                ..Default::default()
+            },
+            now(2, 2),
+        ),
+        Err(StoreError::DependencyCycle)
+    ));
+    assert!(matches!(
+        s.edit_job(
+            &a.id,
+            &JobEdit {
+                after: Some(vec![a.id.clone()]),
+                ..Default::default()
+            },
+            now(2, 2),
+        ),
+        Err(StoreError::DependencyCycle)
+    ));
+    let missing = JobId::new();
+    assert!(matches!(
+        s.edit_job(
+            &a.id,
+            &JobEdit {
+                after: Some(vec![missing]),
+                ..Default::default()
+            },
+            now(2, 2),
+        ),
+        Err(StoreError::InvalidDependency(_))
+    ));
+    let (dead, _) = s
+        .create_job(&spec("https://x/dead.git", None), now(1, 1))
+        .unwrap();
+    s.cancel_job(&dead.id, now(2, 2)).unwrap();
+    assert!(matches!(
+        s.edit_job(
+            &a.id,
+            &JobEdit {
+                after: Some(vec![dead.id]),
+                ..Default::default()
+            },
+            now(3, 3),
+        ),
+        Err(StoreError::DeadDependency(_))
+    ));
+}
+
+fn edit_job_rejects_more_than_sixteen_dependencies<S: Store>(s: &S) {
+    let (job, _) = s
+        .create_job(&spec("https://x/limit.git", None), now(1, 1))
+        .unwrap();
+    let deps: Vec<JobId> = (0..17)
+        .map(|_| {
+            s.create_job(&spec("https://x/dep.git", None), now(1, 1))
+                .unwrap()
+                .0
+                .id
+        })
+        .collect();
+    assert!(matches!(
+        s.edit_job(
+            &job.id,
+            &JobEdit {
+                after: Some(deps),
+                ..Default::default()
+            },
+            now(2, 2),
+        ),
+        Err(StoreError::InvalidSpec(_))
+    ));
 }
 
 fn recovering_job_blocks_new_assignment_on_its_node<S: Store>(s: &S) {

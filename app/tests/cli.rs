@@ -1709,3 +1709,179 @@ async fn retry_wait_reports_the_new_jobs_state_and_exit_code() {
     assert!(text.contains(r#""state":"failed""#), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_sends_the_patch_to_the_edit_route() {
+    let id = job_id();
+    let dep = job_id();
+    let body = job_json(&id, "queued");
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("edit-patch");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &[
+            "edit",
+            &id,
+            "--provider",
+            "peer-b",
+            "--model",
+            "new-model",
+            "--fallback",
+            "peer-c:fallback-model",
+            "--require",
+            "gpu",
+            "--tolerate",
+            "homelab",
+            "--after",
+            &dep,
+        ],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), format!("{id} queued"));
+    let records = server.records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].method, "POST");
+    assert_eq!(records[0].path, format!("/v1/jobs/{id}/edit"));
+    let patch: Value = serde_json::from_slice(&records[0].body).unwrap();
+    assert_eq!(patch["provider"], "peer-b");
+    assert_eq!(patch["model"], "new-model");
+    assert_eq!(
+        patch["fallbacks"],
+        json!([{"provider": "peer-c", "model": "fallback-model"}])
+    );
+    assert_eq!(patch["requires"], json!(["gpu"]));
+    assert_eq!(patch["tolerates"], json!(["homelab"]));
+    assert_eq!(patch["after"], json!([dep]));
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_sends_empty_lists_for_the_no_flags_and_resolves_after_key() {
+    let id = job_id();
+    let dep = job_id();
+    let body = job_json(&id, "blocked");
+    let dep_id = dep.clone();
+    let server = start(move |record| {
+        if record.query.is_some() {
+            Reply::json(&json!({"jobs": [job_json(&dep_id, "queued")], "next": null}))
+        } else {
+            Reply::json(&body)
+        }
+    })
+    .await;
+    let dir = scratch("edit-clear");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &[
+            "edit",
+            &id,
+            "--no-fallbacks",
+            "--no-require",
+            "--no-tolerate",
+            "--after-key",
+            "build",
+        ],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), format!("{id} blocked"));
+    let records = server.records.lock().unwrap();
+    let post = records.iter().find(|r| r.path.ends_with("/edit")).unwrap();
+    let patch: Value = serde_json::from_slice(&post.body).unwrap();
+    assert_eq!(patch["fallbacks"], json!([]));
+    assert_eq!(patch["requires"], json!([]));
+    assert_eq!(patch["tolerates"], json!([]));
+    assert_eq!(patch["after"], json!([dep]));
+    assert!(patch.get("provider").is_none());
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_json_prints_the_raw_body() {
+    let id = job_id();
+    let body = job_json(&id, "queued");
+    let expected = body.to_string();
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("edit-json");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &["--json", "edit", &id, "--model", "peer-model"],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{expected}\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_refuses_any_with_a_model_or_fallback() {
+    let id = job_id();
+    let reply_id = id.clone();
+    let server = start(move |_| Reply::json(&job_json(&reply_id, "queued"))).await;
+    let dir = scratch("edit-any-reject");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+    for extra in [vec!["--model", "some-model"], vec!["--fallback", "peer-b"]] {
+        let mut args = vec!["edit", &id, "--provider", "any"];
+        args.extend(extra);
+        let output = run_with_env(&args, &envs, None, &dir);
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("--provider any cannot be combined"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert!(server.records.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_accepts_any_and_rejects_a_model_or_fallback() {
+    let id = job_id();
+    let body = job_json(&id, "queued");
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("submit-any");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+    let base = [
+        "submit",
+        "--repo",
+        "/r",
+        "--ref",
+        "main",
+        "--provider",
+        "any",
+    ];
+
+    let output = run_with_env(&base, &envs, Some("do it\n"), &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let records = server.records.lock().unwrap();
+    let spec: Value = serde_json::from_slice(&records[0].body).unwrap();
+    assert_eq!(spec["provider"], "any");
+    assert!(spec.get("model").is_none());
+    drop(records);
+
+    for extra in [vec!["--model", "m"], vec!["--fallback", "peer-b"]] {
+        let mut args = base.to_vec();
+        args.extend(extra);
+        let output = run_with_env(&args, &envs, Some("do it\n"), &dir);
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("provider is \"any\""),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert_eq!(server.records.lock().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

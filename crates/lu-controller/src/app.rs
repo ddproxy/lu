@@ -55,6 +55,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/jobs/{id}/cancel",
             post(operator::cancel_job).layer(op_json),
         )
+        .route(
+            "/v1/jobs/{id}/edit",
+            post(operator::edit_job).layer(op_json),
+        )
         .route("/v1/jobs/{id}/logs", get(operator::get_logs))
         .route(
             "/v1/jobs/{id}/artifacts/{name}",

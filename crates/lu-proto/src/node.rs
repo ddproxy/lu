@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{is_name_byte, JobId, NodeName};
 use crate::label::{valid_label, LABEL_SOURCE_PROBED};
 use crate::limits::{
-    MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_NODE_LABELS, MAX_PROVIDERS, MAX_REIKI_BYTES,
-    MAX_STATS_BYTES, MAX_TAINTS, MAX_VERSION_BYTES,
+    MAX_LABEL_BYTES, MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_NODE_LABELS, MAX_PROVIDERS,
+    MAX_REIKI_BYTES, MAX_STATS_BYTES, MAX_TAINTS, MAX_VERSION_BYTES,
 };
 
 /// Whether the peer's harness is free to take a job.
@@ -38,6 +38,14 @@ pub struct ProviderStatus {
     pub state: ProviderState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soonest_secs: Option<u64>,
+}
+
+/// A provider and the model the agent would run for it, offered in preference order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModel {
+    pub provider: String,
+    pub model: String,
 }
 
 /// The host numbers sampled from `/proc`. The disk fields are optional because a portable
@@ -107,6 +115,9 @@ pub struct Heartbeat {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderStatus>,
+    /// Provider/model pairs this node offers to provider-agnostic jobs, in preference order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_models: Vec<ProviderModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reiki: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,6 +143,9 @@ struct RawHeartbeat {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderStatus>,
+    /// Provider/model pairs this node offers to provider-agnostic jobs, in preference order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_models: Vec<ProviderModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reiki: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +170,7 @@ impl TryFrom<RawHeartbeat> for Heartbeat {
             harness: raw.harness,
             version: raw.version,
             providers: raw.providers,
+            provider_models: raw.provider_models,
             reiki: raw.reiki,
             host: raw.host,
             jobs: raw.jobs,
@@ -240,6 +255,34 @@ impl Heartbeat {
                 });
             }
         }
+        if self.provider_models.len() > MAX_PROVIDERS {
+            return Err(HeartbeatError::TooManyProviderModels {
+                got: self.provider_models.len(),
+            });
+        }
+        for (index, pair) in self.provider_models.iter().enumerate() {
+            if !valid_provider_name(&pair.provider) {
+                return Err(HeartbeatError::ProviderModelName {
+                    index,
+                    name: pair.provider.clone(),
+                });
+            }
+            if pair.model.is_empty() || pair.model.len() > MAX_MODEL_BYTES {
+                return Err(HeartbeatError::ProviderModelModel {
+                    index,
+                    model: pair.model.clone(),
+                });
+            }
+            if self.provider_models[..index]
+                .iter()
+                .any(|previous| previous.provider == pair.provider)
+            {
+                return Err(HeartbeatError::DuplicateProviderModel {
+                    index,
+                    name: pair.provider.clone(),
+                });
+            }
+        }
         if self.labels.len() > MAX_NODE_LABELS {
             return Err(HeartbeatError::TooManyLabels {
                 got: self.labels.len(),
@@ -296,6 +339,10 @@ pub enum HeartbeatError {
     Version { value: String },
     TooManyProviders { got: usize },
     ProviderName { index: usize, name: String },
+    TooManyProviderModels { got: usize },
+    ProviderModelName { index: usize, name: String },
+    ProviderModelModel { index: usize, model: String },
+    DuplicateProviderModel { index: usize, name: String },
     TooManyLabels { got: usize },
     Label { value: String },
     TooManyLabelSources { got: usize },
@@ -320,6 +367,22 @@ impl std::fmt::Display for HeartbeatError {
             Self::ProviderName { index, name } => write!(
                 f,
                 "provider #{index} has an invalid name {name:?}; it must be 1 to {MAX_NAME_BYTES} characters from A-Z a-z 0-9 . _ -"
+            ),
+            Self::TooManyProviderModels { got } => write!(
+                f,
+                "a heartbeat may carry at most {MAX_PROVIDERS} provider/model pairs (got {got})"
+            ),
+            Self::ProviderModelName { index, name } => write!(
+                f,
+                "provider/model pair #{index} has an invalid provider {name:?}; it must be 1 to {MAX_NAME_BYTES} characters from A-Z a-z 0-9 . _ -"
+            ),
+            Self::ProviderModelModel { index, model } => write!(
+                f,
+                "provider/model pair #{index} has an invalid model {model:?}; it must be 1 to {MAX_MODEL_BYTES} characters"
+            ),
+            Self::DuplicateProviderModel { index, name } => write!(
+                f,
+                "provider/model pair #{index} repeats provider {name:?}"
             ),
             Self::TooManyLabels { got } => write!(
                 f,
@@ -378,6 +441,7 @@ mod tests {
                 state: ProviderState::Ok,
                 soonest_secs: None,
             }],
+            provider_models: Vec::new(),
             reiki: None,
             host: None,
             jobs: Vec::new(),

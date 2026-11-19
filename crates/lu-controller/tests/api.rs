@@ -3,8 +3,8 @@ use lu_auth::sha256_hex;
 use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator, ControllerRepo};
 use lu_controller::{build_router, run_background, AppState};
 use lu_proto::{
-    Choice, JobId, JobSpec, MAX_AFTER_JOBS, MAX_FALLBACKS, MAX_LOG_BYTES, MAX_REQUIRES_LABELS,
-    MAX_TOLERATES,
+    Choice, JobEdit, JobId, JobSpec, MAX_AFTER_JOBS, MAX_FALLBACKS, MAX_LOG_BYTES,
+    MAX_REQUIRES_LABELS, MAX_TOLERATES,
 };
 use lu_serve::{serve, ServeOptions};
 use lu_store::sqlite::SqliteStore;
@@ -199,6 +199,16 @@ async fn submit_spec(addr: SocketAddr, spec: &JobSpec) -> String {
     let body = serde_json::to_string(spec).unwrap();
     let req = format!(
         "POST /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    raw_request(addr, &req).await
+}
+
+async fn edit_job(addr: SocketAddr, id: &str, edit: &JobEdit) -> String {
+    let body = serde_json::to_string(edit).unwrap();
+    let req = format!(
+        "POST /v1/jobs/{id}/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         body.len(),
         body
     );
@@ -520,6 +530,219 @@ async fn fallback_choices_are_validated_and_assigned() {
     assert_eq!(job["assigned_provider"], "p2", "{job}");
     assert_eq!(job["assigned_model"], "m2", "{job}");
     assert_eq!(job["spec"]["fallbacks"][0]["provider"], "p2", "{job}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn post_edit_changes_a_queued_job_and_rejects_bad_states() {
+    let srv = start_server().await;
+    let r = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let created: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let edit = JobEdit {
+        provider: Some("p2".to_owned()),
+        model: Some("m2".to_owned()),
+        fallbacks: Some(vec![Choice {
+            provider: "p3".to_owned(),
+            model: Some("m3".to_owned()),
+        }]),
+        requires: Some(vec!["gpu".to_owned()]),
+        tolerates: Some(vec!["homelab".to_owned()]),
+        after: None,
+    };
+    let r = edit_job(srv.addr, &id, &edit).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["id"], id);
+    assert_eq!(job["spec"]["provider"], "p2", "{job}");
+    assert_eq!(job["spec"]["model"], "m2", "{job}");
+    assert_eq!(job["spec"]["fallbacks"][0]["provider"], "p3", "{job}");
+    assert_eq!(job["spec"]["requires"][0], "gpu", "{job}");
+    assert_eq!(job["spec"]["tolerates"][0], "homelab", "{job}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    let stored: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(stored["spec"], job["spec"], "{stored}");
+
+    // Self-dependency and unknown dependencies are refused with distinct codes.
+    let self_edit = JobEdit {
+        after: Some(vec![JobId::parse(&id).unwrap()]),
+        ..JobEdit::default()
+    };
+    let r = edit_job(srv.addr, &id, &self_edit).await;
+    assert_eq!(status(&r), 400, "{r}");
+    let missing = JobEdit {
+        after: Some(vec![JobId::new()]),
+        ..JobEdit::default()
+    };
+    let r = edit_job(srv.addr, &id, &missing).await;
+    assert_eq!(status(&r), 422, "{r}");
+
+    // An explicit model with `any` is an invalid spec.
+    let invalid = JobEdit {
+        provider: Some(lu_proto::ANY_PROVIDER.to_owned()),
+        model: Some("m".to_owned()),
+        ..JobEdit::default()
+    };
+    let r = edit_job(srv.addr, &id, &invalid).await;
+    assert_eq!(status(&r), 422, "{r}");
+
+    // The route needs the operator scope.
+    let body = serde_json::to_string(&JobEdit::default()).unwrap();
+    let r = raw_request(srv.addr, &format!("POST /v1/jobs/{id}/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body)).await;
+    assert_eq!(status(&r), 401, "{r}");
+    let r = raw_request(srv.addr, &format!("POST /v1/jobs/{id}/edit HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body)).await;
+    assert_eq!(status(&r), 401, "{r}");
+
+    let r = raw_request(srv.addr, &format!("POST /v1/jobs/{id}/cancel HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let r = edit_job(srv.addr, &id, &JobEdit::default()).await;
+    assert_eq!(status(&r), 409, "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn post_edit_updates_dependencies_without_a_cycle() {
+    let srv = start_server().await;
+    let r = submit_spec(srv.addr, &sample_spec(None)).await;
+    let first: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    let r = submit_spec(srv.addr, &sample_spec(None)).await;
+    let second: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let second_id = second["id"].as_str().unwrap().to_owned();
+
+    let edit = JobEdit {
+        after: Some(vec![JobId::parse(&first_id).unwrap()]),
+        ..JobEdit::default()
+    };
+    let r = edit_job(srv.addr, &second_id, &edit).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["state"], "blocked", "{job}");
+    assert_eq!(job["after"][0], first_id, "{job}");
+
+    let edit = JobEdit {
+        after: Some(vec![JobId::parse(&second_id).unwrap()]),
+        ..JobEdit::default()
+    };
+    let r = edit_job(srv.addr, &first_id, &edit).await;
+    assert_eq!(status(&r), 400, "{r}");
+
+    let r = edit_job(
+        srv.addr,
+        &second_id,
+        &JobEdit {
+            after: Some(Vec::new()),
+            ..JobEdit::default()
+        },
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["state"], "queued", "{job}");
+    assert!(job["after"].as_array().unwrap().is_empty(), "{job}");
+
+    // The first job still exists with its original id, so dependents stay attached.
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{first_id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn any_provider_dispatches_a_published_healthy_pair() {
+    let srv = start_server().await;
+    let mut spec = sample_spec(None);
+    spec.provider = Some(lu_proto::ANY_PROVIDER.to_owned());
+    let r = submit_spec(srv.addr, &spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let created: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let mut invalid = spec.clone();
+    invalid.model = Some("m1".to_owned());
+    assert_eq!(status(&submit_spec(srv.addr, &invalid).await), 422);
+    let mut invalid = spec.clone();
+    invalid.fallbacks = vec![Choice {
+        provider: "p2".to_owned(),
+        model: None,
+    }];
+    assert_eq!(status(&submit_spec(srv.addr, &invalid).await), 422);
+
+    let hb = json!({
+        "node": "node-a",
+        "harness": "idle",
+        "providers": [
+            {"name": "p1", "state": "cooling"},
+            {"name": "p2", "state": "ok"},
+        ],
+        "provider_models": [
+            {"provider": "p1", "model": "m1"},
+            {"provider": "p2", "model": "m2"},
+        ],
+    });
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &hb).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let assign = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "assign")
+        .unwrap_or_else(|| panic!("no assignment: {events}"));
+    assert_eq!(assign["job_id"], id, "{assign}");
+    assert_eq!(assign["provider"], "p2", "{assign}");
+    assert_eq!(assign["model"], "m2", "{assign}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["assigned_provider"], "p2", "{job}");
+    assert_eq!(job["assigned_model"], "m2", "{job}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    let nodes: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let node = nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "node-a")
+        .unwrap();
+    assert_eq!(node["provider_models"][0]["provider"], "p1", "{node}");
+    assert_eq!(node["provider_models"][1]["model"], "m2", "{node}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn any_provider_without_a_healthy_published_pair_waits() {
+    let srv = start_server().await;
+    let mut spec = sample_spec(None);
+    spec.provider = Some(lu_proto::ANY_PROVIDER.to_owned());
+    let r = submit_spec(srv.addr, &spec).await;
+    let created: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let hb = json!({
+        "node": "node-a",
+        "harness": "idle",
+        "providers": [{"name": "p1", "state": "ok"}],
+    });
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &hb).await;
+    assert_eq!(status(&r), 204, "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["state"], "queued", "{job}");
+    assert!(
+        job["waiting_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("any")),
+        "{job}"
+    );
 
     let _ = srv.shutdown.send(());
 }

@@ -17,7 +17,8 @@ pub mod conformance;
 mod model;
 
 use lu_proto::{
-    ArtifactName, Completion, FailureClass, Heartbeat, JobId, JobSpec, JobState, NodeName,
+    ArtifactName, Completion, FailureClass, Heartbeat, JobEdit, JobId, JobSpec, JobState, NodeName,
+    ProviderState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +104,24 @@ pub fn taints_tolerated(node_taints: &[String], tolerates: &[String]) -> bool {
     node_taints.iter().all(|taint| tolerates.contains(taint))
 }
 
+/// The provider/model pairs a node can serve for a `provider = "any"` job, in the preference order
+/// the agent published. A pair is usable only while its provider is healthy in the latest
+/// heartbeat and the node is not cordoned for that provider.
+pub fn healthy_provider_models(node: &NodeRecord) -> Vec<&lu_proto::ProviderModel> {
+    node.heartbeat
+        .provider_models
+        .iter()
+        .filter(|pair| {
+            !node.cordons.contains(&pair.provider)
+                && node
+                    .heartbeat
+                    .providers
+                    .iter()
+                    .any(|status| status.name == pair.provider && status.state == ProviderState::Ok)
+        })
+        .collect()
+}
+
 /// The required labels no online node advertises, in the job's order.
 pub fn missing_labels<'a>(required: &'a [String], nodes: &[NodeRecord]) -> Vec<&'a str> {
     let online = || {
@@ -144,6 +163,14 @@ pub fn waiting_reason(job: &JobRecord, nodes: &[NodeRecord]) -> Option<String> {
             .find(|taint| !job.spec.tolerates.contains(taint))?;
         return Some(format!("only tainted nodes are free: {taint}"));
     }
+    if job.spec.is_any_provider()
+        && !eligible.iter().any(|node| {
+            taints_tolerated(&node.heartbeat.taints, &job.spec.tolerates)
+                && !healthy_provider_models(node).is_empty()
+        })
+    {
+        return Some("no node has a healthy provider for provider \"any\"".to_owned());
+    }
     None
 }
 
@@ -161,6 +188,8 @@ pub enum StoreError {
     InvalidDependency(JobId),
     /// `after` names a job that already failed or was cancelled, so the new job could never run.
     DeadDependency(JobId),
+    /// Editing `after` would make the job depend on itself through its dependents.
+    DependencyCycle,
     /// The spec itself is invalid; normally the API validates before reaching the store.
     InvalidSpec(String),
     Internal(String),
@@ -182,6 +211,12 @@ pub trait Store: Send + Sync + 'static {
     /// Queued or blocked becomes cancelled; leased or running sets `cancel_requested`;
     /// terminal conflicts.
     fn cancel_job(&self, id: &JobId, now: Now) -> Result<JobRecord, StoreError>;
+
+    /// Changes the provider, model, fallbacks, labels, taints or dependencies of a queued or
+    /// blocked job, keeping its id. Other states conflict. New dependencies must exist, be alive,
+    /// number at most 16 and must not form a cycle. The job moves between `blocked` and `queued`
+    /// as its dependencies change.
+    fn edit_job(&self, id: &JobId, edit: &JobEdit, now: Now) -> Result<JobRecord, StoreError>;
 
     /// Records the heartbeat and the time it was seen.
     fn heartbeat(&self, hb: &Heartbeat, now: Now) -> Result<(), StoreError>;

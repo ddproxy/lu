@@ -22,8 +22,8 @@ use lu_client::{ApiError, Controller};
 use lu_config::{AgentConfig, BaseSource};
 use lu_proto::{
     printable, truncate_chars, AgentEvent, ArtifactName, Completion, FailureClass, HarnessState,
-    Heartbeat, JobId, JobSpec, JobStats, NodeName, Outcome, ProviderState, MAX_DIFF_BYTES,
-    MAX_SUMMARY_BYTES,
+    Heartbeat, JobId, JobSpec, JobStats, NodeName, Outcome, ProviderModel, ProviderState,
+    ProviderStatus, MAX_DIFF_BYTES, MAX_SUMMARY_BYTES,
 };
 use lu_staging::{ApplyError, Source, StageRequest, StagedDir, Staging};
 use lu_supervise::{CommandSpec, Limits, Outcome as SuperviseOutcome, Supervisor};
@@ -130,6 +130,25 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// The configured pairs whose provider the Reiki feed currently reports healthy.
+fn offered_provider_models(
+    config: &[lu_config::ProviderModelConfig],
+    providers: &[ProviderStatus],
+) -> Vec<ProviderModel> {
+    config
+        .iter()
+        .filter(|pair| {
+            providers
+                .iter()
+                .any(|p| p.name == pair.provider && p.state == ProviderState::Ok)
+        })
+        .map(|pair| ProviderModel {
+            provider: pair.provider.clone(),
+            model: pair.model.clone(),
+        })
+        .collect()
+}
+
 /// The node agent. One instance runs one job at a time.
 pub struct Agent {
     node: NodeName,
@@ -150,6 +169,8 @@ pub struct Agent {
     reiki_probe: Option<(String, Arc<str>)>,
     /// The last health read from it, sent with every heartbeat.
     health: health::Shared,
+    /// Provider/model pairs from config, offered to provider-agnostic jobs when healthy.
+    provider_models: Arc<Vec<lu_config::ProviderModelConfig>>,
     labels: Arc<labels::LabelSource>,
     probes: Arc<probes::Probes>,
     taints: Arc<Vec<String>>,
@@ -233,6 +254,7 @@ impl Agent {
             opencode_password,
             reiki_probe,
             health: health::Shared::default(),
+            provider_models: Arc::new(config.provider_models),
             labels,
             probes,
             taints: Arc::new(config.taints),
@@ -396,11 +418,13 @@ impl Agent {
     fn poll_request(&self, harness: HarnessState, wait_secs: u64) -> lu_client::PollRequest {
         let current = health::snapshot(&self.health);
         let label_set = self.labels.current_set();
+        let provider_models = offered_provider_models(&self.provider_models, &current.providers);
         let mut beat = Heartbeat {
             node: self.node.clone(),
             harness,
             version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             providers: current.providers,
+            provider_models,
             reiki: current.reiki,
             host: proc::host_stats(&self.work_dir),
             jobs: Vec::new(),
@@ -708,6 +732,7 @@ impl Agent {
                 epoch,
                 heartbeat_secs: self.heartbeat_secs,
                 shared_health: Arc::clone(&self.health),
+                provider_models: Arc::clone(&self.provider_models),
                 labels: Arc::clone(&self.labels),
                 taints: Arc::clone(&self.taints),
                 observation: observation.clone(),
@@ -1213,6 +1238,7 @@ struct ControlTask {
     epoch: u64,
     heartbeat_secs: u64,
     shared_health: health::Shared,
+    provider_models: Arc<Vec<lu_config::ProviderModelConfig>>,
     labels: Arc<labels::LabelSource>,
     taints: Arc<Vec<String>>,
     observation: Option<Arc<Mutex<proc::JobObservation>>>,
@@ -1227,6 +1253,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
         epoch,
         heartbeat_secs,
         shared_health,
+        provider_models,
         labels,
         taints,
         observation,
@@ -1291,11 +1318,13 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                     })
                     .unwrap_or_default();
                 let label_set = labels.current_set();
+                let provider_models = offered_provider_models(&provider_models, &current.providers);
                 let mut beat = Heartbeat {
                     node: node.clone(),
                     harness: HarnessState::Busy,
                     version: Some(env!("CARGO_PKG_VERSION").to_owned()),
                     providers: current.providers,
+                    provider_models,
                     reiki: current.reiki,
                     host,
                     jobs,

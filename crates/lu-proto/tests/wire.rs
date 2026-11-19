@@ -93,6 +93,7 @@ fn a_heartbeat_carries_a_capped_forwarded_document() {
             state: ProviderState::Cooling,
             soonest_secs: Some(15),
         }],
+        provider_models: Vec::new(),
         reiki: Some(serde_json::json!({"providers": ["peer-a"]})),
         host: None,
         jobs: Vec::new(),

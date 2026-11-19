@@ -36,7 +36,20 @@ pub const MAX_DETECT_ARGV: usize = 8;
 pub const MAX_DETECT_TIMEOUT_SECS: u64 = 30;
 pub const MIN_DETECT_EVERY_SECS: u64 = 30;
 
+/// Limits for the provider/model pairs an agent offers to provider-agnostic jobs.
+pub const MAX_PROVIDER_MODELS: usize = 64;
+const MAX_PROVIDER_BYTES: usize = 64;
+const MAX_MODEL_BYTES: usize = 128;
+
 const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+
+fn valid_provider_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PROVIDER_BYTES
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +161,14 @@ fn default_repo_refs() -> Vec<String> {
     vec!["*".to_owned()]
 }
 
+/// One provider and the model to run for it, in preference order.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelConfig {
+    pub provider: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -177,6 +198,9 @@ pub struct AgentConfig {
     pub heartbeat_secs: u64,
     pub reiki_health_url: Option<String>,
     pub reiki_token_file: Option<String>,
+    /// Provider/model pairs this node offers to jobs that request `provider = "any"`.
+    #[serde(default)]
+    pub provider_models: Vec<ProviderModelConfig>,
     /// Labels this node always advertises. Lu never interprets them.
     #[serde(default)]
     pub labels: Vec<String>,
@@ -587,6 +611,43 @@ impl AgentConfig {
                     self.heartbeat_secs
                 ),
             );
+        }
+        if self.provider_models.len() > MAX_PROVIDER_MODELS {
+            return invalid(
+                "[agent]",
+                format!(
+                    "provider_models must name at most {MAX_PROVIDER_MODELS} pairs (got {})",
+                    self.provider_models.len()
+                ),
+            );
+        }
+        let mut providers = HashSet::new();
+        for (index, pair) in self.provider_models.iter().enumerate() {
+            let table = format!("[agent.provider_models] #{}", index + 1);
+            if !valid_provider_name(&pair.provider) {
+                return invalid(
+                    &table,
+                    format!(
+                        "provider must be 1 to {MAX_PROVIDER_BYTES} characters from A-Z a-z 0-9 . _ - (got {:?})",
+                        pair.provider
+                    ),
+                );
+            }
+            if pair.model.is_empty() || pair.model.len() > MAX_MODEL_BYTES {
+                return invalid(
+                    &table,
+                    format!(
+                        "model must be 1 to {MAX_MODEL_BYTES} bytes (got {})",
+                        pair.model.len()
+                    ),
+                );
+            }
+            if !providers.insert(pair.provider.as_str()) {
+                return invalid(
+                    &table,
+                    format!("provider {:?} duplicates an earlier pair", pair.provider),
+                );
+            }
         }
         if self.labels.len() > 32 {
             return invalid(
@@ -1399,6 +1460,65 @@ heartbeat_secs = 15
         }
         assert!(Config::parse(&base("heartbeat_secs", "2")).is_ok());
         assert!(Config::parse(&base("heartbeat_secs", "300")).is_ok());
+    }
+
+    fn agent_with_provider_models(pairs: &[(&str, &str)]) -> String {
+        let mut text = String::from(
+            "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n",
+        );
+        for (provider, model) in pairs {
+            text.push_str(&format!(
+                "[[agent.provider_models]]\nprovider=\"{provider}\"\nmodel=\"{model}\"\n"
+            ));
+        }
+        text
+    }
+
+    #[test]
+    fn provider_models_keep_configuration_order() {
+        let cfg = Config::parse(&agent_with_provider_models(&[
+            ("anthropic", "claude-sonnet-4-5"),
+            ("openai", "gpt-5"),
+        ]))
+        .unwrap();
+        let agent = cfg.agent.unwrap();
+        assert_eq!(agent.provider_models.len(), 2);
+        assert_eq!(agent.provider_models[0].provider, "anthropic");
+        assert_eq!(agent.provider_models[0].model, "claude-sonnet-4-5");
+        assert_eq!(agent.provider_models[1].provider, "openai");
+        assert_eq!(agent.provider_models[1].model, "gpt-5");
+    }
+
+    #[test]
+    fn provider_models_validate_names_models_and_duplicates() {
+        expect_table(
+            &agent_with_provider_models(&[("bad name", "m")]),
+            "[agent.provider_models] #1",
+        );
+        expect_table(
+            &agent_with_provider_models(&[("good", "")]),
+            "[agent.provider_models] #1",
+        );
+        expect_table(
+            &agent_with_provider_models(&[("good", &"m".repeat(MAX_MODEL_BYTES + 1))]),
+            "[agent.provider_models] #1",
+        );
+        expect_table(
+            &agent_with_provider_models(&[("dup", "a"), ("dup", "b")]),
+            "[agent.provider_models] #2",
+        );
+    }
+
+    #[test]
+    fn provider_models_have_a_count_limit() {
+        let pairs: Vec<(String, String)> = (0..MAX_PROVIDER_MODELS + 1)
+            .map(|i| (format!("p{i}"), "m".to_owned()))
+            .collect();
+        let refs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(p, m)| (p.as_str(), m.as_str()))
+            .collect();
+        expect_table(&agent_with_provider_models(&refs), "[agent]");
     }
 
     #[test]
