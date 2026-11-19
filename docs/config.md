@@ -1,6 +1,6 @@
 # Configuration
 
-`lu` reads one TOML file. `--config <path>` selects it; the default is `lu.toml` in the current directory. `lu check` parses the file and prints a summary plus database health, but does not check values, read secret files or load the TLS certificate. `lu serve` validates the whole file and its secret files; `lu backup` and `lu restore` read only `[controller] db`.
+`lu` reads one TOML file. `--config <path>` selects it; the default is `lu.toml` in the current directory. `lu check` parses and validates the values, prints a summary, database health and the checks it ran, but does not read secret files, load the TLS certificate or bind a port. `lu serve` validates the whole file and its secret files; `lu backup` and `lu restore` read only `[controller] db`.
 
 The file is UTF-8 and limited to 64 KiB. Unknown keys and tables are rejected rather than ignored. Every validation error names the table at fault, for example:
 
@@ -62,7 +62,7 @@ A job submitted for a configured repository is pinned in `base_commit` to the co
 
 ## `[agent]`
 
-The `[agent]` table describes an agent host. The operator CLI also reads `controller_url` and `token_file` from this table when `LU_URL` is not set.
+The `[agent]` table describes an agent host. Operator commands never read it: they use `LU_URL`/`LU_TOKEN_FILE` or an operator file.
 
 | Key | Required | Default | Validation |
 | --- | --- | --- | --- |

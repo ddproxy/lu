@@ -185,6 +185,7 @@ pub fn run(args: &[&str], envs: &[(&str, &str)], stdin: Option<&str>, cwd: &Path
         .env_remove("LU_URL")
         .env_remove("LU_TOKEN_FILE")
         .env_remove("LU_CA_FILE")
+        .env_remove("XDG_CONFIG_HOME")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (key, value) in envs {

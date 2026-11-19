@@ -1164,6 +1164,13 @@ pub fn load_structure(path: &Path) -> Result<Config, ConfigError> {
     Config::parse_structure(&read_config_text(path)?)
 }
 
+/// Reads and validates a config file without opening the secret files it names. This gives
+/// `lu check` the same value validation as `lu serve`, but needs no access to TLS keys, tokens
+/// or repository credentials.
+pub fn load_values(path: &Path) -> Result<Config, ConfigError> {
+    Config::parse(&read_config_text(path)?)
+}
+
 #[derive(Deserialize)]
 struct ControllerDbConfig {
     controller: Option<ControllerDbSection>,

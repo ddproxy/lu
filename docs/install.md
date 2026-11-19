@@ -99,7 +99,7 @@ systemctl enable --now lu-controller.service
 curl -fsS https://lu.example.net:7600/v1/health
 ```
 
-`lu check` parses the structure and reports database health without reading secret files. `lu serve` validates the whole file and its secret files. A non-loopback `listen` requires `[tls]`; there is no config reload, so restart after editing config, TLS files or token hashes.
+`lu check` validates config values, reports database health and lists the checks it ran. It opens no secret files and binds no port. `lu serve` validates the whole file and its secret files before binding. A non-loopback `listen` requires `[tls]`; there is no config reload, so restart after editing config, TLS files or token hashes.
 
 ### Running the controller under systemd
 
@@ -136,5 +136,7 @@ lu agent --config /etc/lu/agent.toml
 ```
 
 ## After install
+
+Operator commands use `LU_URL` with `LU_TOKEN_FILE` (optional `LU_CA_FILE`) or the first existing operator file at `$XDG_CONFIG_HOME/lu/operator.toml` (or `~/.config/lu/operator.toml`) or `/etc/lu/operator.toml`. Use an operator token: agent tokens get `401` on operator routes, and `--config` never supplies operator credentials. `lu backup`, `lu restore` and `lu check` use only the config's `[controller] db` key for database access and never open TLS keys or tokens, so they run as root or as the service account even when that account owns the secrets.
 
 Use the [client guide](client-guide.md) to submit and follow jobs, [monitoring.md](monitoring.md) to scrape metrics, and [troubleshooting.md](troubleshooting.md) for failures. Upgrade and backup steps are in [operations.md](operations.md).

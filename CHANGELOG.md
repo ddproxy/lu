@@ -19,6 +19,18 @@ uses semantic versioning once it reaches 1.0.
 - MCP submissions reserve rate-limit budget only after arguments and the resolved spec validate.
 - Mirror sync errors now name the failing step (creating or fetching a mirror) and add a hint for two recognisable causes: a failed stat of a config file under the service account's home directory ("the service account needs a readable HOME") and a failing `git` command ("the controller runs `git` as its own account; it must be able to run git and reach the remote"). The original error text is kept; systemd units should set `Environment=HOME=<state dir>` and a `PATH` that contains `git`.
 
+### Fixed
+
+- Artifact uploads from a stale lease no longer overwrite a newer file: the epoch is checked before the body is read and again when the artifact is recorded, and artifact writes use a temporary file plus rename so a failed write leaves no partial file.
+- Cancelling a job in `recovering` now ends it in `cancelled` immediately, matching the documented transition and cancel effect.
+- Log truncation keeps the `[log truncated]` marker even when the cap leaves less room than the marker itself.
+- Draining or undraining an unknown node returns `404 not_found` instead of a success response.
+- `lu check` now validates the full config with the same value checks as `lu serve`, reports the checks it ran on a `checks:` line, and still opens no TLS key, token or credential file and binds no port. `lu backup`, `lu restore` and `lu check` read only the `[controller] db` key for database work, so they run as root against a service account's secrets.
+
+### Removed
+
+- Operator commands no longer fall back to `[agent].controller_url` and `[agent].token_file` from `--config`. They use `LU_URL`/`LU_TOKEN_FILE` (optional `LU_CA_FILE`) or an operator file only.
+
 ## [0.2.0] - 2026-11-18
 
 ### Added

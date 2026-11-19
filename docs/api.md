@@ -4,6 +4,8 @@ The controller serves JSON over HTTPS; plain HTTP is accepted only on loopback. 
 
 Agents poll; the controller has no push channel. Lease expiry uses the controller's monotonic clock.
 
+Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file (`$XDG_CONFIG_HOME/lu/operator.toml`, `~/.config/lu/operator.toml` or `/etc/lu/operator.toml`). An agent token on an operator route gets `401`; `--config` is not an operator credential source.
+
 ## Operator
 
 | Route | Meaning |

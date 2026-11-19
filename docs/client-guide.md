@@ -20,8 +20,7 @@ flowchart TD
 | Source | Fields | Notes |
 | --- | --- | --- |
 | Environment | `LU_URL`, `LU_TOKEN_FILE`, optional `LU_CA_FILE` | `LU_TOKEN_FILE` is required when `LU_URL` is non-empty. Highest precedence. |
-| `[agent]` in `--config` | `controller_url`, `token_file`, optional `ca_file` | Default config is `lu.toml`. Takes precedence over operator files when present. |
-| Operator file | `url`, `token_file`, optional `ca_file` | `$XDG_CONFIG_HOME/lu/operator.toml` (or `~/.config/lu/operator.toml`), then `/etc/lu/operator.toml`. A leading `~/` in a path expands. |
+| Operator file | `url`, `token_file`, optional `ca_file` | `$XDG_CONFIG_HOME/lu/operator.toml` (or `~/.config/lu/operator.toml`), then `/etc/lu/operator.toml`. A leading `~/` in a path expands. `--config` is not a credential source. |
 
 The token file is read once. It must be a regular file owned by the effective user, with no group or other permission bits, no symlink or FIFO, and at most 8 KiB; trailing CR/LF is trimmed. `ca_file` adds up to 1 MiB of PEM certificates to the system roots. Plain `http` is accepted only on loopback; use `https` for any other host. Redirects are refused.
 
@@ -40,7 +39,7 @@ Global flags: `--config <path>` (default `lu.toml`) and `--json` (raw controller
 
 | Command | Worked example | Result |
 | --- | --- | --- |
-| `lu check` | `lu check --config /etc/lu/lu.toml` | Parses structure, prints config summary and database health; no secret files are read. |
+| `lu check` | `lu check --config /etc/lu/lu.toml` | Validates config values, prints the summary, database health and checks it ran; no secret files are opened and no port is bound. |
 | `lu serve` | `lu serve --config /etc/lu/lu.toml` | Runs the HTTP listener; default when no subcommand is given. |
 | `lu status` | `lu status --json` | Uptime, schema, db size, queue and node counts. |
 | `lu submit` | `lu submit --repo /srv/app --ref main --task-file task.txt --wait` | Submits a job and waits for a terminal state. |

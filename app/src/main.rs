@@ -124,10 +124,11 @@ async fn main() -> ExitCode {
 }
 
 fn check(path: &std::path::Path) -> ExitCode {
-    let config = match lu_config::load_structure(path) {
+    let config = match lu_config::load_values(path) {
         Ok(config) => config,
         Err(error) => return fail(&error.to_string()),
     };
+    let mut checks = vec!["config values".to_owned()];
     let tls_on = config.tls.is_some();
     if let Some(c) = &config.controller {
         println!(
@@ -139,6 +140,19 @@ fn check(path: &std::path::Path) -> ExitCode {
         );
         match admin::database_check(path) {
             Ok(lines) => {
+                if !lines.is_empty() {
+                    checks.extend(
+                        [
+                            "database quick_check",
+                            "database schema",
+                            "database size",
+                            "database leases",
+                            "database job_deps",
+                        ]
+                        .iter()
+                        .map(|name| (*name).to_owned()),
+                    );
+                }
                 for line in lines {
                     println!("{line}");
                 }
@@ -152,6 +166,7 @@ fn check(path: &std::path::Path) -> ExitCode {
             a.name, a.controller_url, a.work_dir
         );
     }
+    println!("checks: {}", checks.join(", "));
     ExitCode::SUCCESS
 }
 

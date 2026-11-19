@@ -23,7 +23,7 @@ systemd units are in [install.md](install.md); the agent's isolation model is in
 1. Read `CHANGELOG.md` and back up the database and artifacts ([below](#backup-and-restore)).
 2. Stop the controller: `systemctl stop lu-controller.service`.
 3. Replace `/usr/local/bin/lu` and any changed unit files, then `systemctl daemon-reload`.
-4. Run `lu check --config /etc/lu/lu.toml` to confirm the file structure, then start the controller.
+4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
 The store has schema version 6. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Schema 5 adds the nullable `assigned_provider` and `assigned_model` job columns and schema 6 adds `diff_bytes`, which backs the `no changes` note; an older database upgrades on open with those columns empty. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
@@ -44,9 +44,9 @@ lu backup --config /etc/lu/lu.toml --out "/var/backups/lu/lu-$(date +%F).db"
 `lu backup` uses SQLite's `VACUUM INTO`, writes the copy with mode `0600`, runs
 `PRAGMA integrity_check`, and prints the size, schema version and job count. It refuses to
 replace an existing file unless `--force` is given. `lu backup` and `lu restore` read only
-`[controller] db`; `lu check` reads the config structure and that database. None of these
-commands opens TLS keys or token files, so they also run as root against a service account's
-secrets.
+`[controller] db`; `lu check` validates config values, uses that key for its database checks and
+lists the checks it ran. None of these commands opens TLS keys or token files, so they also run as
+root against a service account's secrets.
 
 For a daily snapshot, install a small wrapper, a service and a timer as root:
 

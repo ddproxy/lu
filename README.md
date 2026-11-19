@@ -73,9 +73,9 @@ put `target/release` on `PATH` or run `make install` first.
    lu serve --config "$HOME/lu-demo/lu.toml"
    ```
 
-   `lu check` prints `controller: listen 127.0.0.1:7600, 1 agent(s), 1 operator(s), tls off`
-   and `agent: node-a -> http://127.0.0.1:7600, work dir /home/you/lu-demo/work`. It prints no
-   database line until the database exists.
+   `lu check` prints `controller: listen 127.0.0.1:7600, 1 agent(s), 1 operator(s), tls off`,
+   `agent: node-a -> http://127.0.0.1:7600, work dir /home/you/lu-demo/work` and a `checks:` line
+   naming the checks it ran. It prints no database line until the database exists.
 
 4. In shell 2, start the agent. A successful start loads the agent token, heartbeats and polls
    the controller:
@@ -156,7 +156,7 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu drain <node>` | Stop assigning new jobs to a node. The node must have heartbeated at least once. |
 | `lu undrain <node>` | Allow a drained node to take jobs again. The node must have heartbeated at least once. |
 
-Operator connection settings are read in this order: `LU_URL` with `LU_TOKEN_FILE` and optional `LU_CA_FILE`; the `[agent]` table in the `--config` file when that file exists; then the first existing operator file at `$XDG_CONFIG_HOME/lu/operator.toml` (or `~/.config/lu/operator.toml`) or `/etc/lu/operator.toml`. An operator file uses `url`, `token_file` and optional `ca_file`; a leading `~/` is expanded. The token file must be private (mode `0600` or tighter).
+Operator connection settings come from `LU_URL` with `LU_TOKEN_FILE` and optional `LU_CA_FILE`, or from the first existing operator file at `$XDG_CONFIG_HOME/lu/operator.toml` (or `~/.config/lu/operator.toml`) or `/etc/lu/operator.toml`. An operator file uses `url`, `token_file` and optional `ca_file`; a leading `~/` is expanded. The token file must be private (mode `0600` or tighter) and hold an operator token. `--config` supplies controller or agent settings only: an agent token gets `401` on operator routes, so operator commands never read `[agent].token_file`.
 
 ### Exit codes
 

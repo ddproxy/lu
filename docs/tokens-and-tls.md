@@ -78,9 +78,7 @@ A `ca_file` adds up to 1 MiB of PEM certificates to the system trust roots. It d
 them and is not a pinning mechanism. Use a certificate whose subject matches the host name in
 `controller_url` or `LU_URL`. There is no option to disable verification.
 
-`lu check` parses the config and reports `tls on` or `tls off` but does not open token or key
-files. `lu serve` loads the key and certificate; `lu agent` loads the agent token; operator
-commands load the operator token when they construct their client.
+`lu check` validates config values, reports `tls on` or `tls off`, names the checks it ran, and opens no token or key files or port. `lu backup` and `lu restore` read only `[controller] db`, and `lu check` uses that key for its database checks without opening secrets, so all three commands work as root against a service account's secrets. `lu serve` loads the key and certificate; `lu agent` loads the agent token; operator commands load the operator token from `LU_TOKEN_FILE` or an operator file. An agent token on an operator route gets `401`, so operator commands never fall back to `[agent].token_file`.
 
 ## Rotation
 

@@ -88,7 +88,7 @@ async fn top_once_prints_tables_and_top_json_prints_one_object() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn show_uses_the_agent_table_and_sanitises_hostile_text() {
+async fn show_uses_the_operator_file_and_sanitises_hostile_text() {
     let id = job_id();
     let mut job = job_json(&id, "failed");
     job["node"] = json!("node-a");
@@ -99,18 +99,29 @@ async fn show_uses_the_agent_table_and_sanitises_hostile_text() {
     let server = start(move |_| Reply::json(&job)).await;
     let dir = scratch("show-config");
     let token = write_token(&dir, "operator.token", TOKEN);
+    let xdg = dir.join("xdg");
+    std::fs::create_dir_all(xdg.join("lu")).unwrap();
+    std::fs::write(
+        xdg.join("lu").join("operator.toml"),
+        format!(
+            "url = \"{}\"\ntoken_file = \"{}\"\n",
+            server.url,
+            token.display()
+        ),
+    )
+    .unwrap();
+    // An [agent] table in --config must never supply operator credentials.
     let config = dir.join("lu.toml");
     std::fs::write(
         &config,
         format!(
             r#"[agent]
-name = "operator"
-controller_url = "{}"
+name = "agent"
+controller_url = "http://127.0.0.1:1"
 token_file = "{}"
 work_dir = "/srv/work/lu"
 harness = "opencode"
 "#,
-            server.url,
             token.display()
         ),
     )
@@ -118,7 +129,7 @@ harness = "opencode"
 
     let output = run(
         &["--config", config.to_str().unwrap(), "show", &id],
-        &[],
+        &[("XDG_CONFIG_HOME", xdg.to_str().unwrap())],
         None,
         &dir,
     );
