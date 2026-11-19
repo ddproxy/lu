@@ -7,7 +7,7 @@ flowchart LR
     Prometheus -->|"Bearer operator token<br/>GET /metrics"| Controller
     Operator -->|"lu status"| Controller
     Controller --> Store[("SQLite<br/>+ in-memory heartbeats")]
-    NodeExporter -->|"disk, filesystem"| Prometheus
+    NodeExporter -->|"host disk and filesystem"| Prometheus
 ```
 
 ## Scrape configuration
@@ -27,7 +27,7 @@ scrape_configs:
       - targets: ["controller.internal:7600"]
 ```
 
-If Prometheus supports only inline `credentials`, protect that file with the same permissions. Lu does not export disk-free or filesystem metrics: `HostStats.disk_free_bytes` is always omitted by the agent. Pair Lu with node-exporter for disk alerts.
+If Prometheus supports only inline `credentials`, protect that file with the same permissions. Lu exports `lu_node_disk_free_percent{node}` for each node's work filesystem when its heartbeat reports disk totals; use node-exporter for host-wide disk and filesystem alerts.
 
 ## Series
 
@@ -49,6 +49,7 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_jobs_no_changes_total` | counter | `done` jobs whose stored diff was empty and `allow_empty` was false, summed since this controller process started. |
 | `lu_node_last_seen_seconds{node}` | gauge | Seconds since that node's last heartbeat. |
 | `lu_node_labels_info{node,label}` | gauge | `1` per label in the node's latest heartbeat. |
+| `lu_node_disk_free_percent{node}` | gauge | Free space percentage on the node's work filesystem, when its latest heartbeat reported disk totals. |
 | `lu_node_providers{node,provider,state}` | gauge | `1` per reported provider; `state` is `ok`, `cooling`, `disabled` or `unknown`. |
 
 Node series describe the latest heartbeat held in memory. They disappear after a controller restart until agents report again. Provider and label series appear only for nodes that report them.
@@ -105,4 +106,4 @@ groups:
         for: 15m
 ```
 
-Tune heartbeat and queue thresholds against the configured `lease_secs` and expected backlog. A `recovered_on_boot` increase marks a controller restart that interrupted jobs; check `lu ls --state recovering` to see whether they resume or retry. Failure classes and retry rules are in [troubleshooting.md](troubleshooting.md); scrape route details are in [api.md](api.md).
+Tune heartbeat and queue thresholds against the configured `lease_secs` and expected backlog. A `recovered_on_boot` increase marks a controller restart that interrupted jobs; check `lu ls --state recovering` to see whether they resume or retry. Failure classes and retry rules are in [lifecycle.md](lifecycle.md); scrape route details are in [api.md](api.md).

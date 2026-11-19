@@ -41,7 +41,7 @@ stateDiagram-v2
 ```
 
 `needs_input` is part of the wire enum and the transition table, but it is reserved and
-unreachable in 0.1.0. The terminal states are `done`, `failed` and `cancelled`; they have no
+unreachable in this version. The terminal states are `done`, `failed` and `cancelled`; they have no
 outgoing edges.
 
 ## Transition reference
@@ -99,6 +99,18 @@ occurrence and fail any blocked dependents.
 Because node and provider requeues increment `attempt`, the effective budgets are: node failures
 at attempts 1 through `max_retries` are retried, and provider failures at attempts 1 through 100
 are retried. The next failure past the limit ends the job.
+
+A failure before the harness produced a verdict is classified by the agent, one row per case:
+
+| Cause | Class | Retried |
+| --- | --- | --- |
+| The harness process could not be started (command not found, exec refused, no pid) | `node` | within `max_retries` |
+| Staging or preparing the tree failed in a way the node controls (disk, filesystem, clone transport, permissions, leftover directory) | `node` | within `max_retries` |
+| A staging error that names a missing ref, an authentication failure or an unknown repository | `execution` | never |
+| A dependency diff could not be applied and the three-way merge left conflicts (or the patch was unreadable) | `conflict` | never |
+
+Provider-failure detection and cordon behaviour during an outage are in
+[operations.md](operations.md#provider-cordons-and-node-drains).
 
 ## Cancellation
 

@@ -17,6 +17,7 @@ uses semantic versioning once it reaches 1.0.
 
 - `lu_retry` inherits absent fields from the source spec; empty `require` or `fallbacks` clear them and any `after` or `after_keys` replaces the dependencies.
 - MCP submissions reserve rate-limit budget only after arguments and the resolved spec validate.
+- Mirror sync errors now name the failing step (creating or fetching a mirror) and add a hint for two recognisable causes: a failed stat of a config file under the service account's home directory ("the service account needs a readable HOME") and a failing `git` command ("the controller runs `git` as its own account; it must be able to run git and reach the remote"). The original error text is kept; systemd units should set `Environment=HOME=<state dir>` and a `PATH` that contains `git`.
 
 ## [0.2.0] - 2026-11-18
 

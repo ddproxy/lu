@@ -87,18 +87,7 @@ install -d -m 0750 -o root -g lu /etc/lu
 
 ## Controller
 
-Generate a token per scope. The controller stores only the SHA-256 hash; the token file stays on the host that uses it.
-
-```sh
-umask 077
-printf '%s' "$(head -c 32 /dev/urandom | base64)" > /etc/lu/agent.token
-printf '%s' "$(head -c 32 /dev/urandom | base64)" > /etc/lu/operator.token
-chown lu:lu /etc/lu/agent.token
-chmod 600 /etc/lu/agent.token /etc/lu/operator.token
-sha256sum /etc/lu/agent.token /etc/lu/operator.token
-```
-
-Use `printf '%s'`: the CLI trims a trailing newline from the token, but `sha256sum` does not. Copy `contrib/lu-controller.toml`, replace the placeholder hashes, paths and names, then start it:
+Generate one token per scope and put only their SHA-256 hashes in the controller config, as described in [Tokens and TLS](tokens-and-tls.md#token-files-and-hashes). Copy `contrib/lu-controller.toml`, replace the placeholder hashes, paths and names, then start it:
 
 ```sh
 install -m 0644 contrib/lu-controller.toml /etc/lu/lu.toml
@@ -111,6 +100,22 @@ curl -fsS https://lu.example.net:7600/v1/health
 ```
 
 `lu check` parses the structure and reports database health without reading secret files. `lu serve` validates the whole file and its secret files. A non-loopback `listen` requires `[tls]`; there is no config reload, so restart after editing config, TLS files or token hashes.
+
+### Running the controller under systemd
+
+The contributed unit runs as `lu` with `StateDirectory=lu`, so its state directory is `/var/lib/lu`, and it applies `ProtectHome=yes`, which makes the service account's home directory inaccessible. Mirror creation and fetches can read git config files from `$HOME`, so the unit must set `HOME` to a readable directory such as the state directory:
+
+```
+Environment=HOME=/var/lib/lu
+```
+
+The controller fetches mirrors by running `git` as its own account, so the unit's `PATH` must contain `git`:
+
+```
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+```
+
+With `[[controller.repos]]` mirrors configured, `git` must therefore be runnable by the service account and able to reach the remote.
 
 ## Agent
 

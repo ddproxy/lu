@@ -2,10 +2,12 @@
   items:
     - { title: Overview, url: / }
     - { title: Install, url: /docs/install.html }
+    - { title: Running under systemd, url: /docs/install.html#running-the-controller-under-systemd }
 - title: Concepts
   items:
     - { title: Concepts, url: /docs/concepts.html }
     - { title: Job Lifecycle, url: /docs/lifecycle.html }
+    - { title: Failure classes, url: /docs/lifecycle.html#failure-classes-and-retries }
     - { title: Dependencies, url: /docs/dependencies.html }
     - { title: Choosing where a job runs, url: /docs/dispatch.html }
 - title: Reference
@@ -13,11 +15,14 @@
     - { title: HTTP API, url: /docs/api.html }
     - { title: Configuration, url: /docs/config.html }
     - { title: Tokens and TLS, url: /docs/tokens-and-tls.html }
+    - { title: Token rotation, url: /docs/tokens-and-tls.html#rotation }
     - { title: Client guide, url: /docs/client-guide.html }
     - { title: MCP server, url: /docs/mcp.html }
 - title: Run it
   items:
     - { title: Operations, url: /docs/operations.html }
+    - { title: Backup and restore, url: /docs/operations.html#backup-and-restore }
+    - { title: Drains and cordons, url: /docs/operations.html#provider-cordons-and-node-drains }
     - { title: Monitoring, url: /docs/monitoring.html }
     - { title: Troubleshooting, url: /docs/troubleshooting.html }
     - { title: Security, url: /docs/security.html }

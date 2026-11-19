@@ -22,7 +22,7 @@ flowchart TD
 | --- | --- | --- |
 | `lu serve` exits with a config error | `lu check --config …` | The error names the table. Fix that table before starting. |
 | `no controller URL: set LU_URL …` | Environment, `--config` `[agent]`, then operator files | Set `LU_URL` and `LU_TOKEN_FILE`, add an `[agent]` table, or write `~/.config/lu/operator.toml`. See [client guide](client-guide.md). |
-| Token file refused | Owner, mode, type | Regular file, owned by the effective user, mode `0600` or tighter, no symlink or FIFO, at most 8 KiB. |
+| Token file refused | Owner, mode, type | Regular file, owned by the effective user, mode `0600` or tighter, no symlink or FIFO; at most 64 KiB for an agent token, 8 KiB for an operator token. |
 | `401 unauthorized` | Token value, scope, hash | Missing, unknown and wrong-scope tokens all return `401`. Use an operator token for CLI/MCP and an agent token for agent routes. |
 | `403 forbidden` | Node binding | A valid agent token is bound to one node; another node's job or heartbeat is refused. |
 | `429 rate_limited` | `Retry-After` and source address | Ten failed token checks in 60 seconds block an address for the rest of the window. |
@@ -42,15 +42,18 @@ lu status --config /etc/lu/lu.toml
 
 ## Job state
 
-| State | Meaning | Next check |
-| --- | --- | --- |
-| `blocked` | A dependency is unfinished. | `lu show <id>` lists each dependency and its state. |
-| `queued` | Ready for an agent. | `lu nodes --json`: an online, idle, non-draining node with every required label and provider. |
-| `leased` / `running` | Held by a node. | `lu node <node>` for the latest heartbeat and process tree. |
-| `recovering` | Lease expired or the controller restarted. | Agent heartbeat and `recovery_grace_secs`; a late write with an old epoch is discarded. |
-| `done`, `failed`, `cancelled` | Terminal. | `lu logs <id>` and `lu fetch <id>`; `lu retry <id>` resubmits the spec. |
+State definitions, legal transitions and the full state table are in
+[Job Lifecycle](lifecycle.md). For each state, check:
 
-A queued job that cannot be placed shows the first missing label in `lu show` and `lu top`. Draining stops all new assignments; a provider cordon stops only jobs naming that provider. A cordon expires after `provider_cooldown_secs`, or after two healthy provider heartbeats when it came from `retry_after_secs`.
+| State | Next check |
+| --- | --- |
+| `blocked` | `lu show <id>` lists each dependency and its state. |
+| `queued` | `lu nodes --json`: an online, idle, non-draining node with every required label and provider. |
+| `leased` / `running` | `lu node <node>` for the latest heartbeat and process tree. |
+| `recovering` | Agent heartbeat and `recovery_grace_secs`; a late write with an old epoch is discarded. |
+| `done`, `failed`, `cancelled` | `lu logs <id>` and `lu fetch <id>`; `lu retry <id>` resubmits the spec. |
+
+A queued job that cannot be placed shows the first missing label in `lu show` and `lu top`. For what a drain or provider cordon does, see [Provider cordons and node drains](operations.md#provider-cordons-and-node-drains).
 
 Worked example — diagnose a queued job:
 
@@ -62,13 +65,9 @@ lu undrain node-a
 
 ## Failure classes
 
-| `failure_class` | Cause | Retry |
-| --- | --- | --- |
-| `node` | Agent lost, lease expired, or staging/start failed on the node. | While `attempt <= max_retries`. |
-| `provider` | No key, model limit or 429. | Requeued without using that budget, up to 100 times. |
-| `execution` | Harness exited non-zero, timed out or produced no output. | Never. |
-| `dependency` | A dependency ended `failed` or `cancelled`. | Never; cascades to dependents. |
-| `conflict` | A dependency diff could not be applied cleanly. | Never. |
+The full failure-class table, retry rules and agent-side classification are in
+[Job Lifecycle](lifecycle.md#failure-classes-and-retries). Read `failure_class` with `lu show <id>`
+before applying the checks below.
 
 A `409 stale_epoch` means the agent write came from an old lease; the controller ignores it. A log append at the wrong offset returns `409 conflict` with `{"length":L}`; resume from `L`. A `429` carries `Retry-After` seconds.
 
@@ -116,8 +115,8 @@ The first call is `-32602` because `limit` is at most 100. The second returns a 
 
 ## Recovery and backups
 
-The store expects schema version `4`. A newer database is refused at startup; downgrades are not supported. Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch. An agent that renews within `recovery_grace_secs` continues; otherwise the job consumes a node retry or fails.
+The store expects schema version `6`. A newer database is refused at startup; downgrades are not supported. Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
 
-`lu restore` refuses a database still in use, a foreign SQLite file and a schema newer than the binary. Stop the controller first. If a restore is interrupted, the previous files remain as `<db>.pre-restore-<seconds>` for `-wal`, `-shm` and `-journal` too. Artifacts restore separately; see [operations.md](operations.md).
+`lu backup` and `lu restore` procedures, including interrupted restores and artifact snapshots, are in [operations.md](operations.md#backup-and-restore).
 
-For metric-based checks, see [monitoring.md](monitoring.md). For token and TLS rules, see [security.md](security.md).
+For metric-based checks, see [monitoring.md](monitoring.md). For token and TLS rules, see [tokens-and-tls.md](tokens-and-tls.md); for the threat model, see [security.md](security.md).

@@ -29,6 +29,18 @@ lu agent --config "$HOME/lu-demo/agent.toml"
 
 In the other shell, `lu submit ... --wait` returns when the job is done, `lu logs --follow <job-id>` streams its output, and `lu fetch <job-id> --out results` saves the diff, log and report.
 
-For a controller on a non-loopback address, add a `[tls]` table with `cert` and `key`; plain HTTP is accepted only on loopback. See [docs/config.md](docs/config.md).
+For a controller on a non-loopback address, add a `[tls]` table with `cert` and `key`; plain HTTP is accepted only on loopback. See [config.md](config.md).
+
+## Taints and tolerations
+
+A node can refuse work unless a job opts in. An agent lists up to 8 opaque taints in `[agent].taints`; a job names up to 8 with `--tolerate`. Dispatch gives a job only to a node whose every taint the job tolerates, so a node reserved for one kind of work never receives anything else. A taint is compared exactly and never interpreted. `lu nodes` shows taints first with a `!` prefix.
+
+```sh
+lu submit --repo /path/to/repository --ref main --task "build the homelab image" --tolerate homelab
+```
+
+## Detecting labels
+
+An agent can publish labels from commands it runs itself: up to 16 `[[agent.detect]]` entries run an argv command at start and every `every_secs`. Exit status 0 publishes the entry's label; any other exit withdraws it. Probes run off the heartbeat path with a wall timeout and a minimal environment, and `lu nodes` marks a published label as `(probed)`. Config keys are in [config.md](config.md).
 
 See [Concepts](concepts.md) for the vocabulary and [Job lifecycle](lifecycle.md) for what happens when no node qualifies.
