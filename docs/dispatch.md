@@ -29,6 +29,6 @@ lu agent --config "$HOME/lu-demo/agent.toml"
 
 In the other shell, `lu submit ... --wait` returns when the job is done, `lu logs --follow <job-id>` streams its output, and `lu fetch <job-id> --out results` saves the diff, log and report.
 
-For a controller on a non-loopback address, add a `[tls]` table with `cert` and `key`; plain HTTP is accepted only on loopback. See [docs/config.md](docs/config.md).
+For a controller on a non-loopback address, add a `[tls]` table with `cert` and `key`; plain HTTP is accepted only on loopback. See [config.md](config.md).
 
 See [Concepts](concepts.md) for the vocabulary and [Job lifecycle](lifecycle.md) for what happens when no node qualifies.

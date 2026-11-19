@@ -69,28 +69,18 @@ address for the rest of the window and return `429 rate_limited` with `Retry-Aft
 addresses are counted by `/64`, and an IPv4-mapped IPv6 address is counted as IPv4. A
 successful request does not reset the count.
 
-For token generation and the configuration of token hashes, see
-[Tokens and TLS](tokens-and-tls.md). The controller stores only SHA-256 hashes, so the value
-hashed into `token_sha256` is the same byte sequence the client later sends as the bearer token.
-Token files are read once with `O_NOFOLLOW` and `O_NONBLOCK`, must be regular files owned by the
-effective user, must have no group or other permission bits, and are capped at 64 KiB. The same
-rules apply to `reiki_token_file` when that optional health check is configured.
+For token generation, hash configuration, private-file rules and rotation, see
+[Tokens and TLS](tokens-and-tls.md#token-files-and-hashes). The controller stores only SHA-256
+hashes, so the value hashed into `token_sha256` is the same byte sequence the client later sends
+as the bearer token; the same private-file rules cover `reiki_token_file` when that optional
+health check is configured.
 
 ## TLS and transport
 
-Plain HTTP is accepted only when `[controller].listen` is a loopback address. Any non-loopback
-listener must have a `[tls]` table; `lu serve` enforces that. The listener uses TLS 1.2 or 1.3
-with safe defaults, HTTP/1.1 only, and no client certificates: the bearer token is the only
-client authentication.
-
-The TLS key is treated as a secret file by `lu serve`: regular file, owned by the effective user,
-no group/other bits, no symlink, no FIFO. The certificate is public. Both are loaded at startup; replacing them takes effect on the next
-restart. `lu check`, `lu backup` and `lu restore` read only `[controller] db`.
-
-Operators and agents verify the controller certificate against the system trust roots. The
-optional `[agent].ca_file` adds up to 1 MiB of PEM certificates to those roots. The certificate
-matches the host name in `controller_url`. A self-signed certificate belongs in `ca_file`; the
-client keeps verification enabled.
+The trust boundary is the listener: plain HTTP is confined to loopback, any non-loopback listener
+requires `[tls]`, and the bearer token is the only client credential. Certificate verification
+stays enabled; `ca_file` adds roots rather than replacing them. Modes, file rules and rotation are
+in [Tokens and TLS](tokens-and-tls.md#tls-modes).
 
 ## Epoch fencing and node binding
 

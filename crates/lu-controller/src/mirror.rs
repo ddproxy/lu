@@ -34,6 +34,17 @@ impl MirrorError {
         }
     }
 
+    /// `message` keeps its original text; `hint` is appended in parentheses when
+    /// the cause is recognisable, and never contains credential material.
+    fn with_hint(message: impl Into<String>, hint: Option<&'static str>) -> Self {
+        let message = message.into();
+        let message = match hint {
+            Some(hint) => format!("{message} ({hint})"),
+            None => message,
+        };
+        Self { message }
+    }
+
     /// The ref was not a branch, tag or commit the mirror knows, or the allow-list excluded it.
     pub fn is_unknown_ref(&self) -> bool {
         self.message.starts_with("unknown ref ")
@@ -47,6 +58,27 @@ impl fmt::Display for MirrorError {
 }
 
 impl std::error::Error for MirrorError {}
+
+/// A short hint for a recognisable mirror failure cause, or `None`.
+///
+/// `message` is an error string as reported to the user; credential file contents and
+/// URLs with credentials are never part of it, and the hint never quotes them either.
+fn hint_for(message: &str) -> Option<&'static str> {
+    let git_failure = message.contains("git fetch")
+        && (message.contains(" failed")
+            || message.contains(" timed out")
+            || message.contains("cannot run"));
+    if git_failure {
+        return Some(
+            "the controller runs `git` as its own account; it must be able to run git \
+             and reach the remote",
+        );
+    }
+    if message.contains("failed to stat") && message.contains(".gitconfig") {
+        return Some("the service account needs a readable HOME");
+    }
+    None
+}
 
 /// The result of one sync: the branch heads observed and when it finished.
 #[derive(Debug, Clone, Serialize)]
@@ -192,8 +224,15 @@ impl Mirror {
     fn sync_locked(&self, repo: &ControllerRepo) -> Result<SyncResult, MirrorError> {
         let path = self.mirror_path(&repo.name);
         if !path.exists() {
-            Repository::init_bare(&path)
-                .map_err(|e| MirrorError::new(format!("cannot create mirror: {e}")))?;
+            match Repository::init_bare(&path) {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(MirrorError::with_hint(
+                        format!("creating mirror for {} failed: {e}", repo.name),
+                        hint_for(&format!("cannot create mirror: {e}")),
+                    ))
+                }
+            }
             set_mode(&path, 0o700);
         }
         fetch(repo, &path, &self.root)?;
@@ -408,17 +447,18 @@ fn fetch(repo: &ControllerRepo, path: &Path, root: &Path) -> Result<(), MirrorEr
         return Ok(());
     }
     let detail = trim_error(&stderr);
-    if detail.is_empty() {
-        Err(MirrorError::new(format!(
-            "git fetch for {} failed with {}",
-            repo.name, output.status
-        )))
+    let base = if detail.is_empty() {
+        format!("git fetch for {} failed with {}", repo.name, output.status)
     } else {
-        Err(MirrorError::new(format!(
+        format!(
             "git fetch for {} failed with {}: {}",
             repo.name, output.status, detail
-        )))
-    }
+        )
+    };
+    Err(MirrorError::with_hint(
+        format!("fetching mirror for {} failed: {base}", repo.name),
+        hint_for(&base),
+    ))
 }
 
 fn harden(cmd: &mut Command, repo: &ControllerRepo, askpass: Option<&Askpass>) {
@@ -463,9 +503,10 @@ struct FetchOutput {
 }
 
 fn run_with_timeout(cmd: &mut Command) -> Result<FetchOutput, MirrorError> {
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| MirrorError::new(format!("cannot run git fetch: {e}")))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        let base = format!("cannot run git fetch: {e}");
+        MirrorError::with_hint(&base, hint_for(&base))
+    })?;
     let stderr = child.stderr.take();
     let reader = thread::spawn(move || {
         let mut out = String::new();
@@ -496,10 +537,16 @@ fn run_with_timeout(cmd: &mut Command) -> Result<FetchOutput, MirrorError> {
     };
     let stderr = reader.join().unwrap_or_default();
     match status {
-        None => Err(MirrorError::new(format!(
-            "git fetch timed out after {} seconds",
-            FETCH_TIMEOUT.as_secs()
-        ))),
+        None => Err(MirrorError::with_hint(
+            format!(
+                "git fetch timed out after {} seconds",
+                FETCH_TIMEOUT.as_secs()
+            ),
+            hint_for(&format!(
+                "git fetch timed out after {} seconds",
+                FETCH_TIMEOUT.as_secs()
+            )),
+        )),
         Some(status) => Ok(FetchOutput {
             success: status.success(),
             status: status.to_string(),
@@ -666,6 +713,54 @@ mod tests {
         std::fs::create_dir_all(&artifacts).unwrap();
         let mirror = Mirror::new(repos, &artifacts).unwrap();
         (tmp, mirror)
+    }
+
+    #[test]
+    fn hint_for_home_config_stat_suggests_readable_home() {
+        assert_eq!(
+            hint_for("failed to stat '/home/lu/.gitconfig'; class=Config"),
+            Some("the service account needs a readable HOME")
+        );
+    }
+
+    #[test]
+    fn hint_for_git_fetch_nonzero_exit_suggests_git_access() {
+        assert_eq!(
+            hint_for("git fetch for lu failed with exit status: 127: command not found"),
+            Some(
+                "the controller runs `git` as its own account; it must be able to run git \
+                 and reach the remote",
+            )
+        );
+    }
+
+    #[test]
+    fn hint_for_cannot_run_git_suggests_git_access() {
+        assert_eq!(
+            hint_for("cannot run git fetch: No such file or directory (os error 2)"),
+            Some(
+                "the controller runs `git` as its own account; it must be able to run git \
+                 and reach the remote",
+            )
+        );
+    }
+
+    #[test]
+    fn hint_for_timed_out_git_fetch_suggests_git_access() {
+        assert_eq!(
+            hint_for("git fetch timed out after 300 seconds"),
+            Some(
+                "the controller runs `git` as its own account; it must be able to run git \
+                 and reach the remote",
+            )
+        );
+    }
+
+    #[test]
+    fn hint_for_other_errors_returns_none() {
+        assert_eq!(hint_for("unknown ref main in repository local"), None);
+        assert_eq!(hint_for("cannot create mirror: permission denied"), None);
+        assert_eq!(hint_for("cannot read mirror: permission denied"), None);
     }
 
     #[test]

@@ -44,17 +44,17 @@ duplicate hashes.
 
 A token file is opened once with `O_NOFOLLOW | O_NONBLOCK` and must be a regular file owned by the
 effective user, with no group or other permission bits (`0600` or tighter). Symlinks, FIFOs and
-directories are refused. `token_file` and `credential_file` are capped at 64 KiB; clients also
-refuse tokens over 8 KiB. The bearer value must be visible ASCII with no spaces or control
-characters.
+directories are refused. Agent token files, repository credential files and Reiki token files
+are capped at 64 KiB; operator token files and the bearer value itself are capped at 8 KiB.
+The bearer value must be visible ASCII with no spaces or control characters.
 
 ## Authentication in practice
 
 Clients send `Authorization: Bearer <token>`. The controller hashes the presented token and
 compares it against every configured hash in constant time. Operator tokens open operator routes;
-agent tokens open only that agent's node routes. A token from the other scope gets `401` in this
-tree (`docs/api.md` still says `403` for that case). A valid agent token used for another node's
-job, or a write naming another node's job, gets `403 forbidden`.
+agent tokens open only that agent's node routes. A token from the other scope gets `401`, so a
+probe cannot tell scope failures apart. A valid agent token used for another node's job, or a
+write naming another node's job, gets `403 forbidden`.
 
 Ten failed token checks from one address within 60 seconds block that address for the rest of the
 window and return `429 rate_limited` with a retry delay. IPv6 addresses are counted by `/64`, and
