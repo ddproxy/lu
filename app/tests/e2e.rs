@@ -26,13 +26,19 @@ fn sha(token: &str) -> String {
 
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
-        .args(["-c", "user.email=e2e@example.net", "-c", "user.name=e2e"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .status()
         .expect("git runs");
     assert!(status.success(), "git {args:?}");
+}
+
+fn init_repo(dir: &Path) {
+    git(dir, &["init", "-q", "-b", "main"]);
+    git(dir, &["config", "--local", "user.email", "e2e@example.net"]);
+    git(dir, &["config", "--local", "user.name", "e2e"]);
+    git(dir, &["config", "--local", "commit.gpgsign", "false"]);
 }
 
 struct Server(Child);
@@ -86,7 +92,7 @@ async fn a_job_runs_from_submit_to_diff() {
     // A repository with one file.
     let repo = root.join("repo");
     std::fs::create_dir(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
+    init_repo(&repo);
     std::fs::write(repo.join("hello.txt"), "hello\n").unwrap();
     git(&repo, &["add", "hello.txt"]);
     git(&repo, &["commit", "-q", "-m", "init"]);

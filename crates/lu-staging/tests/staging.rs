@@ -55,6 +55,7 @@ fn run(dir: Option<&Path>, args: &[&str]) -> String {
     if let Some(d) = dir {
         cmd.current_dir(d);
     }
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     let out = cmd.output().expect("command spawn failed");
     if !out.status.success() {
         panic!(
@@ -73,9 +74,16 @@ fn init_repo() -> PathBuf {
     run(None, &["git", "init", "-b", "main", dir.to_str().unwrap()]);
     run(
         Some(&dir),
-        &["git", "config", "user.email", "test@example.net"],
+        &["git", "config", "--local", "user.email", "test@example.net"],
     );
-    run(Some(&dir), &["git", "config", "user.name", "Test"]);
+    run(
+        Some(&dir),
+        &["git", "config", "--local", "user.name", "Test"],
+    );
+    run(
+        Some(&dir),
+        &["git", "config", "--local", "commit.gpgsign", "false"],
+    );
     fs::write(dir.join("hello.txt"), "hello\n").unwrap();
     run(Some(&dir), &["git", "add", "hello.txt"]);
     run(Some(&dir), &["git", "commit", "-m", "init"]);
@@ -909,10 +917,22 @@ fn a_group_is_found_by_name_or_number() {
     let _ = fs::remove_dir_all(dir);
 }
 
+fn init_main_repo(path: &Path) -> Repository {
+    let mut opts = git2::RepositoryInitOptions::new();
+    // The host's `init.defaultBranch` must not decide which ref the tests resolve.
+    opts.initial_head("main");
+    let repo = Repository::init_opts(path, &opts).unwrap();
+    let mut config = repo.config().unwrap();
+    config.set_str("user.name", "Test").unwrap();
+    config.set_str("user.email", "test@example.net").unwrap();
+    config.set_bool("commit.gpgsign", false).unwrap();
+    repo
+}
+
 /// A repository with history, nested directories, a symlink, an executable and a binary blob.
 fn make_tree_repo() -> (PathBuf, git2::Oid, git2::Oid) {
     let dir = unique_temp_dir("packrepo");
-    let repo = Repository::init(&dir).unwrap();
+    let repo = init_main_repo(&dir);
     fs::create_dir_all(dir.join("nested/deep")).unwrap();
     fs::write(dir.join("hello.txt"), "hello\n").unwrap();
     fs::write(dir.join("nested/deep/note.txt"), "note\n").unwrap();
@@ -944,7 +964,7 @@ fn make_tree_repo() -> (PathBuf, git2::Oid, git2::Oid) {
     let tree_id = index.write_tree().unwrap();
     let tree = repo.find_tree(tree_id).unwrap();
     let parent = repo
-        .commit(Some("HEAD"), &sig, &sig, "parent", &tree, &[])
+        .commit(Some("refs/heads/main"), &sig, &sig, "parent", &tree, &[])
         .unwrap();
     fs::write(dir.join("later.txt"), "later\n").unwrap();
     index.add_path(Path::new("later.txt")).unwrap();
@@ -953,7 +973,14 @@ fn make_tree_repo() -> (PathBuf, git2::Oid, git2::Oid) {
     let tree = repo.find_tree(tree_id).unwrap();
     let parent_commit = repo.find_commit(parent).unwrap();
     let head = repo
-        .commit(Some("HEAD"), &sig, &sig, "head", &tree, &[&parent_commit])
+        .commit(
+            Some("refs/heads/main"),
+            &sig,
+            &sig,
+            "head",
+            &tree,
+            &[&parent_commit],
+        )
         .unwrap();
     (dir, parent, head)
 }

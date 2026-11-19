@@ -1,4 +1,4 @@
-use git2::{Repository, Signature};
+use git2::Signature;
 use lu_auth::sha256_hex;
 use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator, ControllerRepo};
 use lu_controller::{build_router, run_background, AppState};
@@ -17,6 +17,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
+
+mod common;
 
 const OP_TOKEN: &str = "op-token-1234567890";
 const AGENT_A_TOKEN: &str = "agent-a-token-1234567890";
@@ -982,11 +984,9 @@ async fn graceful_shutdown_ends_waiting_polls() {
 }
 
 fn local_repo(path: &Path) -> (String, String, String) {
-    use git2::{IndexAddOption, Repository, Signature};
+    use git2::IndexAddOption;
 
-    let repo = Repository::init(path).unwrap();
-    // The default branch name depends on the machine's git config, so name it explicitly.
-    repo.set_head("refs/heads/main").unwrap();
+    let repo = common::init_main_repo(path);
     let file = path.join("file.txt");
     std::fs::write(&file, "one\n").unwrap();
     let mut index = repo.index().unwrap();
@@ -998,7 +998,14 @@ fn local_repo(path: &Path) -> (String, String, String) {
     let tree = repo.find_tree(tree_id).unwrap();
     let signature = Signature::now("lu", "lu@example.net").unwrap();
     let first = repo
-        .commit(Some("HEAD"), &signature, &signature, "first", &tree, &[])
+        .commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "first",
+            &tree,
+            &[],
+        )
         .unwrap();
     let first_commit = repo.find_commit(first).unwrap();
     repo.tag_lightweight("v1", first_commit.as_object(), false)
@@ -1013,7 +1020,7 @@ fn local_repo(path: &Path) -> (String, String, String) {
     let tree = repo.find_tree(tree_id).unwrap();
     let second = repo
         .commit(
-            Some("HEAD"),
+            Some("refs/heads/main"),
             &signature,
             &signature,
             "second",
@@ -1820,7 +1827,7 @@ async fn log_append_with_less_room_than_the_marker_keeps_the_marker() {
 fn repo_with_two_commits(root: &std::path::Path) -> (String, String) {
     let dir = root.join("source");
     std::fs::create_dir_all(&dir).unwrap();
-    let repo = Repository::init(&dir).unwrap();
+    let repo = common::init_main_repo(&dir);
     let sig = Signature::now("tester", "tester@example.com").unwrap();
     let mut index = repo.index().unwrap();
 
@@ -1830,7 +1837,7 @@ fn repo_with_two_commits(root: &std::path::Path) -> (String, String) {
     let tree_id = index.write_tree().unwrap();
     let tree = repo.find_tree(tree_id).unwrap();
     let first = repo
-        .commit(Some("HEAD"), &sig, &sig, "first", &tree, &[])
+        .commit(Some("refs/heads/main"), &sig, &sig, "first", &tree, &[])
         .unwrap();
 
     std::fs::create_dir_all(dir.join("nested")).unwrap();
@@ -1843,7 +1850,7 @@ fn repo_with_two_commits(root: &std::path::Path) -> (String, String) {
     let tree = repo.find_tree(tree_id).unwrap();
     let second = repo
         .commit(
-            Some("HEAD"),
+            Some("refs/heads/main"),
             &sig,
             &sig,
             "second",

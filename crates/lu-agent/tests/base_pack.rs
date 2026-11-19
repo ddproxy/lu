@@ -136,7 +136,15 @@ async fn staging_from_a_pack_needs_no_git_binary() {
     std::fs::create_dir_all(source.join("nested")).unwrap();
     std::fs::write(source.join("hello.txt"), "hello\n").unwrap();
     std::fs::write(source.join("nested/data.bin"), [0u8, 1, 2, 255]).unwrap();
-    let repo = Repository::init(&source).unwrap();
+    let mut opts = git2::RepositoryInitOptions::new();
+    // Pin the branch so the pack's ref does not depend on the host's default branch name.
+    opts.initial_head("main");
+    let repo = Repository::init_opts(&source, &opts).unwrap();
+    let mut config = repo.config().unwrap();
+    config.set_str("user.name", "tester").unwrap();
+    config.set_str("user.email", "tester@example.net").unwrap();
+    config.set_bool("commit.gpgsign", false).unwrap();
+    drop(config);
     let sig = Signature::now("tester", "tester@example.net").unwrap();
     let mut index = repo.index().unwrap();
     index.add_path(std::path::Path::new("hello.txt")).unwrap();
@@ -146,7 +154,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
     index.write().unwrap();
     let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
     let oid = repo
-        .commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+        .commit(Some("refs/heads/main"), &sig, &sig, "base", &tree, &[])
         .unwrap();
     let commit = oid.to_string();
     let pack = pack_commit(&repo, oid).unwrap();

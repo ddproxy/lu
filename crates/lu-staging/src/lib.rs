@@ -1177,6 +1177,7 @@ mod tests {
         let out = Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .unwrap();
         assert!(
@@ -1190,21 +1191,15 @@ mod tests {
         let repo = root.join("source");
         fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
-        fs::write(repo.join("README.md"), "test\n").unwrap();
-        git(&repo, &["add", "README.md"]);
         git(
             &repo,
-            &[
-                "-c",
-                "user.email=test@test",
-                "-c",
-                "user.name=test",
-                "commit",
-                "-q",
-                "-m",
-                "init",
-            ],
+            &["config", "--local", "user.email", "test@example.net"],
         );
+        git(&repo, &["config", "--local", "user.name", "Test"]);
+        git(&repo, &["config", "--local", "commit.gpgsign", "false"]);
+        fs::write(repo.join("README.md"), "test\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
         repo
     }
 

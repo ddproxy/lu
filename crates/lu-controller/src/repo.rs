@@ -60,8 +60,8 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let inside_repo = root.path().join("inside");
         let outside_repo = outside.path().join("outside");
-        git2::Repository::init(&inside_repo).unwrap();
-        git2::Repository::init(&outside_repo).unwrap();
+        crate::test_support::init_main_repo(&inside_repo);
+        crate::test_support::init_main_repo(&outside_repo);
         let provider = LocalPathProvider::new(&[root.path().display().to_string()]).unwrap();
         assert!(provider
             .open(&inside_repo.display().to_string())

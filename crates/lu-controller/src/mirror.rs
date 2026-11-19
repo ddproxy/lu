@@ -602,6 +602,7 @@ impl crate::repo::RepoProvider for Mirror {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::init_main_repo;
     use git2::{IndexAddOption, Signature};
     use std::io::Write;
 
@@ -616,11 +617,9 @@ mod tests {
     }
 
     fn local_repo(path: &Path) -> (String, String, String) {
-        let repo = Repository::init(path).unwrap();
+        let repo = init_main_repo(path);
         let file = path.join("file.txt");
         std::fs::write(&file, "one\n").unwrap();
-        // The default branch name depends on the machine's git config, so name it explicitly.
-        repo.set_head("refs/heads/main").unwrap();
         let mut index = repo.index().unwrap();
         index
             .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
@@ -630,7 +629,14 @@ mod tests {
         let tree = repo.find_tree(tree_id).unwrap();
         let signature = Signature::now("lu", "lu@example.net").unwrap();
         let first = repo
-            .commit(Some("HEAD"), &signature, &signature, "first", &tree, &[])
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "first",
+                &tree,
+                &[],
+            )
             .unwrap();
         let first_commit = repo.find_commit(first).unwrap();
         repo.tag_lightweight("v1", first_commit.as_object(), false)
@@ -645,7 +651,7 @@ mod tests {
         let tree = repo.find_tree(tree_id).unwrap();
         let second = repo
             .commit(
-                Some("HEAD"),
+                Some("refs/heads/main"),
                 &signature,
                 &signature,
                 "second",

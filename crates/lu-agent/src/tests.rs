@@ -375,40 +375,28 @@ fn slow_harness(_task_file: &std::path::Path) -> CommandSpec {
     CommandSpec::new("sh").arg("-c").arg("sleep 10; echo done")
 }
 
+fn git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed in {}", dir.display());
+}
+
 /// Creates a local git repository for testing.
-fn create_git_repo(path: &std::path::Path) {
-    std::process::Command::new("git")
-        .args(["init", "-q", "-b", "main"])
-        .current_dir(path)
-        .status()
-        .unwrap();
+fn create_git_repo(path: &Path) {
+    git(path, &["init", "-q", "-b", "main"]);
+    git(
+        path,
+        &["config", "--local", "user.email", "test@example.net"],
+    );
+    git(path, &["config", "--local", "user.name", "Test"]);
+    git(path, &["config", "--local", "commit.gpgsign", "false"]);
     std::fs::write(path.join("README.md"), "test\n").unwrap();
-    std::process::Command::new("git")
-        .args([
-            "-c",
-            "user.email=test@test",
-            "-c",
-            "user.name=test",
-            "add",
-            "README.md",
-        ])
-        .current_dir(path)
-        .status()
-        .unwrap();
-    std::process::Command::new("git")
-        .args([
-            "-c",
-            "user.email=test@test",
-            "-c",
-            "user.name=test",
-            "commit",
-            "-q",
-            "-m",
-            "init",
-        ])
-        .current_dir(path)
-        .status()
-        .unwrap();
+    git(path, &["add", "README.md"]);
+    git(path, &["commit", "-q", "-m", "init"]);
 }
 
 /// A patch from the repository's committed `before` content to `after`, with the worktree
@@ -426,6 +414,7 @@ fn make_diff(repo_dir: &Path, path: &str, before: &str, after: &str) -> Vec<u8> 
             path,
         ])
         .current_dir(repo_dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
     assert!(
