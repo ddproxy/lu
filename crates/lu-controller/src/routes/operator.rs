@@ -452,11 +452,12 @@ pub async fn get_logs(
     let data = if offset >= rec.log_len {
         Vec::new()
     } else {
+        let remaining = rec.log_len - offset;
         match tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
             let mut f = fs::File::open(&path)?;
             f.seek(SeekFrom::Start(offset))?;
             let mut buf = Vec::new();
-            f.read_to_end(&mut buf)?;
+            f.take(remaining).read_to_end(&mut buf)?;
             Ok(buf)
         })
         .await

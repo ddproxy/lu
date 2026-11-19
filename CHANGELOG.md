@@ -30,6 +30,11 @@ uses semantic versioning once it reaches 1.0.
 ### Removed
 
 - Operator commands no longer fall back to `[agent].controller_url` and `[agent].token_file` from `--config`. They use `LU_URL`/`LU_TOKEN_FILE` (optional `LU_CA_FILE`) or an operator file only.
+- Failed log writes release the reserved length, so retries append at the right offset.
+- Log reads stop at the stored length, even when the file is longer.
+- Polls with pending cancellations renew every job held by the polling node.
+- Controller start removes leftover `.askpass-*` directories under the mirror root.
+- Agent disk readings locate `df` at fixed absolute paths, independent of `PATH`.
 
 ## [0.2.0] - 2026-11-18
 

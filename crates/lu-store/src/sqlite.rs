@@ -1169,6 +1169,24 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    fn held_jobs(&self, node: &NodeName) -> Result<Vec<(JobId, u64)>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, epoch FROM jobs WHERE node=?1 AND state IN ('leased','running','recovering')"
+        ).map_err(internal)?;
+        let rows = stmt
+            .query_map(params![node.as_str()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(internal)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, epoch) = r.map_err(internal)?;
+            out.push((JobId::parse(&id).map_err(internal)?, epoch as u64));
+        }
+        Ok(out)
+    }
+
     fn start_job(&self, id: &JobId, epoch: u64, now: Now) -> Result<JobRecord, StoreError> {
         let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let tx = conn
@@ -1255,6 +1273,43 @@ impl Store for SqliteStore {
                 want
             }
         };
+        update_job_tx(&tx, &rec, lease, recov)?;
+        tx.commit().map_err(internal)?;
+        Ok(rec.log_len)
+    }
+
+    fn unreserve_log(
+        &self,
+        id: &JobId,
+        epoch: u64,
+        length: u64,
+        n: u64,
+    ) -> Result<u64, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let (mut rec, lease, recov) = get_job_tx(&tx, id.as_str())?;
+        if rec.epoch != epoch {
+            return Err(StoreError::StaleEpoch);
+        }
+        if !matches!(
+            rec.state,
+            JobState::Leased | JobState::Running | JobState::Recovering
+        ) {
+            return Err(StoreError::Conflict { length: None });
+        }
+        let Some(restored) = length.checked_sub(n) else {
+            return Err(StoreError::Conflict {
+                length: Some(rec.log_len),
+            });
+        };
+        if rec.log_len != length {
+            return Err(StoreError::Conflict {
+                length: Some(rec.log_len),
+            });
+        }
+        rec.log_len = restored;
         update_job_tx(&tx, &rec, lease, recov)?;
         tx.commit().map_err(internal)?;
         Ok(rec.log_len)

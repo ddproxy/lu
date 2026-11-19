@@ -75,6 +75,8 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     label_requirements_route_and_explain(&make());
     taint_tolerations_route_and_explain(&make());
     start_renew_log_artifact(&make());
+    unreserve_log_restores_length_and_is_fenced(&make());
+    held_jobs_lists_the_nodes_active_jobs(&make());
     complete_and_retry_cordon(&make());
     reiki_cordon_yields_to_live_health(&make());
     conflict_failure_class_round_trips(&make());
@@ -966,6 +968,63 @@ fn start_renew_log_artifact<S: Store>(s: &S) {
     let rec = s.get_job(&j.id).unwrap();
     assert!(rec.artifacts.contains(&ArtifactName::DiffPatch));
     assert_eq!(rec.diff_bytes, Some(42));
+}
+
+fn unreserve_log_restores_length_and_is_fenced<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (j, _) = s
+        .create_job(&spec("https://x/unreserve.git", None), now(1, 1))
+        .unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+
+    let len = s.reserve_log(&j.id, a.epoch, 0, 6).unwrap();
+    assert_eq!(len, 6);
+    assert_eq!(s.unreserve_log(&j.id, a.epoch, len, 6).unwrap(), 0);
+    assert_eq!(s.get_job(&j.id).unwrap().log_len, 0);
+
+    // A retry at the same offset succeeds after the rollback.
+    let len = s.reserve_log(&j.id, a.epoch, 0, 4).unwrap();
+    assert_eq!(len, 4);
+    assert_eq!(
+        s.unreserve_log(&j.id, a.epoch, len, 5).unwrap_err(),
+        StoreError::Conflict { length: Some(4) }
+    );
+    assert_eq!(s.get_job(&j.id).unwrap().log_len, 4);
+    assert_eq!(
+        s.unreserve_log(&j.id, a.epoch, 0, 4).unwrap_err(),
+        StoreError::Conflict { length: Some(4) }
+    );
+    assert_eq!(
+        s.unreserve_log(&j.id, a.epoch - 1, 4, 4).unwrap_err(),
+        StoreError::StaleEpoch
+    );
+    assert_eq!(s.get_job(&j.id).unwrap().log_len, 4);
+}
+
+fn held_jobs_lists_the_nodes_active_jobs<S: Store>(s: &S) {
+    let n = node("node-b");
+    s.heartbeat(&hb("node-b", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (j, _) = s
+        .create_job(&spec("https://x/held.git", None), now(1, 1))
+        .unwrap();
+    assert!(s.held_jobs(&n).unwrap().is_empty());
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    assert_eq!(s.held_jobs(&n).unwrap(), vec![(j.id.clone(), a.epoch)]);
+    assert!(s.held_jobs(&node("node-a")).unwrap().is_empty());
+    s.start_job(&j.id, a.epoch, now(3, 3)).unwrap();
+    let completion = Completion {
+        job_id: j.id.clone(),
+        epoch: a.epoch,
+        outcome: Outcome::Done,
+        exit_code: Some(0),
+        summary: None,
+        retry_after_secs: None,
+    };
+    s.complete(&completion, None, now(3, 3), 1, 60_000).unwrap();
+    assert!(s.held_jobs(&n).unwrap().is_empty());
 }
 
 fn complete_and_retry_cordon<S: Store>(s: &S) {
