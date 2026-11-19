@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lu_proto::{
-    AgentEvent, ArtifactName, Completion, JobId, JobSpec, JobState, LogChunk, NodeName,
+    AgentEvent, ArtifactName, Completion, JobEdit, JobId, JobSpec, JobState, LogChunk, NodeName,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
@@ -357,6 +357,30 @@ impl Client {
         Ok(raw_body(&reply))
     }
 
+    /// Changes a queued or blocked job in place, keeping its id.
+    pub async fn edit(&self, id: &JobId, edit: &JobEdit) -> Result<JobView> {
+        let reply = self.edit_reply(id, edit).await?;
+        self.scrub(parse_job(&reply.body))
+    }
+
+    /// Both the parsed view and the exact response body, from one edit request.
+    pub async fn edit_with_raw(&self, id: &JobId, edit: &JobEdit) -> Result<(JobView, String)> {
+        let reply = self.edit_reply(id, edit).await?;
+        let view = self.scrub(parse_job(&reply.body))?;
+        Ok((view, raw_body(&reply)))
+    }
+
+    async fn edit_reply(&self, id: &JobId, edit: &JobEdit) -> Result<HttpReply> {
+        let route = format!("v1/jobs/{id}/edit");
+        let body = serde_json::to_vec(edit).map_err(|error| ApiError::Decode {
+            message: format!("could not encode the job edit: {error}"),
+        })?;
+        let reply = self
+            .send(Method::POST, &route, Some(body), &[], &[], false)
+            .await?;
+        self.success(reply)
+    }
+
     pub async fn nodes(&self) -> Result<ListNodes> {
         let reply = self
             .send(Method::GET, "v1/nodes", None, &[], &[], true)
@@ -524,6 +548,9 @@ impl Client {
         }
         if !request.providers.is_empty() {
             heartbeat["providers"] = serde_json::json!(request.providers);
+        }
+        if !request.provider_models.is_empty() {
+            heartbeat["provider_models"] = serde_json::json!(request.provider_models);
         }
         if let Some(reiki) = &request.reiki {
             heartbeat["reiki"] = reiki.clone();

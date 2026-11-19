@@ -9,7 +9,7 @@ use crate::time::now;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use lu_proto::{validate_idempotency_key, ArtifactName, JobId, JobSpec, NodeName};
+use lu_proto::{validate_idempotency_key, ArtifactName, JobEdit, JobId, JobSpec, NodeName};
 use lu_serve::PeerAddr;
 use lu_store::{missing_labels, waiting_reason, JobRecord, NodeRecord, Now};
 use serde_json::json;
@@ -109,6 +109,7 @@ fn node_view(n: &NodeRecord, stats: Option<&lu_proto::NodeStats>) -> serde_json:
         "draining": n.draining,
         "harness": harness,
         "providers": &n.heartbeat.providers,
+        "provider_models": &n.heartbeat.provider_models,
         "labels": &n.heartbeat.labels,
         "label_sources": &n.heartbeat.label_sources,
         "taints": &n.heartbeat.taints,
@@ -337,6 +338,51 @@ pub async fn cancel_job(
     match res {
         Ok(Ok(rec)) => {
             state.waiters.notify_job(rec.id.as_ref());
+            state.waiters.notify_work();
+            let nodes = match all_nodes(&state, now()).await {
+                Ok(nodes) => nodes,
+                Err(error) => return with_version(error.into_response()),
+            };
+            with_version(json_ok(
+                StatusCode::OK,
+                &job_view_with(&rec, waiting_reason(&rec, &nodes)),
+            ))
+        }
+        Ok(Err(e)) => with_version(store_err(e).into_response()),
+        Err(_) => with_version(ApiError::internal().into_response()),
+    }
+}
+
+pub async fn edit_job(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
+        return with_version(ApiError::unauthorized().into_response());
+    }
+    let job_id = match JobId::parse(&id) {
+        Ok(i) => i,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
+        Ok(b) => b,
+        Err(e) => return with_version(e.into_response()),
+    };
+    let edit: JobEdit = match serde_json::from_slice(&bytes) {
+        Ok(e) => e,
+        Err(e) => return with_version(ApiError::unprocessable(e.to_string()).into_response()),
+    };
+    let n = now();
+    let res = tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        move || store.edit_job(&job_id, &edit, n)
+    })
+    .await;
+    match res {
+        Ok(Ok(rec)) => {
             state.waiters.notify_work();
             let nodes = match all_nodes(&state, now()).await {
                 Ok(nodes) => nodes,

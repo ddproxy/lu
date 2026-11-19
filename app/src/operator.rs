@@ -10,8 +10,8 @@ use lu_client::{
     ApiError, Client, JobView, ListRepos, LogPage, NodeStats, NodeView, RepoView, StatusView,
 };
 use lu_proto::{
-    printable, truncate_chars, ArtifactName, FailureClass, HarnessState, JobId, JobSpec, JobState,
-    NodeName, LABEL_SOURCE_PROBED, MAX_TASK_BYTES,
+    printable, truncate_chars, ArtifactName, FailureClass, HarnessState, JobEdit, JobId, JobSpec,
+    JobState, NodeName, LABEL_SOURCE_PROBED, MAX_TASK_BYTES,
 };
 use lu_tui::graph::{self, Graph};
 use lu_tui::model::Tone;
@@ -126,6 +126,43 @@ pub struct RetryArgs {
 }
 
 #[derive(Debug, clap::Args)]
+pub struct EditArgs {
+    /// Job id.
+    #[arg(value_parser = parse_job_id)]
+    pub id: JobId,
+    /// Replace the provider name; "any" lets dispatch choose a healthy pair.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Replace the model name. Not allowed with --provider any.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Replace the fallbacks with these provider[:model] choices (repeatable).
+    #[arg(long = "fallback", value_parser = parse_fallback, conflicts_with = "no_fallbacks")]
+    pub fallbacks: Vec<lu_proto::Choice>,
+    /// Clear the fallback list.
+    #[arg(long = "no-fallbacks")]
+    pub no_fallbacks: bool,
+    /// Replace the dependencies (repeatable).
+    #[arg(long = "after", value_parser = parse_job_id)]
+    pub after: Vec<JobId>,
+    /// Replace the dependencies with jobs named by these idempotency keys (repeatable).
+    #[arg(long = "after-key")]
+    pub after_key: Vec<String>,
+    /// Replace the label requirements (repeatable).
+    #[arg(long = "require", conflicts_with = "no_require")]
+    pub require: Vec<String>,
+    /// Clear the label requirements.
+    #[arg(long = "no-require")]
+    pub no_require: bool,
+    /// Replace the tolerated taints (repeatable).
+    #[arg(long = "tolerate", conflicts_with = "no_tolerate")]
+    pub tolerate: Vec<String>,
+    /// Clear the tolerated taints.
+    #[arg(long = "no-tolerate")]
+    pub no_tolerate: bool,
+}
+
+#[derive(Debug, clap::Args)]
 pub struct LsArgs {
     /// Only show jobs in this state.
     #[arg(long, value_parser = parse_state)]
@@ -207,6 +244,10 @@ pub async fn submit(args: SubmitArgs, config: &Path, json: bool) -> ExitCode {
 
 pub async fn retry(args: RetryArgs, config: &Path, json: bool) -> ExitCode {
     finish(retry_inner(args, config, json).await)
+}
+
+pub async fn edit(args: EditArgs, config: &Path, json: bool) -> ExitCode {
+    finish(edit_inner(args, config, json).await)
 }
 
 pub async fn ls(args: LsArgs, config: &Path, json: bool) -> ExitCode {
@@ -361,6 +402,42 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
     spec.validate().map_err(|error| error.to_string())?;
 
     submit_and_report(&client, &spec, json, args.wait).await
+}
+
+async fn edit_inner(args: EditArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    if args.provider.as_deref() == Some(lu_proto::ANY_PROVIDER)
+        && (args.model.is_some() || !args.fallbacks.is_empty())
+    {
+        return Err("lu: --provider any cannot be combined with --model or --fallback".into());
+    }
+
+    let client = connect(config)?;
+    let after = if args.after.is_empty() && args.after_key.is_empty() {
+        None
+    } else {
+        match resolve_after(&client, &args.after, &args.after_key).await? {
+            Some(ids) => Some(ids),
+            None => return Ok(ExitCode::from(EXIT_USAGE)),
+        }
+    };
+    let edit = JobEdit {
+        provider: args.provider,
+        model: args.model,
+        fallbacks: (!args.fallbacks.is_empty() || args.no_fallbacks).then_some(args.fallbacks),
+        requires: (!args.require.is_empty() || args.no_require).then_some(args.require),
+        tolerates: (!args.tolerate.is_empty() || args.no_tolerate).then_some(args.tolerate),
+        after,
+    };
+    let (view, raw) = client
+        .edit_with_raw(&args.id, &edit)
+        .await
+        .map_err(|error| error.to_string())?;
+    if json {
+        print_raw(&raw);
+    } else {
+        println!("{} {}", view.id, state_name(view.state));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn submit_and_report(

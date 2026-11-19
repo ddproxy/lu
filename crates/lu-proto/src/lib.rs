@@ -29,8 +29,8 @@ pub use limits::{
 };
 pub use node::{
     valid_provider_name, HarnessState, Heartbeat, HeartbeatError, HostStats, JobStats, NodeStats,
-    ProcessStats, ProviderState, ProviderStatus,
+    ProcessStats, ProviderModel, ProviderState, ProviderStatus,
 };
 pub use sanitize::{printable, truncate_chars};
-pub use spec::{validate_idempotency_key, Choice, JobSpec, JobSpecError};
+pub use spec::{validate_idempotency_key, Choice, JobEdit, JobSpec, JobSpecError, ANY_PROVIDER};
 pub use state::{CancelEffect, JobState};

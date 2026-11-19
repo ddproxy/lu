@@ -5,7 +5,7 @@
 
 use lu_proto::{
     AgentEvent, FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobState, NodeName, Outcome,
-    ProviderStatus,
+    ProviderModel, ProviderStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -112,6 +112,9 @@ pub struct NodeView {
     pub harness: Option<HarnessState>,
     #[serde(default)]
     pub providers: Vec<ProviderStatus>,
+    /// Healthy provider/model pairs the agent offers for `provider = "any"` jobs.
+    #[serde(default)]
+    pub provider_models: Vec<ProviderModel>,
     #[serde(default)]
     pub last_seen: u64,
     #[serde(default)]
@@ -140,6 +143,7 @@ impl NodeView {
             version: None,
             harness: None,
             providers: Vec::new(),
+            provider_models: Vec::new(),
             last_seen: 0,
             draining,
             load1: None,
@@ -218,6 +222,9 @@ pub struct PollRequest {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderStatus>,
+    /// Provider/model pairs the agent can serve for `provider = "any"` jobs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub provider_models: Vec<ProviderModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reiki: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,6 +248,7 @@ impl From<Heartbeat> for PollRequest {
             harness: Some(beat.harness),
             version: beat.version,
             providers: beat.providers,
+            provider_models: beat.provider_models,
             reiki: beat.reiki,
             host: beat.host,
             jobs: beat.jobs,
@@ -486,6 +494,24 @@ mod tests {
     }
 
     #[test]
+    fn poll_requests_carry_provider_model_pairs() {
+        let request = PollRequest {
+            provider_models: vec![ProviderModel {
+                provider: "codex".to_owned(),
+                model: "gpt-5".to_owned(),
+            }],
+            ..PollRequest::default()
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"provider_models":[{"provider":"codex","model":"gpt-5"}]}"#
+        );
+        let parsed: PollRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.provider_models, request.provider_models);
+    }
+
+    #[test]
     fn a_minimal_job_view_still_deserialises() {
         let id = JobId::new();
         let json = format!(r#"{{"id":"{id}","state":"queued"}}"#);
@@ -534,6 +560,23 @@ mod tests {
             serde_json::from_str(r#"{"name":"node-a","labels":["gpu"],"taints":["homelab"]}"#)
                 .unwrap();
         assert_eq!(node.taints, vec!["homelab".to_owned()]);
+    }
+
+    #[test]
+    fn node_views_carry_provider_model_pairs() {
+        let node: NodeView = serde_json::from_str(
+            r#"{"name":"node-a","provider_models":[{"provider":"codex","model":"gpt-5"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            node.provider_models,
+            vec![ProviderModel {
+                provider: "codex".to_owned(),
+                model: "gpt-5".to_owned(),
+            }]
+        );
+        let node: NodeView = serde_json::from_str(r#"{"name":"node-a"}"#).unwrap();
+        assert!(node.provider_models.is_empty());
     }
 
     #[test]

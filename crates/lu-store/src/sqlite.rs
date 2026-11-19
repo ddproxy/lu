@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use lu_proto::{
-    ArtifactName, CancelEffect, Completion, FailureClass, Heartbeat, JobId, JobSpec, JobState,
-    NodeName, Outcome, MAX_LOG_BYTES,
+    ArtifactName, CancelEffect, Completion, FailureClass, Heartbeat, JobEdit, JobId, JobSpec,
+    JobState, NodeName, Outcome, MAX_LOG_BYTES,
 };
 
 use crate::{Assignment, JobCounts, JobRecord, NodeRecord, Now, Store, StoreError};
@@ -400,6 +400,35 @@ fn fail_dependents(
         }
     }
     Ok(())
+}
+
+/// True when following `job -> dep` edges from `start` can reach `target`. Used to reject an
+/// edited dependency list that would make a job depend on itself.
+fn depends_on(
+    tx: &rusqlite::Transaction<'_>,
+    start: &str,
+    target: &str,
+) -> Result<bool, StoreError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![start.to_owned()];
+    while let Some(id) = stack.pop() {
+        if id == target {
+            return Ok(true);
+        }
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let mut stmt = tx
+            .prepare("SELECT dep FROM job_deps WHERE job=?1")
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map(params![id], |r| r.get::<_, String>(0))
+            .map_err(internal)?;
+        for row in rows {
+            stack.push(row.map_err(internal)?);
+        }
+    }
+    Ok(false)
 }
 
 fn get_job_tx(
@@ -993,6 +1022,69 @@ impl Store for SqliteStore {
         Ok(rec)
     }
 
+    fn edit_job(&self, id: &JobId, edit: &JobEdit, now: Now) -> Result<JobRecord, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let (mut rec, lease, recov) = get_job_tx(&tx, id.as_str())?;
+        if !matches!(rec.state, JobState::Queued | JobState::Blocked) {
+            return Err(StoreError::Conflict { length: None });
+        }
+        rec.spec = edit
+            .apply(&rec.spec)
+            .map_err(|e| StoreError::InvalidSpec(e.to_string()))?;
+        // A future attempt uses the new provider choice, so drop the old assignment.
+        rec.assigned_provider = None;
+        rec.assigned_model = None;
+        rec.updated_at = now.wall_unix;
+
+        if edit.after.is_some() {
+            tx.execute("DELETE FROM job_deps WHERE job=?1", params![id.as_str()])
+                .map_err(internal)?;
+            let mut blocked = false;
+            for dep in &rec.spec.after {
+                let dep_state: Option<String> = tx
+                    .query_row(
+                        "SELECT state FROM jobs WHERE id=?1",
+                        params![dep.as_str()],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                match dep_state.as_deref() {
+                    Some("done") => {}
+                    Some("failed" | "cancelled") => {
+                        return Err(StoreError::DeadDependency(dep.clone()))
+                    }
+                    Some(_) => blocked = true,
+                    None => return Err(StoreError::InvalidDependency(dep.clone())),
+                }
+            }
+            for dep in &rec.spec.after {
+                if depends_on(&tx, dep.as_str(), id.as_str())? {
+                    return Err(StoreError::DependencyCycle);
+                }
+            }
+            for (ord, dep) in rec.spec.after.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO job_deps(job,dep,ord) VALUES (?1,?2,?3)",
+                    params![id.as_str(), dep.as_str(), ord as i64],
+                )
+                .map_err(internal)?;
+            }
+            rec.state = if blocked {
+                JobState::Blocked
+            } else {
+                JobState::Queued
+            };
+        }
+        rec.waiting_on = load_waiting(&tx, id.as_str())?;
+        update_job_tx(&tx, &rec, lease, recov)?;
+        tx.commit().map_err(internal)?;
+        Ok(rec)
+    }
+
     fn heartbeat(&self, hb: &Heartbeat, now: Now) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let tx = conn
@@ -1084,21 +1176,32 @@ impl Store for SqliteStore {
             if !crate::taints_tolerated(&hb.taints, &rec.spec.tolerates) {
                 continue;
             }
-            // A job that names no provider runs anywhere, as before. Otherwise the primary is
-            // tried first and the fallbacks in order, each needing this node to be able to serve
-            // it. A fallback without a model keeps the primary model.
-            let choices: Vec<(String, Option<String>)> = match &rec.spec.provider {
-                Some(primary) => std::iter::once((primary.clone(), rec.spec.model.clone()))
-                    .chain(rec.spec.fallbacks.iter().map(|choice| {
-                        (
-                            choice.provider.clone(),
-                            choice.model.clone().or_else(|| rec.spec.model.clone()),
-                        )
-                    }))
-                    .collect(),
-                None => Vec::new(),
+            // A job that names no provider runs anywhere, as before. `provider = "any"` takes
+            // the healthy pairs the agent published, in preference order. Otherwise the primary
+            // is tried first, then the fallbacks; a fallback without a model keeps the primary
+            // model. Every choice still needs this node to serve it.
+            let choices: Vec<(String, Option<String>)> = if rec.spec.is_any_provider() {
+                hb.provider_models
+                    .iter()
+                    .filter(|pair| node_offers_provider(&hb, &pair.provider))
+                    .map(|pair| (pair.provider.clone(), Some(pair.model.clone())))
+                    .collect()
+            } else {
+                match &rec.spec.provider {
+                    Some(primary) => std::iter::once((primary.clone(), rec.spec.model.clone()))
+                        .chain(rec.spec.fallbacks.iter().map(|choice| {
+                            (
+                                choice.provider.clone(),
+                                choice.model.clone().or_else(|| rec.spec.model.clone()),
+                            )
+                        }))
+                        .collect(),
+                    None => Vec::new(),
+                }
             };
-            let mut chosen = if choices.is_empty() {
+            // Only a job with no provider at all may run without an assignment. An `any` job with
+            // no healthy pair waits for a node that has one.
+            let mut chosen = if choices.is_empty() && rec.spec.provider.is_none() {
                 Some((None, None))
             } else {
                 None

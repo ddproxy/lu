@@ -15,6 +15,7 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `GET /v1/jobs?key=<key>` | Look up an idempotency key. Returns the same envelope with zero or one job and `next: null`; other filters are ignored. An empty, over-long or malformed key is `400 bad_request`. |
 | `GET /v1/jobs/{id}` | Return a `JobView`. An unknown id is `404 not_found`. |
 | `POST /v1/jobs/{id}/cancel` | `blocked`, `queued` and `recovering` jobs become `cancelled` at once; `leased`, `running` and `needs_input` jobs get `cancel_requested = true` and the agent is told on its next poll. A terminal job is `409 conflict`. Returns a `JobView`. |
+| `POST /v1/jobs/{id}/edit` body `JobEdit` | Change a `queued` or `blocked` job's provider, model, fallbacks, requirements, tolerations or dependencies in place. Absent fields stay unchanged; an empty array clears a list. The job keeps its id and dependents. Returns a `JobView`. Another state is `409 conflict`; a dependency cycle is `400 bad_request`; an invalid spec or an unknown, failed or cancelled dependency is `422 unprocessable`, naming the fault. Edited dependencies move the job between `blocked` and `queued` and respect the 16-dependency limit. |
 | `GET /v1/jobs/{id}/logs?offset=N&wait=25` | Return raw log bytes from `offset` with `Content-Type: text/plain`, `X-Lu-Log-Length` and `X-Lu-State`. `wait` holds the request for up to 25 seconds while no new bytes arrive. An unknown id is `404`. |
 | `GET /v1/jobs/{id}/artifacts/{name}` | Return one fixed artifact name: `diff.patch`, `run.log` or `report.json`. An unknown name or an artifact that is not stored is `404`. |
 | `GET /v1/status` | Return a `StatusView`. |
@@ -38,8 +39,8 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `base_commit` | string | no | 40-hex commit id. The controller pins it for a configured repository; the agent uses it as the base tree. Omitted when absent. |
 | `task` | string | yes | Up to 256 KiB. |
 | `harness` | string | no | Defaults to `opencode`. |
-| `provider` | string | no | Omitted when absent. |
-| `model` | string | no | Omitted when absent. |
+| `provider` | string | no | Omitted when absent. `any` selects the node's published provider/model pairs in preference order. |
+| `model` | string | no | Omitted when absent; forbidden when `provider` is `any`. |
 | `timeout_secs` | integer | no | 1 to 86400; defaults to 3600. |
 | `idle_timeout_secs` | integer | no | 1 to 86400; omitted when absent. |
 | `idempotency_key` | string | no | Omitted when absent. |
@@ -47,7 +48,7 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `stack_dependencies` | boolean | no | Defaults to `true`; omitted when `true`. When true, dependency diffs are applied to the job's base tree. |
 | `requires` | array of labels | no | At most 8 labels; omitted when empty. |
 | `tolerates` | array of taints | no | At most 8 taints; omitted when empty. A tainted node takes the job only if it tolerates every taint. |
-| `fallbacks` | array of objects | Up to 4 alternative `{provider, model}` choices, tried in order when the primary provider is unavailable on a node. Omitted when empty. |
+| `fallbacks` | array of objects | Up to 4 alternative `{provider, model}` choices, tried in order when the primary provider is unavailable on a node. Omitted when empty; forbidden when `provider` is `any`. |
 | `allow_empty` | boolean | No | Defaults to `false`; omitted when `false`. When true, a successful job with no diff gets no `outcome_note`. |
 
 An unknown `git_ref` for a configured repository is `422 unprocessable` and names the ref. A job for an unlisted repository has no `base_commit` unless one is supplied by the client.
@@ -73,11 +74,24 @@ An unknown `git_ref` for a configured repository is `422 unprocessable` and name
 | `cancel_requested` | boolean | Whether cancellation has been requested. |
 | `after` | array of strings | Dependency ids from the spec. |
 | `waiting_on` | array of strings | Dependencies that are not yet `done`. |
-| `waiting_reason` | string or null | Why a queued job cannot be placed, such as `no node with label php8.3` or `only tainted nodes are free: homelab`. |
+| `waiting_reason` | string or null | Why a queued job cannot be placed, such as `no node with label php8.3`, `only tainted nodes are free: homelab` or `no node has a healthy provider for provider "any"`. |
 | `assigned_provider` | string or null | The provider choice the job was assigned with, when it has fallbacks. |
 | `assigned_model` | string or null | The model of that choice. |
 | `outcome_note` | string or null | Omitted when absent. `no_changes` when the job is `done` and its stored diff is empty and `allow_empty` is false. |
 | `warnings` | array of strings | Submit replies only. |
+
+### `JobEdit`
+
+All fields are optional and omitted when absent. Absent fields stay unchanged; a supplied array replaces the list, and an empty array clears it. Unknown fields are rejected. `any` with an explicit `model` or `fallbacks` is `422`.
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `provider` | string | Valid provider name, or `any`. |
+| `model` | string | At most 128 characters; forbidden with `provider: "any"`. |
+| `fallbacks` | array of objects | At most 4 `{provider, model}` choices; forbidden with `provider: "any"`. |
+| `requires` | array of labels | At most 8 labels. |
+| `tolerates` | array of taints | At most 8 taints. |
+| `after` | array of job ids | At most 16 unique ids, without a cycle or a finished dependency. |
 `HostStats`: `load1`, `load5`, `load15`, `mem_total_kb`, `mem_available_kb`, `swap_used_kb`, `disk_free_bytes` and `disk_total_bytes` (both optional; they describe the agent's work filesystem and are omitted when it cannot be read), `uptime_secs`. Host numbers are read from `/proc`; non-Linux agents report no host stats.
 
 ### `NodeView`
@@ -91,6 +105,7 @@ An unknown `git_ref` for a configured repository is `422 unprocessable` and name
 | `draining` | boolean | Whether new assignment is stopped. |
 | `harness` | string | Last reported harness state: `idle` or `busy`. |
 | `providers` | array | Provider names and states from the latest heartbeat. |
+| `provider_models` | array | Healthy `{provider, model}` pairs published by the agent for `provider = "any"` jobs. Omitted when empty. |
 | `labels` | array of strings | Labels from the latest heartbeat. |
 | `label_sources` | object | Labels published by an operator-declared probe, each mapped to `probed`. Other labels have no entry. |
 | `taints` | array of strings | Taints from the latest heartbeat. |
@@ -154,13 +169,13 @@ An unknown `git_ref` for a configured repository is `422 unprocessable` and name
 
 A `JobSpec.base_commit` is a 40-hex commit id. The agent fetches a pack for it unless `base_source` is `clone`. With `controller`, a `404` fails the job; with `auto`, the default, a `404` falls back to cloning the spec's `repo`.
 
-`Heartbeat` may also carry optional `version` (at most 32 printable ASCII characters), optional `labels` (at most 32 labels, each 1–64 characters from letters, digits, `.`, `_`, `-`, `/`, with at most one `=`), optional `label_sources` (a map of probed labels to `probed`; keys must also appear in `labels`, at most 32 entries), optional `taints` (at most 8, same label syntax) plus optional `host` and `jobs` stats. Older agents that omit them are accepted; each heartbeat replaces the controller's previous stats, labels, label sources and taints for that node, so omitting them clears a stale job tree, label set and taint set. The combined stats are trimmed to 16 KiB before validation by dropping processes first and then whole jobs. Lu never interprets labels or taints; dispatch compares them exactly.
+`Heartbeat` may also carry an optional `provider_models` array of `{provider, model}` pairs (at most 64, unique provider names, valid names and models). Agents publish only pairs whose provider Reiki reports healthy; the controller records them on the node and uses them for `provider = "any"` jobs. Older agents that omit the field are accepted. `Heartbeat` may also carry optional `version` (at most 32 printable ASCII characters), optional `labels` (at most 32 labels, each 1–64 characters from letters, digits, `.`, `_`, `-`, `/`, with at most one `=`), optional `label_sources` (a map of probed labels to `probed`; keys must also appear in `labels`, at most 32 entries), optional `taints` (at most 8, same label syntax) plus optional `host` and `jobs` stats. Older agents that omit them are accepted; each heartbeat replaces the controller's previous stats, labels, label sources and taints for that node, so omitting them clears a stale job tree, label set and taint set. The combined stats are trimmed to 16 KiB before validation by dropping processes first and then whole jobs. Lu never interprets labels or taints; dispatch compares them exactly.
 
 ## Controller rules
 
 - A job with `after` dependencies starts `blocked`. When a dependency becomes `done`, every blocked dependent whose dependencies are all `done` becomes `queued` in the same transaction. When a dependency becomes `failed` or `cancelled`, blocked dependents fail with `failure_class: "dependency"` and summary `dependency <id> <state>`, cascading through their own dependents. Dependency failures never retry.
 - A dependent job with `stack_dependencies: true` (the default) stages its base commit, then the agent fetches the dependency list and applies each finished dependency's `diff.patch` in `after` order before starting the harness. A dependency with no diff is skipped. If a patch does not apply and a three-way merge leaves conflicts, the agent stops before the harness and completes `Failed(Conflict)`; the summary names the dependency and at most 20 conflicting paths. `conflict` never retries. The job's own `diff.patch` is always against its base and includes the dependency changes, so a consumer merging a chain applies only the last diff.
-- Dispatch first applies labels and taints: it assigns a queued job only when its node is idle, not draining, has no held job, offers every label in `spec.requires`, and the job's `spec.tolerates` covers every taint the node reports. A node with no taints accepts any job; a job tolerating nothing avoids all tainted nodes. A job with no `spec.provider` then runs on that node. Otherwise the choices are tried in order—the primary `spec.provider`/`spec.model`, then `spec.fallbacks` in list order—and the job uses the first choice whose provider the node reports healthy and has no unexpired cordon for. The chosen pair is stored as `assigned_provider`/`assigned_model`; a fallback without a model uses the primary `spec.model`. A requeued job is dispatched afresh and may choose another pair, including on the same node.
+- Dispatch first applies labels and taints: it assigns a queued job only when its node is idle, not draining, has no held job, offers every label in `spec.requires`, and the job's `spec.tolerates` covers every taint the node reports. A node with no taints accepts any job; a job tolerating nothing avoids all tainted nodes. A job with no `spec.provider` then runs on that node. A job with `spec.provider = "any"` uses the node's published `provider_models` in order and takes the first pair whose provider is healthy and has no unexpired cordon; with no such pair on any eligible node it stays `queued` with a waiting reason. Otherwise the choices are tried in order—the primary `spec.provider`/`spec.model`, then `spec.fallbacks` in list order—and the job uses the first choice whose provider the node reports healthy and has no unexpired cordon for. The chosen pair is stored as `assigned_provider`/`assigned_model`; a fallback without a model uses the primary `spec.model`. A requeued job is dispatched afresh and may choose another pair, including on the same node.
 - A lease that is not renewed for `lease_secs` expires: the job becomes `recovering`, then after `recovery_grace_secs` returns to `queued` with a bumped attempt (class `node`) unless attempts are exhausted (`max_retries`), when it becomes `failed`.
 - `Completion` with a `provider` failure class cordons `(node, assigned_provider)` for `provider_cooldown_secs`, or for `retry_after_secs` when given; the pair is the one chosen at dispatch, not necessarily the primary. Assignment skips a cordoned choice, so the requeued job can move to its next fallback, another node, or the same node under a different provider. Two healthy heartbeats clear a `retry_after_secs` cordon.
 - Epoch fencing: every agent write names the epoch it was assigned; a write for an older epoch is `409 stale_epoch` and changes nothing.

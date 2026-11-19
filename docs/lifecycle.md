@@ -11,6 +11,7 @@ stateDiagram-v2
     blocked --> failed: dependency failed
     blocked --> cancelled: cancel
     queued --> leased: dispatch to an idle agent
+    queued --> blocked: edit adds an unfinished dependency
     queued --> cancelled: cancel
     leased --> running: agent starts the harness
     leased --> queued: lease/retryable failure
@@ -49,7 +50,7 @@ outgoing edges.
 | From | Allowed targets | What causes it |
 | --- | --- | --- |
 | `blocked` | `queued`, `cancelled`, `failed` | All dependencies become `done`; operator cancel; a dependency fails or is cancelled, which cascades. |
-| `queued` | `leased`, `cancelled` | Dispatch to an idle, non-draining agent; operator cancel. |
+| `queued` | `leased`, `blocked`, `cancelled` | Dispatch to an idle, non-draining agent; edit adds an unfinished dependency; operator cancel. |
 | `leased` | `running`, `queued`, `recovering`, `cancelled`, `failed` | Agent starts; retryable failure or lost lease; lease expiry or controller restart; cancel; non-retryable failure. |
 | `running` | `done`, `failed`, `cancelled`, `queued`, `recovering` | Harness success; terminal failure; honoured cancel; provider retry; lease expiry. |
 | `recovering` | `running`, `done`, `leased`, `queued`, `failed`, `cancelled` | Same-epoch renewal; same-epoch completion; reassignment; grace expiry with or without retry budget; operator cancel. |
@@ -78,7 +79,19 @@ outgoing edges.
 Dispatch considers only `queued` jobs, oldest id first. The node must have a current heartbeat,
 must be idle and not draining, and must not already hold a `leased`, `running` or `recovering`
 job. The job's required labels must be a subset of the node's labels; if it names a provider, the
-node must offer it and no `(node, provider)` cordon may be active.
+node must offer it and no `(node, provider)` cordon may be active. A job with `provider = "any"`
+takes the first healthy, uncordoned pair from the node's published `provider_models`, and records
+it as the assigned provider and model. With no eligible pair the job stays `queued` with a
+waiting reason.
+
+## Editing a queued or blocked job
+
+`lu edit` changes provider, model, fallbacks, requirements, tolerations and dependencies of a
+`queued` or `blocked` job through `POST /v1/jobs/{id}/edit`. The job keeps its id, so dependents
+stay attached, and its assignment is cleared for fresh dispatch. Edited dependencies are checked
+like submission dependencies: at most 16, no cycle and no finished job. The job becomes `blocked`
+when any new dependency is unfinished and `queued` when all are `done`. Other states get `409
+conflict`; a cycle gets `400 bad_request`.
 
 ## Failure classes and retries
 

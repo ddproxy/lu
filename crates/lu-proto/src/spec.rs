@@ -15,6 +15,9 @@ use crate::limits::{
     MIN_TIMEOUT_SECS,
 };
 
+/// The provider name that asks dispatch to choose a healthy provider from the node's offer.
+pub const ANY_PROVIDER: &str = "any";
+
 /// A field of [`JobSpec`] that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSpecError {
@@ -262,13 +265,85 @@ impl JobSpec {
                 ));
             }
         }
+        if self.is_any_provider() {
+            if self.model.is_some() {
+                return Err(invalid("model", "must not be set when provider is \"any\""));
+            }
+            if !self.fallbacks.is_empty() {
+                return Err(invalid(
+                    "fallbacks",
+                    "must be empty when provider is \"any\"",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Whether this job leaves the choice of provider and model to dispatch.
+    pub fn is_any_provider(&self) -> bool {
+        self.provider.as_deref() == Some(ANY_PROVIDER)
     }
 
     /// A stable JSON encoding: fields in declaration order, absent options omitted. Equal specs
     /// always produce the same bytes.
     pub fn canonical_json(&self) -> String {
         serde_json::to_string(self).expect("a JobSpec always serialises")
+    }
+}
+
+/// A change to a queued or blocked job. Absent fields stay as they are; a present vector replaces
+/// the stored list, so an empty vector clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct JobEdit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallbacks: Option<Vec<Choice>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tolerates: Option<Vec<String>>,
+    /// Replacement dependencies. An empty list clears them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<Vec<JobId>>,
+}
+
+impl JobEdit {
+    /// Applies this edit to a copy of `spec` and validates the result. Switching to
+    /// `provider = "any"` clears a previous model and fallbacks; setting either explicitly with
+    /// `any` is rejected.
+    pub fn apply(&self, spec: &JobSpec) -> Result<JobSpec, JobSpecError> {
+        let mut next = spec.clone();
+        if let Some(provider) = &self.provider {
+            next.provider = Some(provider.clone());
+        }
+        if let Some(model) = &self.model {
+            next.model = Some(model.clone());
+        }
+        if let Some(fallbacks) = &self.fallbacks {
+            next.fallbacks = fallbacks.clone();
+        }
+        if let Some(requires) = &self.requires {
+            next.requires = requires.clone();
+        }
+        if let Some(tolerates) = &self.tolerates {
+            next.tolerates = tolerates.clone();
+        }
+        if let Some(after) = &self.after {
+            next.after = after.clone();
+        }
+        if next.is_any_provider() {
+            if self.model.is_some() || self.fallbacks.as_ref().is_some_and(|f| !f.is_empty()) {
+                return Err(invalid("model", "must not be set with provider \"any\""));
+            }
+            next.model = None;
+            next.fallbacks.clear();
+        }
+        next.validate()?;
+        Ok(next)
     }
 }
 
@@ -788,5 +863,99 @@ mod tests {
         assert!(spec.validate().is_ok());
         let parsed: JobSpec = serde_json::from_str(&spec.canonical_json()).unwrap();
         assert_eq!(parsed.task, spec.task);
+    }
+
+    #[test]
+    fn any_provider_is_valid_without_a_model_or_fallbacks() {
+        let mut spec = sample();
+        spec.provider = Some(ANY_PROVIDER.to_owned());
+        assert!(spec.is_any_provider());
+        assert!(spec.validate().is_ok());
+        let parsed: JobSpec = serde_json::from_str(&spec.canonical_json()).unwrap();
+        assert_eq!(parsed, spec);
+    }
+
+    #[test]
+    fn any_provider_refuses_a_model_and_fallbacks() {
+        let mut spec = sample();
+        spec.provider = Some(ANY_PROVIDER.to_owned());
+        spec.model = Some("big".to_owned());
+        assert_eq!(error_field(&spec), "model");
+        spec.model = None;
+        spec.fallbacks = vec![Choice {
+            provider: "peer-b".to_owned(),
+            model: None,
+        }];
+        assert_eq!(error_field(&spec), "fallbacks");
+    }
+
+    #[test]
+    fn job_edit_replaces_fields_and_clears_lists() {
+        let mut spec = sample();
+        spec.provider = Some("old".to_owned());
+        spec.model = Some("old-model".to_owned());
+        spec.fallbacks = vec![Choice {
+            provider: "peer".to_owned(),
+            model: None,
+        }];
+        spec.requires = vec!["gpu".to_owned()];
+        spec.tolerates = vec!["homelab".to_owned()];
+        let edit = JobEdit {
+            provider: Some("new".to_owned()),
+            model: None,
+            fallbacks: Some(Vec::new()),
+            requires: Some(Vec::new()),
+            tolerates: Some(Vec::new()),
+            after: None,
+        };
+        let next = edit.apply(&spec).unwrap();
+        assert_eq!(next.provider.as_deref(), Some("new"));
+        assert_eq!(next.model, spec.model);
+        assert!(next.fallbacks.is_empty());
+        assert!(next.requires.is_empty());
+        assert!(next.tolerates.is_empty());
+        assert_eq!(spec.fallbacks.len(), 1);
+    }
+
+    #[test]
+    fn job_edit_to_any_clears_a_model_and_fallbacks_but_rejects_explicit_ones() {
+        let mut spec = sample();
+        spec.provider = Some("old".to_owned());
+        spec.model = Some("old-model".to_owned());
+        spec.fallbacks = vec![Choice {
+            provider: "peer".to_owned(),
+            model: None,
+        }];
+        let edit = JobEdit {
+            provider: Some(ANY_PROVIDER.to_owned()),
+            ..JobEdit::default()
+        };
+        let next = edit.apply(&spec).unwrap();
+        assert!(next.is_any_provider());
+        assert_eq!(next.model, None);
+        assert!(next.fallbacks.is_empty());
+
+        let bad = JobEdit {
+            model: Some("gpt".to_owned()),
+            fallbacks: Some(Vec::new()),
+            ..edit
+        };
+        assert_eq!(bad.apply(&spec).unwrap_err().field, "model");
+    }
+
+    #[test]
+    fn job_edit_rejects_invalid_names_and_too_many_dependencies() {
+        let spec = sample();
+        let edit = JobEdit {
+            provider: Some("bad name".to_owned()),
+            ..JobEdit::default()
+        };
+        assert_eq!(edit.apply(&spec).unwrap_err().field, "provider");
+
+        let edit = JobEdit {
+            after: Some(vec![JobId::new(); 17]),
+            ..JobEdit::default()
+        };
+        assert_eq!(edit.apply(&spec).unwrap_err().field, "after");
     }
 }

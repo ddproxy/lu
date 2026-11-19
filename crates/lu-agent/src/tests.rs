@@ -352,6 +352,7 @@ fn make_agent(
         opencode_password: None,
         reiki_probe: None,
         health: Default::default(),
+        provider_models: Arc::new(Vec::new()),
         harness: "opencode".to_owned(),
         harness_wrapper: Vec::new(),
         builder: Arc::new(move |task_file, _model, _server, _message| {
@@ -2273,5 +2274,44 @@ async fn heartbeats_use_probe_results_without_waiting_for_the_command() {
     assert_eq!(
         request.label_sources.get("slow-probe").map(String::as_str),
         Some(lu_proto::LABEL_SOURCE_PROBED)
+    );
+}
+
+#[test]
+fn heartbeats_publish_only_configured_healthy_provider_pairs() {
+    use lu_proto::{ProviderModel, ProviderState, ProviderStatus};
+
+    let config = vec![
+        lu_config::ProviderModelConfig {
+            provider: "p1".to_owned(),
+            model: "m1".to_owned(),
+        },
+        lu_config::ProviderModelConfig {
+            provider: "p2".to_owned(),
+            model: "m2".to_owned(),
+        },
+        lu_config::ProviderModelConfig {
+            provider: "p3".to_owned(),
+            model: "m3".to_owned(),
+        },
+    ];
+    let providers = vec![
+        ProviderStatus {
+            name: "p1".to_owned(),
+            state: ProviderState::Cooling,
+            soonest_secs: Some(30),
+        },
+        ProviderStatus {
+            name: "p2".to_owned(),
+            state: ProviderState::Ok,
+            soonest_secs: None,
+        },
+    ];
+    assert_eq!(
+        super::offered_provider_models(&config, &providers),
+        vec![ProviderModel {
+            provider: "p2".to_owned(),
+            model: "m2".to_owned(),
+        }]
     );
 }

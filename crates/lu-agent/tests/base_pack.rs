@@ -199,6 +199,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         heartbeat_secs: 3,
         reiki_health_url: None,
         reiki_token_file: None,
+        provider_models: Vec::new(),
         labels: Vec::new(),
         taints: Vec::new(),
         label_files: Vec::new(),

@@ -58,6 +58,8 @@ enum Command {
     Submit(operator::SubmitArgs),
     /// Resubmit a finished job's spec as a new job.
     Retry(operator::RetryArgs),
+    /// Change the provider, model, fallbacks, labels, taints or dependencies of a queued or blocked job.
+    Edit(operator::EditArgs),
     /// List jobs.
     Ls(operator::LsArgs),
     /// Show one job.
@@ -110,6 +112,7 @@ async fn main() -> ExitCode {
         },
         Command::Submit(args) => operator::submit(args, &cli.config, json).await,
         Command::Retry(args) => operator::retry(args, &cli.config, json).await,
+        Command::Edit(args) => operator::edit(args, &cli.config, json).await,
         Command::Ls(args) => operator::ls(args, &cli.config, json).await,
         Command::Show(args) => operator::show(args, &cli.config, json).await,
         Command::Graph(args) => operator::graph(args, &cli.config, json).await,

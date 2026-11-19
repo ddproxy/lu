@@ -61,6 +61,7 @@ pub fn store_err(e: lu_store::StoreError) -> ApiError {
         StoreError::DeadDependency(id) => {
             ApiError::unprocessable(format!("dependency {id} already failed or was cancelled"))
         }
+        StoreError::DependencyCycle => ApiError::bad_request("dependencies would form a cycle"),
         StoreError::InvalidSpec(message) => ApiError::unprocessable(message),
         StoreError::Internal(_) => ApiError::internal(),
     }
