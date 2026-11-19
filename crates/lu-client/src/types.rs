@@ -122,6 +122,10 @@ pub struct NodeView {
     pub stuck: u64,
     #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default)]
+    pub label_sources: BTreeMap<String, String>,
+    #[serde(default)]
+    pub taints: Vec<String>,
 }
 
 impl NodeView {
@@ -139,6 +143,8 @@ impl NodeView {
             mem_total_kb: None,
             stuck: 0,
             labels: Vec::new(),
+            label_sources: BTreeMap::new(),
+            taints: Vec::new(),
         }
     }
 }
@@ -216,6 +222,10 @@ pub struct PollRequest {
     pub jobs: Vec<JobStats>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub label_sources: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub taints: Vec<String>,
     #[serde(alias = "wait", skip_serializing_if = "Option::is_none")]
     pub wait_secs: Option<u64>,
 }
@@ -231,6 +241,8 @@ impl From<Heartbeat> for PollRequest {
             host: beat.host,
             jobs: beat.jobs,
             labels: beat.labels,
+            label_sources: beat.label_sources,
+            taints: beat.taints,
             wait_secs: None,
         }
     }
@@ -385,6 +397,7 @@ fn empty_spec() -> JobSpec {
         after: Vec::new(),
         stack_dependencies: true,
         requires: Vec::new(),
+        tolerates: Vec::new(),
         fallbacks: Vec::new(),
     }
 }
@@ -456,6 +469,18 @@ mod tests {
     }
 
     #[test]
+    fn poll_requests_carry_node_taints() {
+        let request = PollRequest {
+            taints: vec!["homelab".to_owned()],
+            ..PollRequest::default()
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"taints":["homelab"]}"#);
+        let parsed: PollRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.taints, vec!["homelab"]);
+    }
+
+    #[test]
     fn a_minimal_job_view_still_deserialises() {
         let id = JobId::new();
         let json = format!(r#"{{"id":"{id}","state":"queued"}}"#);
@@ -499,6 +524,25 @@ mod tests {
         let node: NodeView =
             serde_json::from_str(r#"{"name":"node-a","labels":["gpu","php8.3"]}"#).unwrap();
         assert_eq!(node.labels, vec!["gpu".to_owned(), "php8.3".to_owned()]);
+
+        let node: NodeView =
+            serde_json::from_str(r#"{"name":"node-a","labels":["gpu"],"taints":["homelab"]}"#)
+                .unwrap();
+        assert_eq!(node.taints, vec!["homelab".to_owned()]);
+    }
+
+    #[test]
+    fn node_views_carry_probe_label_sources() {
+        let node: NodeView = serde_json::from_str(
+            r#"{"name":"node-a","labels":["gpu"],"label_sources":{"gpu":"probed"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            node.label_sources.get("gpu").map(String::as_str),
+            Some(lu_proto::LABEL_SOURCE_PROBED)
+        );
+        let node: NodeView = serde_json::from_str(r#"{"name":"node-a"}"#).unwrap();
+        assert!(node.label_sources.is_empty());
     }
 
     #[test]

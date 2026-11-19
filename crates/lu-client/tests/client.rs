@@ -193,6 +193,7 @@ fn spec() -> JobSpec {
         after: Vec::new(),
         stack_dependencies: true,
         requires: Vec::new(),
+        tolerates: Vec::new(),
         fallbacks: Vec::new(),
     }
 }

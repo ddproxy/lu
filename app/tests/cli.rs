@@ -212,6 +212,39 @@ async fn submit_passes_required_labels_and_prints_warnings() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_passes_tolerations() {
+    let id = job_id();
+    let mut body = job_json(&id, "queued");
+    body["warnings"] = json!([]);
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("submit-tolerate");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+            "--tolerate",
+            "homelab",
+            "--tolerate",
+            "garage",
+        ],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), id);
+    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap()[0].body).unwrap();
+    assert_eq!(spec["tolerates"], json!(["homelab", "garage"]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_after_key_chains_three_jobs() {
     let build = job_id();
     let test = job_id();
@@ -866,7 +899,8 @@ async fn nodes_and_drain_render_aligned_text() {
             "harness": "idle",
             "last_seen": 10,
             "draining": true,
-            "labels": ["gpu", "php8.3", "ubuntu22.04", "x86_64", "region=eu", "tier=gold"]
+            "labels": ["gpu", "php8.3", "ubuntu22.04", "x86_64", "region=eu", "tier=gold"],
+            "taints": ["homelab"]
         },
         {"name": "node-b", "harness": "busy", "last_seen": 12, "draining": false, "labels": []}
     ]);
@@ -894,7 +928,10 @@ async fn nodes_and_drain_render_aligned_text() {
     assert!(header.contains("LABELS"), "{text}");
     assert!(text.contains("node-a"), "{text}");
     assert!(text.contains("0.1.10"), "{text}");
-    assert!(text.contains("gpu,php8.3,ubuntu22.04,x86_64+2"), "{text}");
+    assert!(
+        text.contains("!homelab,gpu,php8.3,ubuntu22.04,x86_64+2"),
+        "{text}"
+    );
     assert!(text.contains("node-b"), "{text}");
     assert!(text.contains("yes"), "{text}");
 
@@ -920,6 +957,7 @@ async fn nodes_and_drain_render_aligned_text() {
     assert!(output.status.success(), "{}", stderr(&output));
     let raw = stdout(&output);
     assert!(raw.contains("\"labels\":[\"gpu\""), "{raw}");
+    assert!(raw.contains("\"taints\":[\"homelab\"]"), "{raw}");
 
     let records = server.records.lock().unwrap();
     let paths: Vec<&str> = records.iter().map(|record| record.path.as_str()).collect();
@@ -1072,6 +1110,8 @@ async fn node_prints_host_numbers_and_indented_process_tree() {
             "disk_total_bytes": 1000,
             "uptime_secs": 600
         },
+        "labels": ["gpu", "php8.3"],
+        "label_sources": {"php8.3": "probed"},
         "jobs": [{
             "job_id": id,
             "pgid": 4242,
@@ -1100,6 +1140,7 @@ async fn node_prints_host_numbers_and_indented_process_tree() {
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
     assert!(text.contains("node  node-a"), "{text}");
+    assert!(text.contains("labels gpu php8.3 (probed)"), "{text}");
     assert!(matches!(
         text.lines()
             .find(|line| line.starts_with("load1"))
@@ -1246,6 +1287,53 @@ async fn retry_replaces_or_clears_label_requirements() {
         .collect();
     assert_eq!(posts[0]["requires"], json!(["php8.3", "gpu"]));
     assert!(posts[1].get("requires").is_none(), "{}", posts[1]);
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_replaces_or_clears_tolerations() {
+    let id = job_id();
+    let new_id = job_id();
+    let finished = finished_job(&id, "failed");
+    let created = job_json(&new_id, "queued");
+    let server = start(move |record| {
+        if record.method == "POST" {
+            Reply::json(&created)
+        } else {
+            Reply::json(&finished)
+        }
+    })
+    .await;
+    let dir = scratch("retry-tolerate");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let env = env_for(&server, &token);
+
+    let output = run_with_env(
+        &[
+            "retry",
+            &id,
+            "--tolerate",
+            "homelab",
+            "--tolerate",
+            "garage",
+        ],
+        &env,
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = run_with_env(&["retry", &id, "--no-tolerate"], &env, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let records = server.records.lock().unwrap();
+    let posts: Vec<Value> = records
+        .iter()
+        .filter(|record| record.method == "POST")
+        .map(|record| serde_json::from_slice(&record.body).unwrap())
+        .collect();
+    assert_eq!(posts[0]["tolerates"], json!(["homelab", "garage"]));
+    assert!(posts[1].get("tolerates").is_none(), "{}", posts[1]);
     drop(records);
     let _ = std::fs::remove_dir_all(&dir);
 }

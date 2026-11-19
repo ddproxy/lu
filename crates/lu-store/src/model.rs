@@ -484,6 +484,7 @@ impl<S: Store> Model<S> {
             base_commit: None,
             stack_dependencies: true,
             requires: Vec::new(),
+            tolerates: Vec::new(),
             fallbacks: Vec::new(),
         }
     }

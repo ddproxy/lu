@@ -5,6 +5,11 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Node taints and job tolerations. Agents advertise up to 8 opaque taints from `[agent].taints`, sent with each heartbeat; jobs tolerate up to 8 with `JobSpec.tolerates`. Dispatch gives a job only to a node whose every taint the job tolerates, composed with label, provider and cordon rules. `lu submit --tolerate` and `lu retry --tolerate`/`--no-tolerate` set them; `lu nodes` shows taints with a `!` prefix and `lu show` prints `tolerates`. A stalled queued job explains `only tainted nodes are free: <taint>`. No schema change: taints live in the stored heartbeat.
+- Operator-declared node label probes. Up to 16 `[[agent.detect]]` entries run an argv command at start and every `every_secs` off the heartbeat path, with a wall timeout and a minimal environment; exit 0 publishes its label, any other result removes it. Probe labels join static and file labels under the existing 32-label cap and are marked `probed` in the new additive `label_sources` map on heartbeats, node views and `GET /v1/nodes/{name}/stats`. `lu nodes` and `lu node <name>` show `(probed)`; heartbeats only read the last result, so a slow probe never delays dispatch. No schema change: `label_sources` defaults to empty in stored heartbeats.
+
 ## [0.2.0] - 2026-11-18
 
 ### Added

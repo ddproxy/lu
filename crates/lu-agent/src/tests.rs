@@ -31,7 +31,7 @@ type BaseReply = Result<Option<(String, Vec<u8>)>, ApiError>;
 /// A recorded call to the fake controller.
 #[derive(Debug, Clone, PartialEq)]
 enum Call {
-    Poll(PollRequest),
+    Poll(Box<PollRequest>),
     JobBase {
         job_id: JobId,
         epoch: u64,
@@ -185,7 +185,7 @@ impl Controller for FakeController {
         request: &'a PollRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AgentEvent>, ApiError>> + Send + 'a>> {
         let request = request.clone();
-        self.record(Call::Poll(request));
+        self.record(Call::Poll(Box::new(request)));
         // An empty poll sleeps so the run loop yields; a ready future would spin a
         // current-thread runtime forever once the scripted replies run out.
         Box::pin(async move {
@@ -321,6 +321,7 @@ fn test_spec(repo: &str) -> JobSpec {
         after: Vec::new(),
         stack_dependencies: true,
         requires: Vec::new(),
+        tolerates: Vec::new(),
         fallbacks: Vec::new(),
     }
 }
@@ -341,6 +342,8 @@ fn make_agent(
         work_dir: work_dir.to_path_buf(),
         heartbeat_secs: TEST_HEARTBEAT_SECS,
         labels: Arc::new(super::labels::LabelSource::new(Vec::new(), Vec::new())),
+        probes: Arc::new(super::probes::Probes::new(Vec::new())),
+        taints: Arc::new(Vec::new()),
         provider_marker_grace: super::PROVIDER_MARKER_GRACE,
         reiki_watch_period: super::REIKI_WATCH_PERIOD,
         opencode_server: None,
@@ -1863,7 +1866,9 @@ async fn heartbeats_carry_the_providers_the_local_reiki_reports() {
     let carried = loop {
         let found = controller.check(|calls| {
             calls.iter().find_map(|call| match call {
-                Call::Poll(request) if !request.providers.is_empty() => Some(request.clone()),
+                Call::Poll(request) if !request.providers.is_empty() => {
+                    Some(request.as_ref().clone())
+                }
                 _ => None,
             })
         });
@@ -2242,4 +2247,41 @@ async fn clone_base_source_never_asks_the_controller() {
     .await;
     assert!(!calls.iter().any(|c| matches!(c, Call::JobBase { .. })));
     assert!(has_complete(&calls));
+}
+
+#[tokio::test]
+async fn heartbeats_use_probe_results_without_waiting_for_the_command() {
+    let tmp = TempDir::new().unwrap();
+    let work_dir = tmp.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let mut agent = make_agent(&work_dir, Arc::new(FakeController::new()), success_harness);
+    let probes = Arc::new(super::probes::Probes::new(vec![lu_config::DetectConfig {
+        label: "slow-probe".to_owned(),
+        command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+        timeout_secs: 5,
+        every_secs: 60,
+    }]));
+    agent.labels = Arc::new(
+        super::labels::LabelSource::new(Vec::new(), Vec::new()).with_probes(probes.results()),
+    );
+    agent.probes = Arc::clone(&probes);
+    let tasks = agent.probes.spawn_all();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let started = Instant::now();
+    let request = agent.poll_request(lu_proto::HarnessState::Idle, 0);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(!request.labels.iter().any(|label| label == "slow-probe"));
+    assert!(request.label_sources.is_empty());
+    for task in tasks {
+        task.abort();
+    }
+
+    agent.probes.results().set("slow-probe", true);
+    let request = agent.poll_request(lu_proto::HarnessState::Idle, 0);
+    assert!(request.labels.iter().any(|label| label == "slow-probe"));
+    assert_eq!(
+        request.label_sources.get("slow-probe").map(String::as_str),
+        Some(lu_proto::LABEL_SOURCE_PROBED)
+    );
 }

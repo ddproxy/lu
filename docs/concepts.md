@@ -33,7 +33,7 @@ by the controller; see [Tokens and TLS](tokens-and-tls.md).
 | **Lease** | A time-limited claim on a job. Assignment sets the node and starts the lease; a missed renewal moves the job to `recovering`. |
 | **Epoch** | A fencing counter incremented on each assignment. Agents must present the current epoch when starting, renewing, uploading or completing; stale writes are refused. |
 | **Dependency** | An `after` entry naming a job that must be `done` before this job can run. Dependencies can also be stacked as patches; see [Dependencies](dependencies.md). |
-| **Label** | An opaque string (at most 64 bytes). Agents advertise labels; jobs require them; dispatch compares them exactly. Lu never interprets their meaning. |
+| **Label** | An opaque string (at most 64 bytes). Agents advertise labels from config, files or operator-declared probes; jobs require them; dispatch compares them exactly. Lu never interprets their meaning. A probed label is marked in `label_sources` and shown as `(probed)`. |
 | **Cordon** | A `(node, provider)` suppression after a provider failure. Dispatch skips that pair until the cordon expires or live health clears a Reiki-derived cordon. |
 | **Idempotency key** | A stable name for a spec. Re-submitting the same key and spec returns the existing job; the same key with a different spec is a conflict. |
 | **Recovery grace** | The window after a lease loss in which the original agent may renew and resume. After it expires, the controller requeues the job or fails it with a node failure. |

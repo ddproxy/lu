@@ -1,17 +1,28 @@
 //! The labels a node advertises. Fixed labels come from config; each file is re-read before
 //! every heartbeat so an operator can change a node's offers without restarting it.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Read;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use lu_proto::{printable, valid_label, MAX_LABEL_FILE_BYTES, MAX_NODE_LABELS};
+use lu_proto::{
+    printable, valid_label, LABEL_SOURCE_PROBED, MAX_LABEL_FILE_BYTES, MAX_NODE_LABELS,
+};
 use tracing::warn;
+
+use crate::probes::ProbeResults;
+
+/// Labels and the additive source map sent with a heartbeat.
+pub(crate) struct LabelSet {
+    pub(crate) labels: Vec<String>,
+    pub(crate) label_sources: BTreeMap<String, String>,
+}
 
 pub struct LabelSource {
     fixed: Vec<String>,
     files: Vec<String>,
+    probes: Arc<ProbeResults>,
     /// Keys already warned about, so a bad line does not fill the log every heartbeat.
     warned: Mutex<HashSet<String>>,
 }
@@ -21,15 +32,24 @@ impl LabelSource {
         Self {
             fixed,
             files,
+            probes: Arc::new(ProbeResults::default()),
             warned: Mutex::new(HashSet::new()),
         }
     }
 
-    /// The union of the fixed labels and every readable file, sorted, de-duplicated and capped.
-    pub fn current(&self) -> Vec<String> {
-        let mut labels = BTreeSet::new();
+    /// Connects the shared probe results, so heartbeats see only their last values.
+    pub fn with_probes(mut self, probes: Arc<ProbeResults>) -> Self {
+        self.probes = probes;
+        self
+    }
+
+    /// The union of the fixed labels and every readable file, sorted, de-duplicated and capped,
+    /// plus the source of each probed label. Probe labels are dropped last when
+    /// the cap is full; fixed and file labels keep their existing priority.
+    pub(crate) fn current_set(&self) -> LabelSet {
+        let mut base = BTreeSet::new();
         for label in &self.fixed {
-            self.add(&mut labels, label);
+            self.add(&mut base, label);
         }
         for file in &self.files {
             if let Some(text) = read_file(Path::new(file)) {
@@ -38,11 +58,38 @@ impl LabelSource {
                     if line.is_empty() || line.starts_with('#') {
                         continue;
                     }
-                    self.add(&mut labels, line);
+                    self.add(&mut base, line);
                 }
             }
         }
-        labels.into_iter().take(MAX_NODE_LABELS).collect()
+        let mut labels: BTreeSet<String> = base.into_iter().take(MAX_NODE_LABELS).collect();
+        let mut label_sources = BTreeMap::new();
+        for label in self.probes.published() {
+            if !valid_label(&label) {
+                self.warn_once(
+                    format!("probe:{label}"),
+                    &label,
+                    "ignoring an invalid probed node label",
+                );
+                continue;
+            }
+            if labels.contains(&label) {
+                label_sources.insert(label, LABEL_SOURCE_PROBED.to_owned());
+            } else if labels.len() < MAX_NODE_LABELS {
+                labels.insert(label.clone());
+                label_sources.insert(label, LABEL_SOURCE_PROBED.to_owned());
+            } else {
+                self.warn_once(
+                    format!("probe-cap:{label}"),
+                    &label,
+                    "dropping a probed node label: the label cap is full",
+                );
+            }
+        }
+        LabelSet {
+            labels: labels.into_iter().collect(),
+            label_sources,
+        }
     }
 
     fn add(&self, labels: &mut BTreeSet<String>, label: &str) {
@@ -50,16 +97,20 @@ impl LabelSource {
             labels.insert(label.to_owned());
             return;
         }
-        let key = format!("label:{label}");
+        self.warn_once(
+            format!("label:{label}"),
+            label,
+            "ignoring an invalid node label",
+        );
+    }
+
+    fn warn_once(&self, key: String, label: &str, message: &str) {
         let mut warned = self
             .warned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if warned.insert(key) {
-            warn!(
-                label = %printable(label),
-                "ignoring an invalid node label"
-            );
+            warn!(label = %printable(label), "{message}");
         }
     }
 }
@@ -102,7 +153,7 @@ mod tests {
             vec![a.display().to_string(), b.display().to_string()],
         );
         assert_eq!(
-            source.current(),
+            source.current_set().labels,
             vec!["fixed", "gpu", "php8.3", "region=eu"]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -114,9 +165,9 @@ mod tests {
         let file = dir.join("labels");
         std::fs::write(&file, "one\n").unwrap();
         let source = LabelSource::new(Vec::new(), vec![file.display().to_string()]);
-        assert_eq!(source.current(), vec!["one"]);
+        assert_eq!(source.current_set().labels, vec!["one"]);
         std::fs::write(&file, "two\n").unwrap();
-        assert_eq!(source.current(), vec!["two"]);
+        assert_eq!(source.current_set().labels, vec!["two"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -132,7 +183,7 @@ mod tests {
                 big.display().to_string(),
             ],
         );
-        assert_eq!(source.current(), vec!["kept"]);
+        assert_eq!(source.current_set().labels, vec!["kept"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -143,7 +194,34 @@ mod tests {
         let text: String = (0..40).map(|i| format!("label-{i:02}\n")).collect();
         std::fs::write(&file, text).unwrap();
         let source = LabelSource::new(Vec::new(), vec![file.display().to_string()]);
-        assert_eq!(source.current().len(), MAX_NODE_LABELS);
+        assert_eq!(source.current_set().labels.len(), MAX_NODE_LABELS);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_labels_are_marked_and_dropped_last_at_the_cap() {
+        let source = LabelSource::new(vec!["a".to_owned()], Vec::new());
+        source.probes.set("probe-a", true);
+        let set = source.current_set();
+        assert_eq!(set.labels, vec!["a", "probe-a"]);
+        assert_eq!(
+            set.label_sources.get("probe-a").map(String::as_str),
+            Some(LABEL_SOURCE_PROBED)
+        );
+        assert!(!set.label_sources.contains_key("a"));
+
+        let fixed: Vec<String> = (0..MAX_NODE_LABELS)
+            .map(|i| format!("label-{i:02}"))
+            .collect();
+        let full = LabelSource::new(fixed.clone(), Vec::new());
+        full.probes.set("probe-z", true);
+        full.probes.set("label-00", true);
+        let set = full.current_set();
+        assert_eq!(set.labels, fixed);
+        assert_eq!(
+            set.label_sources.get("label-00").map(String::as_str),
+            Some(LABEL_SOURCE_PROBED)
+        );
+        assert!(!set.label_sources.contains_key("probe-z"));
     }
 }

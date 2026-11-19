@@ -9,6 +9,7 @@ mod health;
 pub mod housekeeping;
 mod labels;
 mod logs;
+mod probes;
 mod proc;
 
 use std::future::Future;
@@ -150,6 +151,8 @@ pub struct Agent {
     /// The last health read from it, sent with every heartbeat.
     health: health::Shared,
     labels: Arc<labels::LabelSource>,
+    probes: Arc<probes::Probes>,
+    taints: Arc<Vec<String>>,
     harness: String,
     harness_wrapper: Vec<String>,
     builder: Arc<CommandBuilder>,
@@ -192,7 +195,11 @@ impl Agent {
             }
             None => None,
         };
-        let labels = Arc::new(labels::LabelSource::new(config.labels, config.label_files));
+        let probes = Arc::new(probes::Probes::new(config.detect));
+        let labels = Arc::new(
+            labels::LabelSource::new(config.labels, config.label_files)
+                .with_probes(probes.results()),
+        );
         let housekeeper = config.housekeeping.map(housekeeping::Housekeeper::new);
         let reiki_probe = match (
             config.reiki_health_url.as_deref(),
@@ -227,6 +234,8 @@ impl Agent {
             reiki_probe,
             health: health::Shared::default(),
             labels,
+            probes,
+            taints: Arc::new(config.taints),
             harness: config.harness,
             harness_wrapper: config.harness_wrapper,
             builder: Arc::new(|task_file, model, server, message| {
@@ -288,6 +297,13 @@ impl Agent {
         let mut this = self;
         let mut shutdown = Box::pin(shutdown);
         let mut backoff = Backoff::new();
+        // Probes are independent of polling: their last result is read when a heartbeat is built.
+        let _probe_tasks: Vec<AbortOnDrop> = this
+            .probes
+            .spawn_all()
+            .into_iter()
+            .map(AbortOnDrop)
+            .collect();
         // Ends with the agent: the guard aborts the task when `run` returns.
         let _health_task = this.reiki_probe.as_ref().map(|(url, token)| {
             AbortOnDrop(health::spawn_refresher(
@@ -379,6 +395,7 @@ impl Agent {
 
     fn poll_request(&self, harness: HarnessState, wait_secs: u64) -> lu_client::PollRequest {
         let current = health::snapshot(&self.health);
+        let label_set = self.labels.current_set();
         let mut beat = Heartbeat {
             node: self.node.clone(),
             harness,
@@ -387,7 +404,9 @@ impl Agent {
             reiki: current.reiki,
             host: proc::host_stats(&self.work_dir),
             jobs: Vec::new(),
-            labels: self.labels.current(),
+            labels: label_set.labels,
+            label_sources: label_set.label_sources,
+            taints: self.taints.as_ref().clone(),
         };
         beat.trim_stats();
         let mut request = lu_client::PollRequest::from(beat);
@@ -690,6 +709,7 @@ impl Agent {
                 heartbeat_secs: self.heartbeat_secs,
                 shared_health: Arc::clone(&self.health),
                 labels: Arc::clone(&self.labels),
+                taints: Arc::clone(&self.taints),
                 observation: observation.clone(),
                 work_dir: self.work_dir.clone(),
             },
@@ -1194,6 +1214,7 @@ struct ControlTask {
     heartbeat_secs: u64,
     shared_health: health::Shared,
     labels: Arc<labels::LabelSource>,
+    taints: Arc<Vec<String>>,
     observation: Option<Arc<Mutex<proc::JobObservation>>>,
     work_dir: PathBuf,
 }
@@ -1207,6 +1228,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
         heartbeat_secs,
         shared_health,
         labels,
+        taints,
         observation,
         work_dir,
     } = task;
@@ -1268,6 +1290,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                         )]
                     })
                     .unwrap_or_default();
+                let label_set = labels.current_set();
                 let mut beat = Heartbeat {
                     node: node.clone(),
                     harness: HarnessState::Busy,
@@ -1276,7 +1299,9 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                     reiki: current.reiki,
                     host,
                     jobs,
-                    labels: labels.current(),
+                    labels: label_set.labels,
+                    label_sources: label_set.label_sources,
+                    taints: taints.as_ref().clone(),
                 };
                 beat.trim_stats();
                 let mut request = lu_client::PollRequest::from(beat);

@@ -92,6 +92,8 @@ fn node_view(n: &NodeRecord, stats: Option<&lu_proto::NodeStats>) -> serde_json:
         "harness": harness,
         "providers": &n.heartbeat.providers,
         "labels": &n.heartbeat.labels,
+        "label_sources": &n.heartbeat.label_sources,
+        "taints": &n.heartbeat.taints,
         "current_job": n.current_job.as_ref().map(|j| j.to_string()),
         "cordons": &n.cordons,
         "reiki": n.heartbeat.reiki,

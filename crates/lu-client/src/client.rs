@@ -534,6 +534,15 @@ impl Client {
         if !request.jobs.is_empty() {
             heartbeat["jobs"] = serde_json::json!(request.jobs);
         }
+        if !request.labels.is_empty() {
+            heartbeat["labels"] = serde_json::json!(request.labels);
+        }
+        if !request.label_sources.is_empty() {
+            heartbeat["label_sources"] = serde_json::json!(request.label_sources);
+        }
+        if !request.taints.is_empty() {
+            heartbeat["taints"] = serde_json::json!(request.taints);
+        }
         let body = serde_json::to_vec(&serde_json::json!({
             "heartbeat": heartbeat,
             "wait_secs": request.wait_secs.unwrap_or(0),

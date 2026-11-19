@@ -1,13 +1,15 @@
 //! Node heartbeat: what a peer says about itself. The forwarded Reiki document is opaque and
 //! capped, and provider names are checked with the same rule as node names.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{is_name_byte, JobId, NodeName};
-use crate::label::valid_label;
+use crate::label::{valid_label, LABEL_SOURCE_PROBED};
 use crate::limits::{
     MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_NODE_LABELS, MAX_PROVIDERS, MAX_REIKI_BYTES,
-    MAX_STATS_BYTES, MAX_VERSION_BYTES,
+    MAX_STATS_BYTES, MAX_TAINTS, MAX_VERSION_BYTES,
 };
 
 /// Whether the peer's harness is free to take a job.
@@ -90,6 +92,10 @@ pub struct NodeStats {
     pub host: Option<HostStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobStats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub label_sources: BTreeMap<String, String>,
 }
 
 /// A periodic message from an agent. `reiki` is the opaque health document, forwarded unchanged.
@@ -109,6 +115,12 @@ pub struct Heartbeat {
     pub jobs: Vec<JobStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// Additive description of where labels came from; `probed` marks an operator-declared probe.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub label_sources: BTreeMap<String, String>,
+    /// Taints a job must tolerate before it may run here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub taints: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -128,6 +140,12 @@ struct RawHeartbeat {
     pub jobs: Vec<JobStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// Additive description of where labels came from; `probed` marks an operator-declared probe.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub label_sources: BTreeMap<String, String>,
+    /// Taints a job must tolerate before it may run here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub taints: Vec<String>,
 }
 
 impl TryFrom<RawHeartbeat> for Heartbeat {
@@ -142,6 +160,8 @@ impl TryFrom<RawHeartbeat> for Heartbeat {
             host: raw.host,
             jobs: raw.jobs,
             labels: raw.labels,
+            label_sources: raw.label_sources,
+            taints: raw.taints,
         };
         hb.trim_stats();
         hb.validate()?;
@@ -185,6 +205,8 @@ impl Heartbeat {
         let stats = NodeStats {
             host: self.host.clone(),
             jobs: self.jobs.clone(),
+            labels: Vec::new(),
+            label_sources: BTreeMap::new(),
         };
         serde_json::to_vec(&stats)
             .map(|bytes| bytes.len())
@@ -230,6 +252,32 @@ impl Heartbeat {
                 });
             }
         }
+        if self.label_sources.len() > MAX_NODE_LABELS {
+            return Err(HeartbeatError::TooManyLabelSources {
+                got: self.label_sources.len(),
+            });
+        }
+        for (label, source) in &self.label_sources {
+            if !valid_label(label) || source != LABEL_SOURCE_PROBED || !self.labels.contains(label)
+            {
+                return Err(HeartbeatError::LabelSource {
+                    label: label.clone(),
+                    source: source.clone(),
+                });
+            }
+        }
+        if self.taints.len() > MAX_TAINTS {
+            return Err(HeartbeatError::TooManyTaints {
+                got: self.taints.len(),
+            });
+        }
+        for taint in &self.taints {
+            if !valid_label(taint) {
+                return Err(HeartbeatError::Taint {
+                    value: taint.clone(),
+                });
+            }
+        }
         if let Some(reiki) = &self.reiki {
             let size = serde_json::to_vec(reiki)
                 .map_err(|_| HeartbeatError::ReikiNotSerializable)?
@@ -250,6 +298,10 @@ pub enum HeartbeatError {
     ProviderName { index: usize, name: String },
     TooManyLabels { got: usize },
     Label { value: String },
+    TooManyLabelSources { got: usize },
+    LabelSource { label: String, source: String },
+    TooManyTaints { got: usize },
+    Taint { value: String },
     ReikiTooLarge { got: usize },
     ReikiNotSerializable,
 }
@@ -276,6 +328,22 @@ impl std::fmt::Display for HeartbeatError {
             Self::Label { value } => write!(
                 f,
                 "invalid node label {value:?}; it must be 1 to {MAX_LABEL_BYTES} characters from A-Z a-z 0-9 . _ - / with at most one '='"
+            ),
+            Self::TooManyLabelSources { got } => write!(
+                f,
+                "a heartbeat may carry at most {MAX_NODE_LABELS} label sources (got {got})"
+            ),
+            Self::LabelSource { label, source } => write!(
+                f,
+                "invalid source {source:?} for label {label:?}; only {LABEL_SOURCE_PROBED:?} is allowed and the label must also appear in labels"
+            ),
+            Self::TooManyTaints { got } => write!(
+                f,
+                "a heartbeat may carry at most {MAX_TAINTS} taints (got {got})"
+            ),
+            Self::Taint { value } => write!(
+                f,
+                "invalid node taint {value:?}; it must be 1 to {MAX_LABEL_BYTES} characters from A-Z a-z 0-9 . _ - / with at most one '='"
             ),
             Self::ReikiTooLarge { got } => write!(
                 f,
@@ -314,6 +382,8 @@ mod tests {
             host: None,
             jobs: Vec::new(),
             labels: Vec::new(),
+            label_sources: BTreeMap::new(),
+            taints: Vec::new(),
         }
     }
 
@@ -449,6 +519,53 @@ mod tests {
     }
 
     #[test]
+    fn probed_label_sources_round_trip_and_are_omitted_when_empty() {
+        let mut beat = heartbeat();
+        assert!(!serde_json::to_string(&beat)
+            .unwrap()
+            .contains("label_sources"));
+        beat.labels = vec!["gpu".to_owned()];
+        beat.label_sources = BTreeMap::from([("gpu".to_owned(), LABEL_SOURCE_PROBED.to_owned())]);
+        let json = serde_json::to_string(&beat).unwrap();
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, beat);
+        assert!(beat.validate().is_ok());
+    }
+
+    #[test]
+    fn label_sources_must_be_known_probed_labels() {
+        let mut beat = heartbeat();
+        beat.labels = vec!["gpu".to_owned()];
+        beat.label_sources = BTreeMap::from([("gpu".to_owned(), "fixed".to_owned())]);
+        assert!(matches!(
+            beat.validate().unwrap_err(),
+            HeartbeatError::LabelSource { .. }
+        ));
+        beat.label_sources.clear();
+        beat.label_sources
+            .insert("ghost".to_owned(), LABEL_SOURCE_PROBED.to_owned());
+        assert!(matches!(
+            beat.validate().unwrap_err(),
+            HeartbeatError::LabelSource { .. }
+        ));
+        beat.labels = (0..MAX_NODE_LABELS).map(|i| format!("label-{i}")).collect();
+        beat.label_sources = beat
+            .labels
+            .iter()
+            .cloned()
+            .map(|label| (label, LABEL_SOURCE_PROBED.to_owned()))
+            .collect();
+        beat.label_sources
+            .insert("extra".to_owned(), LABEL_SOURCE_PROBED.to_owned());
+        assert_eq!(
+            beat.validate().unwrap_err(),
+            HeartbeatError::TooManyLabelSources {
+                got: MAX_NODE_LABELS + 1
+            }
+        );
+    }
+
+    #[test]
     fn too_many_or_invalid_node_labels_are_refused() {
         let mut beat = heartbeat();
         beat.labels = (0..=MAX_NODE_LABELS)
@@ -476,10 +593,66 @@ mod tests {
     }
 
     #[test]
+    fn node_taints_round_trip_and_are_omitted_when_empty() {
+        let mut beat = heartbeat();
+        assert!(!serde_json::to_string(&beat).unwrap().contains("taints"));
+        beat.taints = vec!["homelab".to_owned(), "region=eu".to_owned()];
+        let json = serde_json::to_string(&beat).unwrap();
+        let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.taints, beat.taints);
+        assert!(beat.validate().is_ok());
+    }
+
+    #[test]
+    fn too_many_or_invalid_node_taints_are_refused() {
+        let mut beat = heartbeat();
+        beat.taints = (0..=MAX_TAINTS).map(|i| format!("taint-{i}")).collect();
+        assert_eq!(
+            beat.validate().unwrap_err(),
+            HeartbeatError::TooManyTaints {
+                got: MAX_TAINTS + 1
+            }
+        );
+        for taint in [
+            "",
+            "bad taint",
+            "café",
+            "a=b=c",
+            &"a".repeat(MAX_LABEL_BYTES + 1),
+        ] {
+            beat.taints = vec![taint.to_owned()];
+            assert!(
+                matches!(beat.validate().unwrap_err(), HeartbeatError::Taint { .. }),
+                "{taint:?}"
+            );
+        }
+    }
+
+    #[test]
     fn old_heartbeats_without_labels_still_parse() {
         let beat: Heartbeat =
             serde_json::from_str(r#"{"node":"peer-a","harness":"idle","providers":[]}"#).unwrap();
         assert!(beat.labels.is_empty());
+    }
+
+    #[test]
+    fn old_heartbeats_without_label_sources_still_parse() {
+        let beat: Heartbeat =
+            serde_json::from_str(r#"{"node":"peer-a","harness":"idle","labels":["gpu"]}"#).unwrap();
+        assert!(beat.label_sources.is_empty());
+        assert!(!serde_json::to_string(&beat)
+            .unwrap()
+            .contains("label_sources"));
+    }
+
+    #[test]
+    fn older_heartbeats_without_taints_still_parse() {
+        let beat: Heartbeat =
+            serde_json::from_str(r#"{"node":"peer-a","harness":"idle","labels":["gpu"]}"#).unwrap();
+        assert_eq!(beat.labels, vec!["gpu".to_owned()]);
+        assert!(beat.taints.is_empty());
+        let out = serde_json::to_string(&beat).unwrap();
+        assert!(!out.contains("taints"), "{out}");
     }
 
     #[test]
@@ -595,6 +768,8 @@ mod tests {
         let stats = NodeStats {
             host: parsed.host,
             jobs: parsed.jobs,
+            labels: Vec::new(),
+            label_sources: BTreeMap::new(),
         };
         assert!(serde_json::to_vec(&stats).unwrap().len() <= MAX_STATS_BYTES);
     }

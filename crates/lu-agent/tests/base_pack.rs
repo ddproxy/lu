@@ -192,7 +192,9 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         reiki_health_url: None,
         reiki_token_file: None,
         labels: Vec::new(),
+        taints: Vec::new(),
         label_files: Vec::new(),
+        detect: Vec::new(),
         housekeeping: None,
     };
     let done = Arc::new(AtomicBool::new(false));
@@ -210,6 +212,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         after: Vec::new(),
         stack_dependencies: true,
         requires: Vec::new(),
+        tolerates: Vec::new(),
         fallbacks: Vec::new(),
     };
     let controller = Arc::new(PackController {
