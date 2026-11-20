@@ -17,7 +17,7 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `POST /v1/jobs/{id}/cancel` | `blocked`, `queued` and `recovering` jobs become `cancelled` at once; `leased`, `running` and `needs_input` jobs get `cancel_requested = true` and the agent is told on its next poll. A terminal job is `409 conflict`. Returns a `JobView`. |
 | `POST /v1/jobs/{id}/edit` body `JobEdit` | Change a `queued` or `blocked` job's provider, model, fallbacks, requirements, tolerations, dependencies, collect mode or failed-input opt-in in place. Absent fields stay unchanged; an empty array clears a list. The job keeps its id and dependents. Returns a `JobView`. Another state is `409 conflict`; a dependency cycle is `400 bad_request`; an invalid spec or an unknown, failed or cancelled dependency is `422 unprocessable`, naming the fault. `include_failed` also permits an already dead dependency. Edited dependencies move the job between `blocked` and `queued` and respect the 16-dependency limit. |
 | `GET /v1/jobs/{id}/logs?offset=N&wait=25` | Return raw log bytes from `offset` with `Content-Type: text/plain`, `X-Lu-Log-Length` and `X-Lu-State`. `wait` holds the request for up to 25 seconds while no new bytes arrive. An unknown id is `404`. |
-| `GET /v1/jobs/{id}/artifacts/{name}` | Return one fixed artifact name: `diff.patch`, `run.log` or `report.json`. An unknown name or an artifact that is not stored is `404`. |
+| `GET /v1/jobs/{id}/artifacts/{name}` | Return one fixed artifact name: `diff.patch`, `run.log` or `report.json` from any job that stored it, including a `failed` job with a partial diff. An unknown name or an artifact that is not stored is `404`. |
 | `GET /v1/status` | Return a `StatusView`. |
 | `GET /v1/repos` | Return `{"repos":[{"name","url","synced_at","heads"}]}`. `synced_at` is null before the first sync; `heads` maps up to 20 branch names to commit ids. |
 | `POST /v1/repos/{name}/sync` | Fetch one configured mirror and return `{"name","heads","synced_at"}`. An unknown configured name is `404`; a fetch failure is `500` with any credential removed from the message. |
@@ -79,6 +79,7 @@ An unknown `git_ref` for a configured repository is `422 unprocessable` and name
 | `waiting_reason` | string or null | Why a queued job cannot be placed, such as `no node with label php8.3`, `only tainted nodes are free: homelab` or `no node has a healthy provider for provider "any"`. |
 | `assigned_provider` | string or null | The provider choice the job was assigned with, when it has fallbacks. |
 | `assigned_model` | string or null | The model of that choice. |
+| `diff_bytes` | integer or null | Present only for terminal jobs (`done`, `failed`, `cancelled`). Size of the stored `diff.patch` in bytes, or null when none. A failed job can have a non-empty partial diff; clients can fetch it with `GET /v1/jobs/{id}/artifacts/diff.patch`. |
 | `outcome_note` | string or null | Omitted when absent. `no_changes` when the job is `done` and its stored diff is empty and `allow_empty` is false. |
 | `warnings` | array of strings | Submit replies only. |
 

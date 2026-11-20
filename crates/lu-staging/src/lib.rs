@@ -124,16 +124,25 @@ impl From<io::Error> for ArtifactError {
 pub enum ApplyError {
     /// The patch was malformed or git could not read or write the tree.
     Git(String),
-    /// A clean apply failed and the three-way merge left these paths in conflict.
-    Conflict(Vec<String>),
+    /// No apply strategy succeeded. `detail` names the failing hunk and file when known.
+    Conflict {
+        /// Paths left in conflict by a three-way merge, or the patch's target file.
+        paths: Vec<String>,
+        /// Extra context, including the failing hunk and file, when available.
+        detail: Option<String>,
+    },
 }
 
 impl fmt::Display for ApplyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ApplyError::Git(message) => write!(f, "apply error: {message}"),
-            ApplyError::Conflict(paths) => {
-                write!(f, "apply conflict in {}", paths.join(", "))
+            ApplyError::Conflict { paths, detail } => {
+                write!(f, "apply conflict in {}", paths.join(", "))?;
+                if let Some(detail) = detail {
+                    write!(f, ": {detail}")?;
+                }
+                Ok(())
             }
         }
     }
@@ -658,7 +667,10 @@ impl Staging {
     ///
     /// A clean apply is tried first. If the patch no longer matches because earlier dependencies
     /// changed the same file, a three-way merge reconstructs the dependency's side from the base
-    /// tree and merges it with the checkout. A failed merge changes nothing.
+    /// tree and merges it with the checkout. libgit2's three-way preparation uses an exact hunk
+    /// match, so a patch that `git apply --3way` accepts after searching for an offset can fail
+    /// here. In that case a plain apply is retried, then `git apply --3way` when a git binary is
+    /// available. A failed final attempt changes nothing and reports the failing hunk and file.
     pub fn apply_dependency_diff(staged: &StagedDir, patch: &[u8]) -> Result<(), ApplyError> {
         let repo = git2::Repository::open(staged.path())
             .map_err(|e| ApplyError::Git(format!("failed to open repository: {e}")))?;
@@ -682,9 +694,38 @@ impl Staging {
 
         let base = head_tree(&repo)?;
         let ours = worktree_tree(&repo)?;
-        let mut theirs_index = repo
-            .apply_to_tree(&base, &diff, None)
-            .map_err(|e| ApplyError::Git(format!("failed to prepare three-way merge: {e}")))?;
+        let mut theirs_index = match repo.apply_to_tree(&base, &diff, None) {
+            Ok(index) => index,
+            Err(e) => {
+                // libgit2 requires an exact hunk offset here. Try the less strict strategies in
+                // order: plain apply (no check flag), then the git binary's fuzzy three-way apply.
+                let before = worktree_tree(&repo)?;
+                let plain = repo.apply(&diff, git2::ApplyLocation::WorkDir, None);
+                if plain.is_ok() {
+                    return Ok(());
+                }
+                let plain_error = plain.err().map(|e| e.to_string()).unwrap_or_default();
+                match git_apply_3way(staged.path(), patch) {
+                    Ok(()) => return Ok(()),
+                    Err(git_error) => {
+                        restore_tree(&repo, &before)?;
+                        let (file, line) =
+                            patch_location(patch).unwrap_or_else(|| ("unknown file".to_owned(), 0));
+                        let detail = format!(
+                            "failed to prepare three-way merge: hunk at line {line} in {file}: {e}; plain apply: {plain_error}; git apply --3way: {git_error}"
+                        );
+                        return Err(ApplyError::Conflict {
+                            paths: if file == "unknown file" {
+                                Vec::new()
+                            } else {
+                                vec![file]
+                            },
+                            detail: Some(detail),
+                        });
+                    }
+                }
+            }
+        };
         let theirs_oid = theirs_index
             .write_tree_to(&repo)
             .map_err(|e| ApplyError::Git(format!("failed to write merge tree: {e}")))?;
@@ -715,7 +756,10 @@ impl Staging {
             }
         }
         if !paths.is_empty() {
-            return Err(ApplyError::Conflict(paths));
+            return Err(ApplyError::Conflict {
+                paths,
+                detail: None,
+            });
         }
 
         let merged_oid = merged
@@ -865,6 +909,60 @@ impl Staging {
 
         remove_dir_all_robust(&canon_target)?;
         Ok(())
+    }
+}
+
+/// Best-effort location of the first hunk in a patch, for failure reporting.
+fn patch_location(patch: &[u8]) -> Option<(String, usize)> {
+    let text = String::from_utf8_lossy(patch);
+    let mut file = None;
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("+++ ") {
+            let path = path.split_whitespace().next().unwrap_or(path);
+            let path = path.strip_prefix("b/").unwrap_or(path);
+            if path != "/dev/null" {
+                file = Some(path.to_owned());
+            }
+        } else if let Some(header) = line.strip_prefix("@@ ") {
+            if let Some(new) = header.split('+').nth(1) {
+                let digits: String = new.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(start) = digits.parse::<usize>() {
+                    return Some((file.unwrap_or_else(|| "unknown file".to_owned()), start));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Applies a patch with the git binary's fuzzy three-way apply. A missing git binary is reported
+/// as an ordinary error; the caller turns it into a conflict after exhausting all strategies.
+fn git_apply_3way(dir: &Path, patch: &[u8]) -> Result<(), String> {
+    let mut child = Command::new("git")
+        .args(["apply", "--3way", "-"])
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run git apply --3way: {e}"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(patch)
+            .map_err(|e| format!("could not feed patch to git apply --3way: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("could not wait for git apply --3way: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if message.is_empty() {
+            format!("git apply --3way exited with {}", output.status)
+        } else {
+            message
+        })
     }
 }
 
@@ -1414,7 +1512,7 @@ mod tests {
 
         let error = Staging::apply_dependency_diff(&staged, &patch).unwrap_err();
         match error {
-            ApplyError::Conflict(paths) => assert_eq!(paths, ["README.md"]),
+            ApplyError::Conflict { paths, .. } => assert_eq!(paths, ["README.md"]),
             other => panic!("expected a conflict, got {other}"),
         }
         assert_eq!(

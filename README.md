@@ -109,9 +109,11 @@ put `target/release` on `PATH` or run `make install` first.
 
    `lu ls` uses the header `ID STATE NODE ATTEMPT AFTER CREATED NOTE`. `lu show` prints key/value
    rows (`id`, `state`, `node`, `attempt`, `epoch`, `created_at`, `started_at`, `finished_at`,
-   `failure`, `waiting`, `summary`, `outcome_note`). `lu logs --follow` streams stored output and stops when the
-   job reaches a terminal state. `lu fetch` prints one `saved <path>` line per file:
-   `results/diff.patch`, `results/run.log` and `results/report.json`.
+   `failure`, `waiting`, `summary`, `diff_bytes`, `outcome_note`). Terminal jobs report
+   `diff_bytes`, so a failed job that wrote files before failing still advertises its partial
+   diff. `lu logs --follow` streams stored output and stops when the job reaches a terminal state.
+   `lu fetch` prints one `saved <path>` line per file: `results/diff.patch`, `results/run.log` and
+   `results/report.json`. It also fetches artifacts of failed jobs.
 
 7. To chain work, use idempotency keys instead of copying ids:
 
@@ -148,10 +150,10 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu retry <id>` | Resubmit a finished job's spec as a new job. `--provider` and `--model` replace those fields; `--after` and `--after-key` replace the dependency list; `--require` replaces the label requirements and `--no-require` clears them; `--tolerate` replaces the tolerated taints and `--no-tolerate` clears them; `--fallback` replaces the provider choices and `--no-fallbacks` clears them. `--collect` and `--include-failed` replace the collect mode and failed-input opt-in. `--key` gives the new job an idempotency key, and `--wait` polls until it is terminal. A nonterminal job or an unknown `--after-key` is a usage error. |
 | `lu edit <id>` | Change a `queued` or `blocked` job in place; it keeps its id and dependents. `--provider` and `--model` replace those fields; `--fallback`/`--no-fallbacks`, `--require`/`--no-require` and `--tolerate`/`--no-tolerate` replace or clear the lists; `--after` and `--after-key` replace the dependencies, at most 16 and without a cycle. `--collect` and `--include-failed` replace the collect mode and failed-input opt-in. `--provider any` cannot be combined with `--model` or `--fallback`. A job in another state, a cyclic dependency or a bad spec is an error. |
 | `lu ls [--state <state>] [--limit <n>]` | List jobs, newest first. `--state` accepts the nine job states. `AFTER` counts dependencies still unfinished; `NOTE` shows `no changes` for a done job with an empty diff. |
-| `lu show <id>` | Show one job, including each dependency and its state. The `outcome_note` row shows `no changes` when noted. |
+| `lu show <id>` | Show one job, including each dependency and its state. Terminal jobs print `diff_bytes` (the size of the stored diff, even on failure); the `outcome_note` row shows `no changes` when noted. |
 | `lu graph [job]` | Draw the dependency graph of unfinished jobs, newest component first. With a job id, show only its component. `--json` prints a `nodes` array instead. |
 | `lu logs <id> [--follow]` | Print a job's stored log. `--follow` reads until the job reaches a terminal state. |
-| `lu fetch <id> [--out <dir>] [--force]` | Save `diff.patch`, `run.log` and `report.json` into `--out` (default `.`). Missing artifacts are skipped; existing files need `--force`. |
+| `lu fetch <id> [--out <dir>] [--force]` | Save `diff.patch`, `run.log` and `report.json` into `--out` (default `.`) from any job that stored them, including failed jobs with a partial diff. Missing artifacts are skipped; existing files need `--force`. |
 | `lu cancel <id>` | Ask the controller to cancel a job. |
 | `lu nodes` | List known nodes, including the agent version, labels and taints each last reported. Taints are shown with a `!` prefix. |
 | `lu node <name>` | Show the host and job stats the node last reported. |

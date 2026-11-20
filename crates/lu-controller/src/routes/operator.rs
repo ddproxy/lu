@@ -70,6 +70,7 @@ fn job_view_with(r: &JobRecord, reason: Option<String>) -> JobView {
         waiting_on: r.waiting_on.clone(),
         waiting_reason: reason,
         outcome_note: outcome_note(r).map(str::to_owned),
+        diff_bytes: r.state.is_terminal().then(|| r.diff_bytes.unwrap_or(0)),
         warnings: None,
     }
 }
@@ -760,5 +761,20 @@ mod tests {
         assert_eq!(outcome_note(&legacy), None);
         let running = record(JobState::Running, false, Some(0), diff());
         assert_eq!(outcome_note(&running), None);
+    }
+
+    #[test]
+    fn every_terminal_job_view_exposes_diff_bytes() {
+        for state in [JobState::Done, JobState::Failed, JobState::Cancelled] {
+            let r = record(state, false, Some(4096), diff());
+            let view = job_view(&r);
+            assert_eq!(view.diff_bytes, Some(4096), "{state:?}");
+        }
+        // A terminal job without a diff reports zero, and an in-flight job reports none.
+        let failed_without_diff = record(JobState::Failed, false, None, Vec::new());
+        let view = job_view(&failed_without_diff);
+        assert_eq!(view.diff_bytes, Some(0));
+        let running = record(JobState::Running, false, Some(4096), diff());
+        assert_eq!(job_view(&running).diff_bytes, None);
     }
 }

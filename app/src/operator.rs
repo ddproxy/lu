@@ -1141,6 +1141,12 @@ fn print_job(view: &JobView) {
                 .unwrap_or_else(|| "-".to_owned()),
         ),
         ("outcome_note", outcome_text(view.outcome_note.as_deref())),
+        (
+            "diff_bytes",
+            view.diff_bytes
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
     ];
     print_pairs(&rows);
 }

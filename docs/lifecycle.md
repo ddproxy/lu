@@ -97,7 +97,7 @@ conflict`; a cycle gets `400 bad_request`.
 
 | Class | Meaning | Requeue rule |
 | --- | --- | --- |
-| `node` | Agent lost, lease expired, harness spawn failed, workspace prepare failed, or an ordinary staging error. | Requeue while `attempt <= max_retries` (default 1, allowed 0–3); otherwise fail with `node`. |
+| `node` | Agent lost, lease expired, harness spawn failed, harness crashed at launch (a crash banner within 3 seconds and before any harness output), workspace prepare failed, or an ordinary staging error. | Requeue while `attempt <= max_retries` (default 1, allowed 0–3); otherwise fail with `node`. |
 | `provider` | All keys unavailable, a model limit, a 429, or a provider-failure marker followed by harness silence. | Requeue while `attempt <= 100`; `max_retries` is not consulted. At `attempt > 100` the job fails with `provider`. |
 | `execution` | Harness exited non-zero, timed out, produced no output, or the task itself was invalid. Staging errors naming a missing ref, authentication failure or unknown repository are also `execution`. | Never requeue. |
 | `dependency` | A dependency finished `failed` or `cancelled`. | Never requeue. |
@@ -118,9 +118,15 @@ A failure before the harness produced a verdict is classified by the agent, one 
 | Cause | Class | Retried |
 | --- | --- | --- |
 | The harness process could not be started (command not found, exec refused, no pid) | `node` | within `max_retries` |
+| The harness exited or was signalled within 3 seconds with a crash banner (`panic(`, `abort() called`, `Segmentation fault`, `Illegal instruction`, `SIGILL`, `core dumped`) in its output | `node` | within `max_retries` |
 | Staging or preparing the tree failed in a way the node controls (disk, filesystem, clone transport, permissions, leftover directory) | `node` | within `max_retries` |
 | A staging error that names a missing ref, an authentication failure or an unknown repository | `execution` | never |
-| A dependency diff could not be applied and the three-way merge left conflicts (or the patch was unreadable) | `conflict` | never |
+| A dependency diff could not be applied: the three-way merge left conflicts, or plain apply and `git apply --3way` all failed (the summary names the file and hunk) | `conflict` | never |
+
+A harness crash also marks the node with the label and taint `harness_ok=false` in later
+heartbeats. The taint dispatches no further harness jobs to that node unless a job explicitly
+tolerates `harness_ok=false`; a later successful harness run clears both. This uses the ordinary
+[node labels and taints](dispatch.md#taints-and-tolerations) mechanism and needs no extra schema.
 
 Provider-failure detection and cordon behaviour during an outage are in
 [operations.md](operations.md#provider-cordons-and-node-drains).
@@ -140,9 +146,16 @@ prints as `no changes` in `lu ls` and `lu show` and is marked in the TUI job lis
 `allow_empty: true` (`lu submit --allow-empty`) to suppress the note. The controller counts noted
 jobs in `lu_jobs_no_changes_total`, reset on restart.
 
+## Partial diffs on terminal jobs
+
+Every terminal `JobView` (`done`, `failed`, `cancelled`) carries `diff_bytes`: the size of the
+stored `diff.patch`, or null when there is none. A job that wrote files before failing still keeps
+that diff, and `lu fetch` downloads it alongside the log and report; the job's `state` and
+`failure_class` still mark it unsuccessful. `lu show` prints `diff_bytes` as a row.
+
 ## Observing progress
 
-`lu show` prints the current row, including `attempt`, `epoch`, `failure`, `waiting`, `summary` and `outcome_note`.
+`lu show` prints the current row, including `attempt`, `epoch`, `failure`, `waiting`, `summary`, `diff_bytes` and `outcome_note`.
 `lu logs --follow` streams log chunks and stops when the controller reports a terminal state in
 the log response; it exits `0` for `done` and `3` for `failed` or `cancelled`. `lu submit --wait`
 uses the same exit convention.

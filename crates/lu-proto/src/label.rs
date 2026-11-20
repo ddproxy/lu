@@ -6,6 +6,11 @@ use crate::limits::MAX_LABEL_BYTES;
 /// The only label source marker an agent sends: an operator-declared probe published the label.
 pub const LABEL_SOURCE_PROBED: &str = "probed";
 
+/// Published by an agent after its harness crashes at launch. It is sent as both a node label and
+/// a node taint so existing dispatch rules exclude the node for jobs that need a working harness;
+/// a job may opt back in by tolerating it. A healthy run clears it.
+pub const HARNESS_OK_FALSE: &str = "harness_ok=false";
+
 /// Whether `value` may appear as a node label or a job requirement.
 pub fn valid_label(value: &str) -> bool {
     !value.is_empty()

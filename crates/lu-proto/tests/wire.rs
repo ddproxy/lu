@@ -179,6 +179,7 @@ fn job_and_node_views_match_the_documented_json() {
         waiting_on: vec![dep],
         waiting_reason: None,
         outcome_note: None,
+        diff_bytes: None,
         warnings: Some(Vec::new()),
     };
     let expected_job = serde_json::json!({

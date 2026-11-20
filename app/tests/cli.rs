@@ -1012,6 +1012,67 @@ async fn fetch_writes_the_fixed_private_names_and_needs_force_to_replace() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_job_with_artifacts_can_be_fetched_and_shows_its_diff_size() {
+    let id = job_id();
+    let mut job = job_json(&id, "failed");
+    job["failure_class"] = json!("execution");
+    job["summary"] = json!("the prompt could not be answered");
+    job["diff_bytes"] = json!(1024);
+    job["artifacts"] = json!(["diff.patch", "run.log"]);
+    let job_body = job.clone();
+    let job_path = format!("/v1/jobs/{id}");
+    let server = start(move |record| {
+        if record.path == job_path {
+            Reply::json(&job_body)
+        } else if record.path.ends_with(ArtifactName::DiffPatch.file_name()) {
+            Reply::ok(b"diff --git a/a b/a\n+partial work\n".to_vec())
+        } else if record.path.ends_with(ArtifactName::RunLog.file_name()) {
+            Reply::ok(b"log line\n".to_vec())
+        } else {
+            Reply::status(404)
+        }
+    })
+    .await;
+    let dir = scratch("fetch-failed");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+
+    // `show` displays the size of the partial diff, and `--json ls` forwards the
+    // controller's field verbatim.
+    let output = run_with_env(&["show", &id], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("failed"), "{text}");
+    assert!(text.contains("1024"), "{text}");
+    assert!(text.contains("the prompt could not be answered"), "{text}");
+
+    let list = json!({"jobs": [job], "future": true});
+    let json_server = start(move |_| Reply::json(&list)).await;
+    let json_envs = env_for(&json_server, &token);
+    let output = run_with_env(&["--json", "ls"], &json_envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(value["jobs"][0]["diff_bytes"], json!(1024), "{value}");
+
+    // A failed job is not a barrier to fetching whatever artifacts it did write.
+    let out = dir.join("artifacts");
+    let output = run_with_env(
+        &["fetch", &id, "--out", out.to_str().unwrap()],
+        &envs,
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        std::fs::read(out.join("diff.patch")).unwrap(),
+        b"diff --git a/a b/a\n+partial work\n"
+    );
+    assert_eq!(std::fs::read(out.join("run.log")).unwrap(), b"log line\n");
+    assert!(!out.join("report.json").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nodes_and_drain_render_aligned_text() {
     let list = json!([
         {

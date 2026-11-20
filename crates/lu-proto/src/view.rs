@@ -56,6 +56,9 @@ pub struct JobView {
     pub waiting_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_note: Option<String>,
+    /// Size of `diff.patch`, present for terminal jobs (zero when none was stored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warnings: Option<Vec<String>>,
 }
@@ -85,6 +88,7 @@ impl JobView {
             waiting_on: Vec::new(),
             waiting_reason: None,
             outcome_note: None,
+            diff_bytes: None,
             warnings: None,
         }
     }

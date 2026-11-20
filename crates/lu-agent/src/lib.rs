@@ -16,6 +16,7 @@ mod proc;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +25,8 @@ use lu_config::{AgentConfig, BaseSource};
 use lu_proto::{
     effective_collect, printable, truncate_chars, AgentEvent, ArtifactName, Completion,
     FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobStats, NodeName, Outcome,
-    ProviderModel, ProviderState, ProviderStatus, MAX_DIFF_BYTES, MAX_SUMMARY_BYTES,
+    ProviderModel, ProviderState, ProviderStatus, HARNESS_OK_FALSE, MAX_DIFF_BYTES,
+    MAX_NODE_LABELS, MAX_SUMMARY_BYTES, MAX_TAINTS,
 };
 use lu_staging::{ApplyError, Source, StageRequest, StagedDir, Staging};
 use lu_supervise::{CommandSpec, Limits, Outcome as SuperviseOutcome, Supervisor};
@@ -53,6 +55,11 @@ pub const PROVIDER_MARKER_GRACE: Duration = Duration::from_secs(120);
 
 /// How often a running job's provider is checked against the node's Reiki reading.
 const REIKI_WATCH_PERIOD: Duration = Duration::from_secs(5);
+/// A harness that exits non-zero with a crash banner inside this window is a node fault, not a
+/// job failure: an incompatible binary (for example, one needing AVX2) cannot run anywhere on
+/// that node, and the job must be retried elsewhere.
+const HARNESS_CRASH_WINDOW: Duration = Duration::from_secs(3);
+
 /// Added to Reiki's cooldown estimate before the controller cordons the provider, since the
 /// reading may be several seconds old and keys sometimes fail again right after a cooldown.
 const COOLDOWN_BUFFER_SECS: u64 = 60;
@@ -150,6 +157,21 @@ fn offered_provider_models(
         .collect()
 }
 
+/// Adds the node's current harness health to a heartbeat. A crash at launch is reported as both
+/// a label (for operators) and a taint (so dispatch's existing taint rules exclude this node for
+/// jobs that need a working harness). A later successful run stops publishing both.
+fn add_harness_status(labels: &mut Vec<String>, taints: &mut Vec<String>, ok: bool) {
+    if ok {
+        return;
+    }
+    if !labels.iter().any(|label| label == HARNESS_OK_FALSE) && labels.len() < MAX_NODE_LABELS {
+        labels.push(HARNESS_OK_FALSE.to_owned());
+    }
+    if !taints.iter().any(|taint| taint == HARNESS_OK_FALSE) && taints.len() < MAX_TAINTS {
+        taints.push(HARNESS_OK_FALSE.to_owned());
+    }
+}
+
 /// The node agent. One instance runs one job at a time.
 pub struct Agent {
     node: NodeName,
@@ -175,6 +197,9 @@ pub struct Agent {
     labels: Arc<labels::LabelSource>,
     probes: Arc<probes::Probes>,
     taints: Arc<Vec<String>>,
+    /// Cleared after a successful harness run, set when it crashes at launch. Reported as a
+    /// label and taint in every heartbeat so dispatch avoids this node until it recovers.
+    harness_ok: Arc<AtomicBool>,
     harness: String,
     harness_wrapper: Vec<String>,
     builder: Arc<CommandBuilder>,
@@ -259,6 +284,7 @@ impl Agent {
             labels,
             probes,
             taints: Arc::new(config.taints),
+            harness_ok: Arc::new(AtomicBool::new(true)),
             harness: config.harness,
             harness_wrapper: config.harness_wrapper,
             builder: Arc::new(|task_file, model, server, message| {
@@ -420,6 +446,13 @@ impl Agent {
         let current = health::snapshot(&self.health);
         let label_set = self.labels.current_set();
         let provider_models = offered_provider_models(&self.provider_models, &current.providers);
+        let mut labels = label_set.labels;
+        let mut taints = self.taints.as_ref().clone();
+        add_harness_status(
+            &mut labels,
+            &mut taints,
+            self.harness_ok.load(Ordering::SeqCst),
+        );
         let mut beat = Heartbeat {
             node: self.node.clone(),
             harness,
@@ -429,9 +462,9 @@ impl Agent {
             reiki: current.reiki,
             host: proc::host_stats(&self.work_dir),
             jobs: Vec::new(),
-            labels: label_set.labels,
+            labels,
             label_sources: label_set.label_sources,
-            taints: self.taints.as_ref().clone(),
+            taints,
         };
         beat.trim_stats();
         let mut request = lu_client::PollRequest::from(beat);
@@ -721,6 +754,7 @@ impl Agent {
                 grace: STOP_GRACE,
             },
         );
+        let harness_started = Instant::now();
         let mut output = running.output();
         let observation = if proc::enabled() {
             running.process_group().map(|pgid| {
@@ -758,6 +792,7 @@ impl Agent {
                 provider_models: Arc::clone(&self.provider_models),
                 labels: Arc::clone(&self.labels),
                 taints: Arc::clone(&self.taints),
+                harness_ok: Arc::clone(&self.harness_ok),
                 observation: observation.clone(),
                 work_dir: self.work_dir.clone(),
             },
@@ -981,7 +1016,16 @@ impl Agent {
             return Ok(JobEnd::Finished);
         }
 
-        let (outcome, exit_code, reason) = classify(outcome, &tail.text());
+        let text = tail.text();
+        let elapsed = harness_started.elapsed();
+        let crashed = harness_crash(&outcome, &text, elapsed);
+        if crashed {
+            self.harness_ok.store(false, Ordering::SeqCst);
+        }
+        let (outcome, exit_code, reason) = classify(outcome, &text, elapsed);
+        if outcome == Outcome::Done {
+            self.harness_ok.store(true, Ordering::SeqCst);
+        }
         let mut summary = tail.summary();
         if summary.is_empty() {
             summary = reason;
@@ -1072,12 +1116,12 @@ impl Agent {
             };
             match Staging::apply_dependency_diff(staged, &bytes) {
                 Ok(()) => applied.push(dep.job_id.to_string()),
-                Err(ApplyError::Conflict(paths)) => {
+                Err(ApplyError::Conflict { paths, detail }) => {
                     return Ok(DependencyApply::Conflict {
                         dependency: dep.job_id.to_string(),
                         paths,
                         applied,
-                        detail: None,
+                        detail,
                     })
                 }
                 Err(error) => {
@@ -1264,6 +1308,7 @@ struct ControlTask {
     provider_models: Arc<Vec<lu_config::ProviderModelConfig>>,
     labels: Arc<labels::LabelSource>,
     taints: Arc<Vec<String>>,
+    harness_ok: Arc<AtomicBool>,
     observation: Option<Arc<Mutex<proc::JobObservation>>>,
     work_dir: PathBuf,
 }
@@ -1279,6 +1324,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
         provider_models,
         labels,
         taints,
+        harness_ok,
         observation,
         work_dir,
     } = task;
@@ -1342,6 +1388,13 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                     .unwrap_or_default();
                 let label_set = labels.current_set();
                 let provider_models = offered_provider_models(&provider_models, &current.providers);
+                let mut beat_labels = label_set.labels;
+                let mut beat_taints = taints.as_ref().clone();
+                add_harness_status(
+                    &mut beat_labels,
+                    &mut beat_taints,
+                    harness_ok.load(Ordering::SeqCst),
+                );
                 let mut beat = Heartbeat {
                     node: node.clone(),
                     harness: HarnessState::Busy,
@@ -1351,9 +1404,9 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                     reiki: current.reiki,
                     host,
                     jobs,
-                    labels: label_set.labels,
+                    labels: beat_labels,
                     label_sources: label_set.label_sources,
-                    taints: taints.as_ref().clone(),
+                    taints: beat_taints,
                 };
                 beat.trim_stats();
                 let mut request = lu_client::PollRequest::from(beat);
@@ -1454,8 +1507,59 @@ fn jitter_seed() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether the harness died at launch: a failed exit in the first few seconds whose output is a
+/// crash banner. A job that fails this way is retried on another node, since the binary itself
+/// cannot run on this one.
+fn harness_crash(outcome: &SuperviseOutcome, tail: &str, elapsed: Duration) -> bool {
+    if elapsed > HARNESS_CRASH_WINDOW {
+        return false;
+    }
+    let failed = match outcome {
+        SuperviseOutcome::Exited(code) => *code != 0,
+        SuperviseOutcome::Signalled(_) => true,
+        _ => false,
+    };
+    failed && crash_banner(tail)
+}
+
+/// Crash signatures a harness may print before it exits. This codebase has no harness event
+/// schema: its output is raw bytes, so presence of a banner in the output tail is the signal.
+fn crash_banner(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "panic(",
+        "abort() called",
+        "segmentation fault",
+        "illegal instruction",
+        "sigill",
+        "core dumped",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 /// Maps a supervisor outcome to the wire outcome, an exit code, and a fallback summary.
-fn classify(outcome: SuperviseOutcome, tail: &str) -> (Outcome, Option<i32>, String) {
+fn classify(
+    outcome: SuperviseOutcome,
+    tail: &str,
+    elapsed: Duration,
+) -> (Outcome, Option<i32>, String) {
+    if harness_crash(&outcome, tail, elapsed) {
+        let exit_code = match outcome {
+            SuperviseOutcome::Exited(code) => Some(code),
+            _ => None,
+        };
+        let line = tail
+            .lines()
+            .find(|line| crash_banner(line))
+            .map(|line| truncate_chars(&printable(line.trim()), 200))
+            .unwrap_or_else(|| "harness crash banner".to_owned());
+        return (
+            Outcome::Failed(FailureClass::Node),
+            exit_code,
+            format!("harness crashed at launch: {line}"),
+        );
+    }
     match outcome {
         SuperviseOutcome::Exited(0) => {
             (Outcome::Done, Some(0), "harness exited cleanly".to_owned())

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use lu_client::{ApiError, Controller, DependencyView, PollRequest};
 use lu_config::BaseSource;
 use lu_proto::{
-    AgentEvent, ArtifactName, Completion, FailureClass, JobId, JobSpec, JobState, LogChunk,
-    NodeName, Outcome, MAX_LOG_BYTES,
+    AgentEvent, ArtifactName, Completion, FailureClass, HarnessState, JobId, JobSpec, JobState,
+    LogChunk, NodeName, Outcome, HARNESS_OK_FALSE, MAX_LOG_BYTES,
 };
 use lu_staging::Staging;
 use lu_supervise::CommandSpec;
@@ -347,6 +347,7 @@ fn make_agent(
         labels: Arc::new(super::labels::LabelSource::new(Vec::new(), Vec::new())),
         probes: Arc::new(super::probes::Probes::new(Vec::new())),
         taints: Arc::new(Vec::new()),
+        harness_ok: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         provider_marker_grace: super::PROVIDER_MARKER_GRACE,
         reiki_watch_period: super::REIKI_WATCH_PERIOD,
         opencode_server: None,
@@ -1424,6 +1425,86 @@ async fn job_failed_exit_completes_execution_failure() {
     assert_eq!(done.len(), 1, "{done:?}");
     assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Execution));
     assert_eq!(done[0].exit_code, Some(1));
+}
+
+/// Heartbeats after a crash advertise the broken harness as a label and a taint.
+fn reports_broken_harness(poll: &PollRequest) -> bool {
+    poll.labels.iter().any(|label| label == HARNESS_OK_FALSE)
+        && poll.taints.iter().any(|taint| taint == HARNESS_OK_FALSE)
+}
+
+fn polls_after_completion(calls: &[Call]) -> Vec<&PollRequest> {
+    let Some(index) = calls
+        .iter()
+        .position(|call| matches!(call, Call::Complete(_)))
+    else {
+        return Vec::new();
+    };
+    calls[index + 1..]
+        .iter()
+        .filter_map(|call| match call {
+            Call::Poll(request) => Some(request.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_harness_crash_at_launch_is_a_retryable_node_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo 'Bun v1.1.0linux x86_64'; echo 'abort() called'; exit 1"),
+    );
+    let harness_ok = Arc::clone(&agent.harness_ok);
+    let calls = run_job(&controller, agent, |calls| {
+        has_complete(calls)
+            && polls_after_completion(calls)
+                .iter()
+                .any(|poll| reports_broken_harness(poll))
+    })
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Node));
+    assert_eq!(done[0].exit_code, Some(1));
+    let summary = done[0].summary.clone().unwrap_or_default();
+    assert!(summary.contains("abort() called"), "{summary}");
+    assert!(!harness_ok.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_successful_harness_run_clears_the_broken_harness_label() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo success; exit 0"));
+    agent
+        .harness_ok
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let harness_ok = Arc::clone(&agent.harness_ok);
+    let calls = run_job(&controller, agent, |calls| {
+        has_complete(calls)
+            && polls_after_completion(calls)
+                .iter()
+                .any(|poll| poll.harness == Some(HarnessState::Idle))
+    })
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Done);
+    assert!(harness_ok.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        polls_after_completion(&calls)
+            .iter()
+            .all(|poll| !reports_broken_harness(poll)),
+        "a healthy run must stop advertising the broken harness: {calls:?}"
+    );
 }
 
 #[tokio::test]

@@ -19,7 +19,7 @@ pub mod view;
 pub use event::{AgentEvent, Completion, CompletionError, LogChunk, LogChunkError, Outcome};
 pub use failure::{FailureClass, ParseFailureClassError};
 pub use ids::{JobId, JobIdError, NodeName, NodeNameError};
-pub use label::{valid_label, LABEL_SOURCE_PROBED};
+pub use label::{valid_label, HARNESS_OK_FALSE, LABEL_SOURCE_PROBED};
 pub use limits::{
     ArtifactName, ParseArtifactNameError, DEFAULT_TIMEOUT_SECS, INPUT_LOG_BYTES, JOB_ID_LEN,
     MAX_AFTER_JOBS, MAX_COLLECT_BYTES, MAX_COLLECT_INPUTS, MAX_DIFF_BYTES, MAX_FALLBACKS,

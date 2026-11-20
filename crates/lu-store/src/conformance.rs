@@ -5,8 +5,8 @@ use std::str::FromStr;
 
 use lu_proto::{
     ArtifactName, Choice, CollectMode, Completion, FailureClass, HarnessState, Heartbeat, JobEdit,
-    JobId, JobSpec, JobState, NodeName, Outcome, ProviderState, ProviderStatus, MAX_COLLECT_BYTES,
-    MAX_LOG_BYTES,
+    JobId, JobSpec, JobState, NodeName, Outcome, ProviderState, ProviderStatus, HARNESS_OK_FALSE,
+    MAX_COLLECT_BYTES, MAX_LOG_BYTES,
 };
 
 use crate::{Now, Store, StoreError};
@@ -103,6 +103,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     recovering_job_blocks_new_assignment_on_its_node(&make());
     label_requirements_route_and_explain(&make());
     taint_tolerations_route_and_explain(&make());
+    broken_harness_taint_excludes_jobs_until_cleared(&make());
     start_renew_log_artifact(&make());
     unreserve_log_restores_length_and_is_fenced(&make());
     held_jobs_lists_the_nodes_active_jobs(&make());
@@ -1351,6 +1352,65 @@ fn taint_tolerations_route_and_explain<S: Store>(s: &S) {
     s.heartbeat(&beat, now(21, 21)).unwrap();
     let nodes = s.nodes(now(21, 21), 60_000).unwrap();
     assert_eq!(crate::waiting_reason(&waiting, &nodes), None);
+}
+
+/// A node whose harness crashed at launch advertises `harness_ok=false` as a taint. Dispatch
+/// excludes it for jobs that need a harness until a healthy heartbeat clears the taint.
+fn broken_harness_taint_excludes_jobs_until_cleared<S: Store>(s: &S) {
+    let broken = node("broken-harness");
+    let mut beat = hb("broken-harness", HarnessState::Idle, vec![]);
+    beat.labels = vec![HARNESS_OK_FALSE.to_owned()];
+    beat.taints = vec![HARNESS_OK_FALSE.to_owned()];
+    s.heartbeat(&beat, now(1, 1)).unwrap();
+
+    let (job, _) = s
+        .create_job(&spec("https://x/harness.git", None), now(2, 2))
+        .unwrap();
+    assert!(s
+        .next_assignment(&broken, now(3, 3), 60_000)
+        .unwrap()
+        .is_none());
+    let nodes = s.nodes(now(3, 3), 60_000).unwrap();
+    assert_eq!(
+        crate::waiting_reason(&job, &nodes).as_deref(),
+        Some("only tainted nodes are free: harness_ok=false")
+    );
+
+    let mut tolerant = spec("https://x/harness-tolerant.git", None);
+    tolerant.tolerates = vec![HARNESS_OK_FALSE.to_owned()];
+    let (opted_in, _) = s.create_job(&tolerant, now(4, 4)).unwrap();
+    let assigned = s
+        .next_assignment(&broken, now(5, 5), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.job_id, opted_in.id);
+    // Release the held job before asking for another assignment.
+    s.start_job(&opted_in.id, assigned.epoch, now(6, 6))
+        .unwrap();
+    s.complete(
+        &Completion {
+            job_id: opted_in.id.clone(),
+            epoch: assigned.epoch,
+            outcome: Outcome::Done,
+            exit_code: Some(0),
+            summary: None,
+            retry_after_secs: None,
+        },
+        None,
+        now(6, 6),
+        1,
+        1000,
+    )
+    .unwrap();
+
+    // A successful harness run removes the label and the taint from the next heartbeat.
+    s.heartbeat(&hb("broken-harness", HarnessState::Idle, vec![]), now(7, 7))
+        .unwrap();
+    let assigned = s
+        .next_assignment(&broken, now(8, 8), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.job_id, job.id);
 }
 
 fn start_renew_log_artifact<S: Store>(s: &S) {
