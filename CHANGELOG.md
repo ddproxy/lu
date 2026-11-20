@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-20
+
 ### Added
 
 - Dependency input collection. `JobSpec.collect` accepts `none`, `files`, `apply` or `both` (aliases `off`, `false`, `diffs`, `diff`, `patches`, `patch`) and overrides `stack_dependencies`; `files` and `both` stage `INDEX.md`, `diff.patch`, `report.json`, `run.log` and `meta.json` under `.lu/inputs` before the harness starts, with a 16-input/64 MiB cap, private modes, symlink refusal and a 256 KiB log tail. `JobSpec.include_failed` accepts failed or cancelled dependencies, releases their dependents instead of cascading a `dependency` failure, and makes their stored diffs available as inputs. The CLI adds `--collect` and `--include-failed` to `submit`, `retry` and `edit`; MCP adds `collect` and `include_failed` to `lu_submit`, `lu_submit_many` and `lu_retry`. `.lu` is excluded from exported diffs and is a staging error when tracked. No schema change: both fields live in the existing JSON spec.
