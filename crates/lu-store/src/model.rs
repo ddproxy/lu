@@ -1243,6 +1243,7 @@ impl<S: Store> Model<S> {
             .recover_on_boot(self.now)
             .expect("recover_on_boot");
         assert_eq!(got, moving.len() as u64);
+        self.cordons.clear();
         for id in moving {
             self.lease_until.remove(&id);
             self.recovering_since.insert(id.clone(), self.now.mono_ms);

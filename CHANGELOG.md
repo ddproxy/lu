@@ -5,6 +5,12 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-20
+
+### Fixed
+
+- Provider cordons no longer outlive a controller restart. Their expiry is on the process's monotonic clock, so a restart made rows from the previous run look hours in the future and blocked dispatch to a healthy provider; boot recovery now clears them and Reiki health and new failures set them again.
+
 ## [0.3.0] - 2026-11-20
 
 ### Added

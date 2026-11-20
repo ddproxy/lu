@@ -1696,6 +1696,9 @@ impl Store for SqliteStore {
             params![now.mono_ms as i64],
         )
         .map_err(internal)?;
+        // Cordon expiries are on the same monotonic clock: a row from the last run would look
+        // hours away against a fresh clock. Reiki health and new failures set them again.
+        tx.execute("DELETE FROM cordons", []).map_err(internal)?;
         let mut count = 0u64;
         for id in ids {
             let (mut rec, _, _) = get_job_tx(&tx, &id)?;
@@ -2330,5 +2333,29 @@ mod tests {
             crate::StoreError::Internal(_) => {}
             other => panic!("expected internal error, got {other:?}"),
         }
+    }
+    #[test]
+    fn restart_drops_cordons_stamped_by_the_previous_clock() {
+        let path = temp_db("cordons.db");
+        let store = SqliteStore::open(&path).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO cordons(node,provider,until_mono_ms,reiki_derived,healthy_hb_count) \
+                 VALUES('dev-ct-1','zen',70000000,0,0),('dev-ct-1','openrouter',90000000,1,0)",
+                [],
+            )
+            .unwrap();
+        }
+        let now = Now {
+            wall_unix: 1_700_000_000,
+            mono_ms: 3_000,
+        };
+        store.recover_on_boot(now).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cordons", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
     }
 }
