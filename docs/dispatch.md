@@ -25,14 +25,6 @@ Dispatch first applies the label rule, then gives the job to the first choice th
 
 Use `--provider any` to choose from the node's `[[agent.provider_models]]` pairs, tried in agent configuration order. The job names no model or fallback; either with `--provider any` is a validation error. Each agent publishes a pair with its heartbeat when Reiki reports that provider healthy. Dispatch skips cordoned providers and gives the job to the first healthy pair on an otherwise eligible node. The job records that pair as `assigned_provider`/`assigned_model`, so the agent runs that provider's model. With no healthy pair on any eligible node the job stays `queued` and `lu show` reports `no node has a healthy provider for provider "any"`.
 
-5. Run an agent on the same machine. Write `$HOME/lu-demo/agent.toml` with an `[agent]` table (`name = "node-a"`, `controller_url = "http://127.0.0.1:7600"`, `token_file` pointing at `agent.token`, a `work_dir` under `lu-demo`, `harness = "opencode"`), then:
-
-```sh
-lu agent --config "$HOME/lu-demo/agent.toml"
-```
-
-In the other shell, `lu submit ... --wait` returns when the job is done, `lu logs --follow <job-id>` streams its output, and `lu fetch <job-id> --out results` saves the diff, log and report.
-
 For a controller on a non-loopback address, add a `[tls]` table with `cert` and `key`; plain HTTP is accepted only on loopback. See [config.md](config.md).
 
 ## Taints and tolerations

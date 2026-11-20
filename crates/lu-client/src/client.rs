@@ -206,11 +206,7 @@ impl Client {
     pub async fn list_jobs(&self, state: Option<JobState>, limit: Option<u32>) -> Result<ListJobs> {
         let mut query = Vec::new();
         if let Some(state) = state {
-            let name = serde_json::to_value(state)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "queued".to_owned());
-            query.push(("state".to_owned(), name));
+            query.push(("state".to_owned(), state.as_str().to_owned()));
         }
         if let Some(limit) = limit {
             query.push(("limit".to_owned(), limit.to_string()));
@@ -240,11 +236,7 @@ impl Client {
     ) -> Result<String> {
         let mut query = Vec::new();
         if let Some(state) = state {
-            let name = serde_json::to_value(state)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "queued".to_owned());
-            query.push(("state".to_owned(), name));
+            query.push(("state".to_owned(), state.as_str().to_owned()));
         }
         if let Some(limit) = limit {
             query.push(("limit".to_owned(), limit.to_string()));
@@ -773,6 +765,45 @@ impl Client {
         Ok(reply.body)
     }
 
+    /// A fixed artifact of a dependency, optionally limited to its last `tail` bytes. The route
+    /// name comes from [`ArtifactName`], never from the dependency, so no text can become a path.
+    pub async fn dep_artifact(
+        &self,
+        id: &JobId,
+        dep: &JobId,
+        name: ArtifactName,
+        epoch: u64,
+        tail: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        let route = format!(
+            "v1/agent/jobs/{id}/deps/{dep}/artifacts/{}",
+            name.file_name()
+        );
+        let mut query = vec![("epoch".to_owned(), epoch.to_string())];
+        if let Some(tail) = tail {
+            query.push(("tail".to_owned(), tail.to_string()));
+        }
+        let cap = tail.unwrap_or_else(|| name.max_bytes());
+        let reply = self
+            .send_capped(
+                Method::GET,
+                &route,
+                SendParts {
+                    body: None,
+                    query: &query,
+                    headers: &[],
+                },
+                true,
+                cap,
+            )
+            .await?;
+        let reply = self.success(reply)?;
+        if reply.body.len() as u64 > cap {
+            return Err(ApiError::TooLarge { limit: cap });
+        }
+        Ok(reply.body)
+    }
+
     pub async fn complete(&self, completion: &Completion) -> Result<()> {
         completion
             .validate()
@@ -1012,6 +1043,18 @@ pub trait Controller: Send + Sync {
         dep: &'a JobId,
         epoch: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
+    /// Fetches a dependency artifact. The default keeps test fakes that do not model artifact
+    /// reads valid; controller-backed agents use the real implementation.
+    fn dep_artifact<'a>(
+        &'a self,
+        _id: &'a JobId,
+        _dep: &'a JobId,
+        _name: ArtifactName,
+        _epoch: u64,
+        _tail: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     fn complete<'a>(
         &'a self,
         completion: &'a Completion,
@@ -1078,6 +1121,17 @@ impl Controller for Client {
         epoch: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
         Box::pin(async move { Client::dep_diff(self, id, dep, epoch).await })
+    }
+
+    fn dep_artifact<'a>(
+        &'a self,
+        id: &'a JobId,
+        dep: &'a JobId,
+        name: ArtifactName,
+        epoch: u64,
+        tail: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move { Client::dep_artifact(self, id, dep, name, epoch, tail).await })
     }
 
     fn complete<'a>(
@@ -1269,7 +1323,7 @@ fn parse_log(reply: &HttpReply, requested_offset: u64) -> LogPage {
         .headers
         .get("x-lu-state")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| serde_json::from_value::<JobState>(Value::String(value.to_owned())).ok());
+        .and_then(|value| value.parse::<JobState>().ok());
     LogPage {
         data,
         offset,

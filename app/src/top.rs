@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lu_client::Client;
-use lu_proto::{JobId, NodeName, ProviderState};
+use lu_proto::{JobId, NodeName};
 use lu_tui::model::{
     Dashboard, JobRow, NodeRow, ProcessJobView, ProcessPaneTarget, ProcessTreeRow, ProviderCell,
     Request, Snapshot, Update,
@@ -31,15 +31,6 @@ fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-fn provider_state(state: ProviderState) -> &'static str {
-    match state {
-        ProviderState::Ok => "ok",
-        ProviderState::Cooling => "cooling",
-        ProviderState::Disabled => "disabled",
-        ProviderState::Unknown => "unknown",
-    }
 }
 
 /// Drops terminal escape sequences, leaving line breaks and the rest of the text.
@@ -109,7 +100,7 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
                     .iter()
                     .map(|p| ProviderCell {
                         name: p.name.clone(),
-                        state: provider_state(p.state).to_owned(),
+                        state: p.state.as_str().to_owned(),
                         soonest_secs: p.soonest_secs,
                     })
                     .collect(),

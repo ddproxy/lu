@@ -34,6 +34,10 @@ pub enum StageError {
     TooLarge,
     /// A generated base pack exceeded its size cap.
     PackTooLarge { cap: usize },
+    /// The repository tracks a path under `.lu/`, which must never enter an exported diff.
+    TrackedLuPath(String),
+    /// An input directory or file was a symlink, or its name was unsafe.
+    UnsafeInputPath(String),
 }
 
 impl fmt::Display for StageError {
@@ -49,6 +53,13 @@ impl fmt::Display for StageError {
             StageError::TooLarge => write!(f, "output exceeded size cap"),
             StageError::PackTooLarge { cap } => {
                 write!(f, "base pack exceeded the {cap}-byte cap")
+            }
+            StageError::TrackedLuPath(path) => write!(
+                f,
+                "repository tracks {path:?} under .lu/; refusing to stage a job whose own paths could enter diff.patch"
+            ),
+            StageError::UnsafeInputPath(path) => {
+                write!(f, "unsafe input path {path:?}: only regular files are allowed")
             }
         }
     }
@@ -177,6 +188,159 @@ fn validate_job_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The tree-local directory where collected dependency artifacts live.
+pub const INPUTS_DIR: &str = ".lu/inputs";
+
+/// Whether a diff path is inside `.lu/`, the tree-local collection directory.
+pub fn is_lu_path(path: &Path) -> bool {
+    path.components().find_map(|part| match part {
+        Component::Normal(name) => Some(name),
+        Component::CurDir => None,
+        _ => Some(OsStr::new("")),
+    }) == Some(OsStr::new(".lu"))
+}
+
+/// Picks a safe directory name for one collected input. A hostile or empty idempotency key falls
+/// back to the job id, which the controller has already validated.
+pub fn safe_input_name(key: Option<&str>, job_id: &str) -> String {
+    if let Some(name) = key {
+        let safe = !name.is_empty()
+            && name.len() <= MAX_INPUT_NAME_BYTES
+            && !name.starts_with('.')
+            && name != ".."
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-:".contains(&b));
+        if safe {
+            return name.to_owned();
+        }
+    }
+    job_id.to_owned()
+}
+
+const MAX_INPUT_NAME_BYTES: usize = 128;
+
+/// Refuses a checkout that tracks anything under `.lu/`: such a path could leak into `diff.patch`
+/// even when collection is off, because it is part of the job's own tree.
+pub fn reject_tracked_lu(staged: &StagedDir) -> Result<(), StageError> {
+    let repo = git2::Repository::open(staged.path()).map_err(git_err)?;
+    let index = repo.index().map_err(git_err)?;
+    for entry in index.iter() {
+        let path = String::from_utf8_lossy(&entry.path);
+        if is_lu_path(Path::new(path.as_ref())) {
+            return Err(StageError::TrackedLuPath(path.into_owned()));
+        }
+    }
+    Ok(())
+}
+
+/// Creates `.lu/inputs` with restrictive modes, records `.lu/` in the tree-local git exclude file
+/// (never the repository's `.gitignore`), and refuses symlinks in the path.
+pub fn prepare_inputs(staged: &StagedDir) -> Result<PathBuf, StageError> {
+    reject_tracked_lu(staged)?;
+    let lu = staged.path().join(".lu");
+    refuse_symlink(&lu)?;
+    let inputs = lu.join("inputs");
+    refuse_symlink(&inputs)?;
+    create_private_dir(&lu)?;
+    create_private_dir(&inputs)?;
+    write_local_exclude(staged)?;
+    Ok(inputs)
+}
+
+/// Creates one per-input directory under `.lu/inputs`, keeping names unique and refusing links.
+pub fn create_input_dir(inputs: &Path, name: &str) -> Result<PathBuf, StageError> {
+    if name.is_empty()
+        || name.len() > MAX_INPUT_NAME_BYTES
+        || name.starts_with('.')
+        || name.contains('/')
+        || name.contains('\\')
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-:".contains(&b))
+    {
+        return Err(StageError::UnsafeInputPath(name.to_owned()));
+    }
+    let dir = inputs.join(name);
+    refuse_symlink(&dir)?;
+    create_private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// Writes one collected artifact with mode `0600`, refusing to follow or replace a symlink.
+pub fn write_input_file(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<(), StageError> {
+    const ALLOWED: [&str; 5] = [
+        "diff.patch",
+        "report.json",
+        "run.log",
+        "meta.json",
+        "INDEX.md",
+    ];
+    if !ALLOWED.contains(&file_name) {
+        return Err(StageError::UnsafeInputPath(file_name.to_owned()));
+    }
+    let path = dir.join(file_name);
+    refuse_symlink(&path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).map_err(StageError::Io)?;
+    file.write_all(bytes).map_err(StageError::Io)?;
+    file.flush().map_err(StageError::Io)
+}
+
+fn create_private_dir(path: &Path) -> Result<(), StageError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(StageError::UnsafeInputPath(path.display().to_string()));
+        }
+        Ok(meta) if meta.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(StageError::UnsafeInputPath(path.display().to_string()));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(StageError::Io(e)),
+    }
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path).map_err(StageError::Io)
+}
+
+fn refuse_symlink(path: &Path) -> Result<(), StageError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(StageError::UnsafeInputPath(path.display().to_string()))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StageError::Io(e)),
+    }
+}
+
+fn write_local_exclude(staged: &StagedDir) -> Result<(), StageError> {
+    let git_dir = staged.path().join(".git");
+    let info = git_dir.join("info");
+    create_private_dir(&info)?;
+    let exclude = info.join("exclude");
+    refuse_symlink(&exclude)?;
+    let existing = match fs::read_to_string(&exclude) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(StageError::Io(e)),
+    };
+    if existing.lines().any(|line| line.trim() == ".lu/") {
+        return Ok(());
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(exclude).map_err(StageError::Io)?;
+    file.write_all(b"\n.lu/\n").map_err(StageError::Io)
+}
+
 /// Where to obtain the repository for a staged job.
 #[derive(Debug, Clone)]
 pub enum Source {
@@ -285,7 +449,12 @@ impl Staging {
         }
 
         let result = self.stage_inner(&request, &target);
-        if let Err(e) = result {
+        if let Err(e) = result.and_then(|()| {
+            reject_tracked_lu(&StagedDir {
+                path: target.clone(),
+                job_id: request.job_id.clone(),
+            })
+        }) {
             // A failed stage removes what it created.
             let _ = cleanup_created_path(&target);
             return Err(e);
@@ -326,7 +495,12 @@ impl Staging {
         }
 
         let result = self.stage_from_pack_inner(&target, oid, pack);
-        if let Err(e) = result {
+        if let Err(e) = result.and_then(|()| {
+            reject_tracked_lu(&StagedDir {
+                path: target.clone(),
+                job_id: request.job_id.clone(),
+            })
+        }) {
             let _ = cleanup_created_path(&target);
             return Err(e);
         }
@@ -447,7 +621,13 @@ impl Staging {
 
         let mut out: Vec<u8> = Vec::new();
         let mut too_large = false;
-        let print_res = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+        let print_res = diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
+            // `.lu/inputs` is collection scratch space, never job output. Filter here as well
+            // as in `.git/info/exclude` so a forced add or an older agent cannot leak it.
+            let path = delta.new_file().path().or_else(|| delta.old_file().path());
+            if path.is_some_and(is_lu_path) {
+                return true;
+            }
             let content = line.content();
             let prefix = match line.origin() {
                 '+' | '-' | ' ' => Some(line.origin() as u8),
@@ -1241,5 +1421,122 @@ mod tests {
             fs::read_to_string(staged.path().join("README.md")).unwrap(),
             "one\n"
         );
+    }
+
+    #[test]
+    fn export_diff_never_contains_the_local_inputs_directory() {
+        let tmp = TestDir::new("inputs-diff");
+        let repo = source_repo(&tmp.path);
+        let work = tmp.path.join("work");
+        fs::create_dir(&work).unwrap();
+        let staging = Staging::new(&work).unwrap();
+        let staged = staging
+            .stage(StageRequest {
+                job_id: "job".to_owned(),
+                source: Source::Path(repo),
+                git_ref: "main".to_owned(),
+            })
+            .unwrap();
+
+        let inputs = prepare_inputs(&staged).unwrap();
+        let dep = create_input_dir(&inputs, "dep").unwrap();
+        write_input_file(&dep, "diff.patch", b"not a real patch\n").unwrap();
+        fs::write(staged.path().join("new.txt"), "job output\n").unwrap();
+
+        let diff = String::from_utf8(Staging::export_diff(&staged, 1 << 20).unwrap()).unwrap();
+        assert!(diff.contains("new.txt"), "{diff}");
+        assert!(!diff.contains(".lu"), "{diff}");
+        assert!(!diff.contains("not a real patch"), "{diff}");
+
+        let exclude = fs::read_to_string(staged.path().join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.lines().any(|line| line.trim() == ".lu/"),
+            "{exclude}"
+        );
+        assert!(!staged.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn a_tracked_lu_path_is_a_stage_error() {
+        let tmp = TestDir::new("tracked-lu");
+        let repo = tmp.path.join("source");
+        source_repo(&tmp.path);
+        git(&repo, &["checkout", "-q", "-b", "with-lu"]);
+        fs::create_dir(repo.join(".lu")).unwrap();
+        fs::write(repo.join(".lu/tracked.txt"), "secret\n").unwrap();
+        git(&repo, &["add", ".lu/tracked.txt"]);
+        git(&repo, &["commit", "-q", "-m", "track lu"]);
+
+        let work = tmp.path.join("work");
+        fs::create_dir(&work).unwrap();
+        let staging = Staging::new(&work).unwrap();
+        let error = staging
+            .stage(StageRequest {
+                job_id: "job".to_owned(),
+                source: Source::Path(repo),
+                git_ref: "with-lu".to_owned(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, StageError::TrackedLuPath(_)), "{error}");
+        assert!(error.to_string().contains(".lu/"), "{error}");
+    }
+
+    #[test]
+    fn collected_files_are_private_and_symlinks_are_refused() {
+        let tmp = TestDir::new("inputs-modes");
+        let repo = source_repo(&tmp.path);
+        let work = tmp.path.join("work");
+        fs::create_dir(&work).unwrap();
+        let staging = Staging::new(&work).unwrap();
+        let staged = staging
+            .stage(StageRequest {
+                job_id: "job".to_owned(),
+                source: Source::Path(repo),
+                git_ref: "main".to_owned(),
+            })
+            .unwrap();
+
+        let inputs = prepare_inputs(&staged).unwrap();
+        let dep = create_input_dir(&inputs, "dep:1").unwrap();
+        write_input_file(&dep, "run.log", b"tail\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&inputs).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{mode:o}");
+            let mode = fs::metadata(dep.join("run.log"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{mode:o}");
+        }
+
+        let hostile = create_input_dir(&inputs, "../../x").unwrap_err();
+        assert!(
+            matches!(hostile, StageError::UnsafeInputPath(_)),
+            "{hostile}"
+        );
+
+        let link = tmp.path.join("outside");
+        fs::write(&link, "outside\n").unwrap();
+        let another = staging
+            .stage(StageRequest {
+                job_id: "linked".to_owned(),
+                source: Source::Path(source_repo(&tmp.path.join("other"))),
+                git_ref: "main".to_owned(),
+            })
+            .unwrap();
+        std::os::unix::fs::symlink(&link, another.path().join(".lu")).unwrap();
+        let error = prepare_inputs(&another).unwrap_err();
+        assert!(matches!(error, StageError::UnsafeInputPath(_)), "{error}");
+    }
+
+    #[test]
+    fn safe_input_names_fall_back_to_the_job_id() {
+        assert_eq!(safe_input_name(Some("ticket:1234"), "job"), "ticket:1234");
+        assert_eq!(safe_input_name(Some("../../x"), "job-1"), "job-1");
+        assert_eq!(safe_input_name(Some("bad name"), "job-2"), "job-2");
+        assert_eq!(safe_input_name(None, "job-3"), "job-3");
     }
 }

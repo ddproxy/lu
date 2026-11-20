@@ -19,11 +19,12 @@ not contractual guarantees.
 
 | Version | Supported |
 | --- | --- |
+| 0.2.x | yes |
 | 0.1.x | yes |
 | earlier | no |
 
-0.1.0 is a pre-1.0 release. Security fixes may be issued as a new 0.1.x release rather than
-backported to older patch releases. Always run the newest 0.1.x you can.
+These are pre-1.0 releases. Security fixes may be issued as a new patch release rather than
+backported to older patch releases. Always run the newest supported release you can.
 
 ## Scope
 
@@ -45,8 +46,7 @@ Out of scope:
 - a compromised controller or agent host with the service account's privileges;
 - denial of service by an operator or agent that already holds a valid token, beyond the caps
   documented in [docs/security.md](docs/security.md);
-- missing features listed as known gaps, such as the absent agent runtime, unless the gap itself
-  creates a security problem.
+- missing features listed as known gaps, unless the gap itself creates a security problem.
 
 The full threat model, token rules, TLS requirements and residual risks are in
 [docs/security.md](docs/security.md).

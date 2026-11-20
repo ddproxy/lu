@@ -22,6 +22,16 @@ pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 /// The most dependencies one job may name.
 pub const MAX_AFTER_JOBS: usize = 16;
 
+/// The most dependency artifact directories one job may collect into `.lu/inputs`.
+pub const MAX_COLLECT_INPUTS: usize = 16;
+
+/// The largest combined size of collected diffs accepted at submission and re-checked at stage
+/// time. One job's own diff is still capped by [`MAX_DIFF_BYTES`].
+pub const MAX_COLLECT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Collected logs keep only their tail, so one chatty dependency cannot fill the tree.
+pub const INPUT_LOG_BYTES: usize = 256 * 1024;
+
 /// The most alternative provider choices one job may name.
 pub const MAX_FALLBACKS: usize = 4;
 
@@ -72,8 +82,20 @@ pub const MAX_DIFF_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_LOG_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_REPORT_BYTES: u64 = 1024 * 1024;
 
-/// The three artifact files a job may upload. There is deliberately no way to build one from an
-/// arbitrary string, so an agent can never choose a path.
+/// Why a string was not one of the three artifact file names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseArtifactNameError;
+
+impl std::fmt::Display for ParseArtifactNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not a recognised artifact name")
+    }
+}
+
+impl std::error::Error for ParseArtifactNameError {}
+
+/// The three artifact files a job may upload. Parsing accepts only these fixed names, so an agent
+/// can never choose an arbitrary path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArtifactName {
     DiffPatch,
@@ -109,6 +131,25 @@ impl ArtifactName {
     }
 }
 
+impl std::fmt::Display for ArtifactName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.file_name())
+    }
+}
+
+impl std::str::FromStr for ArtifactName {
+    type Err = ParseArtifactNameError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Ok(match text {
+            "diff.patch" => Self::DiffPatch,
+            "run.log" => Self::RunLog,
+            "report.json" => Self::ReportJson,
+            _ => return Err(ParseArtifactNameError),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -126,6 +167,16 @@ mod tests {
             assert!(!file.contains('/') && !file.contains('\\'), "{file}");
             assert!(!file.contains(".."), "{file}");
         }
+    }
+
+    #[test]
+    fn artifact_names_round_trip_through_display_and_from_str() {
+        for name in ArtifactName::ALL {
+            let text = name.to_string();
+            assert_eq!(ArtifactName::from_str(&text).unwrap(), name, "{text}");
+            assert_eq!(text, name.file_name());
+        }
+        assert!("../escape".parse::<ArtifactName>().is_err());
     }
 
     #[test]

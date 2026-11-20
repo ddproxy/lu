@@ -68,21 +68,21 @@ pub fn store_err(e: lu_store::StoreError) -> ApiError {
 }
 
 pub fn job_state_str(s: lu_proto::JobState) -> &'static str {
-    match s {
-        lu_proto::JobState::Blocked => "blocked",
-        lu_proto::JobState::Queued => "queued",
-        lu_proto::JobState::Leased => "leased",
-        lu_proto::JobState::Running => "running",
-        lu_proto::JobState::Recovering => "recovering",
-        lu_proto::JobState::NeedsInput => "needs_input",
-        lu_proto::JobState::Done => "done",
-        lu_proto::JobState::Failed => "failed",
-        lu_proto::JobState::Cancelled => "cancelled",
+    s.as_str()
+}
+
+pub fn failure_class_str(class: lu_proto::FailureClass) -> &'static str {
+    match class {
+        lu_proto::FailureClass::Node => "node",
+        lu_proto::FailureClass::Provider => "provider",
+        lu_proto::FailureClass::Execution => "execution",
+        lu_proto::FailureClass::Dependency => "dependency",
+        lu_proto::FailureClass::Conflict => "conflict",
     }
 }
 
 pub fn parse_job_state(s: &str) -> Option<lu_proto::JobState> {
-    serde_json::from_str::<lu_proto::JobState>(&format!("\"{s}\"")).ok()
+    s.parse().ok()
 }
 
 pub fn version_header() -> HeaderValue {

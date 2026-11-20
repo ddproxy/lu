@@ -451,12 +451,7 @@ pub async fn append_log(
 }
 
 fn artifact_name_from_str(name: &str) -> Option<ArtifactName> {
-    match name {
-        "diff.patch" => Some(ArtifactName::DiffPatch),
-        "run.log" => Some(ArtifactName::RunLog),
-        "report.json" => Some(ArtifactName::ReportJson),
-        _ => None,
-    }
+    name.parse().ok()
 }
 
 async fn put_artifact_impl(
@@ -715,6 +710,14 @@ pub async fn list_deps(
             "job_id": dep.to_string(),
             "state": crate::routes::job_state_str(dep_rec.state),
             "diff_bytes": diff_bytes,
+            "idempotency_key": dep_rec.spec.idempotency_key.clone(),
+            "provider": dep_rec.assigned_provider.clone().or_else(|| dep_rec.spec.provider.clone()),
+            "model": dep_rec.assigned_model.clone().or_else(|| dep_rec.spec.model.clone()),
+            "node": dep_rec.node.as_ref().map(|node| node.to_string()),
+            "started_at": dep_rec.started_at,
+            "finished_at": dep_rec.finished_at,
+            "failure_class": dep_rec.failure_class.map(crate::routes::failure_class_str),
+            "summary": dep_rec.summary,
         }));
     }
     with_version(json_ok(StatusCode::OK, &deps))
@@ -765,6 +768,81 @@ pub async fn get_dep_diff(
         }
         Err(_) => with_version(ApiError::not_found("not found").into_response()),
     }
+}
+
+/// Serves one fixed artifact of a dependency that is in this job's `after` list. The artifact
+/// name comes from an allow-list, not from untrusted dependency text, so it cannot become a path.
+pub async fn get_dep_artifact(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path((id, dep, name)): Path<(String, String, String)>,
+    uri: axum::http::Uri,
+) -> Response {
+    let node = match authenticate_agent(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(n) => n,
+        Err(e) => return with_version(e.into_response()),
+    };
+    let artifact = match name.as_str() {
+        "diff.patch" => ArtifactName::DiffPatch,
+        "report.json" => ArtifactName::ReportJson,
+        "run.log" => ArtifactName::RunLog,
+        _ => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let job_id = match JobId::parse(&id) {
+        Ok(i) => i,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let dep_id = match JobId::parse(&dep) {
+        Ok(i) => i,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let rec = match owned_job(&state, &node, &job_id).await {
+        Ok(rec) => rec,
+        Err(res) => return *res,
+    };
+    let epoch = match epoch_from_uri(&uri) {
+        Ok(epoch) => epoch,
+        Err(res) => return *res,
+    };
+    if rec.epoch != epoch {
+        return with_version(ApiError::stale_epoch().into_response());
+    }
+    if !rec.spec.after.contains(&dep_id) {
+        return with_version(ApiError::forbidden("forbidden").into_response());
+    }
+    let query = crate::routes::parse_query(&uri);
+    let tail = match query.get("tail") {
+        Some(text) => match text.parse::<u64>().ok() {
+            Some(tail) if tail > 0 => Some(tail),
+            _ => return with_version(ApiError::bad_request("invalid tail").into_response()),
+        },
+        None => None,
+    };
+    let path = state
+        .artifacts_dir
+        .join(dep_id.to_string())
+        .join(artifact.file_name());
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let bytes = match tail {
+        Some(tail) => {
+            let skip = bytes
+                .len()
+                .saturating_sub(usize::try_from(tail).unwrap_or(usize::MAX));
+            bytes[skip..].to_vec()
+        }
+        None => bytes,
+    };
+    let res = (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response();
+    with_version(res)
 }
 
 pub async fn put_diff_artifact(

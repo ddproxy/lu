@@ -2,6 +2,8 @@
 //! capped, and provider names are checked with the same rule as node names.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +14,18 @@ use crate::limits::{
     MAX_REIKI_BYTES, MAX_STATS_BYTES, MAX_TAINTS, MAX_VERSION_BYTES,
 };
 
+/// Why a string was not a recognised harness state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseHarnessStateError;
+
+impl fmt::Display for ParseHarnessStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("not a recognised harness state")
+    }
+}
+
+impl std::error::Error for ParseHarnessStateError {}
+
 /// Whether the peer's harness is free to take a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -19,6 +33,46 @@ pub enum HarnessState {
     Idle,
     Busy,
 }
+
+impl HarnessState {
+    /// The wire spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Busy => "busy",
+        }
+    }
+}
+
+impl fmt::Display for HarnessState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for HarnessState {
+    type Err = ParseHarnessStateError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Ok(match text {
+            "idle" => Self::Idle,
+            "busy" => Self::Busy,
+            _ => return Err(ParseHarnessStateError),
+        })
+    }
+}
+
+/// Why a string was not a recognised provider state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseProviderStateError;
+
+impl fmt::Display for ParseProviderStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("not a recognised provider state")
+    }
+}
+
+impl std::error::Error for ParseProviderStateError {}
 
 /// A provider's availability on this peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -28,6 +82,38 @@ pub enum ProviderState {
     Cooling,
     Disabled,
     Unknown,
+}
+
+impl ProviderState {
+    /// The wire spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Cooling => "cooling",
+            Self::Disabled => "disabled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for ProviderState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProviderState {
+    type Err = ParseProviderStateError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Ok(match text {
+            "ok" => Self::Ok,
+            "cooling" => Self::Cooling,
+            "disabled" => Self::Disabled,
+            "unknown" => Self::Unknown,
+            _ => return Err(ParseProviderStateError),
+        })
+    }
 }
 
 /// One provider and its state, as reported by the peer.
@@ -859,5 +945,24 @@ mod tests {
             let json = serde_json::to_string(&state).unwrap();
             assert_eq!(serde_json::from_str::<HarnessState>(&json).unwrap(), state);
         }
+    }
+
+    #[test]
+    fn provider_and_harness_states_round_trip_through_display_and_from_str() {
+        for state in [
+            ProviderState::Ok,
+            ProviderState::Cooling,
+            ProviderState::Disabled,
+            ProviderState::Unknown,
+        ] {
+            let text = state.to_string();
+            assert_eq!(ProviderState::from_str(&text).unwrap(), state, "{text}");
+        }
+        for state in [HarnessState::Idle, HarnessState::Busy] {
+            let text = state.to_string();
+            assert_eq!(HarnessState::from_str(&text).unwrap(), state, "{text}");
+        }
+        assert!("paused".parse::<HarnessState>().is_err());
+        assert!("paused".parse::<ProviderState>().is_err());
     }
 }

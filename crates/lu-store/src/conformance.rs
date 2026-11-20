@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use lu_proto::{
-    ArtifactName, Choice, Completion, FailureClass, HarnessState, Heartbeat, JobEdit, JobId,
-    JobSpec, JobState, NodeName, Outcome, ProviderState, ProviderStatus, MAX_LOG_BYTES,
+    ArtifactName, Choice, CollectMode, Completion, FailureClass, HarnessState, Heartbeat, JobEdit,
+    JobId, JobSpec, JobState, NodeName, Outcome, ProviderState, ProviderStatus, MAX_COLLECT_BYTES,
+    MAX_LOG_BYTES,
 };
 
 use crate::{Now, Store, StoreError};
@@ -28,6 +29,8 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         idempotency_key: key.map(|s| s.to_owned()),
         after: Vec::new(),
         stack_dependencies: true,
+        collect: None,
+        include_failed: false,
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),
@@ -119,12 +122,19 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     cancelled_dependency_cascades_two_levels(&make());
     diamond_dependency(&make());
     unknown_and_invalid_dependencies_are_rejected(&make());
+    include_failed_releases_dependents(&make());
+    collect_size_is_checked_at_submit(&make());
     job_counts(&make());
     crate::model::run(&make);
 }
 
 fn with_after(mut sp: JobSpec, after: &[JobId]) -> JobSpec {
     sp.after = after.to_vec();
+    sp
+}
+
+fn with_include_failed(mut sp: JobSpec) -> JobSpec {
+    sp.include_failed = true;
     sp
 }
 
@@ -428,6 +438,98 @@ fn unknown_and_invalid_dependencies_are_rejected<S: Store>(s: &S) {
         )
         .unwrap_err();
     assert!(matches!(err, StoreError::InvalidSpec(_)));
+}
+
+fn include_failed_releases_dependents<S: Store>(s: &S) {
+    // A dependency that was already dead at submit time is accepted with `include_failed`.
+    let (dead, _) = s
+        .create_job(&spec("https://x/dead.git", None), now(1, 1))
+        .unwrap();
+    s.cancel_job(&dead.id, now(2, 2)).unwrap();
+    let (late, _) = s
+        .create_job(
+            &with_include_failed(with_after(
+                spec("https://x/late.git", None),
+                std::slice::from_ref(&dead.id),
+            )),
+            now(3, 3),
+        )
+        .unwrap();
+    assert_eq!(late.state, JobState::Queued);
+    assert!(late.waiting_on.is_empty());
+    s.cancel_job(&late.id, now(4, 4)).unwrap();
+
+    // A dependency that fails later releases the opt-in dependent instead of cascading.
+    let (a, _) = s
+        .create_job(&spec("https://x/a.git", None), now(4, 4))
+        .unwrap();
+    let (b, _) = s
+        .create_job(
+            &with_include_failed(with_after(
+                spec("https://x/b.git", None),
+                std::slice::from_ref(&a.id),
+            )),
+            now(5, 5),
+        )
+        .unwrap();
+    assert_eq!(b.state, JobState::Blocked);
+    finish_failed(s, &a.id, "include-failed-node", 10, 10);
+    let b2 = s.get_job(&b.id).unwrap();
+    assert_eq!(b2.state, JobState::Queued);
+    assert_eq!(b2.failure_class, None);
+    assert!(b2.waiting_on.is_empty());
+    // Cancel the released dependent so it cannot interfere with the next case.
+    s.cancel_job(&b.id, now(11, 11)).unwrap();
+
+    // A dependent that did not opt in still fails as before.
+    let (c, _) = s
+        .create_job(&spec("https://x/c.git", None), now(6, 6))
+        .unwrap();
+    let (d, _) = s
+        .create_job(
+            &with_after(spec("https://x/d.git", None), std::slice::from_ref(&c.id)),
+            now(7, 7),
+        )
+        .unwrap();
+    finish_failed(s, &c.id, "cascade-node", 20, 20);
+    let d2 = s.get_job(&d.id).unwrap();
+    assert_eq!(d2.state, JobState::Failed);
+    assert_eq!(d2.failure_class, Some(FailureClass::Dependency));
+}
+
+fn collect_size_is_checked_at_submit<S: Store>(s: &S) {
+    let (dep, _) = s
+        .create_job(&spec("https://x/collect-source.git", None), now(1, 1))
+        .unwrap();
+    let n = node("collect-node");
+    s.heartbeat(&hb("collect-node", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    assert_eq!(a.job_id, dep.id);
+    s.start_job(&dep.id, a.epoch, now(3, 3)).unwrap();
+    s.record_artifact(
+        &dep.id,
+        a.epoch,
+        ArtifactName::DiffPatch,
+        MAX_COLLECT_BYTES + 1,
+    )
+    .unwrap();
+
+    let mut dependent = with_after(
+        spec("https://x/collect-dependent.git", None),
+        std::slice::from_ref(&dep.id),
+    );
+    dependent.collect = Some(CollectMode::Files);
+    let err = s.create_job(&dependent, now(4, 4)).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidSpec(message) if message.contains("collect") && message.contains("over the")),
+        "{err:?}"
+    );
+
+    // Without file collection the same dependency size is still acceptable.
+    dependent.collect = Some(CollectMode::None);
+    let (accepted, _) = s.create_job(&dependent, now(4, 4)).unwrap();
+    assert_eq!(accepted.state, JobState::Blocked);
 }
 
 fn idempotent_create<S: Store>(s: &S) {
@@ -854,6 +956,8 @@ fn edit_job_changes_spec_and_dependency_state<S: Store>(s: &S) {
         requires: Some(vec!["gpu".to_owned()]),
         tolerates: Some(vec!["spot".to_owned()]),
         after: Some(Vec::new()),
+        collect: None,
+        include_failed: None,
     };
     let rec = s.edit_job(&job.id, &edit, now(2, 2)).unwrap();
     assert_eq!(rec.id, job.id);

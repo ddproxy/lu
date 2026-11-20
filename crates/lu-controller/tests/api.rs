@@ -188,6 +188,8 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         idempotency_key: key.map(|s| s.to_owned()),
         after: Vec::new(),
         stack_dependencies: true,
+        collect: None,
+        include_failed: false,
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),
@@ -552,6 +554,8 @@ async fn post_edit_changes_a_queued_job_and_rejects_bad_states() {
         requires: Some(vec!["gpu".to_owned()]),
         tolerates: Some(vec!["homelab".to_owned()]),
         after: None,
+        collect: None,
+        include_failed: None,
     };
     let r = edit_job(srv.addr, &id, &edit).await;
     assert_eq!(status(&r), 200, "{r}");
@@ -1603,10 +1607,12 @@ async fn agent_dependency_routes_list_and_serve_diffs() {
     let r = raw_request(srv.addr, &deps(AGENT_A_TOKEN, epoch)).await;
     assert_eq!(status(&r), 200, "{r}");
     let list: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
-    assert_eq!(
-        list,
-        json!([{"job_id": dep_id, "state": "done", "diff_bytes": 0}])
-    );
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["job_id"], dep_id);
+    assert_eq!(list[0]["state"], "done");
+    assert_eq!(list[0]["diff_bytes"], 0);
+    assert_eq!(list[0]["failure_class"], serde_json::Value::Null);
+    assert_eq!(list[0]["node"], "node-a");
     let r = raw_request(srv.addr, &diff(AGENT_A_TOKEN, epoch)).await;
     assert_eq!(status(&r), 404, "{r}");
 
@@ -1618,14 +1624,37 @@ async fn agent_dependency_routes_list_and_serve_diffs() {
     let r = raw_request(srv.addr, &deps(AGENT_A_TOKEN, epoch)).await;
     assert_eq!(status(&r), 200, "{r}");
     let list: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
-    assert_eq!(
-        list,
-        json!([{"job_id": dep_id, "state": "done", "diff_bytes": patch.len()}])
-    );
+    assert_eq!(list[0]["diff_bytes"], patch.len());
 
     let r = raw_request(srv.addr, &diff(AGENT_A_TOKEN, epoch)).await;
     assert_eq!(status(&r), 200, "{r}");
     assert_eq!(body_str(&r).as_bytes(), patch);
+
+    // The artifact route serves only the three fixed names and honours `tail`.
+    let other = JobId::new();
+    let artifact = |token: &str, epoch: u64, name: &str, tail: &str| {
+        format!("GET /v1/agent/jobs/{job_id}/deps/{dep_id}/artifacts/{name}?epoch={epoch}{tail} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {token}\r\n\r\n")
+    };
+    let r = raw_request(srv.addr, &artifact(AGENT_A_TOKEN, epoch, "report.json", "")).await;
+    assert_eq!(status(&r), 404, "{r}");
+    std::fs::write(dep_dir.join("report.json"), b"{\"summary\":\"ok\"}").unwrap();
+    std::fs::write(dep_dir.join("run.log"), b"tool output").unwrap();
+    let r = raw_request(srv.addr, &artifact(AGENT_A_TOKEN, epoch, "report.json", "")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(body_str(&r), "{\"summary\":\"ok\"}");
+    let r = raw_request(
+        srv.addr,
+        &artifact(AGENT_A_TOKEN, epoch, "run.log", "&tail=4"),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(body_str(&r), "tput");
+    assert_eq!(
+        status(&raw_request(srv.addr, &artifact(AGENT_A_TOKEN, epoch, "evil.txt", ""),).await),
+        404
+    );
+    let req = format!("GET /v1/agent/jobs/{job_id}/deps/{other}/artifacts/diff.patch?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\n\r\n");
+    assert_eq!(status(&raw_request(srv.addr, &req).await), 403);
 
     // Wrong scope, wrong node and epoch fencing are refused.
     assert_eq!(
@@ -1646,7 +1675,6 @@ async fn agent_dependency_routes_list_and_serve_diffs() {
     );
 
     // A job that is not in `after` is not readable.
-    let other = JobId::new();
     let req = format!("GET /v1/agent/jobs/{job_id}/deps/{other}/diff?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\n\r\n");
     assert_eq!(status(&raw_request(srv.addr, &req).await), 403);
 

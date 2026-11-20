@@ -69,7 +69,7 @@ The full failure-class table, retry rules and agent-side classification are in
 [Job Lifecycle](lifecycle.md#failure-classes-and-retries). Read `failure_class` with `lu show <id>`
 before applying the checks below.
 
-A `409 stale_epoch` means the agent write came from an old lease; the controller ignores it. A log append at the wrong offset returns `409 conflict` with `{"length":L}`; resume from `L`. A `429` carries `Retry-After` seconds.
+A `409 stale_epoch` means the agent write came from an old lease; the controller ignores it. A log append at the wrong offset returns `409 conflict` with `{"error":"conflict","message":"conflict","length":L}`; resume from `L`. A `429` carries `Retry-After` seconds.
 
 Worked example — inspect a failure:
 

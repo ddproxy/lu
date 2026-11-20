@@ -9,7 +9,9 @@ use crate::time::now;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use lu_proto::{validate_idempotency_key, ArtifactName, JobEdit, JobId, JobSpec, NodeName};
+use lu_proto::{
+    validate_idempotency_key, ArtifactName, JobEdit, JobId, JobSpec, JobView, NodeName, NodeView,
+};
 use lu_serve::PeerAddr;
 use lu_store::{missing_labels, waiting_reason, JobRecord, NodeRecord, Now};
 use serde_json::json;
@@ -31,55 +33,45 @@ pub fn outcome_note(r: &JobRecord) -> Option<&'static str> {
     }
 }
 
-pub fn job_view(r: &JobRecord) -> serde_json::Value {
+/// Stored timestamps are Unix seconds, which are never negative in practice; the wire views use
+/// unsigned seconds.
+fn seconds(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
+pub fn job_view(r: &JobRecord) -> JobView {
     job_view_with(r, None)
 }
 
-fn job_view_with(r: &JobRecord, reason: Option<String>) -> serde_json::Value {
-    let artifacts: Vec<&str> = r.artifacts.iter().map(|a| a.file_name()).collect();
-    let failure_class = r.failure_class.map(|f| match f {
-        lu_proto::FailureClass::Node => "node",
-        lu_proto::FailureClass::Provider => "provider",
-        lu_proto::FailureClass::Execution => "execution",
-        lu_proto::FailureClass::Dependency => "dependency",
-        lu_proto::FailureClass::Conflict => "conflict",
-    });
-    let mut view = json!({
-        "id": r.id.to_string(),
-        "state": match r.state {
-            lu_proto::JobState::Blocked => "blocked",
-            lu_proto::JobState::Queued => "queued",
-            lu_proto::JobState::Leased => "leased",
-            lu_proto::JobState::Running => "running",
-            lu_proto::JobState::Recovering => "recovering",
-            lu_proto::JobState::NeedsInput => "needs_input",
-            lu_proto::JobState::Done => "done",
-            lu_proto::JobState::Failed => "failed",
-            lu_proto::JobState::Cancelled => "cancelled",
-        },
-        "spec": &r.spec,
-        "attempt": r.attempt,
-        "node": r.node.as_ref().map(|n| n.to_string()),
-        "assigned_provider": r.assigned_provider,
-        "assigned_model": r.assigned_model,
-        "epoch": r.epoch,
-        "created_at": r.created_at,
-        "updated_at": r.updated_at,
-        "started_at": r.started_at,
-        "finished_at": r.finished_at,
-        "failure_class": failure_class,
-        "summary": r.summary,
-        "exit_code": r.exit_code,
-        "artifacts": artifacts,
-        "cancel_requested": r.cancel_requested,
-        "after": r.spec.after.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-        "waiting_on": r.waiting_on.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-        "waiting_reason": reason,
-    });
-    if let Some(note) = outcome_note(r) {
-        view["outcome_note"] = json!(note);
+fn job_view_with(r: &JobRecord, reason: Option<String>) -> JobView {
+    JobView {
+        id: r.id.clone(),
+        state: r.state,
+        spec: r.spec.clone(),
+        attempt: r.attempt,
+        node: r.node.clone(),
+        assigned_provider: r.assigned_provider.clone(),
+        assigned_model: r.assigned_model.clone(),
+        epoch: r.epoch,
+        created_at: seconds(r.created_at),
+        updated_at: seconds(r.updated_at),
+        started_at: r.started_at.map(seconds),
+        finished_at: r.finished_at.map(seconds),
+        failure_class: r.failure_class,
+        summary: r.summary.clone(),
+        exit_code: r.exit_code,
+        artifacts: r
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.file_name().to_owned())
+            .collect(),
+        cancel_requested: r.cancel_requested,
+        after: r.spec.after.clone(),
+        waiting_on: r.waiting_on.clone(),
+        waiting_reason: reason,
+        outcome_note: outcome_note(r).map(str::to_owned),
+        warnings: None,
     }
-    view
 }
 
 async fn all_nodes(state: &Arc<AppState>, at: Now) -> Result<Vec<NodeRecord>, ApiError> {
@@ -92,35 +84,31 @@ async fn all_nodes(state: &Arc<AppState>, at: Now) -> Result<Vec<NodeRecord>, Ap
     }
 }
 
-fn node_view(n: &NodeRecord, stats: Option<&lu_proto::NodeStats>) -> serde_json::Value {
-    let harness = match n.heartbeat.harness {
-        lu_proto::HarnessState::Idle => "idle",
-        lu_proto::HarnessState::Busy => "busy",
-    };
+fn node_view(n: &NodeRecord, stats: Option<&lu_proto::NodeStats>) -> NodeView {
     let host = stats.and_then(|stats| stats.host.as_ref());
     let stuck = stats
         .map(|stats| stats.jobs.iter().filter(|job| job.stuck).count())
         .unwrap_or(0);
-    json!({
-        "name": n.name.to_string(),
-        "version": n.heartbeat.version.as_deref(),
-        "last_seen": n.last_seen,
-        "online": n.online,
-        "draining": n.draining,
-        "harness": harness,
-        "providers": &n.heartbeat.providers,
-        "provider_models": &n.heartbeat.provider_models,
-        "labels": &n.heartbeat.labels,
-        "label_sources": &n.heartbeat.label_sources,
-        "taints": &n.heartbeat.taints,
-        "current_job": n.current_job.as_ref().map(|j| j.to_string()),
-        "cordons": &n.cordons,
-        "reiki": n.heartbeat.reiki,
-        "load1": host.map(|host| host.load1),
-        "mem_available_kb": host.map(|host| host.mem_available_kb),
-        "mem_total_kb": host.map(|host| host.mem_total_kb),
-        "stuck": stuck,
-    })
+    NodeView {
+        name: n.name.clone(),
+        version: n.heartbeat.version.clone(),
+        last_seen: seconds(n.last_seen),
+        online: n.online,
+        draining: n.draining,
+        harness: Some(n.heartbeat.harness),
+        providers: n.heartbeat.providers.clone(),
+        provider_models: n.heartbeat.provider_models.clone(),
+        labels: n.heartbeat.labels.clone(),
+        label_sources: n.heartbeat.label_sources.clone(),
+        taints: n.heartbeat.taints.clone(),
+        current_job: n.current_job.clone(),
+        cordons: n.cordons.clone(),
+        reiki: n.heartbeat.reiki.clone(),
+        load1: host.map(|host| host.load1),
+        mem_available_kb: host.map(|host| host.mem_available_kb),
+        mem_total_kb: host.map(|host| host.mem_total_kb),
+        stuck: u64::try_from(stuck).unwrap_or(0),
+    }
 }
 
 pub async fn create_job(
@@ -190,7 +178,7 @@ pub async fn create_job(
         .map(|label| format!("no node with label {label}"))
         .collect();
     let mut body = job_view_with(&rec, waiting_reason(&rec, &nodes));
-    body["warnings"] = json!(warnings);
+    body.warnings = Some(warnings);
     if created {
         state.waiters.notify_work();
         with_version(json_ok(StatusCode::CREATED, &body))
@@ -399,12 +387,7 @@ pub async fn edit_job(
 }
 
 fn artifact_name_from_str(name: &str) -> Option<ArtifactName> {
-    match name {
-        "diff.patch" => Some(ArtifactName::DiffPatch),
-        "run.log" => Some(ArtifactName::RunLog),
-        "report.json" => Some(ArtifactName::ReportJson),
-        _ => None,
-    }
+    name.parse().ok()
 }
 
 pub async fn get_artifact(
@@ -518,20 +501,10 @@ pub async fn get_logs(
         header::HeaderValue::from_str(&rec.log_len.to_string())
             .unwrap_or(header::HeaderValue::from_static("0")),
     );
-    let st = match rec.state {
-        lu_proto::JobState::Blocked => "blocked",
-        lu_proto::JobState::Queued => "queued",
-        lu_proto::JobState::Leased => "leased",
-        lu_proto::JobState::Running => "running",
-        lu_proto::JobState::Recovering => "recovering",
-        lu_proto::JobState::NeedsInput => "needs_input",
-        lu_proto::JobState::Done => "done",
-        lu_proto::JobState::Failed => "failed",
-        lu_proto::JobState::Cancelled => "cancelled",
-    };
     res.headers_mut().insert(
         "x-lu-state",
-        header::HeaderValue::from_str(st).unwrap_or(header::HeaderValue::from_static("queued")),
+        header::HeaderValue::from_str(rec.state.as_str())
+            .unwrap_or(header::HeaderValue::from_static("queued")),
     );
     with_version(res)
 }
@@ -727,6 +700,8 @@ mod tests {
                 idempotency_key: None,
                 after: Vec::new(),
                 stack_dependencies: true,
+                collect: None,
+                include_failed: false,
                 allow_empty,
                 requires: Vec::new(),
                 tolerates: Vec::new(),
@@ -760,21 +735,21 @@ mod tests {
     fn an_empty_diff_on_a_done_job_gets_the_note() {
         let r = record(JobState::Done, false, Some(0), diff());
         assert_eq!(outcome_note(&r), Some("no_changes"));
-        assert_eq!(job_view(&r)["outcome_note"], json!("no_changes"));
+        assert_eq!(job_view(&r).outcome_note.as_deref(), Some("no_changes"));
     }
 
     #[test]
     fn a_nonempty_diff_has_no_note() {
         let r = record(JobState::Done, false, Some(1), diff());
         assert_eq!(outcome_note(&r), None);
-        assert!(job_view(&r).get("outcome_note").is_none());
+        assert!(job_view(&r).outcome_note.is_none());
     }
 
     #[test]
     fn allow_empty_suppresses_the_note() {
         let r = record(JobState::Done, true, Some(0), diff());
         assert_eq!(outcome_note(&r), None);
-        assert!(job_view(&r).get("outcome_note").is_none());
+        assert!(job_view(&r).outcome_note.is_none());
     }
 
     #[test]

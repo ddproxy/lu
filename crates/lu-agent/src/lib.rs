@@ -5,6 +5,7 @@
 //! errors only when the agent cannot continue; a broken log stream is never allowed to kill a
 //! running job.
 
+mod collect;
 mod health;
 pub mod housekeeping;
 mod labels;
@@ -21,9 +22,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use lu_client::{ApiError, Controller};
 use lu_config::{AgentConfig, BaseSource};
 use lu_proto::{
-    printable, truncate_chars, AgentEvent, ArtifactName, Completion, FailureClass, HarnessState,
-    Heartbeat, JobId, JobSpec, JobStats, NodeName, Outcome, ProviderModel, ProviderState,
-    ProviderStatus, MAX_DIFF_BYTES, MAX_SUMMARY_BYTES,
+    effective_collect, printable, truncate_chars, AgentEvent, ArtifactName, Completion,
+    FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobStats, NodeName, Outcome,
+    ProviderModel, ProviderState, ProviderStatus, MAX_DIFF_BYTES, MAX_SUMMARY_BYTES,
 };
 use lu_staging::{ApplyError, Source, StageRequest, StagedDir, Staging};
 use lu_supervise::{CommandSpec, Limits, Outcome as SuperviseOutcome, Supervisor};
@@ -536,8 +537,9 @@ impl Agent {
             }
         };
 
+        let mode = effective_collect(spec.collect, spec.stack_dependencies);
         let mut applied = Vec::new();
-        if spec.stack_dependencies {
+        if mode.applies_diffs() {
             match self.apply_dependencies(&job_id, epoch, &staged).await? {
                 DependencyApply::Applied(deps) => applied = deps,
                 DependencyApply::Stale => return Ok(JobEnd::Stale),
@@ -566,6 +568,27 @@ impl Agent {
                     .await?;
                     return Ok(JobEnd::Finished);
                 }
+            }
+        }
+
+        // Input files must exist before the harness starts, and never enter the job's own diff.
+        match collect::collect_inputs(&*self.controller, &job_id, epoch, &spec, &applied, &staged)
+            .await
+        {
+            Ok(collect::CollectOutcome::Collected) => {}
+            Ok(collect::CollectOutcome::Stale) => return Ok(JobEnd::Stale),
+            Err(AgentError::Unauthorized) => return Err(AgentError::Unauthorized),
+            Err(AgentError::Forbidden) => return Err(AgentError::Forbidden),
+            Err(error) => {
+                let summary = format!("input collection failed: {error}");
+                self.complete_failure(
+                    &job_id,
+                    epoch,
+                    &summary,
+                    pre_verdict_class(PreVerdict::Prepare),
+                )
+                .await?;
+                return Ok(JobEnd::Finished);
             }
         }
 

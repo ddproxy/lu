@@ -1,7 +1,22 @@
 //! Why a job stopped. A node failure and a provider failure are both worth one more try; an
 //! execution failure is the job's own outcome and is never retried.
 
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
+
+/// Why a string was not a recognised failure class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseFailureClassError;
+
+impl fmt::Display for ParseFailureClassError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("not a recognised failure class")
+    }
+}
+
+impl std::error::Error for ParseFailureClassError {}
 
 /// The class of a failure, which decides whether the job is retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -25,6 +40,38 @@ pub enum FailureClass {
 pub const PROVIDER_ATTEMPT_LIMIT: u32 = 100;
 
 impl FailureClass {
+    /// The wire spelling documented in `docs/api.md`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Provider => "provider",
+            Self::Execution => "execution",
+            Self::Dependency => "dependency",
+            Self::Conflict => "conflict",
+        }
+    }
+
+    /// Every class, in declaration order.
+    pub const ALL: [FailureClass; 5] = [
+        Self::Node,
+        Self::Provider,
+        Self::Execution,
+        Self::Dependency,
+        Self::Conflict,
+    ];
+
+    /// Parses the wire spelling documented in `docs/api.md`.
+    pub fn parse(text: &str) -> Result<Self, ParseFailureClassError> {
+        Ok(match text {
+            "node" => Self::Node,
+            "provider" => Self::Provider,
+            "execution" => Self::Execution,
+            "dependency" => Self::Dependency,
+            "conflict" => Self::Conflict,
+            _ => return Err(ParseFailureClassError),
+        })
+    }
+
     /// Node failures retry while the attempt count is within the cap, provider failures until
     /// [`PROVIDER_ATTEMPT_LIMIT`]; an execution failure never does.
     pub fn retryable(self, attempt: u32, max_retries: u32) -> bool {
@@ -33,6 +80,20 @@ impl FailureClass {
             Self::Provider => attempt <= PROVIDER_ATTEMPT_LIMIT,
             Self::Execution | Self::Dependency | Self::Conflict => false,
         }
+    }
+}
+
+impl fmt::Display for FailureClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for FailureClass {
+    type Err = ParseFailureClassError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::parse(text)
     }
 }
 
@@ -97,5 +158,34 @@ mod tests {
             serde_json::to_string(&FailureClass::Execution).unwrap(),
             "\"execution\""
         );
+    }
+
+    #[test]
+    fn every_failure_class_round_trips_through_as_str_and_from_str() {
+        for class in FailureClass::ALL {
+            let text = class.as_str();
+            assert_eq!(FailureClass::from_str(text).unwrap(), class, "{text}");
+            assert_eq!(class.to_string(), text);
+            assert_eq!(
+                serde_json::to_string(&class).unwrap(),
+                format!("\"{text}\"")
+            );
+        }
+        assert_eq!(
+            "conflict".parse::<FailureClass>().unwrap(),
+            FailureClass::Conflict
+        );
+        assert!("timeout".parse::<FailureClass>().is_err());
+    }
+
+    #[test]
+    fn failure_class_strings_match_docs_api_md() {
+        // docs/api.md, "JobView": `node`, `provider`, `execution`, `dependency` or `conflict`.
+        let documented = ["node", "provider", "execution", "dependency", "conflict"];
+        let actual: Vec<&str> = FailureClass::ALL
+            .iter()
+            .map(|class| class.as_str())
+            .collect();
+        assert_eq!(actual, documented);
     }
 }

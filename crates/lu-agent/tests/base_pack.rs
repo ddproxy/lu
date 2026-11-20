@@ -220,6 +220,8 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         idempotency_key: None,
         after: Vec::new(),
         stack_dependencies: true,
+        collect: None,
+        include_failed: false,
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),

@@ -8,11 +8,8 @@ One `lu` binary is the controller, the operator CLI, the node agent and the MCP 
 flowchart TD
     A[ lu command ] --> B{ LU_URL set? }
     B -->|yes| C[ LU_TOKEN_FILE required<br/>LU_CA_FILE optional ]
-    B -->|no| D{ --config has [agent]? }
-    D -->|yes| E[ controller_url, token_file, ca_file<br/>from [agent] ]
-    D -->|no| F[ ~/.config/lu/operator.toml<br/>then /etc/lu/operator.toml ]
+    B -->|no| F[ ~/.config/lu/operator.toml<br/>then /etc/lu/operator.toml ]
     C --> G[ Client::new ]
-    E --> G
     F --> G
     G --> H[ HTTPS to controller ]
 ```
@@ -80,7 +77,7 @@ Each `submit` prints its new job id; use that id with `lu show`.
 | Uploads | Agent log and artifact uploads use `Content-Type: application/octet-stream`. Log appends must use the current stored offset. |
 | Redirects | Never followed; a `3xx` becomes an error so the token cannot leak through `Location`. |
 | Retries | Failed GETs and other retryable reads are retried up to 3 attempts for network failures, 429 and 5xx, with exponential backoff from 100 ms. A 429 error reports `Retry-After` seconds. |
-| Bodies | JSON responses are capped at 1 MiB; artifacts use their per-file caps (10 MiB diff, 50 MiB log, 1 MiB report). |
+| Bodies | JSON responses are capped at 8 MiB (the controller caps JSON request bodies at 1 MiB); artifacts use their per-file caps (10 MiB diff, 50 MiB log, 1 MiB report). |
 | Secrets | The token is redacted from `Debug` output and error text, including text echoed by a hostile controller. |
 
 `lu logs --follow` reads pages with `wait=25` and stops when the controller's `X-Lu-State` is terminal. Exit `0` means the job ended `done`; exit `3` means `failed` or `cancelled`.

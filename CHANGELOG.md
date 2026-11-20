@@ -7,6 +7,7 @@ uses semantic versioning once it reaches 1.0.
 
 ### Added
 
+- Dependency input collection. `JobSpec.collect` accepts `none`, `files`, `apply` or `both` (aliases `off`, `false`, `diffs`, `diff`, `patches`, `patch`) and overrides `stack_dependencies`; `files` and `both` stage `INDEX.md`, `diff.patch`, `report.json`, `run.log` and `meta.json` under `.lu/inputs` before the harness starts, with a 16-input/64 MiB cap, private modes, symlink refusal and a 256 KiB log tail. `JobSpec.include_failed` accepts failed or cancelled dependencies, releases their dependents instead of cascading a `dependency` failure, and makes their stored diffs available as inputs. The CLI adds `--collect` and `--include-failed` to `submit`, `retry` and `edit`; MCP adds `collect` and `include_failed` to `lu_submit`, `lu_submit_many` and `lu_retry`. `.lu` is excluded from exported diffs and is a staging error when tracked. No schema change: both fields live in the existing JSON spec.
 - Provider-agnostic jobs. `lu submit --provider any` picks a provider from the node's `[[agent.provider_models]]` pairs, tried in configuration order. Agents publish each pair with their heartbeat while Reiki reports that provider healthy; dispatch skips cordoned providers and records the chosen pair as `assigned_provider`/`assigned_model`, which the agent runs. `any` with `--model` or `--fallback` is a validation error. With no healthy pair on any eligible node the job stays `queued` with a waiting reason. Node views expose `provider_models`; no schema change, since pairs live in the stored heartbeat.
 - `lu edit <job>` changes provider, model, fallbacks, requirements, tolerations and dependencies of a `queued` or `blocked` job in place through `POST /v1/jobs/{id}/edit` (operator scope). The job keeps its id and dependents; its assignment is cleared. Edited dependencies respect the 16-dependency limit, reject cycles with `400 bad_request` and move the job between `blocked` and `queued`. Other states get `409 conflict`. No schema change.
 - `lu mcp` write tools now accept the CLI's scheduling fields: `require`, `fallbacks`, `after_keys`, `no_stack`, `harness`, `timeout`/`timeout_secs` and `idle_timeout`/`idle_timeout_secs` on `lu_submit`, `lu_submit_many` and `lu_retry`. Bounds appear in `tools/list` and are enforced by the shared `JobSpec::validate`, so MCP returns the CLI's validation text.
@@ -75,7 +76,7 @@ uses semantic versioning once it reaches 1.0.
 
 ### Changed
 
-- Schema 3 indexes the spec's idempotency key for the new lookup. Older databases gain the index on open.
+- Schema 4 indexes the spec's idempotency key for the new lookup. Older databases gain the index on open.
 
 ### Added
 

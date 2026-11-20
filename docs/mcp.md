@@ -30,7 +30,7 @@ sequenceDiagram
 A successful reply has this shape:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"version 0.1.10 ..."}],"isError":false,"structuredContent":{"version":"0.1.10"}}}
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"version 0.2.0 ..."}],"isError":false,"structuredContent":{"version":"0.2.0"}}}
 ```
 
 Worked example — initialize and list tools:

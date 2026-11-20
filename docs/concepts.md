@@ -24,7 +24,7 @@ by the controller; see [Tokens and TLS](tokens-and-tls.md).
 | Term | Meaning |
 | --- | --- |
 | **Job** | A persisted record with a 26-character id, a state, an `attempt` and an `epoch`. It is created from a spec and finishes `done`, `failed` or `cancelled`. |
-| **Spec** | The immutable request: repository, git ref, task text, harness, optional provider/model, timeouts, `after` dependencies, required labels, idempotency key and `stack_dependencies`. |
+| **Spec** | The stored request: repository, git ref, task text, harness, optional provider/model, timeouts, `after` dependencies, required labels, idempotency key and `stack_dependencies`. While the job is `queued` or `blocked`, `lu edit` can change its provider, model, fallbacks, requirements, tolerations and dependencies in place. |
 | **Controller** | The HTTP(S) service that owns state, leases, retries, node cordons, mirrors and artifacts. Job records live in SQLite; artifact files live under `artifacts_dir`. |
 | **Agent / node** | A named `lu agent` process. It has one job slot in this version, advertises labels, renews leases and stages each job in its own work directory. The agent token is bound to that node name. |
 | **Operator** | Any caller using the operator API: `lu` commands, `lu mcp` tools or a direct HTTP client. Operator tokens are a separate scope. |

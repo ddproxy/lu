@@ -1,8 +1,8 @@
 # Dependencies
 
-A job can wait for earlier jobs and, by default, build on their diffs. Dependencies are declared
-at submission and cannot be changed later; `lu retry` can replace the whole list when it
-resubmits a finished job.
+A job can wait for earlier jobs and, by default, build on their diffs. Dependencies are supplied
+at submission and can be changed later with `lu edit`; `lu retry` can also replace the whole list
+when it resubmits a finished job.
 
 ```mermaid
 graph TD
@@ -31,8 +31,10 @@ lu submit --key ship --after-key test --after-key lint \
   rejected. An unknown `--after-key` is a CLI usage error (exit 2); an unknown ID from the API is
   `422 unknown dependency <id>`.
 - A dependency that is already `failed` or `cancelled` is rejected with
-  `422 dependency <id> already failed or was cancelled`. It is not possible to submit a job that
-  starts in a state from which recovery depends on a dead predecessor.
+  `422 dependency <id> already failed or was cancelled` unless the new spec sets
+  `include_failed: true`. With that opt-in the dead dependency is accepted, the dependent starts
+  `queued` when the rest of its dependency set is ready, and a later dependency failure releases
+  the dependent instead of failing it with `failure_class: "dependency"`.
 - `lu retry <id> --after ... --after-key ...` replaces the dependency list on the new job. An old
   job must be terminal first.
 
@@ -69,6 +71,32 @@ diff and are listed in `applied_dependencies`.
 
 Pass `--no-stack` to set `stack_dependencies: false`. The job still waits for its dependencies,
 but the harness runs on the dependent's own base tree alone and no dependency diffs are applied.
+
+## Collecting inputs
+
+`--collect <mode>` stages dependency artifacts under `.lu/inputs` before the harness starts. The
+modes are `none` (default), `files`, `apply` and `both`; aliases `off`, `false`, `diffs`, `diff`,
+`patches` and `patch` are accepted. An explicit `collect` wins over `stack_dependencies`, so
+`--no-stack --collect files` collects files without applying diffs. When `collect` is absent,
+`stack_dependencies` keeps its old meaning: `true` behaves like `apply`, `false` like `none`.
+`apply` and `both` use the existing stacking path; in this part of the design neither applies a
+dependency diff that was not already applied by `stack_dependencies`.
+
+Inputs are the job's `after` dependencies. A `done` dependency is always an input. A `failed` or
+`cancelled` dependency becomes an input only when `--include-failed` is set and that job stored a
+`diff.patch`; without the opt-in, a dead dependency still fails its dependents as described above.
+`--include-failed` is also accepted by `lu retry` and `lu edit`. At most 16 inputs and 64 MiB of
+stored diffs are allowed; the controller checks the limit at submit time when sizes are known and
+the agent re-checks it before staging.
+
+With `files` or `both`, the agent writes `.lu/inputs/INDEX.md` and one directory per input, named
+from a safe idempotency key (or a short job id, with `-2`, `-3`, … for duplicates). Each directory
+contains `diff.patch`, `report.json`, `run.log` and `meta.json`. `INDEX.md` lists the key, job id,
+state, node, failure class, changed-file count and diff bytes; `run.log` keeps only the last
+256 KiB and the index notes when a log was capped. Files are `0600`, directories `0700` and
+symlinks are refused. Text from another job is untrusted: it is sanitised in the index and never
+used as a path or command. `.lu` is added to `.git/info/exclude` and stripped from the exported
+`diff.patch`; a tracked `.lu` path is a staging error rather than being silently removed.
 
 ## Viewing the graph
 

@@ -4,8 +4,8 @@ use std::collections::{HashSet, VecDeque};
 
 use lu_client::{ApiError, Client, JobView, ListNodes, NodeStats, NodeView};
 use lu_proto::{
-    truncate_chars, ArtifactName, Choice, HarnessState, JobId, JobSpec, JobState, NodeName,
-    ProviderState, DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_FALLBACKS, MAX_IDLE_TIMEOUT_SECS,
+    truncate_chars, ArtifactName, Choice, CollectMode, HarnessState, JobId, JobSpec, JobState,
+    NodeName, DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_FALLBACKS, MAX_IDLE_TIMEOUT_SECS,
     MAX_REQUIRES_LABELS, MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
 };
 use lu_tui::graph::{self, Graph};
@@ -230,6 +230,16 @@ const NO_STACK_FIELD: Field = optional(
     "boolean",
     "Do not apply dependency diffs to this job's tree",
 );
+const COLLECT_FIELD: Field = optional(
+    "collect",
+    "string",
+    "Collect dependency inputs into .lu/inputs: none, files, apply or both; aliases: off, false, diffs, diff, patches, patch; defaults to the no_stack behaviour when absent",
+);
+const INCLUDE_FAILED_FIELD: Field = optional(
+    "include_failed",
+    "boolean",
+    "Include failed and cancelled dependencies as inputs when they stored a diff",
+);
 const HARNESS_FIELD: Field = optional("harness", "string", "Harness name");
 const REQUIRE_FIELD: Field = spec_bounds(array(
     "require",
@@ -266,6 +276,8 @@ static JOB_FIELDS: &[Field] = &[
     REQUIRE_FIELD,
     FALLBACKS_FIELD,
     NO_STACK_FIELD,
+    COLLECT_FIELD,
+    INCLUDE_FAILED_FIELD,
     TIMEOUT_SECS_FIELD,
     TIMEOUT_FIELD,
     IDLE_TIMEOUT_SECS_FIELD,
@@ -375,6 +387,8 @@ const TOOLS: &[ToolDef] = &[
             REQUIRE_FIELD,
             FALLBACKS_FIELD,
             NO_STACK_FIELD,
+            COLLECT_FIELD,
+            INCLUDE_FAILED_FIELD,
             AFTER_FIELD,
             AFTER_KEYS_FIELD,
             TIMEOUT_SECS_FIELD,
@@ -447,6 +461,8 @@ const TOOLS: &[ToolDef] = &[
             REQUIRE_FIELD,
             FALLBACKS_FIELD,
             NO_STACK_FIELD,
+            COLLECT_FIELD,
+            INCLUDE_FAILED_FIELD,
             AFTER_FIELD,
             AFTER_KEYS_FIELD,
             RETRY_TIMEOUT_SECS_FIELD,
@@ -788,6 +804,16 @@ fn spec_idle_timeout(args: &Value) -> Option<u64> {
         .map(|secs| u64::try_from(secs).unwrap_or(0))
 }
 
+/// `collect` is parsed by `lu-proto`, so the CLI and MCP accept exactly the same spellings.
+fn spec_collect(args: &Value) -> Result<Option<CollectMode>, ToolError> {
+    args.get("collect")
+        .map(|value| {
+            CollectMode::parse(value.as_str().unwrap_or_default())
+                .map_err(|error| ToolError::Failed(error.to_string()))
+        })
+        .transpose()
+}
+
 fn spec_fallbacks(args: &Value) -> Vec<Choice> {
     args.get("fallbacks")
         .and_then(Value::as_array)
@@ -823,6 +849,11 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
         after,
         stack_dependencies: !args
             .get("no_stack")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        collect: spec_collect(args)?,
+        include_failed: args
+            .get("include_failed")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         allow_empty: false,
@@ -917,6 +948,8 @@ fn submit_output(view: &JobView) -> ToolOutput {
                     "model": choice.model.as_deref().map(clean)
                 })).collect::<Vec<_>>(),
                 "stack_dependencies": view.spec.stack_dependencies,
+                "collect": view.spec.collect.map(|mode| mode.as_str()),
+                "include_failed": view.spec.include_failed,
                 "timeout_secs": view.spec.timeout_secs,
                 "idle_timeout_secs": view.spec.idle_timeout_secs,
                 "idempotency_key": view.spec.idempotency_key.as_deref().map(clean)
@@ -1284,6 +1317,12 @@ async fn retry(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     if let Some(no_stack) = args.get("no_stack").and_then(Value::as_bool) {
         spec.stack_dependencies = !no_stack;
     }
+    if let Some(collect) = spec_collect(args)? {
+        spec.collect = Some(collect);
+    }
+    if let Some(include_failed) = args.get("include_failed").and_then(Value::as_bool) {
+        spec.include_failed = include_failed;
+    }
     if args.get("after").is_some() || args.get("after_keys").is_some() {
         let ids = parse_ids(&field_strings(args, "after"))?;
         spec.after = resolve_after(client, &ids, &field_strings(args, "after_keys")).await?;
@@ -1373,7 +1412,7 @@ async fn status(host: &Host) -> Result<ToolOutput, ToolError> {
 async fn jobs(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     let state = match args.get("state").and_then(Value::as_str) {
         Some(name) => Some(
-            serde_json::from_str::<JobState>(&json!(name).to_string())
+            name.parse::<JobState>()
                 .map_err(|_| ToolError::Args(format!("invalid state: {}", clean(name))))?,
         ),
         None => None,
@@ -1596,15 +1635,9 @@ fn provider_rows(node: &NodeView) -> Vec<Value> {
     node.providers
         .iter()
         .map(|provider| {
-            let state = match provider.state {
-                ProviderState::Ok => "ok",
-                ProviderState::Cooling => "cooling",
-                ProviderState::Disabled => "disabled",
-                ProviderState::Unknown => "unknown",
-            };
             json!({
                 "name": clean(&provider.name),
-                "state": state,
+                "state": provider.state.as_str(),
                 "cooling_secs": provider.soonest_secs
             })
         })
@@ -1809,7 +1842,7 @@ async fn graph(host: &Host) -> Result<ToolOutput, ToolError> {
         .map(|node| {
             json!({
                 "id": clean(&node.id),
-                "state": clean(node.state.name()),
+                "state": clean(node.state.as_str()),
                 "title": clean(&node.title),
                 "after": node.after.iter().map(|id| clean(id)).collect::<Vec<_>>()
             })

@@ -66,7 +66,7 @@ lu status --json
 
 ```json
 {
-  "version": "0.1.10",
+  "version": "0.2.0",
   "uptime_secs": 3600,
   "schema_version": 6,
   "db_bytes": 81920,

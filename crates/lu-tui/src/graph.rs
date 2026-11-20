@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use crate::model::Tone;
 use crate::sanitize::printable;
 
+pub use lu_proto::JobState as State;
+
 /// Components shown by one graph.
 pub const MAX_COMPONENTS: usize = 6;
 /// Jobs shown by one graph.
@@ -15,51 +17,16 @@ const GAP: usize = 9;
 const SHORT_ID: usize = 5;
 const TITLE_CHARS: usize = 30;
 
-/// A job state reduced to what the graph draws.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State {
-    Blocked,
-    Queued,
-    Leased,
-    Running,
-    Recovering,
-    NeedsInput,
-    Done,
-    Failed,
-    Cancelled,
+/// Presentation rules the graph adds to a wire [`State`].
+pub trait StateStyle {
+    fn glyph(self) -> char;
+    fn tone(self) -> Tone;
+    /// Finished jobs do not keep a component on screen.
+    fn unfinished(self) -> bool;
 }
 
-impl State {
-    pub fn from_name(name: &str) -> Self {
-        match name {
-            "blocked" => Self::Blocked,
-            "queued" => Self::Queued,
-            "leased" => Self::Leased,
-            "running" => Self::Running,
-            "recovering" => Self::Recovering,
-            "needs_input" => Self::NeedsInput,
-            "done" => Self::Done,
-            "failed" => Self::Failed,
-            "cancelled" => Self::Cancelled,
-            _ => Self::Queued,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Blocked => "blocked",
-            Self::Queued => "queued",
-            Self::Leased => "leased",
-            Self::Running => "running",
-            Self::Recovering => "recovering",
-            Self::NeedsInput => "needs_input",
-            Self::Done => "done",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    pub fn glyph(self) -> char {
+impl StateStyle for State {
+    fn glyph(self) -> char {
         match self {
             Self::Done => '✓',
             Self::Running | Self::Leased => '▶',
@@ -70,7 +37,7 @@ impl State {
         }
     }
 
-    pub fn tone(self) -> Tone {
+    fn tone(self) -> Tone {
         match self {
             Self::Done => Tone::Done,
             Self::Running | Self::Leased => Tone::Good,
@@ -81,9 +48,8 @@ impl State {
         }
     }
 
-    /// Finished jobs do not keep a component on screen.
-    pub fn unfinished(self) -> bool {
-        !matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    fn unfinished(self) -> bool {
+        !self.is_terminal()
     }
 }
 

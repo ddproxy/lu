@@ -483,6 +483,8 @@ impl<S: Store> Model<S> {
             after: Vec::new(),
             base_commit: None,
             stack_dependencies: true,
+            collect: None,
+            include_failed: false,
             allow_empty: false,
             requires: Vec::new(),
             tolerates: Vec::new(),

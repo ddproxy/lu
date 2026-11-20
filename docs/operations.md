@@ -174,7 +174,7 @@ For the one-shot controller summary, see [`lu status` on the monitoring page](mo
 
 ```text
 NAME    VERSION  HARNESS  LABELS                        LAST_SEEN            DRAINED
-node-a  0.1.10   idle     !homelab,gpu,php8.3,region=eu   2026-11-16 09:12:00Z no
+node-a  0.2.0   idle     !homelab,gpu,php8.3,region=eu   2026-11-16 09:12:00Z no
 ```
 
 - `NAME` is the node name bound to the agent token.

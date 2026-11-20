@@ -6,7 +6,6 @@ use crate::time::now;
 use axum::extract::{Extension, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use lu_proto::ProviderState;
 use lu_serve::PeerAddr;
 use std::sync::Arc;
 
@@ -122,18 +121,7 @@ pub async fn metrics(
     out.push_str("# HELP lu_jobs Number of jobs per state\n");
     out.push_str("# TYPE lu_jobs gauge\n");
     for (state, count) in &counts.jobs {
-        let state_str = match state {
-            lu_proto::JobState::Blocked => "blocked",
-            lu_proto::JobState::Queued => "queued",
-            lu_proto::JobState::Leased => "leased",
-            lu_proto::JobState::Running => "running",
-            lu_proto::JobState::Recovering => "recovering",
-            lu_proto::JobState::NeedsInput => "needs_input",
-            lu_proto::JobState::Done => "done",
-            lu_proto::JobState::Failed => "failed",
-            lu_proto::JobState::Cancelled => "cancelled",
-        };
-        out.push_str(&gauge("lu_jobs", &[("state", state_str)], *count));
+        out.push_str(&gauge("lu_jobs", &[("state", state.as_str())], *count));
         out.push('\n');
     }
 
@@ -175,19 +163,19 @@ pub async fn metrics(
     out.push_str("# TYPE lu_jobs_completed_total counter\n");
     out.push_str(&counter(
         "lu_jobs_completed_total",
-        &[("outcome", "done")],
+        &[("outcome", lu_proto::JobState::Done.as_str())],
         counts.completed_done,
     ));
     out.push('\n');
     out.push_str(&counter(
         "lu_jobs_completed_total",
-        &[("outcome", "failed")],
+        &[("outcome", lu_proto::JobState::Failed.as_str())],
         counts.completed_failed,
     ));
     out.push('\n');
     out.push_str(&counter(
         "lu_jobs_completed_total",
-        &[("outcome", "cancelled")],
+        &[("outcome", lu_proto::JobState::Cancelled.as_str())],
         counts.completed_cancelled,
     ));
     out.push('\n');
@@ -276,18 +264,12 @@ pub async fn metrics(
         }
         for prov in &node_rec.heartbeat.providers {
             let prov_name = escape_label(&prov.name);
-            let state_str = match prov.state {
-                ProviderState::Ok => "ok",
-                ProviderState::Cooling => "cooling",
-                ProviderState::Disabled => "disabled",
-                ProviderState::Unknown => "unknown",
-            };
             out.push_str(&gauge(
                 "lu_node_providers",
                 &[
                     ("node", &node_name),
                     ("provider", &prov_name),
-                    ("state", state_str),
+                    ("state", prov.state.as_str()),
                 ],
                 1,
             ));

@@ -7,7 +7,7 @@ The file is UTF-8 and limited to 64 KiB. Unknown keys and tables are rejected ra
 ```text
 [controller]: listen 0.0.0.0:7600 is not a loopback address, so [tls] is required
 [[controller.agents]] #1 (node-a): token_sha256 must be 64 lowercase hex characters
-[agent]: heartbeat_secs * 2 (30) must be less than controller lease_secs (31)
+[agent]: heartbeat_secs * 2 (30) must be less than controller lease_secs (30)
 ```
 
 At least one of `[controller]` and `[agent]` must be present. A file may contain both, which is useful for a single-machine setup and for `lu check`.
@@ -52,7 +52,7 @@ A token must not work in both scopes. Reusing a hash across the two arrays is re
 | --- | --- | --- | --- |
 | `url` | yes | — | `https` URL with a host and no userinfo (no `user:password@`). `http` is refused. A `file://` URL is accepted only with `allow_file_urls = true`. Jobs whose `repo` equals this string are pinned. |
 | `name` | yes | — | 1 to 64 characters from `A-Z a-z 0-9 . _ -`; unique among repositories. It also names the mirror directory. |
-| `credential_file` | no | — | Non-empty path when set. A private file holding `username:password` or a single token line, checked like `token_file` on `load` (regular file, owner-only, no symlink or FIFO, at most 8 KiB). The controller reads it only while fetching. The value never enters the git command line, a log or an error. |
+| `credential_file` | no | — | Non-empty path when set. A private file holding `username:password` or a single token line, checked like `token_file` on `load` (regular file, owner-only, no symlink or FIFO, at most 64 KiB). The controller reads it only while fetching, when it is capped at 8 KiB. The value never enters the git command line, a log or an error. |
 | `refs` | no | `["*"]` | Non-empty glob allow-list of branches and tags, using `*` and `?`. A ref outside the list resolves as unknown. |
 | `allow_file_urls` | no | `false` | Test-only. Allows `file://` repository URLs; do not enable it in production. |
 
@@ -80,13 +80,12 @@ The `[agent]` table describes an agent host. Operator commands never read it: th
 | `heartbeat_secs` | no | `15` | Integer `2` to `300`. When a `[controller]` table is also present, `heartbeat_secs * 2` must be strictly less than `lease_secs`. |
 | `reiki_health_url` | no | — | Loopback `http` or `https` URL with no credentials, query or fragment. Requires `reiki_token_file`. The agent reads the local Reiki's peer health (`GET /v1/health`) every 10 seconds and sends each upstream as a provider (`ok`, `cooling` with seconds left, `disabled` or `unknown`) with every heartbeat, plus the document itself. A job that names a `provider` goes only to nodes that report it. After three failed reads the node reports no providers. |
 | `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set, and rejected when set alone. Checked like `token_file` on `load`; the agent reads at most 4 KiB. |
-| `provider_models` | no | `[]` | Up to 64 `[[agent.provider_models]]` pairs, in preference order. Each provider is 1 to 64 characters from `A-Z a-z 0-9 . _ -`; each model is 1 to 128 characters; provider names are unique. See below. |
+| `provider_models` | no | `[]` | Up to 64 `[[agent.provider_models]]` pairs, in preference order. Each provider is 1 to 64 characters from `A-Z a-z 0-9 . _ -`; each model is 1 to 128 bytes; provider names are unique. See below. |
 | `labels` | no | `[]` | At most 32 labels. Each is 1 to 64 characters from `A-Z a-z 0-9 . _ - /`, with at most one `=`. Lu never interprets them; a job's `requires` must match every label exactly. |
 | `label_files` | no | `[]` | At most 8 absolute paths without `..`. Each file is read again before every heartbeat; a missing or unreadable file contributes nothing. Each file is capped at 4 KiB, must be UTF-8, and holds one label per line; blank lines and lines starting with `#` are ignored. Invalid labels are dropped with one warning per label. File labels are merged with `labels`, then sorted and de-duplicated. |
 | `detect` | no | `[]` | Up to 16 `[[agent.detect]]` entries; labels must be valid and unique. See below. |
 | `taints` | no | `[]` | At most 8 taints. Each is a label with the same syntax as `labels`. A tainted node takes only jobs that tolerate every taint. Sent with every heartbeat and replaced on change. |
 | `housekeeping` | no | — | Optional `[agent.housekeeping]` table. Without it the agent removes nothing. |
-| `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set. Checked like `token_file` on `load`. |
 
 Labels let one controller route work to particular hosts without a new job field for every
 machine property. For example:
@@ -104,7 +103,7 @@ taints = ["homelab"]
 | Key | Required | Default | Validation |
 | --- | --- | --- | --- |
 | `provider` | yes | — | 1 to 64 characters from `A-Z a-z 0-9 . _ -`; unique among pairs. |
-| `model` | yes | — | 1 to 128 characters. |
+| `model` | yes | — | 1 to 128 bytes. |
 
 Pairs are published with every heartbeat only while Reiki reports the named provider healthy. Dispatch tries them in configuration order for jobs submitted with `--provider any`. No schema change: pairs live in the stored heartbeat.
 

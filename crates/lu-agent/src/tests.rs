@@ -320,6 +320,8 @@ fn test_spec(repo: &str) -> JobSpec {
         idempotency_key: None,
         after: Vec::new(),
         stack_dependencies: true,
+        collect: None,
+        include_failed: false,
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),
@@ -436,6 +438,14 @@ fn dependency(id: &JobId, diff: &[u8]) -> DependencyView {
         job_id: id.clone(),
         state: JobState::Done,
         diff_bytes: diff.len() as u64,
+        idempotency_key: None,
+        node: None,
+        assigned_provider: None,
+        assigned_model: None,
+        started_at: None,
+        finished_at: None,
+        failure_class: None,
+        summary: None,
     }
 }
 

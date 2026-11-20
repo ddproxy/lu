@@ -117,7 +117,7 @@ The agent treats these inputs as untrusted:
 
 For a configured repository the controller mirrors the forge itself and pins the job to a
 commit, so an agent no longer needs forge access or its credential. A mirror is a bare repository
-under `<artifacts_dir>/../mirrors`, mode `0700`; fetching uses `https` only, no terminal prompts,
+under `<artifacts_dir>/../mirrors`, mode `0700`; fetching uses `https` (`file://` is allowed only by the test-only `allow_file_urls` escape hatch), no terminal prompts,
 no system or global config, no hooks and no inherited askpass or ssh command, with a 5-minute
 timeout and a size cap. A repository credential is read at fetch time, passed through a
 short-lived private askpass helper, and scrubbed from any stderr before it becomes an error. A restart clears helpers left by a crash.
@@ -133,15 +133,17 @@ The controller uses the agent's report as the record of what its harness did. An
 job's task and repository content and produces the diff, log and report, so operators open those
 files as untrusted input and place secrets only on trusted nodes.
 
-## The harness runs unprivileged
+## Keeping the harness unprivileged
 
-The contributed units use a separate `lu` service account and an unprivileged `lu-harness`
-account created by `contrib/lu.sysusers`:
+The contributed units use a separate `lu` service account and create an unprivileged
+`lu-harness` account in `contrib/lu.sysusers`. The units alone do not switch the harness to
+that account: the agent launches it as its own user unless a separate runner is configured.
 
 - `lu` runs the controller or agent and owns the token file, mode `0600`;
-- `lu-harness` runs the coding-agent process and cannot read the token, the controller config
-  or the TLS key;
-- the shared staging root is group-writable by `lu-harness`, while each job directory is
+- `lu-harness` can run the coding-agent process through a separate-account runner such as
+  `harness_wrapper` with `[agent] workspace_group`; only then is it kept away from the token,
+  the controller config and the TLS key;
+- the shared staging root can be group-writable by `lu-harness`, while each job directory is
   created mode `0700`.
 
 The units apply `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
@@ -160,10 +162,11 @@ secrets, and treat a job's harness as able to act with that account's rights. Us
 ## Credentials stay on the leaf
 
 Provider credentials (API keys and similar) belong to the harness on the agent/leaf host. The
-controller stores the provider name and model in the job spec. In the agent, the provider
-credential is set for the harness process through `OPENCODE_SERVER_PASSWORD`. The agent clears
-the child environment and adds only `PATH`, `HOME`, `LANG`, the explicit `CommandSpec::env`
-entries, and that credential.
+controller stores the provider name and model in the job spec. The agent can read an opencode
+server password from `opencode_password_file` (at most 4 KiB) and, when set, pass it to the harness
+as `OPENCODE_SERVER_PASSWORD`; that variable is an opencode server password, not a general
+provider-key channel. The agent clears the child environment and adds only `PATH`, `HOME`, `LANG`,
+the explicit `CommandSpec::env` entries, and that password.
 
 A task, repository file, command line, model response or harness log can contain a secret, and
 that text is stored in `run.log`, `diff.patch`, `report.json` or SQLite. Logs and artifacts are

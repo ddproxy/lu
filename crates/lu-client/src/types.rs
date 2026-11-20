@@ -4,84 +4,16 @@
 //! [`lu_proto::printable`]; the types do not pretend to sanitise untrusted text on construction.
 
 use lu_proto::{
-    AgentEvent, FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobState, NodeName, Outcome,
+    AgentEvent, FailureClass, HarnessState, Heartbeat, JobId, JobState, NodeName, Outcome,
     ProviderModel, ProviderStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub use lu_proto::{HostStats, JobStats, NodeStats, ProcessStats};
+pub use lu_proto::{HostStats, JobStats, JobView, NodeStats, NodeView, ProcessStats};
 
 /// Largest JSON response the client will read. Artifacts have their own per-file cap.
 pub const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
-
-/// A submitted job, as the controller sees it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobView {
-    pub id: JobId,
-    pub state: JobState,
-    #[serde(default = "empty_spec")]
-    pub spec: JobSpec,
-    #[serde(default)]
-    pub node: Option<NodeName>,
-    #[serde(default)]
-    pub assigned_provider: Option<String>,
-    #[serde(default)]
-    pub assigned_model: Option<String>,
-    #[serde(default)]
-    pub attempt: u32,
-    #[serde(default)]
-    pub epoch: u64,
-    #[serde(default)]
-    pub created_at: u64,
-    #[serde(default)]
-    pub started_at: Option<u64>,
-    #[serde(default)]
-    pub finished_at: Option<u64>,
-    #[serde(default)]
-    pub failure_class: Option<FailureClass>,
-    #[serde(default)]
-    pub summary: Option<String>,
-    /// `no_changes` when a done job stored an empty diff without `allow_empty`.
-    #[serde(default)]
-    pub outcome_note: Option<String>,
-    #[serde(default)]
-    pub after: Vec<JobId>,
-    #[serde(default)]
-    pub waiting_on: Vec<JobId>,
-    /// Why a queued job cannot be placed, when no online node has all its labels.
-    #[serde(default)]
-    pub waiting_reason: Option<String>,
-    /// Advice from a submit the controller accepted, such as an unknown label.
-    #[serde(default)]
-    pub warnings: Vec<String>,
-}
-
-impl JobView {
-    /// A view for a route that answered 204 (cancel) or with only an id (submit).
-    pub fn placeholder(id: JobId, state: JobState) -> Self {
-        Self {
-            id,
-            state,
-            spec: empty_spec(),
-            node: None,
-            assigned_provider: None,
-            assigned_model: None,
-            attempt: 0,
-            epoch: 0,
-            created_at: 0,
-            started_at: None,
-            finished_at: None,
-            failure_class: None,
-            summary: None,
-            outcome_note: None,
-            after: Vec::new(),
-            waiting_on: Vec::new(),
-            waiting_reason: None,
-            warnings: Vec::new(),
-        }
-    }
-}
 
 /// One of a job's `after` dependencies, as the agent sees it before staging its own tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +23,23 @@ pub struct DependencyView {
     /// The size of the dependency's `diff.patch`; zero means it changed nothing.
     #[serde(default)]
     pub diff_bytes: u64,
+    /// The dependency's idempotency key, or its short id when it had none.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub node: Option<NodeName>,
+    #[serde(default)]
+    pub assigned_provider: Option<String>,
+    #[serde(default)]
+    pub assigned_model: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    pub finished_at: Option<u64>,
+    #[serde(default)]
+    pub failure_class: Option<FailureClass>,
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// A page of jobs. The controller may add fields later; unknown ones are ignored.
@@ -100,61 +49,6 @@ pub struct ListJobs {
     pub jobs: Vec<JobView>,
     #[serde(default)]
     pub next: Option<String>,
-}
-
-/// One node's heartbeat and drain state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NodeView {
-    pub name: NodeName,
-    #[serde(default)]
-    pub version: Option<String>,
-    #[serde(default)]
-    pub harness: Option<HarnessState>,
-    #[serde(default)]
-    pub providers: Vec<ProviderStatus>,
-    /// Healthy provider/model pairs the agent offers for `provider = "any"` jobs.
-    #[serde(default)]
-    pub provider_models: Vec<ProviderModel>,
-    #[serde(default)]
-    pub last_seen: u64,
-    #[serde(default)]
-    pub draining: bool,
-    #[serde(default)]
-    pub load1: Option<f64>,
-    #[serde(default)]
-    pub mem_available_kb: Option<u64>,
-    #[serde(default)]
-    pub mem_total_kb: Option<u64>,
-    #[serde(default)]
-    pub stuck: u64,
-    #[serde(default)]
-    pub labels: Vec<String>,
-    #[serde(default)]
-    pub label_sources: BTreeMap<String, String>,
-    #[serde(default)]
-    pub taints: Vec<String>,
-}
-
-impl NodeView {
-    /// A view for a drain route that answered 204.
-    pub fn placeholder(name: NodeName, draining: bool) -> Self {
-        Self {
-            name,
-            version: None,
-            harness: None,
-            providers: Vec::new(),
-            provider_models: Vec::new(),
-            last_seen: 0,
-            draining,
-            load1: None,
-            mem_available_kb: None,
-            mem_total_kb: None,
-            stuck: 0,
-            labels: Vec::new(),
-            label_sources: BTreeMap::new(),
-            taints: Vec::new(),
-        }
-    }
 }
 
 /// The node list.
@@ -358,7 +252,8 @@ fn log_page_from_value(value: serde_json::Value) -> LogPage {
             let state = map
                 .get("state")
                 .or_else(|| map.get("job_state"))
-                .and_then(|value| serde_json::from_value::<JobState>(value.clone()).ok());
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.parse::<JobState>().ok());
             let terminal = map
                 .get("terminal")
                 .or_else(|| map.get("done"))
@@ -394,27 +289,6 @@ pub struct CompletionBody {
     pub summary: Option<String>,
 }
 
-fn empty_spec() -> JobSpec {
-    JobSpec {
-        repo: String::new(),
-        git_ref: String::new(),
-        base_commit: None,
-        task: String::new(),
-        harness: "opencode".to_owned(),
-        provider: None,
-        model: None,
-        timeout_secs: lu_proto::DEFAULT_TIMEOUT_SECS,
-        idle_timeout_secs: None,
-        idempotency_key: None,
-        after: Vec::new(),
-        stack_dependencies: true,
-        allow_empty: false,
-        requires: Vec::new(),
-        tolerates: Vec::new(),
-        fallbacks: Vec::new(),
-    }
-}
-
 #[allow(dead_code)]
 fn _assert_send_sync() {
     fn check<T: Send + Sync>() {}
@@ -425,6 +299,7 @@ fn _assert_send_sync() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lu_proto::FailureClass;
 
     #[test]
     fn job_view_ignores_future_fields_and_keeps_known_ones() {
@@ -466,7 +341,10 @@ mod tests {
             view.waiting_reason.as_deref(),
             Some("no node with label php8.3")
         );
-        assert_eq!(view.warnings, vec!["no node with label php8.3".to_owned()]);
+        assert_eq!(
+            view.warnings(),
+            &["no node with label php8.3".to_owned()][..]
+        );
     }
 
     #[test]

@@ -112,6 +112,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(agent::get_dep_diff),
         )
         .route(
+            "/v1/agent/jobs/{id}/deps/{dep}/artifacts/{name}",
+            get(agent::get_dep_artifact),
+        )
+        .route(
             "/v1/agent/jobs/{id}/complete",
             post(agent::complete_job).layer(op_json),
         );

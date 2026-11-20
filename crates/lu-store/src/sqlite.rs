@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use lu_proto::{
-    ArtifactName, CancelEffect, Completion, FailureClass, Heartbeat, JobEdit, JobId, JobSpec,
-    JobState, NodeName, Outcome, MAX_LOG_BYTES,
+    effective_collect, ArtifactName, CancelEffect, Completion, FailureClass, Heartbeat, JobEdit,
+    JobId, JobSpec, JobState, NodeName, Outcome, MAX_COLLECT_BYTES, MAX_LOG_BYTES,
 };
 
 use crate::{Assignment, JobCounts, JobRecord, NodeRecord, Now, Store, StoreError};
@@ -22,74 +22,30 @@ fn internal<E: std::fmt::Display>(e: E) -> StoreError {
 }
 
 fn state_str(s: JobState) -> &'static str {
-    match s {
-        JobState::Blocked => "blocked",
-        JobState::Queued => "queued",
-        JobState::Leased => "leased",
-        JobState::Running => "running",
-        JobState::Recovering => "recovering",
-        JobState::NeedsInput => "needs_input",
-        JobState::Done => "done",
-        JobState::Failed => "failed",
-        JobState::Cancelled => "cancelled",
-    }
+    s.as_str()
 }
 
 fn parse_state(s: &str) -> Result<JobState, StoreError> {
-    Ok(match s {
-        "blocked" => JobState::Blocked,
-        "queued" => JobState::Queued,
-        "leased" => JobState::Leased,
-        "running" => JobState::Running,
-        "recovering" => JobState::Recovering,
-        "needs_input" => JobState::NeedsInput,
-        "done" => JobState::Done,
-        "failed" => JobState::Failed,
-        "cancelled" => JobState::Cancelled,
-        _ => return Err(internal(format!("unknown state {s}"))),
-    })
+    s.parse()
+        .map_err(|_| internal(format!("unknown state {s}")))
 }
 
 fn failure_str(f: FailureClass) -> &'static str {
-    match f {
-        FailureClass::Node => "node",
-        FailureClass::Provider => "provider",
-        FailureClass::Execution => "execution",
-        FailureClass::Dependency => "dependency",
-        FailureClass::Conflict => "conflict",
-    }
+    f.as_str()
 }
 
 fn parse_failure(s: &str) -> Result<FailureClass, StoreError> {
-    Ok(match s {
-        "node" => FailureClass::Node,
-        "provider" => FailureClass::Provider,
-        "execution" => FailureClass::Execution,
-        "dependency" => FailureClass::Dependency,
-        "conflict" => FailureClass::Conflict,
-        _ => return Err(internal(format!("unknown failure class {s}"))),
-    })
-}
-
-fn artifact_str(a: ArtifactName) -> &'static str {
-    match a {
-        ArtifactName::DiffPatch => "diff.patch",
-        ArtifactName::RunLog => "run.log",
-        ArtifactName::ReportJson => "report.json",
-    }
+    s.parse()
+        .map_err(|_| internal(format!("unknown failure class {s}")))
 }
 
 fn parse_artifact(s: &str) -> Result<ArtifactName, StoreError> {
-    Ok(match s {
-        "diff.patch" => ArtifactName::DiffPatch,
-        "run.log" => ArtifactName::RunLog,
-        "report.json" => ArtifactName::ReportJson,
-        _ => return Err(internal(format!("unknown artifact {s}"))),
-    })
+    s.parse()
+        .map_err(|_| internal(format!("unknown artifact {s}")))
 }
 
 fn encode_artifacts(arts: &[ArtifactName]) -> String {
-    let v: Vec<&str> = arts.iter().map(|a| artifact_str(*a)).collect();
+    let v: Vec<&str> = arts.iter().map(|a| a.file_name()).collect();
     serde_json::to_string(&v).unwrap_or_else(|_| "[]".to_owned())
 }
 
@@ -347,20 +303,112 @@ fn apply_v6(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
 }
 
 fn load_waiting(conn: &Connection, id: &str) -> Result<Vec<JobId>, StoreError> {
+    let spec_json: String = conn
+        .query_row("SELECT spec_json FROM jobs WHERE id=?1", params![id], |r| {
+            r.get(0)
+        })
+        .map_err(internal)?;
+    let spec: JobSpec = serde_json::from_str(&spec_json).map_err(internal)?;
     let mut stmt = conn
         .prepare(
-            "SELECT d.dep FROM job_deps d JOIN jobs j ON j.id=d.dep
-             WHERE d.job=?1 AND j.state!='done' ORDER BY d.ord",
+            "SELECT d.dep,j.state FROM job_deps d JOIN jobs j ON j.id=d.dep
+             WHERE d.job=?1 ORDER BY d.ord",
         )
         .map_err(internal)?;
     let rows = stmt
-        .query_map(params![id], |r| r.get::<_, String>(0))
+        .query_map(params![id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
         .map_err(internal)?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(JobId::parse(&row.map_err(internal)?).map_err(internal)?);
+        let (dep, state) = row.map_err(internal)?;
+        let satisfied = state == "done"
+            || (spec.include_failed && matches!(state.as_str(), "failed" | "cancelled"));
+        if !satisfied {
+            out.push(JobId::parse(&dep).map_err(internal)?);
+        }
     }
     Ok(out)
+}
+
+fn blocked_dependents(
+    tx: &rusqlite::Transaction<'_>,
+    dep: &str,
+) -> Result<Vec<(String, JobSpec)>, StoreError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT j.id,j.spec_json FROM jobs j JOIN job_deps d ON d.job=j.id
+             WHERE d.dep=?1 AND j.state='blocked'",
+        )
+        .map_err(internal)?;
+    let rows = stmt
+        .query_map(params![dep], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .map_err(internal)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, json) = row.map_err(internal)?;
+        let spec: JobSpec = serde_json::from_str(&json).map_err(internal)?;
+        out.push((id, spec));
+    }
+    Ok(out)
+}
+
+fn deps_satisfied(
+    tx: &rusqlite::Transaction<'_>,
+    job: &str,
+    include_failed: bool,
+) -> Result<bool, StoreError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT j.state FROM job_deps d JOIN jobs j ON j.id=d.dep
+             WHERE d.job=?1 ORDER BY d.ord",
+        )
+        .map_err(internal)?;
+    let rows = stmt
+        .query_map(params![job], |r| r.get::<_, String>(0))
+        .map_err(internal)?;
+    for row in rows {
+        match row.map_err(internal)?.as_str() {
+            "done" => {}
+            "failed" | "cancelled" if include_failed => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// Move one blocked job to the queue if every dependency it is waiting on is now acceptable.
+/// `include_failed` comes from the job's spec: failed and cancelled dependencies count as
+/// satisfied only when the job opted into collecting them as inputs.
+fn release_blocked_job(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    include_failed: bool,
+    now: Now,
+) -> Result<(), StoreError> {
+    if deps_satisfied(tx, id, include_failed)? {
+        tx.execute(
+            "UPDATE jobs SET state='queued',updated_at=?2,failure_class=NULL,
+             summary=NULL,finished_at=NULL WHERE id=?1 AND state='blocked'",
+            params![id, now.wall_unix],
+        )
+        .map_err(internal)?;
+    }
+    Ok(())
+}
+
+fn release_dependents(
+    tx: &rusqlite::Transaction<'_>,
+    dep: &str,
+    now: Now,
+) -> Result<(), StoreError> {
+    for (id, spec) in blocked_dependents(tx, dep)? {
+        release_blocked_job(tx, &id, spec.include_failed, now)?;
+    }
+    Ok(())
 }
 
 fn fail_dependents(
@@ -371,23 +419,12 @@ fn fail_dependents(
 ) -> Result<(), StoreError> {
     let mut queue = vec![(dep.to_owned(), dep_state.to_owned())];
     while let Some((dep_id, dep_state)) = queue.pop() {
-        let ids: Vec<String> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT j.id FROM jobs j JOIN job_deps d ON d.job=j.id
-                     WHERE d.dep=?1 AND j.state='blocked'",
-                )
-                .map_err(internal)?;
-            let rows = stmt
-                .query_map(params![dep_id], |r| r.get::<_, String>(0))
-                .map_err(internal)?;
-            let mut v = Vec::new();
-            for row in rows {
-                v.push(row.map_err(internal)?);
+        for (id, spec) in blocked_dependents(tx, &dep_id)? {
+            // Opting into failed inputs means the dependency is data, not a reason to fail.
+            if spec.include_failed {
+                release_blocked_job(tx, &id, spec.include_failed, now)?;
+                continue;
             }
-            v
-        };
-        for id in ids {
             let summary = format!("dependency {dep_id} {dep_state}");
             tx.execute(
                 "UPDATE jobs SET state='failed',failure_class='dependency',summary=?2,
@@ -396,7 +433,7 @@ fn fail_dependents(
                 params![id, summary, now.wall_unix],
             )
             .map_err(internal)?;
-            queue.push((id, "failed".to_owned()));
+            queue.push((id, JobState::Failed.as_str().to_owned()));
         }
     }
     Ok(())
@@ -641,22 +678,36 @@ impl Store for SqliteStore {
         }
         let id = JobId::new();
         let mut blocked = false;
+        let collects_files =
+            effective_collect(spec.collect, spec.stack_dependencies).collects_files();
+        let mut collected_bytes = 0u64;
         for dep in &spec.after {
-            let dep_state: Option<String> = tx
+            let (dep_state, diff_bytes): (Option<String>, Option<i64>) = tx
                 .query_row(
-                    "SELECT state FROM jobs WHERE id=?1",
+                    "SELECT state, diff_bytes FROM jobs WHERE id=?1",
                     params![dep.as_str()],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()
-                .map_err(internal)?;
+                .map_err(internal)?
+                .unwrap_or((None, None));
             match dep_state.as_deref() {
                 Some("done") => {}
+                Some("failed" | "cancelled") if spec.include_failed => {}
                 Some("failed" | "cancelled") => {
                     return Err(StoreError::DeadDependency(dep.clone()))
                 }
                 Some(_) => blocked = true,
                 None => return Err(StoreError::InvalidDependency(dep.clone())),
+            }
+            if collects_files {
+                let bytes = diff_bytes.unwrap_or(0).max(0) as u64;
+                collected_bytes = collected_bytes.saturating_add(bytes);
+                if collected_bytes > MAX_COLLECT_BYTES {
+                    return Err(StoreError::InvalidSpec(format!(
+                        "collect: input diffs are {collected_bytes} bytes, over the {MAX_COLLECT_BYTES}-byte cap"
+                    )));
+                }
             }
         }
         let mut rec = JobRecord {
@@ -1008,7 +1059,7 @@ impl Store for SqliteStore {
                 rec.updated_at = now.wall_unix;
                 rec.finished_at = Some(now.wall_unix);
                 update_job_tx(&tx, &rec, None, None)?;
-                fail_dependents(&tx, rec.id.as_str(), "cancelled", now)?;
+                fail_dependents(&tx, rec.id.as_str(), JobState::Cancelled.as_str(), now)?;
             }
             CancelEffect::Request => {
                 rec.cancel_requested = true;
@@ -1054,6 +1105,7 @@ impl Store for SqliteStore {
                     .map_err(internal)?;
                 match dep_state.as_deref() {
                     Some("done") => {}
+                    Some("failed" | "cancelled") if rec.spec.include_failed => {}
                     Some("failed" | "cancelled") => {
                         return Err(StoreError::DeadDependency(dep.clone()))
                     }
@@ -1477,17 +1529,7 @@ impl Store for SqliteStore {
                 rec.updated_at = now.wall_unix;
                 rec.failure_class = None;
                 update_job_tx(&tx, &rec, None, None)?;
-                tx.execute(
-                    "UPDATE jobs SET state='queued',updated_at=?2,failure_class=NULL,
-                     summary=NULL,finished_at=NULL
-                     WHERE state='blocked' AND id IN
-                       (SELECT job FROM job_deps WHERE dep=?1)
-                       AND NOT EXISTS
-                       (SELECT 1 FROM job_deps d JOIN jobs j ON j.id=d.dep
-                        WHERE d.job=jobs.id AND j.state!='done')",
-                    params![rec.id.as_str(), now.wall_unix],
-                )
-                .map_err(internal)?;
+                release_dependents(&tx, rec.id.as_str(), now)?;
             }
             Outcome::Cancelled => {
                 check_transition(rec.state, JobState::Cancelled)?;
@@ -1495,7 +1537,7 @@ impl Store for SqliteStore {
                 rec.finished_at = Some(now.wall_unix);
                 rec.updated_at = now.wall_unix;
                 update_job_tx(&tx, &rec, None, None)?;
-                fail_dependents(&tx, rec.id.as_str(), "cancelled", now)?;
+                fail_dependents(&tx, rec.id.as_str(), JobState::Cancelled.as_str(), now)?;
             }
             Outcome::Failed(out_class) => {
                 let (class, provider) = failure.unwrap_or((out_class, None));
@@ -1534,7 +1576,7 @@ impl Store for SqliteStore {
                     rec.finished_at = Some(now.wall_unix);
                     rec.updated_at = now.wall_unix;
                     update_job_tx(&tx, &rec, None, None)?;
-                    fail_dependents(&tx, rec.id.as_str(), "failed", now)?;
+                    fail_dependents(&tx, rec.id.as_str(), JobState::Failed.as_str(), now)?;
                 }
             }
         }
@@ -1621,7 +1663,7 @@ impl Store for SqliteStore {
                 rec.updated_at = now.wall_unix;
                 rec.finished_at = Some(now.wall_unix);
                 update_job_tx(&tx, &rec, None, None)?;
-                fail_dependents(&tx, rec.id.as_str(), "failed", now)?;
+                fail_dependents(&tx, rec.id.as_str(), JobState::Failed.as_str(), now)?;
             }
             moved.push(rec.id);
         }
@@ -1965,6 +2007,8 @@ mod tests {
             idempotency_key: Some("k".to_owned()),
             after: Vec::new(),
             stack_dependencies: true,
+            collect: None,
+            include_failed: false,
             allow_empty: false,
             requires: Vec::new(),
             tolerates: Vec::new(),

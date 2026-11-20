@@ -293,6 +293,8 @@ mod tests {
             idempotency_key: None,
             after: Vec::new(),
             stack_dependencies: true,
+            collect: None,
+            include_failed: false,
             allow_empty: false,
             requires: Vec::new(),
             tolerates: Vec::new(),

@@ -27,9 +27,9 @@ The archive contains `lu`, `LICENSE`, `README.md`, `CHANGELOG.md`, `SECURITY.md`
 Worked example:
 
 ```sh
-tar -xzf lu-v0.1.10-x86_64-unknown-linux-musl.tar.gz
-cd lu-v0.1.10-x86_64-unknown-linux-musl
-sha256sum -c lu-v0.1.10-x86_64-unknown-linux-musl.tar.gz.sha256
+sha256sum -c lu-v0.2.0-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf lu-v0.2.0-x86_64-unknown-linux-musl.tar.gz
+cd lu-v0.2.0-x86_64-unknown-linux-musl
 ./lu --version
 install -m 0755 lu /usr/local/bin/lu
 ```

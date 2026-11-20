@@ -122,7 +122,8 @@ put `target/release` on `PATH` or run `make install` first.
 
    The second job stays `blocked` while `build` is unfinished, then becomes `queued`. By default
    its agent applies the first job's `diff.patch` to its own base tree before starting;
-   `--no-stack` disables that. See [Dependencies](docs/dependencies.md).
+   `--no-stack` disables that. `--collect files` instead stages dependency artifacts under
+   `.lu/inputs` without changing the base tree. See [Dependencies](docs/dependencies.md).
 
 A controller listening on a non-loopback address requires a `[tls]` table; plain HTTP is accepted
 only on loopback. See [Tokens and TLS](docs/tokens-and-tls.md).
@@ -143,9 +144,9 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu serve` | Run the HTTP(S) controller. This is the default when no subcommand is given. |
 | `lu top [--once]` | Live view of the nodes and recent jobs, refreshed every two seconds. `--once` prints one snapshot as text and exits; global `--json` prints one snapshot as JSON and cannot be combined with `--once`. Only in a build with `--features tui`. |
 | `lu agent` | Run the node agent loop. It needs an `[agent]` config. |
-| `lu submit` | Submit a job. `--repo` and `--ref` are required. The task comes from `--task`, `--task-file` or stdin. Flags: `--harness` (default `opencode`), `--provider` (`any` picks a healthy provider published by the node), `--model`, `--timeout` (default `3600`), `--idle-timeout` (1 to 86400 seconds), `--after`, `--after-key`, `--no-stack`, `--allow-empty`, `--require`, `--tolerate`, `--fallback`, `--key` and `--wait`. `--tolerate` is repeatable, at most 8 taints. `--allow-empty` suppresses the `no changes` outcome note. `--fallback provider:model` is repeatable, at most 4; a fallback with only a provider keeps the job's model. `--after` and `--after-key` are repeatable, at most 16 dependencies in total; a key resolves to the newest job submitted with it. `--require` is repeatable, at most 8 labels. `--wait` polls until the job is terminal. |
-| `lu retry <id>` | Resubmit a finished job's spec as a new job. `--provider` and `--model` replace those fields; `--after` and `--after-key` replace the dependency list; `--require` replaces the label requirements and `--no-require` clears them; `--tolerate` replaces the tolerated taints and `--no-tolerate` clears them; `--fallback` replaces the provider choices and `--no-fallbacks` clears them. `--key` gives the new job an idempotency key, and `--wait` polls until it is terminal. A nonterminal job or an unknown `--after-key` is a usage error. |
-| `lu edit <id>` | Change a `queued` or `blocked` job in place; it keeps its id and dependents. `--provider` and `--model` replace those fields; `--fallback`/`--no-fallbacks`, `--require`/`--no-require` and `--tolerate`/`--no-tolerate` replace or clear the lists; `--after` and `--after-key` replace the dependencies, at most 16 and without a cycle. `--provider any` cannot be combined with `--model` or `--fallback`. A job in another state, a cyclic dependency or a bad spec is an error. |
+| `lu submit` | Submit a job. `--repo` and `--ref` are required. The task comes from `--task`, `--task-file` or stdin. Flags: `--harness` (default `opencode`), `--provider` (`any` picks a healthy provider published by the node), `--model`, `--timeout` (default `3600`), `--idle-timeout` (1 to 86400 seconds), `--after`, `--after-key`, `--no-stack`, `--collect`, `--include-failed`, `--allow-empty`, `--require`, `--tolerate`, `--fallback`, `--key` and `--wait`. `--tolerate` is repeatable, at most 8 taints. `--allow-empty` suppresses the `no changes` outcome note. `--fallback provider:model` is repeatable, at most 4; a fallback with only a provider keeps the job's model. `--after` and `--after-key` are repeatable, at most 16 dependencies in total; a key resolves to the newest job submitted with it. `--require` is repeatable, at most 8 labels. `--collect <mode>` selects `none`, `files`, `apply` or `both` (plus documented aliases) and overrides `--no-stack`; `files` and `both` write `.lu/inputs` before the harness starts. `--include-failed` accepts failed or cancelled dependencies as inputs when they stored a diff. `--wait` polls until the job is terminal. |
+| `lu retry <id>` | Resubmit a finished job's spec as a new job. `--provider` and `--model` replace those fields; `--after` and `--after-key` replace the dependency list; `--require` replaces the label requirements and `--no-require` clears them; `--tolerate` replaces the tolerated taints and `--no-tolerate` clears them; `--fallback` replaces the provider choices and `--no-fallbacks` clears them. `--collect` and `--include-failed` replace the collect mode and failed-input opt-in. `--key` gives the new job an idempotency key, and `--wait` polls until it is terminal. A nonterminal job or an unknown `--after-key` is a usage error. |
+| `lu edit <id>` | Change a `queued` or `blocked` job in place; it keeps its id and dependents. `--provider` and `--model` replace those fields; `--fallback`/`--no-fallbacks`, `--require`/`--no-require` and `--tolerate`/`--no-tolerate` replace or clear the lists; `--after` and `--after-key` replace the dependencies, at most 16 and without a cycle. `--collect` and `--include-failed` replace the collect mode and failed-input opt-in. `--provider any` cannot be combined with `--model` or `--fallback`. A job in another state, a cyclic dependency or a bad spec is an error. |
 | `lu ls [--state <state>] [--limit <n>]` | List jobs, newest first. `--state` accepts the nine job states. `AFTER` counts dependencies still unfinished; `NOTE` shows `no changes` for a done job with an empty diff. |
 | `lu show <id>` | Show one job, including each dependency and its state. The `outcome_note` row shows `no changes` when noted. |
 | `lu graph [job]` | Draw the dependency graph of unfinished jobs, newest component first. With a job id, show only its component. `--json` prints a `nodes` array instead. |
@@ -182,15 +183,16 @@ Read tools: `lu_status`, `lu_jobs`, `lu_job`, `lu_logs`, `lu_nodes`, `lu_node`, 
 
 Write tools: `lu_submit`, `lu_submit_many`, `lu_cancel`, `lu_retry`, `lu_drain`, `lu_undrain`.
 
-- `lu_submit` takes `repo`, `ref` and inline `task` text, plus optional `provider`, `model`, `require`, `fallbacks`, `after`, `after_keys`, `no_stack`, `harness`, `timeout`/`timeout_secs`, `idle_timeout`/`idle_timeout_secs` and `key`. When `key` is absent the server derives `mcp-` followed by 16 hex characters of the spec's SHA-256, so repeating the same submission is idempotent.
+- `lu_submit` takes `repo`, `ref` and inline `task` text, plus optional `provider`, `model`, `require`, `fallbacks`, `after`, `after_keys`, `no_stack`, `collect`, `include_failed`, `harness`, `timeout`/`timeout_secs`, `idle_timeout`/`idle_timeout_secs` and `key`. When `key` is absent the server derives `mcp-` followed by 16 hex characters of the spec's SHA-256, so repeating the same submission is idempotent.
 - `lu_submit_many` submits up to 12 named jobs in order. Each job accepts the same spec fields as `lu_submit`, plus `name` and `after_names`. A job's `after_names` may refer only to earlier jobs in the same call; duplicate, unknown, forward or cyclic names are rejected before any request is sent. A failure partway through reports which jobs were submitted and which were not.
+- `lu_retry` accepts the same override fields as `lu_submit`, including `collect` and `include_failed`; absent fields are inherited from the finished job's spec.
 - `lu_result` returns a finished job's summary, report, diff stats and a page of the diff. It defaults to 24 KiB and accepts `offset` and `max_bytes` (at most 32 KiB); follow `next_offset` until `done` is true.
 - Submissions (`lu_submit`, `lu_submit_many` and `lu_retry`) are limited to 30 per rolling minute per server process. Over the limit, the call returns `isError` with the number of seconds to wait.
 - `lu_cancel`, `lu_drain` and `lu_undrain` are marked destructive; all write tools report `readOnlyHint: false`.
 
 ## Known gaps
 
-- The agent runs the harness as its own user; see `docs/security.md`.
+- The agent runs the harness as the agent process's user; there is no built-in per-job user isolation. Use `harness_wrapper` to start it as another account, and see `docs/security.md`.
 
 ## Crates
 

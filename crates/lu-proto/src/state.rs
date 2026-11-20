@@ -1,7 +1,22 @@
 //! Job lifecycle. The allowed edges are an explicit table so a controller can never move a job
 //! into a state that has no way out, and a terminal job is frozen.
 
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
+
+/// Why a string was not a recognised job state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseJobStateError;
+
+impl fmt::Display for ParseJobStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("not a recognised job state")
+    }
+}
+
+impl std::error::Error for ParseJobStateError {}
 
 /// Where a job is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -33,6 +48,37 @@ pub enum CancelEffect {
 }
 
 impl JobState {
+    /// The wire spelling documented in `docs/api.md`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Queued => "queued",
+            Self::Leased => "leased",
+            Self::Running => "running",
+            Self::Recovering => "recovering",
+            Self::NeedsInput => "needs_input",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parses the wire spelling documented in `docs/api.md`.
+    pub fn parse(text: &str) -> Result<Self, ParseJobStateError> {
+        Ok(match text {
+            "blocked" => Self::Blocked,
+            "queued" => Self::Queued,
+            "leased" => Self::Leased,
+            "running" => Self::Running,
+            "recovering" => Self::Recovering,
+            "needs_input" => Self::NeedsInput,
+            "done" => Self::Done,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => return Err(ParseJobStateError),
+        })
+    }
+
     /// What a cancel does in this state.
     pub fn cancel_effect(self) -> CancelEffect {
         match self {
@@ -96,6 +142,20 @@ impl JobState {
                 | (NeedsInput, Cancelled)
                 | (NeedsInput, Failed)
         )
+    }
+}
+
+impl fmt::Display for JobState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for JobState {
+    type Err = ParseJobStateError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::parse(text)
     }
 }
 
@@ -177,5 +237,39 @@ mod tests {
             "\"needs_input\""
         );
         assert!(serde_json::from_str::<JobState>("\"paused\"").is_err());
+    }
+
+    #[test]
+    fn every_job_state_round_trips_through_as_str_and_from_str() {
+        for state in JobState::ALL {
+            let text = state.as_str();
+            assert_eq!(JobState::from_str(text).unwrap(), state, "{text}");
+            assert_eq!(state.to_string(), text);
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{text}\"")
+            );
+        }
+        assert_eq!("needs_input".parse::<JobState>().unwrap(), NeedsInput);
+        assert!("paused".parse::<JobState>().is_err());
+    }
+
+    #[test]
+    fn job_state_strings_match_docs_api_md() {
+        // docs/api.md, "JobView": one of `blocked`, `queued`, `leased`, `running`, `recovering`,
+        // `needs_input`, `done`, `failed`, `cancelled`.
+        let documented = [
+            "blocked",
+            "queued",
+            "leased",
+            "running",
+            "recovering",
+            "needs_input",
+            "done",
+            "failed",
+            "cancelled",
+        ];
+        let actual: Vec<&str> = JobState::ALL.iter().map(|state| state.as_str()).collect();
+        assert_eq!(actual, documented);
     }
 }

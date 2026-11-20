@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::graph::{self, Graph};
 use crate::sanitize::printable;
+use lu_proto::{HarnessState, JobState, ProviderState};
 
 /// One provider on a node, already reduced to text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,26 +233,30 @@ pub struct Sample {
 
 impl Sample {
     fn of(snapshot: &Snapshot) -> Self {
-        let count = |states: &[&str]| {
+        let count = |states: &[JobState]| {
             snapshot
                 .jobs
                 .iter()
-                .filter(|job| states.contains(&job.state.as_str()))
+                .filter(|job| {
+                    job.state
+                        .parse::<JobState>()
+                        .is_ok_and(|state| states.contains(&state))
+                })
                 .count() as u64
         };
         Self {
-            running: count(&["running", "leased"]),
-            queued: count(&["queued", "blocked", "recovering"]),
+            running: count(&[JobState::Running, JobState::Leased]),
+            queued: count(&[JobState::Queued, JobState::Blocked, JobState::Recovering]),
             busy_nodes: snapshot
                 .nodes
                 .iter()
-                .filter(|n| n.harness == "busy")
+                .filter(|n| n.harness.parse::<HarnessState>() == Ok(HarnessState::Busy))
                 .count() as u64,
             providers_ok: snapshot
                 .nodes
                 .iter()
                 .flat_map(|n| &n.providers)
-                .filter(|p| p.state == "ok")
+                .filter(|p| p.state.parse::<ProviderState>() == Ok(ProviderState::Ok))
                 .count() as u64,
         }
     }
@@ -397,7 +402,7 @@ impl Dashboard {
             return None;
         }
         let job = self.current().jobs.get(self.selection.job)?;
-        if job.state != "running" {
+        if job.state.parse::<JobState>() != Ok(JobState::Running) {
             return None;
         }
         let node = job.node.as_ref()?.clone();
@@ -751,23 +756,26 @@ fn clip(text: &str, width: usize) -> String {
 
 fn provider_text(cell: &ProviderCell) -> (String, Tone) {
     let name = printable(&cell.name);
-    match (cell.state.as_str(), cell.soonest_secs) {
-        ("ok", _) => (format!("{name} ok"), Tone::Good),
-        ("cooling", Some(secs)) => (format!("{name} cooling {}", short_age(secs)), Tone::Warn),
-        ("cooling", None) => (format!("{name} cooling"), Tone::Warn),
-        ("disabled", _) => (format!("{name} disabled"), Tone::Bad),
-        (other, _) => (format!("{name} {}", printable(other)), Tone::Dim),
+    match (cell.state.parse::<ProviderState>(), cell.soonest_secs) {
+        (Ok(ProviderState::Ok), _) => (format!("{name} ok"), Tone::Good),
+        (Ok(ProviderState::Cooling), Some(secs)) => {
+            (format!("{name} cooling {}", short_age(secs)), Tone::Warn)
+        }
+        (Ok(ProviderState::Cooling), None) => (format!("{name} cooling"), Tone::Warn),
+        (Ok(ProviderState::Disabled), _) => (format!("{name} disabled"), Tone::Bad),
+        (Ok(state), _) => (format!("{name} {}", state.as_str()), Tone::Dim),
+        (Err(_), _) => (format!("{name} {}", printable(&cell.state)), Tone::Dim),
     }
 }
 
 fn job_tone(state: &str) -> Tone {
-    match state {
-        "done" => Tone::Done,
-        "running" | "leased" => Tone::Good,
-        "blocked" => Tone::Blocked,
-        "queued" | "recovering" | "needs_input" => Tone::Warn,
-        "failed" => Tone::Bad,
-        _ => Tone::Dim,
+    match state.parse::<JobState>() {
+        Ok(JobState::Done) => Tone::Done,
+        Ok(JobState::Running | JobState::Leased) => Tone::Good,
+        Ok(JobState::Blocked) => Tone::Blocked,
+        Ok(JobState::Queued | JobState::Recovering | JobState::NeedsInput) => Tone::Warn,
+        Ok(JobState::Failed) => Tone::Bad,
+        Ok(JobState::Cancelled) | Err(_) => Tone::Dim,
     }
 }
 
@@ -1215,7 +1223,7 @@ impl ViewModel {
                 .iter()
                 .map(|job| graph::Job {
                     id: job.id.clone(),
-                    state: graph::State::from_name(&job.state),
+                    state: job.state.parse().unwrap_or(graph::State::Queued),
                     title: job.title.clone(),
                     after: job.after.clone(),
                 })

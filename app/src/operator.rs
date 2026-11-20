@@ -10,8 +10,8 @@ use lu_client::{
     ApiError, Client, JobView, ListRepos, LogPage, NodeStats, NodeView, RepoView, StatusView,
 };
 use lu_proto::{
-    printable, truncate_chars, ArtifactName, FailureClass, HarnessState, JobEdit, JobId, JobSpec,
-    JobState, NodeName, LABEL_SOURCE_PROBED, MAX_TASK_BYTES,
+    printable, truncate_chars, ArtifactName, CollectMode, FailureClass, HarnessState, JobEdit,
+    JobId, JobSpec, JobState, NodeName, LABEL_SOURCE_PROBED, MAX_TASK_BYTES,
 };
 use lu_tui::graph::{self, Graph};
 use lu_tui::model::Tone;
@@ -59,6 +59,12 @@ pub struct SubmitArgs {
     /// Do not apply dependency diffs to this job's tree.
     #[arg(long)]
     pub no_stack: bool,
+    /// Stage dependency artifacts under .lu/inputs: none, files, apply or both.
+    #[arg(long, value_name = "MODE")]
+    pub collect: Option<CollectMode>,
+    /// Treat failed and cancelled dependencies as inputs when they stored a diff.
+    #[arg(long)]
+    pub include_failed: bool,
     /// Expect an empty diff, so no `no changes` note is added when the job is done.
     #[arg(long)]
     pub allow_empty: bool,
@@ -105,6 +111,12 @@ pub struct RetryArgs {
     /// Only run after the job with this idempotency key (repeatable).
     #[arg(long = "after-key")]
     pub after_key: Vec<String>,
+    /// Stage dependency artifacts under .lu/inputs: none, files, apply or both.
+    #[arg(long, value_name = "MODE")]
+    pub collect: Option<CollectMode>,
+    /// Treat failed and cancelled dependencies as inputs when they stored a diff.
+    #[arg(long)]
+    pub include_failed: bool,
     /// Replace the label requirements (repeatable).
     #[arg(long = "require", conflicts_with = "no_require")]
     pub require: Vec<String>,
@@ -148,6 +160,12 @@ pub struct EditArgs {
     /// Replace the dependencies with jobs named by these idempotency keys (repeatable).
     #[arg(long = "after-key")]
     pub after_key: Vec<String>,
+    /// Replace the collect mode: none, files, apply or both.
+    #[arg(long, value_name = "MODE")]
+    pub collect: Option<CollectMode>,
+    /// Include failed and cancelled dependencies as inputs when they stored a diff.
+    #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+    pub include_failed: Option<bool>,
     /// Replace the label requirements (repeatable).
     #[arg(long = "require", conflicts_with = "no_require")]
     pub require: Vec<String>,
@@ -321,6 +339,8 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         idempotency_key: args.key,
         after,
         stack_dependencies: !args.no_stack,
+        collect: args.collect,
+        include_failed: args.include_failed,
         allow_empty: args.allow_empty,
         requires: args.require,
         tolerates: args.tolerate,
@@ -397,6 +417,12 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
     } else if args.no_fallbacks {
         spec.fallbacks.clear();
     }
+    if let Some(collect) = args.collect {
+        spec.collect = Some(collect);
+    }
+    if args.include_failed {
+        spec.include_failed = true;
+    }
     // A retry is a new job; only --key gives it an idempotency key.
     spec.idempotency_key = args.key;
     spec.validate().map_err(|error| error.to_string())?;
@@ -427,6 +453,8 @@ async fn edit_inner(args: EditArgs, config: &Path, json: bool) -> Result<ExitCod
         requires: (!args.require.is_empty() || args.no_require).then_some(args.require),
         tolerates: (!args.tolerate.is_empty() || args.no_tolerate).then_some(args.tolerate),
         after,
+        collect: args.collect,
+        include_failed: args.include_failed,
     };
     let (view, raw) = client
         .edit_with_raw(&args.id, &edit)
@@ -451,7 +479,7 @@ async fn submit_and_report(
         .await
         .map_err(|error| error.to_string())?;
 
-    for warning in &view.warnings {
+    for warning in view.warnings() {
         eprintln!("lu: warning: {warning}");
     }
 
@@ -821,7 +849,7 @@ async fn graph_inner(args: GraphArgs, config: &Path, json: bool) -> Result<ExitC
 pub(crate) fn graph_job(view: &JobView) -> graph::Job {
     graph::Job {
         id: view.id.to_string(),
-        state: graph::State::from_name(state_name(view.state)),
+        state: view.state,
         title: job_title(&view.spec.task),
         after: view.after.iter().map(ToString::to_string).collect(),
     }
@@ -835,7 +863,7 @@ fn print_graph_json(graph: &Graph) {
         .map(|node| {
             serde_json::json!({
                 "id": node.id,
-                "state": node.state.name(),
+                "state": node.state.as_str(),
                 "title": node.title,
                 "after": node.after,
             })
@@ -1466,22 +1494,15 @@ pub(crate) fn job_title(task: &str) -> String {
 }
 
 pub(crate) fn harness_name(value: Option<HarnessState>) -> String {
-    match value {
-        Some(HarnessState::Idle) => "idle".to_owned(),
-        Some(HarnessState::Busy) => "busy".to_owned(),
-        None => "-".to_owned(),
-    }
+    value
+        .map(|state| state.as_str().to_owned())
+        .unwrap_or_else(|| "-".to_owned())
 }
 
 pub(crate) fn failure_name(value: Option<FailureClass>) -> String {
-    match value {
-        Some(FailureClass::Node) => "node".to_owned(),
-        Some(FailureClass::Provider) => "provider".to_owned(),
-        Some(FailureClass::Execution) => "execution".to_owned(),
-        Some(FailureClass::Dependency) => "dependency".to_owned(),
-        Some(FailureClass::Conflict) => "conflict".to_owned(),
-        None => "-".to_owned(),
-    }
+    value
+        .map(|class| class.as_str().to_owned())
+        .unwrap_or_else(|| "-".to_owned())
 }
 
 /// The controller sends a small fixed set of notes; only display the one we understand.
@@ -1493,17 +1514,7 @@ pub(crate) fn outcome_text(note: Option<&str>) -> String {
 }
 
 pub(crate) fn state_name(state: JobState) -> &'static str {
-    match state {
-        JobState::Blocked => "blocked",
-        JobState::Queued => "queued",
-        JobState::Leased => "leased",
-        JobState::Running => "running",
-        JobState::Recovering => "recovering",
-        JobState::NeedsInput => "needs_input",
-        JobState::Done => "done",
-        JobState::Failed => "failed",
-        JobState::Cancelled => "cancelled",
-    }
+    state.as_str()
 }
 
 fn parse_job_id(value: &str) -> Result<JobId, String> {
@@ -1527,20 +1538,16 @@ fn parse_fallback(value: &str) -> Result<lu_proto::Choice, String> {
 }
 
 fn parse_state(value: &str) -> Result<JobState, String> {
-    match value.to_ascii_lowercase().replace('-', "_").as_str() {
-        "blocked" => Ok(JobState::Blocked),
-        "queued" => Ok(JobState::Queued),
-        "leased" => Ok(JobState::Leased),
-        "running" => Ok(JobState::Running),
-        "recovering" => Ok(JobState::Recovering),
-        "needs_input" => Ok(JobState::NeedsInput),
-        "done" => Ok(JobState::Done),
-        "failed" => Ok(JobState::Failed),
-        "cancelled" | "canceled" => Ok(JobState::Cancelled),
-        other => Err(format!(
-            "unknown job state {other:?}; expected blocked, queued, leased, running, recovering, needs_input, done, failed, or cancelled"
-        )),
+    let normalized = value.to_ascii_lowercase().replace('-', "_");
+    // CLI-only spelling; the controller's wire state is always `cancelled`.
+    if normalized == "canceled" {
+        return Ok(JobState::Cancelled);
     }
+    normalized.parse().map_err(|_| {
+        format!(
+            "unknown job state {normalized:?}; expected blocked, queued, leased, running, recovering, needs_input, done, failed, or cancelled"
+        )
+    })
 }
 
 fn parse_idle_timeout(value: &str) -> Result<u64, String> {
@@ -1606,5 +1613,119 @@ mod time_tests {
         assert_eq!(time(0), "-");
         assert_eq!(time(1_794_818_368), "2026-11-16 08:39:28Z");
         assert_eq!(time(951_782_400), "2000-02-29 00:00:00Z");
+    }
+}
+
+#[cfg(test)]
+mod collect_cli_tests {
+    use clap::Parser;
+    use lu_proto::CollectMode;
+
+    use super::{EditArgs, RetryArgs, SubmitArgs};
+
+    #[derive(Debug, Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: Command,
+    }
+
+    #[derive(Debug, clap::Subcommand)]
+    enum Command {
+        Submit(SubmitArgs),
+        Retry(RetryArgs),
+        Edit(EditArgs),
+    }
+
+    #[test]
+    fn submit_parses_collect_and_include_failed() {
+        let cli = Cli::try_parse_from([
+            "lu",
+            "submit",
+            "--repo",
+            "https://example.net/r.git",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+            "--collect",
+            "files",
+            "--include-failed",
+        ])
+        .unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit");
+        };
+        assert_eq!(args.collect, Some(CollectMode::Files));
+        assert!(args.include_failed);
+
+        let cli = Cli::try_parse_from([
+            "lu",
+            "submit",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+        ])
+        .unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit");
+        };
+        assert_eq!(args.collect, None);
+        assert!(!args.include_failed);
+    }
+
+    #[test]
+    fn retry_and_edit_parse_collect_and_include_failed() {
+        let id = lu_proto::JobId::new().to_string();
+        let cli =
+            Cli::try_parse_from(["lu", "retry", &id, "--collect", "patch", "--include-failed"])
+                .unwrap();
+        let Command::Retry(args) = cli.command else {
+            panic!("expected retry");
+        };
+        assert_eq!(args.collect, Some(CollectMode::Files));
+        assert!(args.include_failed);
+
+        let cli = Cli::try_parse_from([
+            "lu",
+            "edit",
+            &id,
+            "--collect",
+            "both",
+            "--include-failed",
+            "false",
+        ])
+        .unwrap();
+        let Command::Edit(args) = cli.command else {
+            panic!("expected edit");
+        };
+        assert_eq!(args.collect, Some(CollectMode::Both));
+        assert_eq!(args.include_failed, Some(false));
+
+        let cli = Cli::try_parse_from(["lu", "edit", &id, "--include-failed"]).unwrap();
+        let Command::Edit(args) = cli.command else {
+            panic!("expected edit");
+        };
+        assert_eq!(args.include_failed, Some(true));
+    }
+
+    #[test]
+    fn an_invalid_collect_mode_is_a_clap_error() {
+        let error = Cli::try_parse_from([
+            "lu",
+            "submit",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+            "--collect",
+            "nope",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("collect"), "{error}");
     }
 }
