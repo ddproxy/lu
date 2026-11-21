@@ -393,7 +393,7 @@ mod tests {
         assert!(replies[0]["result"]["serverInfo"]["version"].is_string());
         assert!(replies[0]["result"]["instructions"].is_string());
         assert_eq!(replies[1]["result"], json!({}));
-        assert_eq!(replies[2]["result"]["tools"].as_array().unwrap().len(), 14);
+        assert_eq!(replies[2]["result"]["tools"].as_array().unwrap().len(), 15);
         assert_eq!(replies[3]["result"]["protocolVersion"], "2025-06-18");
         for (reply, id) in replies.iter().zip([json!(1), json!(2), json!(3), json!(4)]) {
             assert_eq!(reply["id"], id);
@@ -463,7 +463,7 @@ mod tests {
         let lines = vec![request("tools/list", json!({}), json!(1))];
         let replies = exchange(&script(&initialize_then(&lines)), &host).await;
         let tools = replies[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 15);
         let mut names = Vec::new();
         for tool in tools {
             let name = tool["name"].as_str().unwrap();
@@ -481,7 +481,10 @@ mod tests {
                     | "lu_result"
             );
             assert_eq!(tool["annotations"]["readOnlyHint"], read_only, "{name}");
-            let destructive = matches!(name, "lu_cancel" | "lu_drain" | "lu_undrain");
+            let destructive = matches!(
+                name,
+                "lu_cancel" | "lu_drain" | "lu_undrain" | "lu_uncordon"
+            );
             assert_eq!(
                 tool["annotations"].get("destructiveHint"),
                 destructive.then_some(&json!(true)),
@@ -515,7 +518,8 @@ mod tests {
                 "lu_cancel",
                 "lu_retry",
                 "lu_drain",
-                "lu_undrain"
+                "lu_undrain",
+                "lu_uncordon"
             ]
         );
         let submit_many = tools
@@ -557,7 +561,16 @@ mod tests {
                 "timeout_secs",
                 "idle_timeout",
                 "idle_timeout_secs",
+                "on_stuck",
+                "stuck_after",
+                "stuck_after_secs",
                 "harness",
+                "expect_files",
+                "expect_changed",
+                "forbid_changed",
+                "min_diff_bytes",
+                "max_diff_bytes",
+                "expect_mode",
             ] {
                 assert!(props.get(key).is_some(), "{name} is missing {key}");
             }
@@ -565,6 +578,12 @@ mod tests {
             assert_eq!(props["fallbacks"]["maxItems"], 4);
             assert_eq!(props["after_keys"]["maxItems"], 16);
             assert_eq!(props["timeout"]["minimum"], 1);
+            assert_eq!(props["on_stuck"]["type"], "string");
+            for key in ["stuck_after", "stuck_after_secs"] {
+                assert_eq!(props[key]["type"], "integer", "{name}.{key}");
+                assert_eq!(props[key]["minimum"], 60, "{name}.{key}");
+                assert_eq!(props[key]["maximum"], 86400, "{name}.{key}");
+            }
             assert_eq!(props["timeout"]["maximum"], 86400);
             assert_eq!(props["idle_timeout"]["minimum"], 1);
             assert_eq!(props["idle_timeout"]["maximum"], 86400);
@@ -573,6 +592,10 @@ mod tests {
             assert_eq!(props["include_failed"]["type"], "boolean");
             assert_eq!(props["on_conflict"]["type"], "string");
             assert_eq!(props["harness"]["type"], "string");
+            assert_eq!(props["expect_files"]["maxItems"], 16);
+            assert_eq!(props["expect_changed"]["maxItems"], 16);
+            assert_eq!(props["forbid_changed"]["maxItems"], 16);
+            assert_eq!(props["expect_mode"]["type"], "string");
             if name == "lu_submit_many" || name == "lu_submit" {
                 assert_eq!(props["timeout_secs"]["default"], 3600);
             } else {
@@ -972,7 +995,16 @@ mod tests {
                     "timeout_secs": 999,
                     "idle_timeout": 60,
                     "idle_timeout_secs": 888,
-                    "harness": "claude"
+                    "on_stuck": "retry",
+                    "stuck_after": 240,
+                    "stuck_after_secs": 999,
+                    "harness": "claude",
+                    "expect_files": ["REVIEW.md"],
+                    "expect_changed": ["src/**"],
+                    "forbid_changed": ["Cargo.lock"],
+                    "min_diff_bytes": 1,
+                    "max_diff_bytes": 5242880,
+                    "expect_mode": "fail"
                 }),
             )
             .await,
@@ -994,7 +1026,20 @@ mod tests {
         assert_eq!(body["after"], json!([dependency]));
         assert_eq!(body["timeout_secs"], 120);
         assert_eq!(body["idle_timeout_secs"], 60);
+        assert_eq!(body["on_stuck"], "retry");
+        assert_eq!(body["stuck_after_secs"], 240);
         assert_eq!(body["harness"], "claude");
+        assert_eq!(
+            body["expect"],
+            json!({
+                "files": ["REVIEW.md"],
+                "changed": ["src/**"],
+                "forbid_changed": ["Cargo.lock"],
+                "min_diff_bytes": 1,
+                "max_diff_bytes": 5242880,
+                "mode": "fail"
+            })
+        );
         assert_eq!(structured["spec"]["requires"], body["requires"]);
         assert_eq!(
             structured["spec"]["fallbacks"],
@@ -1009,7 +1054,10 @@ mod tests {
         assert_eq!(structured["spec"]["on_conflict"], "markers");
         assert_eq!(structured["spec"]["timeout_secs"], 120);
         assert_eq!(structured["spec"]["idle_timeout_secs"], 60);
+        assert_eq!(structured["spec"]["on_stuck"], "retry");
+        assert_eq!(structured["spec"]["stuck_after_secs"], 240);
         assert_eq!(structured["spec"]["harness"], "claude");
+        assert_eq!(structured["spec"]["expect"], body["expect"]);
     }
 
     #[tokio::test]
@@ -1043,6 +1091,8 @@ mod tests {
         job["timeout_secs"] = json!(999);
         job["idle_timeout"] = json!(30);
         job["idle_timeout_secs"] = json!(888);
+        job["on_stuck"] = json!("cancel");
+        job["stuck_after_secs"] = json!(120);
         job["harness"] = json!("claude");
         let (text, structured, failed) =
             tool_result(&call_tool(&host, "lu_submit_many", json!({"jobs": [job]})).await);
@@ -1061,6 +1111,8 @@ mod tests {
         assert_eq!(body["after"], json!([dependency]));
         assert_eq!(body["timeout_secs"], 90);
         assert_eq!(body["idle_timeout_secs"], 30);
+        assert_eq!(body["on_stuck"], "cancel");
+        assert_eq!(body["stuck_after_secs"], 120);
         assert_eq!(body["harness"], "claude");
     }
 
@@ -1075,6 +1127,7 @@ mod tests {
             "requires": ["gpu"], "fallbacks": [{"provider": "copilot"}],
             "stack_dependencies": false, "collect": "files", "include_failed": false,
             "on_conflict": "skip", "timeout_secs": 500, "idle_timeout_secs": 250,
+            "on_stuck": "cancel", "stuck_after_secs": 300,
             "after": [dependency], "idempotency_key": "old-key"
         });
         let done_path = format!("/v1/jobs/{done}");
@@ -1107,6 +1160,8 @@ mod tests {
         assert_eq!(structured["spec"]["on_conflict"], "skip");
         assert_eq!(structured["spec"]["timeout_secs"], 500);
         assert_eq!(structured["spec"]["idle_timeout_secs"], 250);
+        assert_eq!(structured["spec"]["on_stuck"], "cancel");
+        assert_eq!(structured["spec"]["stuck_after_secs"], 300);
         assert_eq!(structured["spec"]["harness"], "opencode");
 
         let (text, structured, failed) = tool_result(
@@ -1124,6 +1179,8 @@ mod tests {
                     "after": [],
                     "timeout": 90,
                     "idle_timeout": 30,
+                    "on_stuck": "retry",
+                    "stuck_after": 600,
                     "harness": "claude"
                 }),
             )
@@ -1139,6 +1196,8 @@ mod tests {
         assert_eq!(structured["after"], json!([]));
         assert_eq!(structured["spec"]["timeout_secs"], 90);
         assert_eq!(structured["spec"]["idle_timeout_secs"], 30);
+        assert_eq!(structured["spec"]["on_stuck"], "retry");
+        assert_eq!(structured["spec"]["stuck_after_secs"], 600);
         assert_eq!(structured["spec"]["harness"], "claude");
         let bodies = post_bodies(&server);
         assert_eq!(bodies.len(), 2);
@@ -1234,6 +1293,31 @@ mod tests {
             ),
             (
                 "lu_submit",
+                json!({"expect_mode": "nope"}),
+                "invalid expect mode \"nope\"; expected one of suspect, fail",
+            ),
+            (
+                "lu_submit",
+                json!({"expect_files": ["../REVIEW.md"]}),
+                "expect: files: must not contain `..` components",
+            ),
+            (
+                "lu_submit",
+                json!({"expect_changed": ["src/***"]}),
+                "expect: changed: `***` is not a valid pattern",
+            ),
+            (
+                "lu_submit",
+                json!({"min_diff_bytes": 9, "max_diff_bytes": 1}),
+                "expect: min_diff_bytes 9 exceeds max_diff_bytes 1",
+            ),
+            (
+                "lu_submit",
+                json!({"on_stuck": "later"}),
+                "invalid stuck policy \"later\"; expected one of none, cancel, retry",
+            ),
+            (
+                "lu_submit",
                 json!({"after_keys": keys}),
                 "after: must name at most 16 jobs (got 17)",
             ),
@@ -1259,6 +1343,26 @@ mod tests {
                 "lu_retry",
                 json!({"id": done, "on_conflict": "nope"}),
                 "invalid on_conflict mode \"nope\"; expected one of fail, markers, skip",
+            ),
+            (
+                "lu_retry",
+                json!({"id": done, "on_stuck": "later"}),
+                "invalid stuck policy \"later\"; expected one of none, cancel, retry",
+            ),
+            (
+                "lu_submit",
+                json!({"stuck_after": 59}),
+                "stuck_after_secs: must be 60 to 86400 seconds (got 59)",
+            ),
+            (
+                "lu_submit",
+                json!({"stuck_after_secs": 86_401}),
+                "stuck_after_secs: must be 60 to 86400 seconds (got 86401)",
+            ),
+            (
+                "lu_retry",
+                json!({"id": done, "stuck_after": 59}),
+                "stuck_after_secs: must be 60 to 86400 seconds (got 59)",
             ),
         ];
         for (name, extra, expected) in cases.drain(..) {
@@ -1303,6 +1407,7 @@ mod tests {
                 .unwrap()
                 .contains(fragment));
         }
+
         assert_eq!(posts(&server), 0);
     }
 
@@ -1441,6 +1546,7 @@ mod tests {
                 Reply::json(&submitted_job(&spec, "queued"))
             }
             "/v1/nodes/node-a/drain" | "/v1/nodes/node-a/undrain" => Reply::json(&json!({})),
+            "/v1/nodes/node-a/uncordon" => Reply::json(&json!({"removed": ["zen"]})),
             _ => Reply::status(404),
         })
         .await;
@@ -1451,6 +1557,7 @@ mod tests {
             ("lu_retry", json!({"id": done})),
             ("lu_drain", json!({"node": "node-a"})),
             ("lu_undrain", json!({"node": "node-a"})),
+            ("lu_uncordon", json!({"node": "node-a", "provider": "zen"})),
         ] {
             let (text, structured, failed) = tool_result(&call_tool(&host, name, args).await);
             assert!(!failed, "{name}: {text}");
@@ -1502,6 +1609,11 @@ mod tests {
             assert!(failed, "{name}");
             assert!(text.contains("heartbeat"), "{name}: {text}");
         }
+
+        let (text, _, failed) =
+            tool_result(&call_tool(&host, "lu_uncordon", json!({"node": "node-missing"})).await);
+        assert!(failed);
+        assert!(text.contains("not found"), "{text}");
     }
 
     #[tokio::test]

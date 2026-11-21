@@ -29,6 +29,7 @@ At least one of `[controller]` and `[agent]` must be present. A file may contain
 | `agents` | no | `[]` | Array of `[[controller.agents]]` tables. With no agent entries, no agent token can authenticate. |
 | `operators` | no | `[]` | Array of `[[controller.operators]]` tables. With no operator entries, no operator token can authenticate. |
 | `repos` | no | `[]` | Array of `[[controller.repos]]` tables. A repository listed here is mirrored by the controller and jobs for its `url` are pinned to a resolved commit. A repository not listed behaves as before. |
+| `groups` | no | `[]` | Array of `[[controller.groups]]` tables. Each caps the number of concurrent jobs naming the same `--group`. Unnamed groups and jobs without a group are unlimited. |
 
 ### `[[controller.agents]]`
 
@@ -60,6 +61,15 @@ Each mirror is a bare repository at `<artifacts_dir>/../mirrors/<name>.git`; the
 
 A job submitted for a configured repository is pinned in `base_commit` to the commit its `git_ref` names. The controller syncs first when the mirror has never been synced, is older than 60 seconds, or does not know the ref. An unknown ref is `422 unprocessable` and names the ref. Jobs for repositories not in this list are unchanged.
 
+### `[[controller.groups]]`
+
+| Key | Required | Default | Validation |
+| --- | --- | --- | --- |
+| `name` | yes | — | 1 to 64 characters from `A-Z a-z 0-9 . _ -`; unique among groups. Matches a job's `--group` exactly. |
+| `max_running` | yes | — | Integer `1` to `64`. At most this many jobs in the group may be `leased`, `running`, `recovering` or `needs_input`. |
+
+The cap is applied inside the dispatch transaction, so concurrent polls cannot exceed it. A queued job waiting on a full group reports `group limit (<name> <running>/<max>)`. Metrics expose `lu_group_running{group}` and `lu_group_limit{group}` for each configured group.
+
 ## `[agent]`
 
 The `[agent]` table describes an agent host. Operator commands never read it: they use `LU_URL`/`LU_TOKEN_FILE` or an operator file.
@@ -78,6 +88,8 @@ The `[agent]` table describes an agent host. Operator commands never read it: th
 | `opencode_password_file` | no | — | A private file (a regular file owned by the agent's account, no group or other access) whose single line is the opencode server's password. The agent reads it at start and passes it to the harness as `OPENCODE_SERVER_PASSWORD`. |
 | `harness_wrapper` | no | `[]` | A command that wraps the harness, for example `["podman", "exec", "-i", "--workdir", "{cwd}", "--env", "OPENCODE_SERVER_PASSWORD", "opencode-agent"]`, so it runs inside a container. `{cwd}` becomes the job's working tree. Entries must be non-empty text without control characters. The wrapper runs directly, never through a shell. |
 | `heartbeat_secs` | no | `15` | Integer `2` to `300`. When a `[controller]` table is also present, `heartbeat_secs * 2` must be strictly less than `lease_secs`. |
+| `on_stuck` | no | `none` | One of `none`, `cancel`, `retry`. Default response for jobs whose spec omits `on_stuck`; `none` leaves stuck jobs running. |
+| `stuck_after_secs` | no | `1800` | Integer `60` to `86400`. Default continuous stuck interval for jobs whose spec omits `stuck_after_secs`. |
 | `reiki_health_url` | no | — | Loopback `http` or `https` URL with no credentials, query or fragment. Requires `reiki_token_file`. The agent reads the local Reiki's peer health (`GET /v1/health`) every 10 seconds and sends each upstream as a provider (`ok`, `cooling` with seconds left, `disabled` or `unknown`) with every heartbeat, plus the document itself. A job that names a `provider` goes only to nodes that report it. After three failed reads the node reports no providers. |
 | `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set, and rejected when set alone. Checked like `token_file` on `load`; the agent reads at most 4 KiB. |
 | `provider_models` | no | `[]` | Up to 64 `[[agent.provider_models]]` pairs, in preference order. Each provider is 1 to 64 characters from `A-Z a-z 0-9 . _ -`; each model is 1 to 128 bytes; provider names are unique. See below. |
@@ -86,6 +98,11 @@ The `[agent]` table describes an agent host. Operator commands never read it: th
 | `detect` | no | `[]` | Up to 16 `[[agent.detect]]` entries; labels must be valid and unique. See below. |
 | `taints` | no | `[]` | At most 8 taints. Each is a label with the same syntax as `labels`. A tainted node takes only jobs that tolerate every taint. Sent with every heartbeat and replaced on change. |
 | `housekeeping` | no | — | Optional `[agent.housekeeping]` table. Without it the agent removes nothing. |
+
+An explicit job spec field overrides both stuck defaults. Stuck uses the same output/CPU
+observation as `lu node`: both idle counters must exceed 300 seconds, and that observation must
+stay continuous for `stuck_after_secs` before the agent acts. See
+[operations.md](operations.md#stuck-jobs).
 
 Labels let one controller route work to particular hosts without a new job field for every
 machine property. For example:

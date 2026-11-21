@@ -3,12 +3,12 @@ use lu_auth::sha256_hex;
 use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator, ControllerRepo};
 use lu_controller::{build_router, run_background, AppState};
 use lu_proto::{
-    Choice, JobEdit, JobId, JobSpec, MAX_AFTER_JOBS, MAX_FALLBACKS, MAX_LOG_BYTES,
-    MAX_REQUIRES_LABELS, MAX_TOLERATES,
+    Choice, JobEdit, JobId, JobSpec, NodeName, StuckPolicy, MAX_AFTER_JOBS, MAX_FALLBACKS,
+    MAX_LOG_BYTES, MAX_REQUIRES_LABELS, MAX_TOLERATES,
 };
 use lu_serve::{serve, ServeOptions};
 use lu_store::sqlite::SqliteStore;
-use lu_store::Store;
+use lu_store::{CordonSource, Store};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -52,12 +52,14 @@ fn controller_cfg(db: &str, artifacts_dir: &str) -> ControllerConfig {
             token_sha256: sha256_hex(OP_TOKEN),
         }],
         repos: Vec::new(),
+        groups: Vec::new(),
     }
 }
 
 struct TestServer {
     addr: SocketAddr,
     shutdown: broadcast::Sender<()>,
+    state: Arc<AppState>,
     store: Arc<SqliteStore>,
     _handle: tokio::task::JoinHandle<()>,
     _bg: tokio::task::JoinHandle<()>,
@@ -112,7 +114,7 @@ async fn start_server_full(
     });
     let handle = tokio::spawn(serve(
         listener,
-        build_router(state),
+        build_router(Arc::clone(&state)),
         options,
         None,
         async move {
@@ -122,6 +124,7 @@ async fn start_server_full(
     TestServer {
         addr,
         shutdown: tx,
+        state,
         store,
         _handle: handle,
         _bg: bg,
@@ -194,7 +197,12 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),
+        on_stuck: None,
+        stuck_after_secs: None,
+        priority: lu_proto::DEFAULT_PRIORITY,
+        group: None,
         fallbacks: Vec::new(),
+        expect: None,
     }
 }
 
@@ -553,10 +561,15 @@ async fn post_edit_changes_a_queued_job_and_rejects_bad_states() {
             model: Some("m3".to_owned()),
         }]),
         requires: Some(vec!["gpu".to_owned()]),
+        on_stuck: None,
+        stuck_after_secs: None,
         tolerates: Some(vec!["homelab".to_owned()]),
         after: None,
+        priority: None,
+        group: None,
         collect: None,
         include_failed: None,
+        expect: None,
         on_conflict: Default::default(),
     };
     let r = edit_job(srv.addr, &id, &edit).await;
@@ -1081,6 +1094,51 @@ async fn no_changes_metric(srv: &TestServer) -> String {
         .to_owned()
 }
 
+async fn expect_failed_metric(srv: &TestServer) -> String {
+    let r = raw_request(srv.addr, &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    body_str(&r)
+        .lines()
+        .find(|line| line.starts_with("lu_jobs_expect_failed_total "))
+        .unwrap_or_else(|| panic!("missing counter: {}", body_str(&r)))
+        .to_owned()
+}
+
+async fn finish_with_expect_failure(srv: &TestServer) -> (String, String) {
+    let r = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let j: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = j["id"].as_str().unwrap().to_owned();
+
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let assign = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign")
+        .unwrap();
+    let epoch = assign["epoch"].as_u64().unwrap();
+
+    let start = json!({"epoch": epoch}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", start.len(), start);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let diff = "diff --git a/x.txt b/x.txt\n";
+    let req = format!("PUT /v1/agent/jobs/{id}/artifacts/diff.patch?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n{}", diff.len(), diff);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let comp =
+        json!({"job_id": id, "epoch": epoch, "outcome": "done", "expect_failed": true}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/complete HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", comp.len(), comp);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    (id, body_str(&r).to_owned())
+}
+
 #[tokio::test]
 async fn an_empty_diff_on_done_sets_the_note_and_counts_it() {
     let srv = start_server().await;
@@ -1109,6 +1167,27 @@ async fn allow_empty_suppresses_the_note_and_the_count() {
     assert_eq!(status(&r), 200, "{r}");
     let view: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
     assert!(view.get("outcome_note").is_none(), "{r}");
+    assert_eq!(no_changes_metric(&srv).await, "lu_jobs_no_changes_total 0");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn an_expectation_failure_sets_the_note_and_counts_it() {
+    let srv = start_server().await;
+    let (id, completed) = finish_with_expect_failure(&srv).await;
+    let view: serde_json::Value = serde_json::from_str(&completed).unwrap();
+    assert_eq!(view["state"], "done", "{completed}");
+    assert_eq!(view["outcome_note"], "expect_failed", "{completed}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let view: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(view["outcome_note"], "expect_failed", "{r}");
+    assert_eq!(
+        expect_failed_metric(&srv).await,
+        "lu_jobs_expect_failed_total 1"
+    );
     assert_eq!(no_changes_metric(&srv).await, "lu_jobs_no_changes_total 0");
 
     let _ = srv.shutdown.send(());
@@ -1768,6 +1847,130 @@ async fn drain_and_undrain_an_unknown_node_is_not_found() {
 }
 
 #[tokio::test]
+async fn uncordon_requires_operator_scope_and_a_known_node() {
+    let srv = start_server().await;
+    for auth in ["", &format!("Authorization: Bearer {AGENT_A_TOKEN}\r\n")] {
+        let r = raw_request(
+            srv.addr,
+            &format!("POST /v1/nodes/node-a/uncordon HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{auth}Content-Length: 0\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status(&r), 401, "{r}");
+    }
+    let r = raw_request(
+        srv.addr,
+        &format!("POST /v1/nodes/ghost/uncordon HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&r), 404, "{r}");
+    let jb: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(jb["error"], "not_found", "{r}");
+
+    let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    assert_eq!(status(&raw_request(srv.addr, &req).await), 204);
+    let r = raw_request(
+        srv.addr,
+        &format!("POST /v1/nodes/node-a/uncordon HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    let jb: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(jb["removed"], json!([]), "{r}");
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn node_views_expose_cordon_details_and_uncordon_clears_them() {
+    let srv = start_server().await;
+    let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    assert_eq!(status(&raw_request(srv.addr, &req).await), 204);
+    let node = NodeName::parse("node-a").unwrap();
+    srv.store
+        .set_cordon(
+            &node,
+            "p1",
+            CordonSource::Failure,
+            "Provider p1 failed: timeout",
+            1_700_000_000,
+            120_000,
+        )
+        .unwrap();
+    srv.store
+        .set_cordon(
+            &node,
+            "p2",
+            CordonSource::Reiki,
+            "Reiki cooldown for p2",
+            1_700_000_001,
+            120_000,
+        )
+        .unwrap();
+
+    let nodes = node_list(srv.addr).await;
+    let detail = &nodes[0]["cordon_details"];
+    assert_eq!(detail[0]["provider"], "p1");
+    assert_eq!(detail[0]["source"], "failure");
+    assert_eq!(detail[0]["reason"], "Provider p1 failed: timeout");
+    assert_eq!(detail[0]["set_at"], 1_700_000_000);
+    assert!(detail[0]["until"].as_i64().is_some());
+    assert_eq!(detail[1]["source"], "reiki");
+    assert_eq!(detail[1]["until"], serde_json::Value::Null);
+    assert_eq!(detail[1]["lifts_after_healthy_heartbeats"], 2);
+
+    let body = r#"{"provider":"p1"}"#;
+    let r = raw_request(
+        srv.addr,
+        &format!("POST /v1/nodes/node-a/uncordon HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    let jb: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(jb["removed"], json!(["p1"]), "{r}");
+    let nodes = node_list(srv.addr).await;
+    assert_eq!(nodes[0]["cordon_details"].as_array().unwrap().len(), 1);
+
+    let r = raw_request(
+        srv.addr,
+        &format!("POST /v1/nodes/node-a/uncordon HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    let jb: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(jb["removed"], json!(["p2"]), "{r}");
+    let nodes = node_list(srv.addr).await;
+    assert!(nodes[0]["cordon_details"].as_array().unwrap().is_empty());
+
+    let r = raw_request(
+        srv.addr,
+        &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    // Cordons were cleared, so the HELP line remains but no series is emitted.
+    let text = body_str(&r);
+    assert!(text.contains("lu_node_cordon_seconds_remaining"), "{text}");
+    let _ = srv.shutdown.send(());
+}
+
+async fn node_list(addr: SocketAddr) -> serde_json::Value {
+    let r = raw_request(
+        addr,
+        &format!("GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()
+}
+
+#[tokio::test]
 async fn status_requires_operator_token_and_reports_counts() {
     let srv = start_server().await;
     let r = raw_request(
@@ -1965,6 +2168,34 @@ async fn metrics_series_after_job_lifecycle() {
         "{b}"
     );
 
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn stuck_stopped_metric_counts_cancel_and_retry() {
+    let srv = start_server().await;
+    assert_eq!(srv.state.stuck_stopped_total(StuckPolicy::Cancel), 0);
+    assert_eq!(srv.state.stuck_stopped_total(StuckPolicy::Retry), 0);
+    srv.state.count_stuck_stopped(Some(StuckPolicy::Cancel));
+    srv.state.count_stuck_stopped(Some(StuckPolicy::Retry));
+    srv.state.count_stuck_stopped(Some(StuckPolicy::Retry));
+    srv.state.count_stuck_stopped(Some(StuckPolicy::None));
+
+    let r = raw_request(srv.addr, &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let b = body_str(&r);
+    assert!(
+        b.contains("# HELP lu_jobs_stuck_stopped_total Jobs stopped by the agent's stuck policy"),
+        "{b}"
+    );
+    assert!(
+        b.contains("lu_jobs_stuck_stopped_total{mode=\"cancel\"} 1"),
+        "{b}"
+    );
+    assert!(
+        b.contains("lu_jobs_stuck_stopped_total{mode=\"retry\"} 2"),
+        "{b}"
+    );
     let _ = srv.shutdown.send(());
 }
 

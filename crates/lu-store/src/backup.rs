@@ -449,7 +449,12 @@ mod tests {
             allow_empty: false,
             requires: Vec::new(),
             tolerates: Vec::new(),
+            on_stuck: None,
+            stuck_after_secs: None,
+            priority: lu_proto::DEFAULT_PRIORITY,
+            group: None,
             fallbacks: Vec::new(),
+            expect: None,
         }
     }
 

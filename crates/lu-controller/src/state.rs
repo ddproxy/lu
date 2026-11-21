@@ -4,7 +4,7 @@ use crate::repo::{LocalPathProvider, RepoProvider};
 use crate::wait::Waiters;
 use lu_auth::{LoginThrottle, ThrottleSettings};
 use lu_config::ControllerConfig;
-use lu_proto::{NodeName, NodeStats};
+use lu_proto::{NodeName, NodeStats, StuckPolicy};
 use lu_staging::ArtifactDir;
 use lu_store::Store;
 use std::collections::HashMap;
@@ -21,6 +21,11 @@ pub struct AppState {
     pub recovered_on_boot: AtomicU64,
     /// Jobs completed `done` with an empty diff and no `allow_empty` opt-out.
     pub no_changes_total: AtomicU64,
+    /// Jobs the agent stopped because they were stuck, since this controller process started.
+    pub stuck_stopped_cancel_total: AtomicU64,
+    pub stuck_stopped_retry_total: AtomicU64,
+    /// Jobs completed `done` with unmet expectations in suspect mode.
+    pub expect_failed_total: AtomicU64,
     pub auth: AuthConfig,
     pub throttle: LoginThrottle,
     pub waiters: Arc<Waiters>,
@@ -39,6 +44,8 @@ pub struct AppState {
     pub lease_ms: u64,
     pub recovery_grace_ms: u64,
     pub cordon_ms: u64,
+    /// Configured group caps, also installed in the store so dispatch enforces them atomically.
+    pub group_limits: HashMap<String, usize>,
 }
 
 impl AppState {
@@ -70,12 +77,23 @@ impl AppState {
         let mirror = Arc::new(Mirror::from_config(cfg)?);
         // A mirrored repository serves its pinned base from the mirror, after any local path root.
         repo_providers.push(mirror.clone());
+        let group_limits: HashMap<String, usize> = cfg
+            .groups
+            .iter()
+            .map(|group| (group.name.clone(), group.max_running))
+            .collect();
+        store
+            .set_group_limits(group_limits.clone())
+            .map_err(|e| format!("cannot install group limits: {e:?}"))?;
         Ok(Self {
             store,
             db_path: PathBuf::from(&cfg.db),
             started: Instant::now(),
             recovered_on_boot: AtomicU64::new(0),
             no_changes_total: AtomicU64::new(0),
+            expect_failed_total: AtomicU64::new(0),
+            stuck_stopped_cancel_total: AtomicU64::new(0),
+            stuck_stopped_retry_total: AtomicU64::new(0),
             auth,
             throttle,
             waiters: Arc::new(Waiters::new()),
@@ -91,6 +109,7 @@ impl AppState {
             lease_ms: lease_secs.saturating_mul(1000),
             recovery_grace_ms: cfg.recovery_grace_secs.saturating_mul(1000),
             cordon_ms: cfg.provider_cooldown_secs.saturating_mul(1000),
+            group_limits,
         })
     }
 
@@ -112,5 +131,38 @@ impl AppState {
 
     pub fn no_changes_total(&self) -> u64 {
         self.no_changes_total.load(Ordering::Relaxed)
+    }
+
+    pub fn count_expect_failed(&self) {
+        self.expect_failed_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn expect_failed_total(&self) -> u64 {
+        self.expect_failed_total.load(Ordering::Relaxed)
+    }
+
+    pub fn count_stuck_stopped(&self, mode: Option<StuckPolicy>) {
+        let Some(mode) = mode else {
+            return;
+        };
+        match mode {
+            StuckPolicy::Cancel => {
+                self.stuck_stopped_cancel_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            StuckPolicy::Retry => {
+                self.stuck_stopped_retry_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            StuckPolicy::None => {}
+        }
+    }
+
+    pub fn stuck_stopped_total(&self, mode: StuckPolicy) -> u64 {
+        match mode {
+            StuckPolicy::Cancel => self.stuck_stopped_cancel_total.load(Ordering::Relaxed),
+            StuckPolicy::Retry => self.stuck_stopped_retry_total.load(Ordering::Relaxed),
+            StuckPolicy::None => 0,
+        }
     }
 }

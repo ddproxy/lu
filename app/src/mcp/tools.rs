@@ -4,9 +4,11 @@ use std::collections::{HashSet, VecDeque};
 
 use lu_client::{ApiError, Client, JobView, ListNodes, NodeStats, NodeView};
 use lu_proto::{
-    truncate_chars, ArtifactName, Choice, CollectMode, HarnessState, JobId, JobSpec, JobState,
-    NodeName, OnConflict, DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_FALLBACKS,
-    MAX_IDLE_TIMEOUT_SECS, MAX_REQUIRES_LABELS, MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
+    truncate_chars, ArtifactName, Choice, CollectMode, ExpectMode, ExpectSpec, HarnessState, JobId,
+    JobSpec, JobState, NodeName, OnConflict, StuckPolicy, DEFAULT_PRIORITY, DEFAULT_TIMEOUT_SECS,
+    MAX_AFTER_JOBS, MAX_DIFF_BYTES, MAX_EXPECT_ITEMS, MAX_FALLBACKS, MAX_IDLE_TIMEOUT_SECS,
+    MAX_PRIORITY, MAX_REQUIRES_LABELS, MAX_STUCK_AFTER_SECS, MAX_TIMEOUT_SECS, MIN_PRIORITY,
+    MIN_STUCK_AFTER_SECS, MIN_TIMEOUT_SECS,
 };
 use lu_tui::graph::{self, Graph};
 use serde_json::{json, Map, Value};
@@ -219,6 +221,25 @@ const fn idle_timeout_field(key: &'static str) -> Field {
     ))
 }
 
+const fn stuck_after_field(key: &'static str) -> Field {
+    spec_bounds(limited(
+        optional(
+            key,
+            "integer",
+            "Seconds continuously stuck before acting; absent uses the agent default",
+        ),
+        MIN_STUCK_AFTER_SECS as i64,
+        MAX_STUCK_AFTER_SECS as i64,
+    ))
+}
+
+const ON_STUCK_FIELD: Field = optional(
+    "on_stuck",
+    "string",
+    "Action when continuously stuck: none, cancel or retry; absent uses the agent default",
+);
+const STUCK_AFTER_SECS_FIELD: Field = stuck_after_field("stuck_after_secs");
+const STUCK_AFTER_FIELD: Field = stuck_after_field("stuck_after");
 const TIMEOUT_SECS_FIELD: Field = timeout_field("timeout_secs", true);
 const TIMEOUT_FIELD: Field = timeout_field("timeout", false);
 const RETRY_TIMEOUT_SECS_FIELD: Field = timeout_field("timeout_secs", false);
@@ -245,7 +266,78 @@ const ON_CONFLICT_FIELD: Field = optional(
     "string",
     "Handle input patches that do not apply: fail, markers or skip; defaults to fail",
 );
+const EXPECT_FILES_FIELD: Field = spec_bounds(array(
+    "expect_files",
+    "Relative working-tree paths that must exist after the run, at most 16",
+    &STRING_ITEM,
+    false,
+    0,
+    MAX_EXPECT_ITEMS as i64,
+));
+const EXPECT_CHANGED_FIELD: Field = spec_bounds(array(
+    "expect_changed",
+    "Globs that at least one changed path must match, at most 16",
+    &STRING_ITEM,
+    false,
+    0,
+    MAX_EXPECT_ITEMS as i64,
+));
+const FORBID_CHANGED_FIELD: Field = spec_bounds(array(
+    "forbid_changed",
+    "Globs that no changed path may match, at most 16",
+    &STRING_ITEM,
+    false,
+    0,
+    MAX_EXPECT_ITEMS as i64,
+));
+const MIN_DIFF_BYTES_FIELD: Field = limited(
+    optional(
+        "min_diff_bytes",
+        "integer",
+        "Minimum exported diff size in bytes",
+    ),
+    0,
+    MAX_DIFF_BYTES as i64,
+);
+const MAX_DIFF_BYTES_FIELD: Field = limited(
+    optional(
+        "max_diff_bytes",
+        "integer",
+        "Maximum exported diff size in bytes",
+    ),
+    0,
+    MAX_DIFF_BYTES as i64,
+);
+const EXPECT_MODE_FIELD: Field = optional(
+    "expect_mode",
+    "string",
+    "Unmet expectations: suspect adds an outcome note, fail fails the run",
+);
 const HARNESS_FIELD: Field = optional("harness", "string", "Harness name");
+const PRIORITY_FIELD: Field = bounded(
+    optional(
+        "priority",
+        "integer",
+        "Dispatch priority, 0 (lowest) to 9 (highest); defaults to 5",
+    ),
+    MIN_PRIORITY as i64,
+    MAX_PRIORITY as i64,
+    DEFAULT_PRIORITY as i64,
+);
+const RETRY_PRIORITY_FIELD: Field = limited(
+    optional(
+        "priority",
+        "integer",
+        "Replace the dispatch priority, 0 (lowest) to 9 (highest)",
+    ),
+    MIN_PRIORITY as i64,
+    MAX_PRIORITY as i64,
+);
+const GROUP_FIELD: Field = optional(
+    "group",
+    "string",
+    "Concurrency group name, 1-64 chars from A-Z a-z 0-9 . _ -",
+);
 const REQUIRE_FIELD: Field = spec_bounds(array(
     "require",
     "Node labels required by this job, at most 8",
@@ -283,11 +375,22 @@ static JOB_FIELDS: &[Field] = &[
     NO_STACK_FIELD,
     COLLECT_FIELD,
     INCLUDE_FAILED_FIELD,
+    PRIORITY_FIELD,
+    GROUP_FIELD,
+    EXPECT_FILES_FIELD,
+    EXPECT_CHANGED_FIELD,
+    FORBID_CHANGED_FIELD,
+    MIN_DIFF_BYTES_FIELD,
+    MAX_DIFF_BYTES_FIELD,
+    EXPECT_MODE_FIELD,
     ON_CONFLICT_FIELD,
     TIMEOUT_SECS_FIELD,
     TIMEOUT_FIELD,
     IDLE_TIMEOUT_SECS_FIELD,
     IDLE_TIMEOUT_FIELD,
+    ON_STUCK_FIELD,
+    STUCK_AFTER_SECS_FIELD,
+    STUCK_AFTER_FIELD,
     HARNESS_FIELD,
     optional(
         "key",
@@ -388,12 +491,20 @@ const TOOLS: &[ToolDef] = &[
             required("repo", "string", "Repository URL or absolute local path"),
             required("ref", "string", "Git ref to check out"),
             required("task", "string", "Task text, never a path"),
+            PRIORITY_FIELD,
+            GROUP_FIELD,
             optional("provider", "string", "Provider name"),
             optional("model", "string", "Model name"),
             REQUIRE_FIELD,
             FALLBACKS_FIELD,
             NO_STACK_FIELD,
             COLLECT_FIELD,
+            EXPECT_FILES_FIELD,
+            EXPECT_CHANGED_FIELD,
+            FORBID_CHANGED_FIELD,
+            MIN_DIFF_BYTES_FIELD,
+            MAX_DIFF_BYTES_FIELD,
+            EXPECT_MODE_FIELD,
             INCLUDE_FAILED_FIELD,
             ON_CONFLICT_FIELD,
             AFTER_FIELD,
@@ -402,6 +513,9 @@ const TOOLS: &[ToolDef] = &[
             TIMEOUT_FIELD,
             IDLE_TIMEOUT_SECS_FIELD,
             IDLE_TIMEOUT_FIELD,
+            ON_STUCK_FIELD,
+            STUCK_AFTER_SECS_FIELD,
+            STUCK_AFTER_FIELD,
             HARNESS_FIELD,
             optional(
                 "key",
@@ -468,8 +582,16 @@ const TOOLS: &[ToolDef] = &[
             REQUIRE_FIELD,
             FALLBACKS_FIELD,
             NO_STACK_FIELD,
+            EXPECT_FILES_FIELD,
+            EXPECT_CHANGED_FIELD,
+            FORBID_CHANGED_FIELD,
+            MIN_DIFF_BYTES_FIELD,
+            MAX_DIFF_BYTES_FIELD,
+            EXPECT_MODE_FIELD,
             COLLECT_FIELD,
             INCLUDE_FAILED_FIELD,
+            RETRY_PRIORITY_FIELD,
+            GROUP_FIELD,
             ON_CONFLICT_FIELD,
             AFTER_FIELD,
             AFTER_KEYS_FIELD,
@@ -477,6 +599,9 @@ const TOOLS: &[ToolDef] = &[
             RETRY_TIMEOUT_FIELD,
             IDLE_TIMEOUT_SECS_FIELD,
             IDLE_TIMEOUT_FIELD,
+            ON_STUCK_FIELD,
+            STUCK_AFTER_SECS_FIELD,
+            STUCK_AFTER_FIELD,
             HARNESS_FIELD,
             optional("key", "string", "Idempotency key for the new job"),
         ],
@@ -494,6 +619,16 @@ const TOOLS: &[ToolDef] = &[
         name: "lu_undrain",
         description: "Allow a drained node to take jobs again.",
         fields: &[NODE_FIELD],
+        read_only: false,
+        destructive: true,
+    },
+    ToolDef {
+        name: "lu_uncordon",
+        description: "Clear provider cordons on a node, or one provider's cordon when named.",
+        fields: &[
+            NODE_FIELD,
+            optional("provider", "string", "Provider to clear; omit to clear all"),
+        ],
         read_only: false,
         destructive: true,
     },
@@ -710,6 +845,7 @@ pub async fn call(host: &Host, name: &str, args: &Value) -> Result<ToolOutput, T
         "lu_retry" => retry(host, &args).await?,
         "lu_drain" => drain(host, &args, true).await?,
         "lu_undrain" => drain(host, &args, false).await?,
+        "lu_uncordon" => uncordon(host, &args).await?,
         _ => unreachable!("tool table and dispatch agree"),
     };
     Ok(cap_result(output))
@@ -812,6 +948,32 @@ fn spec_idle_timeout(args: &Value) -> Option<u64> {
         .map(|secs| u64::try_from(secs).unwrap_or(0))
 }
 
+/// Out-of-range numbers become the largest `u8`, so `JobSpec::validate` reports a `priority` error.
+fn spec_priority(args: &Value) -> u8 {
+    args.get("priority")
+        .and_then(Value::as_i64)
+        .map(|value| u8::try_from(value).unwrap_or(u8::MAX))
+        .unwrap_or(DEFAULT_PRIORITY)
+}
+
+/// The CLI spelling wins when both names are present. Range checks come from `JobSpec::validate`.
+fn spec_stuck_after(args: &Value) -> Option<u64> {
+    args.get("stuck_after")
+        .or_else(|| args.get("stuck_after_secs"))
+        .and_then(Value::as_i64)
+        .map(|secs| u64::try_from(secs).unwrap_or(0))
+}
+
+/// `on_stuck` is parsed by `lu-proto`, so the CLI and MCP accept exactly the same spellings.
+fn spec_stuck_policy(args: &Value) -> Result<Option<StuckPolicy>, ToolError> {
+    args.get("on_stuck")
+        .map(|value| {
+            StuckPolicy::parse(value.as_str().unwrap_or_default())
+                .map_err(|error| ToolError::Failed(error.to_string()))
+        })
+        .transpose()
+}
+
 /// `collect` is parsed by `lu-proto`, so the CLI and MCP accept exactly the same spellings.
 fn spec_collect(args: &Value) -> Result<Option<CollectMode>, ToolError> {
     args.get("collect")
@@ -829,6 +991,36 @@ fn spec_on_conflict(args: &Value) -> Result<OnConflict, ToolError> {
             .map_err(|error| ToolError::Failed(error.to_string())),
         None => Ok(OnConflict::Fail),
     }
+}
+
+fn spec_expect(args: &Value) -> Result<Option<ExpectSpec>, ToolError> {
+    let keys = [
+        "expect_files",
+        "expect_changed",
+        "forbid_changed",
+        "min_diff_bytes",
+        "max_diff_bytes",
+        "expect_mode",
+    ];
+    if keys.iter().all(|key| args.get(*key).is_none()) {
+        return Ok(None);
+    }
+    let mode = args
+        .get("expect_mode")
+        .map(|value| {
+            ExpectMode::parse(value.as_str().unwrap_or_default())
+                .map_err(|error| ToolError::Failed(error.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Some(ExpectSpec {
+        files: field_strings(args, "expect_files"),
+        changed: field_strings(args, "expect_changed"),
+        forbid_changed: field_strings(args, "forbid_changed"),
+        min_diff_bytes: args.get("min_diff_bytes").and_then(Value::as_u64),
+        max_diff_bytes: args.get("max_diff_bytes").and_then(Value::as_u64),
+        mode,
+    }))
 }
 
 fn spec_fallbacks(args: &Value) -> Vec<Choice> {
@@ -860,8 +1052,12 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
         harness: optional_string(args, "harness").unwrap_or_else(|| "opencode".to_owned()),
         provider: optional_string(args, "provider"),
         model: optional_string(args, "model"),
+        priority: spec_priority(args),
+        group: optional_string(args, "group"),
         timeout_secs: spec_timeout(args).unwrap_or(DEFAULT_TIMEOUT_SECS),
         idle_timeout_secs: spec_idle_timeout(args),
+        on_stuck: spec_stuck_policy(args)?,
+        stuck_after_secs: spec_stuck_after(args),
         idempotency_key: optional_string(args, "key"),
         after,
         stack_dependencies: !args
@@ -878,6 +1074,7 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
         requires: field_strings(args, "require"),
         tolerates: Vec::new(),
         fallbacks: spec_fallbacks(args),
+        expect: spec_expect(args)?,
     };
     validate_spec(&spec)?;
     Ok(spec)
@@ -932,11 +1129,13 @@ fn submit_output(view: &JobView) -> ToolOutput {
         .map(|id| clean(id.as_str()))
         .collect::<Vec<_>>();
     let text = format!(
-        "id={} state={} attempt={} node={} repo={} ref={} title={}\nafter={} waiting_on={}\ngraph: {}",
+        "id={} state={} attempt={} node={} priority={} group={} repo={} ref={} title={}\nafter={} waiting_on={}\ngraph: {}",
         clean(view.id.as_str()),
         state,
         view.attempt,
         node.as_deref().unwrap_or("-"),
+        view.spec.priority,
+        view.spec.group.as_deref().map(clean).unwrap_or_else(|| "-".to_owned()),
         clean(&view.spec.repo),
         clean(&view.spec.git_ref),
         title,
@@ -968,9 +1167,21 @@ fn submit_output(view: &JobView) -> ToolOutput {
                 "stack_dependencies": view.spec.stack_dependencies,
                 "collect": view.spec.collect.map(|mode| mode.as_str()),
                 "include_failed": view.spec.include_failed,
+                "priority": view.spec.priority,
+                "group": view.spec.group.as_deref().map(clean),
+                "expect": view.spec.expect.as_ref().map(|expect| json!({
+                    "files": expect.files.iter().map(|p| clean(p)).collect::<Vec<_>>(),
+                    "changed": expect.changed.iter().map(|p| clean(p)).collect::<Vec<_>>(),
+                    "forbid_changed": expect.forbid_changed.iter().map(|p| clean(p)).collect::<Vec<_>>(),
+                    "min_diff_bytes": expect.min_diff_bytes,
+                    "max_diff_bytes": expect.max_diff_bytes,
+                    "mode": expect.mode.as_str()
+                })),
                 "on_conflict": view.spec.on_conflict.as_str(),
                 "timeout_secs": view.spec.timeout_secs,
                 "idle_timeout_secs": view.spec.idle_timeout_secs,
+                "on_stuck": view.spec.on_stuck.map(|policy| policy.as_str()),
+                "stuck_after_secs": view.spec.stuck_after_secs,
                 "idempotency_key": view.spec.idempotency_key.as_deref().map(clean)
             },
             "after": after,
@@ -1345,6 +1556,34 @@ async fn retry(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     if args.get("on_conflict").is_some() {
         spec.on_conflict = spec_on_conflict(args)?;
     }
+    if spec_expect(args)?.is_some() {
+        let mut next = spec.expect.clone().unwrap_or_default();
+        if args.get("expect_files").is_some() {
+            next.files = field_strings(args, "expect_files");
+        }
+        if args.get("expect_changed").is_some() {
+            next.changed = field_strings(args, "expect_changed");
+        }
+        if args.get("forbid_changed").is_some() {
+            next.forbid_changed = field_strings(args, "forbid_changed");
+        }
+        if args.get("min_diff_bytes").is_some() {
+            next.min_diff_bytes = args.get("min_diff_bytes").and_then(Value::as_u64);
+        }
+        if args.get("max_diff_bytes").is_some() {
+            next.max_diff_bytes = args.get("max_diff_bytes").and_then(Value::as_u64);
+        }
+        if args.get("expect_mode").is_some() {
+            next.mode = spec_expect(args)?.unwrap_or_default().mode;
+        }
+        spec.expect = Some(next);
+    }
+    if args.get("priority").is_some() {
+        spec.priority = spec_priority(args);
+    }
+    if let Some(group) = optional_string(args, "group") {
+        spec.group = Some(group);
+    }
     if args.get("after").is_some() || args.get("after_keys").is_some() {
         let ids = parse_ids(&field_strings(args, "after"))?;
         spec.after = resolve_after(client, &ids, &field_strings(args, "after_keys")).await?;
@@ -1354,6 +1593,12 @@ async fn retry(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     }
     if args.get("idle_timeout").is_some() || args.get("idle_timeout_secs").is_some() {
         spec.idle_timeout_secs = spec_idle_timeout(args);
+    }
+    if let Some(policy) = spec_stuck_policy(args)? {
+        spec.on_stuck = Some(policy);
+    }
+    if args.get("stuck_after").is_some() || args.get("stuck_after_secs").is_some() {
+        spec.stuck_after_secs = spec_stuck_after(args);
     }
     if let Some(harness) = optional_string(args, "harness") {
         spec.harness = harness;
@@ -1386,6 +1631,36 @@ async fn drain(host: &Host, args: &Value, drain: bool) -> Result<ToolOutput, Too
             "name": clean(view.name.as_str()),
             "draining": view.draining,
             "action": action
+        }),
+    })
+}
+
+async fn uncordon(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
+    let text = args["node"].as_str().unwrap_or_default();
+    let node = NodeName::parse(text)
+        .map_err(|error| ToolError::Failed(format!("bad node name: {error}")))?;
+    let provider = args["provider"].as_str().filter(|p| !p.is_empty());
+    let removed = match connected(host)?.uncordon(&node, provider).await {
+        Ok(removed) => removed,
+        Err(ApiError::NotFound) => {
+            return Err(ToolError::Failed(format!(
+                "node {:?} not found",
+                clean(node.as_str())
+            )));
+        }
+        Err(error) => return Err(failure(error)),
+    };
+    let shown = removed.iter().map(|p| clean(p)).collect::<Vec<_>>();
+    Ok(ToolOutput {
+        text: if shown.is_empty() {
+            format!("{} has no cordons", clean(node.as_str()))
+        } else {
+            format!("{} uncordoned: {}", clean(node.as_str()), shown.join(", "))
+        },
+        structured: json!({
+            "node": clean(node.as_str()),
+            "provider": provider.map(clean),
+            "removed": shown
         }),
     })
 }
@@ -1560,6 +1835,8 @@ async fn job(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
                 "model": view.spec.model.as_deref().map(clean),
                 "timeout_secs": view.spec.timeout_secs,
                 "idle_timeout_secs": view.spec.idle_timeout_secs,
+                "on_stuck": view.spec.on_stuck.map(|policy| policy.as_str()),
+                "stuck_after_secs": view.spec.stuck_after_secs,
                 "task": task
             },
             "summary": summary,
@@ -1666,6 +1943,26 @@ fn provider_rows(node: &NodeView) -> Vec<Value> {
         .collect()
 }
 
+fn cordon_detail_rows(item: Option<&Value>) -> Vec<Value> {
+    item.and_then(|item| item["cordon_details"].as_array())
+        .map(|details| {
+            details
+                .iter()
+                .map(|detail| {
+                    json!({
+                        "provider": clean(detail["provider"].as_str().unwrap_or("")),
+                        "source": clean(detail["source"].as_str().unwrap_or("")),
+                        "reason": clean(detail["reason"].as_str().unwrap_or("")),
+                        "set_at": detail["set_at"].as_i64(),
+                        "until": detail["until"].as_i64(),
+                        "lifts_after_healthy_heartbeats": detail["lifts_after_healthy_heartbeats"].as_u64()
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn nodes(host: &Host) -> Result<ToolOutput, ToolError> {
     let client = connected(host)?;
     let raw = client.nodes_raw().await.map_err(failure)?;
@@ -1693,6 +1990,7 @@ async fn nodes(host: &Host) -> Result<ToolOutput, ToolError> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let cordon_details = cordon_detail_rows(item);
         let stats = client
             .node_stats_raw(&node.name)
             .await
@@ -1723,7 +2021,8 @@ async fn nodes(host: &Host) -> Result<ToolOutput, ToolError> {
             "disk_total_bytes": disk_total,
             "disk_free_percent": disk_percent,
             "stuck": node.stuck,
-            "cordons": cordons
+            "cordons": cordons,
+            "cordon_details": cordon_details
         });
         lines.push(format!(
             "{} {} age={}s version={} labels={} disk_free={}/{} ({}%) providers={} load1={} mem={}/{} stuck={} cordons={}",
@@ -1780,6 +2079,7 @@ async fn node(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let cordon_details = cordon_detail_rows(item);
 
     let stats_raw = client.node_stats_raw(&name).await.map_err(failure)?;
     let stats = parse_node_stats(&stats_raw)?;
@@ -1811,7 +2111,8 @@ async fn node(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
         "disk_free_percent": disk_percent,
         "running_jobs": stats.jobs.len(),
         "stuck": view.stuck,
-        "cordons": cordons
+        "cordons": cordons,
+        "cordon_details": cordon_details
     });
     let mut structured = row.clone();
     structured
@@ -1852,7 +2153,7 @@ async fn graph(host: &Host) -> Result<ToolOutput, ToolError> {
         .map(crate::operator::graph_job)
         .collect::<Vec<_>>();
     let graph = Graph::build(&jobs);
-    let text = graph::render(&graph, 120)
+    let text = graph::render(&graph, 120, true)
         .iter()
         .map(|line| clean(&line.text()))
         .collect::<Vec<_>>()

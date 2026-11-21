@@ -4,22 +4,24 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lu_client::{ApiError, Controller, DependencyView, PollRequest};
 use lu_config::BaseSource;
 use lu_proto::{
-    AgentEvent, ArtifactName, Completion, FailureClass, HarnessState, JobId, JobSpec, JobState,
-    LogChunk, NodeName, OnConflict, Outcome, HARNESS_OK_FALSE, MAX_LOG_BYTES,
+    AgentEvent, ArtifactName, Completion, ExpectMode, ExpectSpec, FailureClass, HarnessState,
+    JobId, JobSpec, JobState, LogChunk, NodeName, OnConflict, Outcome, StuckPolicy,
+    HARNESS_OK_FALSE, MAX_LOG_BYTES,
 };
-use lu_staging::Staging;
+use lu_staging::{ExportedDiff, Staging};
 use lu_supervise::CommandSpec;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use super::{Agent, AgentError};
+use super::{evaluate_expect, Agent, AgentError};
 
 const TEST_HEARTBEAT_SECS: u64 = 5;
 const IDLE_POLL: Duration = Duration::from_millis(10);
@@ -326,7 +328,12 @@ fn test_spec(repo: &str) -> JobSpec {
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),
+        on_stuck: None,
+        stuck_after_secs: None,
+        priority: lu_proto::DEFAULT_PRIORITY,
+        group: None,
         fallbacks: Vec::new(),
+        expect: None,
     }
 }
 
@@ -345,6 +352,12 @@ fn make_agent(
         base_source: BaseSource::Auto,
         work_dir: work_dir.to_path_buf(),
         heartbeat_secs: TEST_HEARTBEAT_SECS,
+        default_on_stuck: lu_proto::StuckPolicy::None,
+        default_stuck_after_secs: 1_800,
+        stuck_detect_secs: super::proc::STUCK_AFTER_SECS,
+        stuck_poll_period: super::STUCK_POLL_PERIOD,
+        stuck_after_override: None,
+        stuck_clock: Arc::new(super::proc::RealClock),
         labels: Arc::new(super::labels::LabelSource::new(Vec::new(), Vec::new())),
         probes: Arc::new(super::probes::Probes::new(Vec::new())),
         taints: Arc::new(Vec::new()),
@@ -1178,6 +1191,173 @@ async fn job_happy_path_calls_in_order() {
     assert_eq!(done[0].job_id, job_id);
     assert_eq!(done[0].epoch, EPOCH);
     assert!(log_text(&calls).contains("working"));
+}
+
+fn exported(bytes: &str, paths: &[&str]) -> ExportedDiff {
+    ExportedDiff {
+        bytes: bytes.as_bytes().to_vec(),
+        changed_paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn evaluate_expect_checks_each_kind_of_expectation() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("REVIEW.md"), b"review\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/main.rs"), b"fn main() {}\n").unwrap();
+    let expect = ExpectSpec {
+        files: vec!["REVIEW.md".to_owned(), "MISSING.md".to_owned()],
+        changed: vec!["src/**".to_owned(), "tests/**".to_owned()],
+        forbid_changed: vec!["Cargo.lock".to_owned()],
+        min_diff_bytes: Some(12),
+        max_diff_bytes: Some(64),
+        mode: ExpectMode::Suspect,
+    };
+    let diff = exported("patch bytes", &["src/main.rs", "Cargo.lock"]);
+    let (failures, outcome, _, suspect) =
+        evaluate_expect(&expect, Some(&diff), tmp.path(), "harness summary");
+    assert_eq!(outcome, Outcome::Done);
+    assert!(suspect);
+    assert!(failures.iter().any(|f| f.contains("MISSING.md")));
+    assert!(failures.iter().any(|f| f.contains("tests/**")));
+    assert!(failures.iter().any(|f| f.contains("Cargo.lock")));
+    assert!(failures
+        .iter()
+        .any(|f| f.contains("below minimum") || f.contains("above maximum")));
+    assert_eq!(failures.len(), 4, "{failures:?}");
+}
+
+#[test]
+fn evaluate_expect_accepts_met_expectations_and_rejects_size_bounds() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("REVIEW.md"), b"review\n").unwrap();
+    let expect = ExpectSpec {
+        files: vec!["REVIEW.md".to_owned()],
+        changed: vec!["**/*.md".to_owned()],
+        forbid_changed: vec!["Cargo.lock".to_owned()],
+        min_diff_bytes: Some(1),
+        max_diff_bytes: Some(64),
+        mode: ExpectMode::Suspect,
+    };
+    let diff = exported("patch", &["REVIEW.md", ".hidden.md"]);
+    let (failures, outcome, summary, suspect) =
+        evaluate_expect(&expect, Some(&diff), tmp.path(), "harness summary");
+    assert!(failures.is_empty());
+    assert_eq!(outcome, Outcome::Done);
+    assert_eq!(summary, "harness summary");
+    assert!(!suspect);
+
+    let too_small = ExpectSpec {
+        min_diff_bytes: Some(4096),
+        ..expect.clone()
+    };
+    let (failures, _, _, _) =
+        evaluate_expect(&too_small, Some(&diff), tmp.path(), "harness summary");
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("below minimum"));
+
+    let too_large = ExpectSpec {
+        max_diff_bytes: Some(1),
+        ..expect
+    };
+    let (failures, _, _, _) =
+        evaluate_expect(&too_large, Some(&diff), tmp.path(), "harness summary");
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("above maximum"));
+}
+
+#[tokio::test]
+async fn suspect_expectations_keep_the_job_done_and_record_report_failures() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.expect = Some(ExpectSpec {
+        files: vec!["MISSING.md".to_owned()],
+        mode: ExpectMode::Suspect,
+        ..ExpectSpec::default()
+    });
+    let controller = assigned_controller(&job_id, spec);
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo done"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    let failures = report["expect_failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].as_str().unwrap().contains("MISSING.md"));
+    let done = completions(&calls);
+    assert_eq!(done[0].outcome, Outcome::Done);
+    assert!(done[0].expect_failed);
+}
+
+#[tokio::test]
+async fn fail_mode_expectations_fail_the_run_with_an_execution_class() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.expect = Some(ExpectSpec {
+        changed: vec!["src/**".to_owned()],
+        mode: ExpectMode::Fail,
+        ..ExpectSpec::default()
+    });
+    let controller = assigned_controller(&job_id, spec);
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo done"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    assert_eq!(
+        report["outcome"],
+        serde_json::json!({ "failed": "execution" })
+    );
+    let done = completions(&calls);
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Execution));
+    assert!(!done[0].expect_failed);
+    assert!(done[0]
+        .summary
+        .as_deref()
+        .unwrap()
+        .contains("expect failed"));
+}
+
+#[tokio::test]
+async fn harness_failure_keeps_its_own_class_with_expectations_declared() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.expect = Some(ExpectSpec {
+        changed: vec!["src/**".to_owned()],
+        mode: ExpectMode::Fail,
+        ..ExpectSpec::default()
+    });
+    let controller = assigned_controller(&job_id, spec);
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo broken; exit 1"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    assert!(report.get("expect_failures").is_none());
+    let done = completions(&calls);
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Execution));
+    assert!(!done[0].expect_failed);
+    assert!(!done[0]
+        .summary
+        .as_deref()
+        .unwrap()
+        .contains("expect failed"));
 }
 
 #[tokio::test]
@@ -2570,4 +2750,226 @@ fn heartbeats_publish_only_configured_healthy_provider_pairs() {
             model: "m2".to_owned(),
         }]
     );
+}
+
+/// A clock that advances one virtual second per call. The stuck watcher and the output reader
+/// are the only callers during these tests, so virtual time tracks watcher samples without
+/// sleeping through the production thresholds.
+#[derive(Debug)]
+struct SteppingClock {
+    start: Instant,
+    step_millis: u64,
+    calls: AtomicU64,
+}
+
+impl SteppingClock {
+    fn new(step_secs: u64) -> Self {
+        Self {
+            start: Instant::now(),
+            step_millis: step_secs.saturating_mul(1_000),
+            calls: AtomicU64::new(0),
+        }
+    }
+}
+
+impl super::proc::Clock for SteppingClock {
+    fn now(&self) -> Instant {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.start + Duration::from_millis(self.step_millis.saturating_mul(call))
+    }
+}
+
+/// A harness that produces no output and no CPU once started.
+fn idle_harness(_task_file: &Path) -> CommandSpec {
+    CommandSpec::new("sh").arg("-c").arg("sleep 10")
+}
+
+/// A harness that goes idle, emits one line, then exits before the stuck interval is reached
+/// again. The line must reset the stuck watcher's timer.
+fn activity_harness(_task_file: &Path) -> CommandSpec {
+    CommandSpec::new("sh")
+        .arg("-c")
+        .arg("sleep 0.02; echo alive; sleep 0.03")
+}
+
+/// A harness that finishes while still inside the stuck interval.
+fn short_harness(_task_file: &Path) -> CommandSpec {
+    CommandSpec::new("sh").arg("-c").arg("sleep 0.02")
+}
+
+async fn wait_for_completion(controller: &FakeController) -> Completion {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let found = controller.check(|calls| {
+                calls.iter().find_map(|call| match call {
+                    Call::Complete(completion) => Some(completion.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(completion) = found {
+                return completion;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("job did not complete")
+}
+
+/// Runs one job with a lowered observation threshold and virtual clock. `after_override` stands
+/// in for a sub-minute policy threshold; job fields themselves must stay in the valid range.
+async fn run_stuck_case(
+    mut spec: JobSpec,
+    harness: fn(&Path) -> CommandSpec,
+    default_policy: StuckPolicy,
+    default_after_secs: u64,
+    step_secs: u64,
+    after_override: Option<u64>,
+) -> (Completion, Vec<Call>, Result<(), AgentError>) {
+    let tmp = TempDir::new().unwrap();
+    let work_dir = tmp.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir(&repo_dir).unwrap();
+    create_git_repo(&repo_dir);
+    spec.repo = repo_dir.to_string_lossy().into_owned();
+
+    let controller = controller_with_assign(JobId::new(), EPOCH, spec);
+    let mut agent = make_agent(&work_dir, controller.clone(), harness);
+    agent.default_on_stuck = default_policy;
+    agent.default_stuck_after_secs = default_after_secs;
+    let agent = agent.with_stuck_timing_for_tests(
+        2,
+        Duration::from_millis(2),
+        after_override,
+        Arc::new(SteppingClock::new(step_secs)),
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        agent
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let completion = wait_for_completion(&controller).await;
+    let _ = shutdown_tx.send(());
+    let result = handle.await.unwrap();
+    (completion, controller.take_calls(), result)
+}
+
+fn assert_stuck_artifacts(calls: &[Call]) {
+    for name in [ArtifactName::DiffPatch, ArtifactName::ReportJson] {
+        assert!(
+            calls.iter().any(|call| matches!(
+                call,
+                Call::PutArtifact { name: actual, .. } if *actual == name
+            )),
+            "missing {name} artifact"
+        );
+    }
+}
+
+fn assert_stuck_summary(completion: &Completion, secs: u64) {
+    assert_eq!(
+        completion.summary.as_deref(),
+        Some(format!("stuck for {secs}s, stopped").as_str())
+    );
+}
+
+#[tokio::test]
+async fn stuck_cancel_policy_stops_the_harness_and_fails_execution() {
+    let mut spec = test_spec("");
+    spec.on_stuck = Some(StuckPolicy::Cancel);
+    spec.stuck_after_secs = Some(60);
+    let (completion, calls, result) =
+        run_stuck_case(spec, idle_harness, StuckPolicy::None, 1_800, 1, Some(5)).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        completion.outcome,
+        Outcome::Failed(FailureClass::Execution),
+        "{completion:?}"
+    );
+    assert_eq!(
+        completion.stuck_mode,
+        Some(StuckPolicy::Cancel),
+        "{completion:?}"
+    );
+    assert_stuck_summary(&completion, 5);
+    assert_stuck_artifacts(&calls);
+}
+
+#[tokio::test]
+async fn stuck_retry_policy_fails_with_node_class() {
+    let mut spec = test_spec("");
+    spec.on_stuck = Some(StuckPolicy::Retry);
+    spec.stuck_after_secs = Some(60);
+    let (completion, calls, result) =
+        run_stuck_case(spec, idle_harness, StuckPolicy::None, 1_800, 1, Some(4)).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(completion.outcome, Outcome::Failed(FailureClass::Node));
+    assert_eq!(completion.stuck_mode, Some(StuckPolicy::Retry));
+    assert_stuck_summary(&completion, 4);
+    assert_stuck_artifacts(&calls);
+}
+
+#[tokio::test]
+async fn output_resets_the_stuck_timer() {
+    let mut spec = test_spec("");
+    spec.on_stuck = Some(StuckPolicy::Retry);
+    spec.stuck_after_secs = Some(60);
+    let (completion, _, result) =
+        run_stuck_case(spec, activity_harness, StuckPolicy::None, 1_800, 1, None).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(completion.outcome, Outcome::Done);
+    assert_eq!(completion.stuck_mode, None);
+}
+
+#[tokio::test]
+async fn job_finishing_before_the_threshold_is_not_stopped() {
+    let mut spec = test_spec("");
+    spec.on_stuck = Some(StuckPolicy::Cancel);
+    spec.stuck_after_secs = Some(60);
+    let (completion, _, result) =
+        run_stuck_case(spec, short_harness, StuckPolicy::None, 1_800, 1, None).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(completion.outcome, Outcome::Done);
+    assert_eq!(completion.stuck_mode, None);
+}
+
+#[tokio::test]
+async fn agent_default_applies_when_the_job_omits_stuck_fields() {
+    let spec = test_spec("");
+    let (completion, calls, result) =
+        run_stuck_case(spec, idle_harness, StuckPolicy::Cancel, 60, 1, Some(5)).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(completion.outcome, Outcome::Failed(FailureClass::Execution));
+    assert_eq!(completion.stuck_mode, Some(StuckPolicy::Cancel));
+    assert_stuck_summary(&completion, 5);
+    assert_stuck_artifacts(&calls);
+}
+
+#[tokio::test]
+async fn explicit_job_none_disables_the_agent_default() {
+    let mut spec = test_spec("");
+    spec.on_stuck = Some(StuckPolicy::None);
+    spec.stuck_after_secs = Some(60);
+    let (completion, _, result) =
+        run_stuck_case(spec, short_harness, StuckPolicy::Cancel, 60, 1, Some(5)).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(completion.outcome, Outcome::Done);
+    assert_eq!(completion.stuck_mode, None);
+}
+
+#[tokio::test]
+async fn job_override_wins_over_the_agent_default() {
+    let mut spec = test_spec("");
+    spec.on_stuck = Some(StuckPolicy::Retry);
+    spec.stuck_after_secs = Some(60);
+    let (completion, _, result) =
+        run_stuck_case(spec, idle_harness, StuckPolicy::Cancel, 100, 30, None).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(completion.outcome, Outcome::Failed(FailureClass::Node));
+    assert_eq!(completion.stuck_mode, Some(StuckPolicy::Retry));
+    assert_stuck_summary(&completion, 60);
 }

@@ -42,7 +42,7 @@ Worked example — initialize and list tools:
 
 ## Tools
 
-`readOnlyHint: true` is set on the eight read tools. Only `lu_cancel`, `lu_drain` and `lu_undrain` carry `destructiveHint: true`.
+`readOnlyHint: true` is set on the eight read tools. Only `lu_cancel`, `lu_drain`, `lu_undrain` and `lu_uncordon` carry `destructiveHint: true`.
 
 Every argument is listed below; `?` marks an optional argument.
 
@@ -52,20 +52,21 @@ Every argument is listed below; `?` marks an optional argument.
 | `lu_jobs` | `state?`, `limit?` 1–100, default 20 | Compact newest-first job list. |
 | `lu_job` | `id` | Full job detail, spec and artifacts. |
 | `lu_logs` | `id`, `lines?` 1–400, default 80 | Log tail with escape sequences removed. |
-| `lu_nodes` | none | Node states, providers, load, labels, version and disk-free stats. |
-| `lu_node` | `node` | One node's state, labels, version, providers, load, uptime and disk-free stats. |
-| `lu_graph` | none | Dependency graph of unfinished jobs. |
+| `lu_nodes` | none | Node states, providers, cordon details, load, labels, version and disk-free stats. |
+| `lu_node` | `node` | One node's state, labels, version, providers, cordon details, load, uptime and disk-free stats. |
+| `lu_graph` | none | Horizontal dependency graph of unfinished jobs, with task titles. |
 | `lu_result` | `id`, `offset?`, `max_bytes?` 1–32768, default 24576 | Summary, report, diff stats and a page of diff text. |
-| `lu_submit` | `repo`, `ref`, `task`; `provider?`, `model?`, `require?`, `fallbacks?`, `no_stack?`, `after?`, `after_keys?`, `timeout?`, `timeout_secs?`, `idle_timeout?`, `idle_timeout_secs?`, `harness?`, `key?` | Submit one job. |
-| `lu_submit_many` | `jobs[]` 1–12; each with `name`, `repo`, `ref`, `task`, `provider?`, `model?`, `require?`, `fallbacks?`, `no_stack?`, `timeout?`, `timeout_secs?`, `idle_timeout?`, `idle_timeout_secs?`, `harness?`, `key?`, `after_names?`, `after_keys?` | Submit named jobs in order. |
+| `lu_submit` | `repo`, `ref`, `task`; `provider?`, `model?`, `priority?`, `group?`, `require?`, `fallbacks?`, `no_stack?`, `collect?`, `include_failed?`, `on_conflict?`, `on_stuck?`, `stuck_after?`/`stuck_after_secs?`, `after?`, `after_keys?`, `timeout?`, `timeout_secs?`, `idle_timeout?`, `idle_timeout_secs?`, `harness?`, `expect_files?`, `expect_changed?`, `forbid_changed?`, `min_diff_bytes?`, `max_diff_bytes?`, `expect_mode?`, `key?` | Submit one job. |
+| `lu_submit_many` | `jobs[]` 1–12; each with `name`, `repo`, `ref`, `task`, `provider?`, `model?`, `priority?`, `group?`, `require?`, `fallbacks?`, `no_stack?`, `collect?`, `include_failed?`, `on_conflict?`, `on_stuck?`, `stuck_after?`/`stuck_after_secs?`, `after_names?`, `after_keys?`, `timeout?`, `timeout_secs?`, `idle_timeout?`, `idle_timeout_secs?`, `harness?`, `expect_files?`, `expect_changed?`, `forbid_changed?`, `min_diff_bytes?`, `max_diff_bytes?`, `expect_mode?`, `key?` | Submit named jobs in order. |
 | `lu_cancel` | `id` | Ask the controller to cancel a job. Destructive. |
-| `lu_retry` | `id`; `provider?`, `model?`, `require?`, `fallbacks?`, `no_stack?`, `after?`, `after_keys?`, `timeout?`, `timeout_secs?`, `idle_timeout?`, `idle_timeout_secs?`, `harness?`, `key?` | Resubmit a terminal job's spec as a new job. |
+| `lu_retry` | `id`; `provider?`, `model?`, `priority?`, `group?`, `require?`, `fallbacks?`, `no_stack?`, `collect?`, `include_failed?`, `on_conflict?`, `on_stuck?`, `stuck_after?`/`stuck_after_secs?`, `after?`, `after_keys?`, `timeout?`, `timeout_secs?`, `idle_timeout?`, `idle_timeout_secs?`, `harness?`, `expect_files?`, `expect_changed?`, `forbid_changed?`, `min_diff_bytes?`, `max_diff_bytes?`, `expect_mode?`, `key?` | Resubmit a terminal job's spec as a new job. |
 | `lu_drain` | `node` | Stop assigning new jobs to a node. Destructive. |
 | `lu_undrain` | `node` | Allow a drained node to take jobs again. Destructive. |
+| `lu_uncordon` | `node`, `provider?` | Clear one provider cordon, or every cordon when the provider is omitted. Destructive. |
 
-`require` holds at most 8 node labels. `fallbacks` holds at most 4 objects with a `provider` and optional `model`. `after`, `after_keys` and `after_names` hold at most 16 entries; `after_keys` resolves existing jobs by their idempotency key. Timeouts are 1–86400 seconds: `timeout_secs` defaults to 3600, and `timeout` wins when both spellings are present. `idle_timeout` wins over `idle_timeout_secs` likewise. `no_stack: true` sets `stack_dependencies` to false, and `harness` defaults to `opencode`. `task` is inline text, never a path.
+`require` holds at most 8 node labels. `fallbacks` holds at most 4 objects with a `provider` and optional `model`. `after`, `after_keys` and `after_names` hold at most 16 entries; `after_keys` resolves existing jobs by their idempotency key. Timeouts are 1–86400 seconds: `timeout_secs` defaults to 3600, and `timeout` wins when both spellings are present. `idle_timeout` wins over `idle_timeout_secs` likewise. `no_stack: true` sets `stack_dependencies` to false, and `harness` defaults to `opencode`. `task` is inline text, never a path. Expectation lists hold at most 16 entries each: `expect_files` names relative paths, `expect_changed` and `forbid_changed` take globs, and `min_diff_bytes`/`max_diff_bytes` bound the diff size. `expect_mode` is `suspect` (default) or `fail`. `priority` is 0 to 9 (default 5) and dispatches higher values first. `group` is a 1–64 character concurrency group name; unconfigured groups are unlimited. `on_stuck` is `none`, `cancel` or `retry`, and `stuck_after`/`stuck_after_secs` is 60 to 86400 seconds; absent values use the agent defaults.
 
-On `lu_retry`, absent fields inherit the source spec. Empty `require` or `fallbacks` clear those lists, and any `after` or `after_keys` argument replaces the dependencies.
+On `lu_retry`, absent fields inherit the source spec. Empty `require` or `fallbacks` clear those lists, and any `after` or `after_keys` argument replaces the dependencies. Expectation fields are likewise overrides: a present list replaces the stored one, and a present bound or mode is set; absent ones stay as they are.
 
 Worked example — submit one job:
 

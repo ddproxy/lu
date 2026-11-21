@@ -448,6 +448,13 @@ pub struct Staging {
     work_root: PathBuf,
 }
 
+/// A patch and the paths it changes, including deletions and renames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedDiff {
+    pub bytes: Vec<u8>,
+    pub changed_paths: Vec<String>,
+}
+
 impl Staging {
     /// Create a staging manager rooted at `work_root`.
     ///
@@ -629,6 +636,15 @@ impl Staging {
     /// Export everything the job changed relative to the checked-out commit,
     /// including new untracked files that are not ignored, as a binary-safe patch.
     pub fn export_diff(staged: &StagedDir, cap_bytes: usize) -> Result<Vec<u8>, StageError> {
+        Self::export_diff_with_paths(staged, cap_bytes).map(|exported| exported.bytes)
+    }
+
+    /// Exports the patch and the changed paths it contains. Paths come from the same diff, with
+    /// the same `.lu/` filtering, so expectations see exactly what the job uploads.
+    pub fn export_diff_with_paths(
+        staged: &StagedDir,
+        cap_bytes: usize,
+    ) -> Result<ExportedDiff, StageError> {
         let repo = git2::Repository::open(staged.path()).map_err(|e| StageError::Git {
             message: format!("failed to open repository: {e}"),
         })?;
@@ -649,6 +665,20 @@ impl Staging {
             .map_err(|e| StageError::Git {
                 message: format!("failed to compute diff: {e}"),
             })?;
+
+        let mut changed_paths = Vec::new();
+        for delta in diff.deltas() {
+            for file in [delta.old_file(), delta.new_file()] {
+                let Some(path) = file.path() else { continue };
+                if is_lu_path(path) {
+                    continue;
+                }
+                let text = path.to_string_lossy().into_owned();
+                if !changed_paths.contains(&text) {
+                    changed_paths.push(text);
+                }
+            }
+        }
 
         let mut out: Vec<u8> = Vec::new();
         let mut too_large = false;
@@ -682,7 +712,10 @@ impl Staging {
         print_res.map_err(|e| StageError::Git {
             message: format!("failed to format diff: {e}"),
         })?;
-        Ok(out)
+        Ok(ExportedDiff {
+            bytes: out,
+            changed_paths,
+        })
     }
 
     /// Apply a dependency's `diff.patch` to a staged checkout, with the default `fail` policy.
@@ -1837,6 +1870,44 @@ mod tests {
             "{exclude}"
         );
         assert!(!staged.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn export_diff_with_paths_lists_exactly_the_uploaded_changes() {
+        let tmp = TestDir::new("export-paths");
+        let repo = source_repo(&tmp.path);
+        let work = tmp.path.join("work");
+        fs::create_dir(&work).unwrap();
+        let staging = Staging::new(&work).unwrap();
+        let staged = staging
+            .stage(StageRequest {
+                job_id: "job".to_owned(),
+                source: Source::Path(repo),
+                git_ref: "main".to_owned(),
+            })
+            .unwrap();
+
+        fs::write(staged.path().join("README.md"), "changed\n").unwrap();
+        fs::write(staged.path().join("new.txt"), "output\n").unwrap();
+        let inputs = prepare_inputs(&staged).unwrap();
+        let dep = create_input_dir(&inputs, "dep").unwrap();
+        write_input_file(&dep, "diff.patch", b"not a real patch\n").unwrap();
+
+        let exported = Staging::export_diff_with_paths(&staged, 1 << 20).unwrap();
+        assert!(exported.changed_paths.iter().any(|p| p == "README.md"));
+        assert!(exported.changed_paths.iter().any(|p| p == "new.txt"));
+        assert!(
+            exported
+                .changed_paths
+                .iter()
+                .all(|p| !is_lu_path(Path::new(p))),
+            "{:?}",
+            exported.changed_paths
+        );
+        assert_eq!(
+            exported.bytes,
+            Staging::export_diff(&staged, 1 << 20).unwrap()
+        );
     }
 
     #[test]

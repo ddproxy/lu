@@ -22,6 +22,13 @@ pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 /// The most dependencies one job may name.
 pub const MAX_AFTER_JOBS: usize = 16;
 
+/// The most paths or glob patterns in one `expect` block.
+pub const MAX_EXPECT_ITEMS: usize = 16;
+
+/// One expected path or glob pattern, in bytes.
+pub const MAX_EXPECT_PATH_BYTES: usize = 1024;
+pub const MAX_EXPECT_GLOB_BYTES: usize = 256;
+
 /// The most dependency artifact directories one job may collect into `.lu/inputs`.
 pub const MAX_COLLECT_INPUTS: usize = 16;
 
@@ -39,6 +46,22 @@ pub const MIN_TIMEOUT_SECS: u64 = 1;
 pub const MAX_TIMEOUT_SECS: u64 = 86_400;
 pub const MAX_IDLE_TIMEOUT_SECS: u64 = 86_400;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 3_600;
+
+/// Higher priority dispatches first; 5 is the default when a spec omits the field.
+pub const MIN_PRIORITY: u8 = 0;
+pub const MAX_PRIORITY: u8 = 9;
+pub const DEFAULT_PRIORITY: u8 = 5;
+
+/// A job group name, in bytes.
+pub const MAX_GROUP_BYTES: usize = 64;
+
+/// The largest concurrency cap a configured group may have.
+pub const MAX_GROUP_RUNNING: usize = 64;
+
+/// A job's continuous stuck interval. An absent value uses the agent's default.
+pub const MIN_STUCK_AFTER_SECS: u64 = 60;
+pub const MAX_STUCK_AFTER_SECS: u64 = 86_400;
+pub const DEFAULT_STUCK_AFTER_SECS: u64 = 1_800;
 
 /// At most this many providers may appear in one heartbeat.
 pub const MAX_PROVIDERS: usize = 64;

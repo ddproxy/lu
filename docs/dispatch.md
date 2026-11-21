@@ -2,6 +2,14 @@
 
 A job runs on a node that is idle, not draining and able to serve what the job needs. Two optional fields on a job narrow that choice: labels describe what the node can do, and provider choices describe which model the harness may use. A node must satisfy the labels first, then it must be able to serve one of the provider choices.
 
+## Priority and groups
+
+`--priority N` sets an integer from 0 (lowest) to 9 (highest); the default is 5. Dispatch takes the highest priority first and, within a priority, the oldest job first. A newly submitted high-priority job overtakes older, lower-priority queued jobs.
+
+`--group NAME` marks a job as part of a concurrency group. Names are 1-64 characters from `A-Z a-z 0-9 . _ -`. A controller can cap a group with `[[controller.groups]]`; jobs in unconfigured groups are unlimited. Jobs count toward the cap while `leased`, `running`, `recovering` or `needs_input`. A queued job blocked by a full group stays queued and reports `group limit (<name> <running>/<max>)` in `waiting_reason`. Cancellation and failure release the slot.
+
+Both fields are optional; omitting them keeps the previous dispatch behaviour. The provider, label and taint rules described below still apply first: priority and group limits only order eligible jobs, they never bypass node eligibility.
+
 ## Labels and providers
 
 To pin work to nodes that advertise every named label, repeat `--require`:
@@ -26,6 +34,15 @@ Dispatch first applies the label rule, then gives the job to the first choice th
 Use `--provider any` to choose from the node's `[[agent.provider_models]]` pairs, tried in agent configuration order. The job names no model or fallback; either with `--provider any` is a validation error. Each agent publishes a pair with its heartbeat when Reiki reports that provider healthy. Dispatch skips cordoned providers and gives the job to the first healthy pair on an otherwise eligible node. The job records that pair as `assigned_provider`/`assigned_model`, so the agent runs that provider's model. With no healthy pair on any eligible node the job stays `queued` and `lu show` reports `no node has a healthy provider for provider "any"`.
 
 For a controller on a non-loopback address, add a `[tls]` table with `cert` and `key`; plain HTTP is accepted only on loopback. See [config.md](config.md).
+
+## Cordons
+
+A cordon is a `(node, provider)` block. Dispatch skips that pair on that node, so fallbacks, other nodes and other providers remain available. A job with no provider is not affected.
+
+- **Reiki-derived**: the agent reports two consecutive unhealthy Reiki readings and completes the job as `Failed(Provider)` with `retry_after_secs`. The cordon has source `reiki`, records Reiki's estimated return time in its reason, and lifts after two consecutive healthy provider heartbeats. Its API `until` is null because the end time is not fixed.
+- **Failure-derived**: any other retryable provider failure uses `provider_cooldown_secs`. The cordon has source `failure`, a reason naming the provider and failure summary, and a fixed wall-clock expiry.
+
+`lu nodes` shows cordoned providers in the `CORDONS` column as `!provider`; `lu top` marks the provider chip with `!` and a `~` suffix for Reiki-derived cordons, then lists both kinds with their reason and remaining time or lift count. `lu node <name>` prints the same details with the age of each cordon. An operator can clear a cordon early with `lu uncordon <node> [<provider>]`, which calls `POST /v1/nodes/{name}/uncordon`; omitting the provider clears every cordon on that node. Boot still clears all stored cordons, so a controller restart never blocks dispatch with stale deadlines.
 
 ## Taints and tolerations
 

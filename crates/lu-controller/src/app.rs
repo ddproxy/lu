@@ -80,6 +80,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/nodes/{name}/undrain",
             post(operator::undrain_node).layer(op_json),
         )
+        .route(
+            "/v1/nodes/{name}/uncordon",
+            post(operator::uncordon_node).layer(op_json),
+        )
         .route("/metrics", get(metrics::metrics));
 
     // agent routes with specific body limits

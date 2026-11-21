@@ -83,6 +83,8 @@ enum Command {
     Drain(operator::NodeArgs),
     /// Allow a drained node to take jobs again. The node must have heartbeated at least once.
     Undrain(operator::NodeArgs),
+    /// Clear provider cordons on a node, or just one provider's cordon.
+    Uncordon(operator::UncordonArgs),
 }
 
 #[tokio::main]
@@ -127,6 +129,7 @@ async fn main() -> ExitCode {
         Command::Node(args) => operator::node(args, &cli.config, json).await,
         Command::Drain(args) => operator::drain(args, &cli.config, json).await,
         Command::Undrain(args) => operator::undrain(args, &cli.config, json).await,
+        Command::Uncordon(args) => operator::uncordon(args, &cli.config, json).await,
     }
 }
 

@@ -17,6 +17,18 @@ pub struct ProviderCell {
     pub soonest_secs: Option<u64>,
 }
 
+/// A provider cordon as shown in the node table and the detail pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CordonCell {
+    pub provider: String,
+    /// `reiki` or `failure`.
+    pub source: String,
+    pub reason: String,
+    /// None when the cordon lifts on healthy heartbeats instead of a deadline.
+    pub remaining_secs: Option<u64>,
+    pub lifts_after_healthy_heartbeats: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeRow {
     pub name: String,
@@ -26,6 +38,7 @@ pub struct NodeRow {
     /// Seconds since the node's last heartbeat, when it has sent one.
     pub seen_secs_ago: Option<u64>,
     pub providers: Vec<ProviderCell>,
+    pub cordons: Vec<CordonCell>,
     pub version: Option<String>,
     pub load1: Option<f64>,
     pub mem_available_kb: Option<u64>,
@@ -60,12 +73,13 @@ pub struct Snapshot {
     pub controller_version: Option<String>,
 }
 
-/// Which table the selection keys act on.
+/// Which pane the selection keys act on. The Jobs table and the graph share one selected job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
     #[default]
     Nodes,
     Jobs,
+    Graph,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -325,6 +339,7 @@ pub struct Dashboard {
     pending: Option<PendingDrain>,
     notice: Option<(String, Tone)>,
     graph_hidden: bool,
+    graph_offset: usize,
     controller_version: Option<String>,
     node_history: HashMap<String, NodeHistory>,
     process_target: Option<ProcessPaneTarget>,
@@ -469,16 +484,26 @@ impl Dashboard {
         }
     }
 
-    /// Moves the highlighted row in the focused table.
+    /// Moves the highlighted row. In the graph, Up/Down move between siblings and components.
     pub fn move_selection(&mut self, down: bool) {
+        if self.selection.focus == Focus::Graph {
+            self.move_graph(if down {
+                graph::Step::Next
+            } else {
+                graph::Step::Previous
+            });
+            return;
+        }
         self.pending = None;
         let len = match self.selection.focus {
             Focus::Nodes => self.current().nodes.len(),
             Focus::Jobs => self.current().jobs.len(),
+            Focus::Graph => unreachable!("graph handled above"),
         };
         let index = match self.selection.focus {
             Focus::Nodes => &mut self.selection.node,
             Focus::Jobs => &mut self.selection.job,
+            Focus::Graph => unreachable!("graph handled above"),
         };
         if len == 0 {
             *index = 0;
@@ -489,23 +514,77 @@ impl Dashboard {
         }
     }
 
+    /// Moves the graph selection; keys that do not apply to the graph are ignored.
+    pub fn move_graph(&mut self, step: graph::Step) {
+        if self.selection.focus != Focus::Graph {
+            return;
+        }
+        self.pending = None;
+        let Some(graph) = self.visible_graph() else {
+            return;
+        };
+        let Some(id) = self
+            .current()
+            .jobs
+            .get(self.selection.job)
+            .map(|job| job.id.clone())
+        else {
+            return;
+        };
+        let Some(next) = graph.step(&id, step) else {
+            return;
+        };
+        if let Some(index) = self.current().jobs.iter().position(|job| job.id == next) {
+            self.selection.job = index;
+            self.graph_offset = 0;
+        }
+    }
+
+    fn visible_graph(&self) -> Option<Graph> {
+        if self.graph_hidden {
+            return None;
+        }
+        let jobs: Vec<graph::Job> = self
+            .current()
+            .jobs
+            .iter()
+            .map(|job| graph::Job {
+                id: job.id.clone(),
+                state: job.state.parse().unwrap_or(graph::State::Queued),
+                title: job.title.clone(),
+                after: job.after.clone(),
+            })
+            .collect();
+        let graph = Graph::build(&jobs);
+        (!graph.is_empty()).then_some(graph)
+    }
+
     /// Hides or shows the dependency graph under the job list.
     pub fn toggle_graph(&mut self) {
         self.graph_hidden = !self.graph_hidden;
     }
 
-    /// Switches the arrows and `d` between the node table and the job list.
+    /// Tab moves Nodes → Jobs → Graph; Shift+Tab moves the other way.
     pub fn toggle_focus(&mut self) {
+        self.cycle_focus(false);
+    }
+
+    pub fn toggle_focus_back(&mut self) {
+        self.cycle_focus(true);
+    }
+
+    fn cycle_focus(&mut self, back: bool) {
         self.pending = None;
-        self.selection.focus = match self.selection.focus {
-            Focus::Nodes => Focus::Jobs,
-            Focus::Jobs => Focus::Nodes,
+        self.selection.focus = match (back, self.selection.focus) {
+            (false, Focus::Nodes) | (true, Focus::Graph) => Focus::Jobs,
+            (false, Focus::Jobs) | (true, Focus::Nodes) => Focus::Graph,
+            (false, Focus::Graph) | (true, Focus::Jobs) => Focus::Nodes,
         };
     }
 
     /// Opens the selected job's log pane and returns its id for the feeder to fetch.
     pub fn open_selected_log(&mut self) -> Option<String> {
-        if self.selection.focus != Focus::Jobs {
+        if !matches!(self.selection.focus, Focus::Jobs | Focus::Graph) {
             return None;
         }
         let job = self.current().jobs.get(self.selection.job)?.clone();
@@ -517,6 +596,85 @@ impl Dashboard {
         });
         self.pending = None;
         Some(job_id)
+    }
+
+    /// Selects a node row clicked with the mouse.
+    pub fn select_node_at(&mut self, index: usize) -> bool {
+        if index >= self.current().nodes.len() {
+            return false;
+        }
+        self.selection.node = index;
+        self.selection.focus = Focus::Nodes;
+        self.pending = None;
+        true
+    }
+
+    /// Selects a job row or graph node. Both panes share `selection.job`.
+    pub fn select_job_at(&mut self, index: usize, focus: Focus) -> bool {
+        if index >= self.current().jobs.len() || focus == Focus::Nodes {
+            return false;
+        }
+        self.selection.job = index;
+        self.selection.focus = focus;
+        self.pending = None;
+        self.graph_offset = 0;
+        true
+    }
+
+    pub fn select_job_id(&mut self, id: &str, focus: Focus) -> bool {
+        let Some(index) = self.current().jobs.iter().position(|job| job.id == id) else {
+            return false;
+        };
+        self.select_job_at(index, focus)
+    }
+
+    /// Selects a job and opens its log, as a double click does.
+    pub fn open_job_id(&mut self, id: &str, focus: Focus) -> Option<String> {
+        if !self.select_job_id(id, focus) {
+            return None;
+        }
+        self.open_selected_log()
+    }
+
+    /// Wheel over the graph moves its window by three rows.
+    pub fn scroll_graph(&mut self, down: bool) {
+        if self.selection.focus != Focus::Graph {
+            return;
+        }
+        let rows = self
+            .visible_graph()
+            .map(|graph| {
+                graph::render(&graph, 100, false)
+                    .lines
+                    .len()
+                    .saturating_sub(1)
+            })
+            .unwrap_or(0);
+        self.graph_offset = if down {
+            self.graph_offset.saturating_add(3).min(rows)
+        } else {
+            self.graph_offset.saturating_sub(3)
+        };
+    }
+
+    /// Wheel over a table moves its selection by three rows.
+    pub fn scroll_table(&mut self, down: bool) {
+        if self.selection.focus == Focus::Graph {
+            return;
+        }
+        self.pending = None;
+        let (len, index) = match self.selection.focus {
+            Focus::Nodes => (self.current().nodes.len(), &mut self.selection.node),
+            Focus::Jobs => (self.current().jobs.len(), &mut self.selection.job),
+            Focus::Graph => unreachable!("graph handled above"),
+        };
+        if len == 0 {
+            *index = 0;
+        } else if down {
+            *index = (*index + 3).min(len - 1);
+        } else {
+            *index = index.saturating_sub(3);
+        }
     }
 
     /// Closes the log pane; returns whether one was open.
@@ -680,10 +838,20 @@ impl Dashboard {
             controller_version,
             status,
             selection: self.selection,
+            graph_offset: self.graph_offset,
             log: self.log.as_ref(),
             show_graph: !self.graph_hidden,
             process_target: self.process_target.as_ref(),
             process: self.process.as_ref(),
+            cordon_pane: if self.selection.focus == Focus::Nodes {
+                snapshot
+                    .nodes
+                    .get(self.selection.node)
+                    .filter(|node| !node.cordons.is_empty())
+                    .map(cordon_pane_view)
+            } else {
+                None
+            },
         })
     }
 }
@@ -716,10 +884,22 @@ pub struct ViewModel {
     pub paused: bool,
     /// Index into `lines` of the highlighted row.
     pub selected_line: Option<usize>,
+    pub focus: Focus,
+    /// How many rows the node table occupies, for mouse hit testing.
+    pub node_rows: usize,
+    pub node_names: Vec<String>,
+    pub job_ids: Vec<String>,
+    /// The job selected in both the Jobs table and the graph.
+    pub selected_job: Option<String>,
+    /// Full id, state and title shown on the graph block's bottom border.
+    pub graph_detail: Option<Line>,
+    pub graph_offset: usize,
     pub log: Option<LogPane>,
     /// The dependency graph under the job list, when it has a component to show.
     pub graph: Option<Graph>,
     pub process_pane: Option<ProcessPaneView>,
+    /// Cordons for the selected node, shown when no log or process pane is open.
+    pub cordon_pane: Option<ProcessPaneView>,
 }
 
 struct ViewBuild<'a> {
@@ -729,10 +909,12 @@ struct ViewBuild<'a> {
     controller_version: Option<&'a str>,
     status: Status,
     selection: Selection,
+    graph_offset: usize,
     log: Option<&'a LogPane>,
     show_graph: bool,
     process_target: Option<&'a ProcessPaneTarget>,
     process: Option<&'a ProcessPaneState>,
+    cordon_pane: Option<ProcessPaneView>,
 }
 
 fn short_age(secs: u64) -> String {
@@ -754,9 +936,9 @@ fn clip(text: &str, width: usize) -> String {
     out
 }
 
-fn provider_text(cell: &ProviderCell) -> (String, Tone) {
+fn provider_text(cell: &ProviderCell, cordon: Option<&CordonCell>) -> (String, Tone) {
     let name = printable(&cell.name);
-    match (cell.state.parse::<ProviderState>(), cell.soonest_secs) {
+    let (text, tone) = match (cell.state.parse::<ProviderState>(), cell.soonest_secs) {
         (Ok(ProviderState::Ok), _) => (format!("{name} ok"), Tone::Good),
         (Ok(ProviderState::Cooling), Some(secs)) => {
             (format!("{name} cooling {}", short_age(secs)), Tone::Warn)
@@ -765,6 +947,41 @@ fn provider_text(cell: &ProviderCell) -> (String, Tone) {
         (Ok(ProviderState::Disabled), _) => (format!("{name} disabled"), Tone::Bad),
         (Ok(state), _) => (format!("{name} {}", state.as_str()), Tone::Dim),
         (Err(_), _) => (format!("{name} {}", printable(&cell.state)), Tone::Dim),
+    };
+    match cordon {
+        Some(c) if c.source == "reiki" => (format!("!{name}~"), Tone::Blocked),
+        Some(_) => (format!("!{name}"), Tone::Blocked),
+        None => (text, tone),
+    }
+}
+
+fn cordon_pane_view(node: &NodeRow) -> ProcessPaneView {
+    let mut lines = Vec::new();
+    for cordon in &node.cordons {
+        let (mark, tone) = if cordon.source == "reiki" {
+            ("~", Tone::Warn)
+        } else {
+            ("!", Tone::Blocked)
+        };
+        let state = match (cordon.remaining_secs, cordon.lifts_after_healthy_heartbeats) {
+            (Some(secs), _) => format!("{} left", short_age(secs)),
+            (None, Some(count)) => format!("lifts on {count} healthy"),
+            (None, None) => "lifts on healthy".to_owned(),
+        };
+        lines.push(Line::rich(vec![
+            Segment::new(format!("{mark} {} ", printable(&cordon.provider)), tone),
+            Segment::new(state, tone),
+        ]));
+        lines.push(Line::new(
+            format!("    {}", printable(&cordon.reason)),
+            Tone::Dim,
+        ));
+    }
+    ProcessPaneView {
+        title: format!("cordons {}", printable(&node.name)),
+        lines,
+        load_spark: Vec::new(),
+        mem_spark: Vec::new(),
     }
 }
 
@@ -896,7 +1113,14 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
         base_state
     };
 
-    let provider_cells: Vec<(String, Tone)> = node.providers.iter().map(provider_text).collect();
+    let provider_cells: Vec<(String, Tone)> = node
+        .providers
+        .iter()
+        .map(|cell| {
+            let cordon = node.cordons.iter().find(|c| c.provider == cell.name);
+            provider_text(cell, cordon)
+        })
+        .collect();
     let providers_plain = provider_cells
         .iter()
         .map(|(text, _)| text.as_str())
@@ -1123,10 +1347,12 @@ impl ViewModel {
             controller_version,
             status,
             selection,
+            graph_offset,
             log,
             show_graph,
             process_target,
             process,
+            cordon_pane,
         } = args;
         let mut lines = vec![Line::new(
             format!(
@@ -1241,18 +1467,53 @@ impl ViewModel {
         );
         let process_pane =
             process_target.map(|target| process_pane_view(target, process, node_history));
+        let selected_job = snapshot.jobs.get(selection.job);
+        let graph_detail = selected_job.map(|job| {
+            Line::new(
+                format!(
+                    "{}  {}  {}",
+                    printable(&job.id),
+                    printable(&job.state),
+                    printable(&job.title)
+                ),
+                job_tone(&job.state),
+            )
+        });
+        let footer = match selection.focus {
+            Focus::Nodes => {
+                "↑↓/jk node  Tab/⇧Tab focus  d drain  g graph  p pause  q quit"
+            }
+            Focus::Jobs => {
+                "↑↓/jk job  Tab/⇧Tab focus  Enter log  x proc  Esc close  g graph  p pause  q quit"
+            }
+            Focus::Graph => {
+                "h/l parent-child  j/k sibling  Home/End ends  Enter log  click select  wheel scroll  Tab/⇧Tab focus  q quit"
+            }
+        }
+        .to_owned();
         Self {
             title,
             charts: charts(history),
             lines,
             status,
-            footer: "↑↓/jk select  Tab focus  Enter log  x proc  Esc close  d drain  g graph  p pause  q quit"
-                .to_owned(),
+            footer,
             paused,
             selected_line,
+            focus: selection.focus,
+            node_rows,
+            node_names: snapshot
+                .nodes
+                .iter()
+                .map(|node| node.name.clone())
+                .collect(),
+            job_ids: snapshot.jobs.iter().map(|job| job.id.clone()).collect(),
+            selected_job: selected_job.map(|job| job.id.clone()),
+            graph_detail,
+            graph_offset,
             log: log.cloned(),
             graph: graph.filter(|graph| !graph.is_empty()),
             process_pane,
+            cordon_pane,
         }
     }
 
@@ -1260,7 +1521,7 @@ impl ViewModel {
     pub fn table_text(&self) -> String {
         let mut lines: Vec<String> = self.lines.iter().map(|line| line.text.clone()).collect();
         if let Some(graph) = &self.graph {
-            let graph_lines: Vec<String> = graph::render(graph, 100)
+            let graph_lines: Vec<String> = graph::render(graph, 100, false)
                 .iter()
                 .map(graph::GraphLine::text)
                 .collect();
@@ -1286,6 +1547,10 @@ impl ViewModel {
             lines.extend(log.lines.iter().map(|line| line.text.clone()));
         }
         if let Some(pane) = &self.process_pane {
+            lines.push(pane.title.clone());
+            lines.extend(pane.lines.iter().map(|line| line.text.clone()));
+        }
+        if let Some(pane) = &self.cordon_pane {
             lines.push(pane.title.clone());
             lines.extend(pane.lines.iter().map(|line| line.text.clone()));
         }
@@ -1317,6 +1582,7 @@ mod tests {
                     soonest_secs: None,
                 },
             ],
+            cordons: Vec::new(),
             version: None,
             load1: None,
             mem_available_kb: None,
@@ -1362,6 +1628,70 @@ mod tests {
         assert!(text.contains("01ABC"), "{text}");
         assert!(text.contains("do the thing"), "{text}");
         assert!(text.contains("2m"), "{text}");
+    }
+
+    #[test]
+    fn cordons_mark_provider_chips_and_open_a_detail_pane() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        let mut snap = snapshot();
+        snap.nodes[0].cordons = vec![
+            CordonCell {
+                provider: "zen".to_owned(),
+                source: "failure".to_owned(),
+                reason: "provider timeout".to_owned(),
+                remaining_secs: Some(120),
+                lifts_after_healthy_heartbeats: None,
+            },
+            CordonCell {
+                provider: "openrouter".to_owned(),
+                source: "reiki".to_owned(),
+                reason: "Reiki cooldown".to_owned(),
+                remaining_secs: None,
+                lifts_after_healthy_heartbeats: Some(2),
+            },
+        ];
+        dashboard.apply(Ok(snap), t0);
+        let view = dashboard.view(t0);
+        let text = view.plain_text();
+        assert!(text.contains("!zen"), "{text}");
+        assert!(text.contains("!openrouter~"), "{text}");
+        assert!(text.contains("cordons ct-1"), "{text}");
+        assert!(text.contains("! zen 2m left"), "{text}");
+        assert!(text.contains("~ openrouter lifts on 2 healthy"), "{text}");
+        assert!(text.contains("provider timeout"), "{text}");
+
+        let node_line = view
+            .lines
+            .iter()
+            .find(|line| line.text.starts_with("ct-1"))
+            .unwrap();
+        let chip = node_line
+            .segments
+            .iter()
+            .find(|segment| segment.text == "!zen")
+            .unwrap();
+        assert_eq!(chip.tone, Tone::Blocked);
+        let reiki_chip = node_line
+            .segments
+            .iter()
+            .find(|segment| segment.text == "!openrouter~")
+            .unwrap();
+        assert_eq!(reiki_chip.tone, Tone::Blocked);
+
+        let pane = view.cordon_pane.as_ref().unwrap();
+        let failure = pane
+            .lines
+            .iter()
+            .find(|line| line.text.contains("zen"))
+            .unwrap();
+        assert_eq!(failure.tone, Tone::Blocked);
+        let reiki = pane
+            .lines
+            .iter()
+            .find(|line| line.text.contains("openrouter"))
+            .unwrap();
+        assert_eq!(reiki.tone, Tone::Warn);
     }
 
     #[test]
@@ -1618,6 +1948,7 @@ mod tests {
             drained: false,
             seen_secs_ago: seen,
             providers: Vec::new(),
+            cordons: Vec::new(),
             version: version.map(str::to_owned),
             load1,
             mem_available_kb,
@@ -2075,5 +2406,289 @@ mod tests {
         assert!(!all.contains('\u{1b}'), "{all}");
         assert!(!all.contains('\u{202e}'), "{all}");
         assert!(!all.contains('\u{2028}'), "{all}");
+    }
+
+    fn chain() -> Dashboard {
+        let mut jobs = snapshot().jobs;
+        jobs[0].after.clear();
+        jobs[1].after = vec!["01ABC".to_owned()];
+        let mut third = job("01XYZ", "running");
+        third.title = "a title long enough to need clipping in a narrow graph panel".to_owned();
+        third.after = vec!["01BLK".to_owned()];
+        jobs.push(third);
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Ok(Snapshot { jobs, ..snapshot() }), Instant::now());
+        dashboard
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Key {
+        Up,
+        Down,
+        Left,
+        Right,
+        Home,
+        End,
+        Enter,
+        Drain,
+    }
+
+    fn apply_key(dashboard: &mut Dashboard, key: Key) {
+        match key {
+            Key::Up => dashboard.move_selection(false),
+            Key::Down => dashboard.move_selection(true),
+            Key::Left => dashboard.move_graph(graph::Step::Parent),
+            Key::Right => dashboard.move_graph(graph::Step::Child),
+            Key::Home => dashboard.move_graph(graph::Step::First),
+            Key::End => dashboard.move_graph(graph::Step::Last),
+            Key::Enter => {
+                dashboard.open_selected_log();
+            }
+            Key::Drain => {
+                dashboard.request_drain(Instant::now());
+            }
+        }
+    }
+
+    #[test]
+    fn keys_act_on_the_focused_pane() {
+        let t0 = Instant::now();
+        let cases: &[(Focus, &[Key], Option<&str>)] = &[
+            (
+                Focus::Nodes,
+                &[Key::Down, Key::Up, Key::Right, Key::End, Key::Drain],
+                Some("01ABC"),
+            ),
+            (
+                Focus::Jobs,
+                &[Key::Down, Key::Left, Key::End, Key::Enter],
+                Some("01XYZ"),
+            ),
+            (
+                Focus::Graph,
+                &[Key::Right, Key::Right, Key::Right],
+                Some("01XYZ"),
+            ),
+            (
+                Focus::Graph,
+                &[Key::End, Key::Left, Key::Right],
+                Some("01XYZ"),
+            ),
+            (Focus::Graph, &[Key::Home, Key::Left], Some("01ABC")),
+        ];
+        for (focus, keys, expected_job) in cases {
+            let mut dashboard = chain();
+            dashboard.select_job_at(2, *focus);
+            for key in *keys {
+                apply_key(&mut dashboard, *key);
+            }
+            let view = dashboard.view(t0);
+            assert_eq!(view.focus, *focus, "{focus:?} {keys:?}");
+            assert_eq!(
+                view.selected_job.as_deref(),
+                *expected_job,
+                "{focus:?} {keys:?}"
+            );
+        }
+
+        let mut nodes = chain();
+        assert_eq!(
+            nodes.open_selected_log(),
+            None,
+            "Enter does nothing in Nodes"
+        );
+        assert_eq!(nodes.request_drain(t0), None, "first d only asks");
+        assert_eq!(
+            nodes.request_drain(t0).map(|drain| drain.node),
+            Some("ct-1".to_owned())
+        );
+        let mut jobs = chain();
+        jobs.toggle_focus();
+        assert_eq!(jobs.request_drain(t0), None, "d does nothing in Jobs");
+        assert_eq!(jobs.open_selected_log(), Some("01ABC".to_owned()));
+        let mut graph = chain();
+        graph.select_job_at(0, Focus::Graph);
+        assert_eq!(graph.request_drain(t0), None, "d does nothing in Graph");
+        assert_eq!(graph.open_selected_log(), Some("01ABC".to_owned()));
+    }
+
+    #[test]
+    fn tab_cycles_focus_in_both_directions() {
+        let mut dashboard = chain();
+        assert_eq!(dashboard.view(Instant::now()).focus, Focus::Nodes);
+        dashboard.toggle_focus();
+        assert_eq!(dashboard.view(Instant::now()).focus, Focus::Jobs);
+        dashboard.toggle_focus();
+        assert_eq!(dashboard.view(Instant::now()).focus, Focus::Graph);
+        dashboard.toggle_focus();
+        assert_eq!(dashboard.view(Instant::now()).focus, Focus::Nodes);
+        dashboard.toggle_focus_back();
+        assert_eq!(dashboard.view(Instant::now()).focus, Focus::Graph);
+        dashboard.toggle_focus_back();
+        assert_eq!(dashboard.view(Instant::now()).focus, Focus::Jobs);
+        dashboard.toggle_focus_back();
+        assert_eq!(dashboard.view(Instant::now()).focus, Focus::Nodes);
+    }
+
+    #[test]
+    fn the_jobs_table_and_the_graph_share_one_selected_job() {
+        let t0 = Instant::now();
+        let mut dashboard = chain();
+        assert!(dashboard.select_job_id("01BLK", Focus::Jobs));
+        let view = dashboard.view(t0);
+        assert_eq!(view.selected_job.as_deref(), Some("01BLK"));
+        assert_eq!(
+            view.selected_line,
+            Some(6),
+            "second job row in the Jobs pane"
+        );
+        assert!(dashboard.select_job_id("01ABC", Focus::Graph));
+        let view = dashboard.view(t0);
+        assert_eq!(view.selected_job.as_deref(), Some("01ABC"));
+        assert_eq!(view.selected_line, None, "graph focus has no table row");
+        dashboard.toggle_focus_back();
+        assert_eq!(dashboard.view(t0).selected_line, Some(5));
+        assert!(!dashboard.select_job_id("MISSING", Focus::Graph));
+        assert!(!dashboard.select_job_at(99, Focus::Jobs));
+        assert_eq!(dashboard.view(t0).selected_job.as_deref(), Some("01ABC"));
+    }
+
+    fn navigation_graph() -> (Dashboard, Graph) {
+        let jobs = vec![
+            job("01A", "running"),
+            JobRow {
+                after: vec!["01A".to_owned()],
+                ..job("01B", "running")
+            },
+            JobRow {
+                after: vec!["01B".to_owned()],
+                ..job("01C", "running")
+            },
+            JobRow {
+                after: vec!["01B".to_owned()],
+                ..job("01D", "running")
+            },
+            JobRow {
+                after: vec!["01C".to_owned(), "01D".to_owned()],
+                ..job("01E", "running")
+            },
+            JobRow {
+                after: vec!["MISSING".to_owned()],
+                ..job("01F", "running")
+            },
+        ];
+        let graph = Graph::build(
+            &jobs
+                .iter()
+                .map(|job| graph::Job {
+                    id: job.id.clone(),
+                    state: graph::State::Running,
+                    title: job.title.clone(),
+                    after: job.after.clone(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(
+            Ok(Snapshot {
+                jobs,
+                ..Snapshot::default()
+            }),
+            Instant::now(),
+        );
+        dashboard.select_job_at(0, Focus::Graph);
+        (dashboard, graph)
+    }
+
+    fn selected(dashboard: &Dashboard) -> String {
+        dashboard
+            .view(Instant::now())
+            .selected_job
+            .expect("a selected job")
+    }
+
+    #[test]
+    fn graph_navigation_covers_chains_fan_out_fan_in_and_stubs() {
+        let (mut dashboard, graph) = navigation_graph();
+
+        dashboard.move_graph(graph::Step::Child);
+        assert_eq!(selected(&dashboard), "01B", "chain child");
+        let child = graph.step("01B", graph::Step::Child).unwrap();
+        dashboard.move_graph(graph::Step::Child);
+        assert_eq!(selected(&dashboard), child, "first child of the fan-out");
+        let parent = graph.step(&child, graph::Step::Parent).unwrap();
+        dashboard.move_graph(graph::Step::Parent);
+        assert_eq!(selected(&dashboard), parent);
+        let sibling = graph.step(&child, graph::Step::Next).unwrap();
+        dashboard.select_job_id(&child, Focus::Graph);
+        dashboard.move_graph(graph::Step::Next);
+        assert_eq!(
+            selected(&dashboard),
+            sibling,
+            "next sibling at the same depth"
+        );
+        let back = graph.step(&sibling, graph::Step::Previous).unwrap();
+        dashboard.move_graph(graph::Step::Previous);
+        assert_eq!(selected(&dashboard), back);
+
+        dashboard.select_job_id("01E", Focus::Graph);
+        dashboard.move_graph(graph::Step::Parent);
+        assert_eq!(
+            selected(&dashboard),
+            graph.step("01E", graph::Step::Parent).unwrap()
+        );
+
+        dashboard.select_job_id("01F", Focus::Graph);
+        dashboard.move_graph(graph::Step::Parent);
+        assert_eq!(selected(&dashboard), "01F", "a stub is not a parent");
+        dashboard.move_graph(graph::Step::Child);
+        assert_eq!(selected(&dashboard), "01F", "no children at an edge");
+
+        let order = graph.draw_order();
+        dashboard.move_graph(graph::Step::First);
+        assert_eq!(selected(&dashboard), order.first().unwrap().as_str());
+        dashboard.move_graph(graph::Step::Last);
+        assert_eq!(selected(&dashboard), order.last().unwrap().as_str());
+        dashboard.move_graph(graph::Step::Child);
+        assert_eq!(selected(&dashboard), order.last().unwrap().as_str(), "edge");
+    }
+
+    #[test]
+    fn the_graph_shows_the_selected_jobs_full_details_and_a_focus_specific_footer() {
+        let t0 = Instant::now();
+        let mut dashboard = chain();
+        let nodes = dashboard.view(t0).footer.clone();
+        dashboard.toggle_focus();
+        let jobs = dashboard.view(t0).footer.clone();
+        dashboard.toggle_focus();
+        let graph = dashboard.view(t0).footer.clone();
+        assert!(nodes.contains("d drain") && !nodes.contains("Enter log"));
+        assert!(jobs.contains("Enter log") && jobs.contains("x proc"));
+        assert!(graph.contains("h/l parent-child") && graph.contains("Home/End"));
+        assert_ne!(nodes, jobs);
+        assert_ne!(jobs, graph);
+
+        dashboard.select_job_id("01XYZ", Focus::Graph);
+        let view = dashboard.view(t0);
+        let detail = view.graph_detail.expect("the selected job's detail");
+        assert!(detail.text.contains("01XYZ"), "{detail:?}");
+        assert!(detail.text.contains("running"), "{detail:?}");
+        assert!(detail.text.contains("a title long enough"), "{detail:?}");
+    }
+
+    #[test]
+    fn the_wheel_moves_only_the_focused_pane() {
+        let (mut dashboard, _) = navigation_graph();
+        dashboard.scroll_graph(true);
+        assert_eq!(dashboard.view(Instant::now()).graph_offset, 3);
+        dashboard.scroll_graph(false);
+        assert_eq!(dashboard.view(Instant::now()).graph_offset, 0);
+        dashboard.toggle_focus_back();
+        dashboard.scroll_graph(true);
+        assert_eq!(dashboard.view(Instant::now()).graph_offset, 0);
+        dashboard.scroll_table(true);
+        assert_eq!(dashboard.view(Instant::now()).selected_line, Some(7));
+        dashboard.scroll_table(false);
+        assert_eq!(dashboard.view(Instant::now()).selected_line, Some(4));
     }
 }

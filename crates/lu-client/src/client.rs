@@ -523,6 +523,41 @@ impl Client {
         self.set_drain(node, false).await
     }
 
+    /// Clears one provider's cordon, or every cordon on the node when `provider` is `None`.
+    /// Returns the providers that were actually removed.
+    pub async fn uncordon(&self, node: &NodeName, provider: Option<&str>) -> Result<Vec<String>> {
+        let route = format!("v1/nodes/{node}/uncordon");
+        let body = match provider {
+            Some(p) => Some(
+                serde_json::to_vec(&serde_json::json!({ "provider": p })).map_err(|error| {
+                    ApiError::Decode {
+                        message: format!("could not encode the uncordon request: {error}"),
+                    }
+                })?,
+            ),
+            None => None,
+        };
+        let reply = self
+            .send(Method::POST, &route, body, &[], &[], false)
+            .await?;
+        let reply = self.success(reply)?;
+        let value: Value =
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode the uncordon reply: {error}"),
+            })?;
+        Ok(value
+            .get("removed")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     // ---- agent ------------------------------------------------------------
 
     /// Registers a heartbeat and asks for work. Returns every event the controller has for

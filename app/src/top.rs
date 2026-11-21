@@ -9,8 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use lu_client::Client;
 use lu_proto::{JobId, NodeName};
 use lu_tui::model::{
-    Dashboard, JobRow, NodeRow, ProcessJobView, ProcessPaneTarget, ProcessTreeRow, ProviderCell,
-    Request, Snapshot, Update,
+    CordonCell, Dashboard, JobRow, NodeRow, ProcessJobView, ProcessPaneTarget, ProcessTreeRow,
+    ProviderCell, Request, Snapshot, Update,
 };
 use lu_tui::sanitize::printable;
 
@@ -104,6 +104,19 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
                         soonest_secs: p.soonest_secs,
                     })
                     .collect(),
+                cordons: node
+                    .cordon_details
+                    .iter()
+                    .map(|cordon| CordonCell {
+                        provider: cordon.provider.clone(),
+                        source: cordon.source.clone(),
+                        reason: cordon.reason.clone(),
+                        remaining_secs: cordon
+                            .until
+                            .map(|until| until.saturating_sub(now as i64).max(0) as u64),
+                        lifts_after_healthy_heartbeats: cordon.lifts_after_healthy_heartbeats,
+                    })
+                    .collect(),
                 version: node.version.clone(),
                 load1: node.load1,
                 mem_available_kb: node.mem_available_kb,
@@ -125,6 +138,7 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
                 model: job.spec.model.clone(),
                 note: match job.outcome_note.as_deref() {
                     Some("no_changes") => "no changes".to_owned(),
+                    Some("expect_failed") => "expect failed".to_owned(),
                     _ => match (&job.failure_class, &job.summary) {
                         (Some(_), Some(summary)) => format!(
                             "{}: {}",

@@ -25,6 +25,7 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `GET /v1/nodes/{name}/stats` | Return the latest `NodeStats` from the node's heartbeat. An unknown node is `404`; a known node with no stats returns `{}`. Stats live in memory and are lost on controller restart. |
 | `POST /v1/nodes/{name}/drain` | Stop assigning new jobs to the node. A node that has never heartbeated is `404`. |
 | `POST /v1/nodes/{name}/undrain` | Let the node take new jobs again. A node that has never heartbeated is `404`. |
+| `POST /v1/nodes/{name}/uncordon` body optional `{"provider":"<name>"}` | Clear one provider cordon, or every cordon on the node with an empty body. An unknown node is `404`. Returns `{"removed":["<provider>",…]}` with the providers actually removed. |
 | `GET /metrics` | Return Prometheus text with `Content-Type: text/plain; version=0.0.4; charset=utf-8`. It needs an operator token. Series are listed in [monitoring.md](monitoring.md#series). |
 | `GET /v1/health` | Return `{"ok":true,"version":"…","db":"ok"}` without authentication. |
 
@@ -43,6 +44,8 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `model` | string | no | Omitted when absent; forbidden when `provider` is `any`. |
 | `timeout_secs` | integer | no | 1 to 86400; defaults to 3600. |
 | `idle_timeout_secs` | integer | no | 1 to 86400; omitted when absent. |
+| `on_stuck` | string | no | One of `none`, `cancel` or `retry`; omitted when absent. An absent value uses the agent default; an explicit `none` disables the policy. |
+| `stuck_after_secs` | integer | no | 60 to 86400; omitted when absent. Continuous stuck time before the agent acts; an absent value uses the agent default. |
 | `idempotency_key` | string | no | Omitted when absent. |
 | `after` | array of job ids | no | At most 16 unique ids; omitted when empty. |
 | `stack_dependencies` | boolean | no | Defaults to `true`; omitted when `true`. When true, dependency diffs are applied to the job's base tree. |
@@ -52,7 +55,10 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `requires` | array of labels | no | At most 8 labels; omitted when empty. |
 | `tolerates` | array of taints | no | At most 8 taints; omitted when empty. A tainted node takes the job only if it tolerates every taint. |
 | `fallbacks` | array of objects | no | Up to 4 alternative `{provider, model}` choices, tried in order when the primary provider is unavailable on a node. Omitted when empty; forbidden when `provider` is `any`. |
+| `priority` | integer | no | `0` to `9`; defaults to `5`. Higher dispatches first, then creation time. Always present in views. |
+| `group` | string | no | `1` to 64 characters from `A-Z a-z 0-9 . _ -`; omitted when absent. A configured `[[controller.groups]]` entry caps concurrent jobs with the same value. |
 | `allow_empty` | boolean | No | Defaults to `false`; omitted when `false`. When true, a successful job with no diff gets no `outcome_note`. |
+| `expect` | object | no | Expected outputs of a successful run; omitted when absent. Accepts `{ files, changed, forbid_changed, min_diff_bytes, max_diff_bytes, mode }`. Each list holds at most 16 entries. `files` are relative paths without `..`; `changed` and `forbid_changed` accept `*`, `**` and `?` globs. `min_diff_bytes` and `max_diff_bytes` bound the exported diff size. `mode` is `suspect` (default) or `fail`. |
 
 An unknown `git_ref` for a configured repository is `422 unprocessable` and names the ref. A job for an unlisted repository has no `base_commit` unless one is supplied by the client.
 
@@ -77,11 +83,11 @@ An unknown `git_ref` for a configured repository is `422 unprocessable` and name
 | `cancel_requested` | boolean | Whether cancellation has been requested. |
 | `after` | array of strings | Dependency ids from the spec. |
 | `waiting_on` | array of strings | Dependencies that are not yet `done`. |
-| `waiting_reason` | string or null | Why a queued job cannot be placed, such as `no node with label php8.3`, `only tainted nodes are free: homelab` or `no node has a healthy provider for provider "any"`. |
+| `waiting_reason` | string or null | Why a queued job cannot be placed, such as `group limit (build 4/4)`, `no node with label php8.3`, `only tainted nodes are free: homelab` or `no node has a healthy provider for provider "any"`. A group cap is reported before label, taint and provider reasons. |
 | `assigned_provider` | string or null | The provider choice the job was assigned with, when it has fallbacks. |
 | `assigned_model` | string or null | The model of that choice. |
 | `diff_bytes` | integer or null | Present only for terminal jobs (`done`, `failed`, `cancelled`). Size of the stored `diff.patch` in bytes, or null when none. A failed job can have a non-empty partial diff; clients can fetch it with `GET /v1/jobs/{id}/artifacts/diff.patch`. |
-| `outcome_note` | string or null | Omitted when absent. `no_changes` when the job is `done` and its stored diff is empty and `allow_empty` is false. |
+| `outcome_note` | string or null | Omitted when absent. `no_changes` when the job is `done` and its stored diff is empty and `allow_empty` is false; otherwise `expect_failed` when a suspect expectation failed. `no_changes` takes precedence when both apply. |
 | `warnings` | array of strings | Submit replies only. |
 
 ### `JobEdit`
@@ -93,12 +99,18 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `provider` | string | Valid provider name, or `any`. |
 | `model` | string | At most 128 characters; forbidden with `provider: "any"`. |
 | `fallbacks` | array of objects | At most 4 `{provider, model}` choices; forbidden with `provider: "any"`. |
+| `on_stuck` | string | One of `none`, `cancel` or `retry`; overrides the stuck policy. |
+| `stuck_after_secs` | integer | 60 to 86400; overrides the continuous stuck interval. |
 | `requires` | array of labels | At most 8 labels. |
 | `tolerates` | array of taints | At most 8 taints. |
 | `collect` | string | One of `none`, `files`, `apply` or `both`, or an accepted alias; overrides `stack_dependencies`. |
 | `include_failed` | boolean | When true, failed or cancelled dependencies are accepted and their stored diffs are available as inputs. |
 | `on_conflict` | string | One of `fail`, `markers` or `skip`, case-insensitive; replaces the conflict policy. |
+| `priority` | integer | `0` to `9`; higher dispatches first, then creation time. |
+| `group` | string or null | `1` to 64 characters from `A-Z a-z 0-9 . _ -`, or `null` to clear the group. |
 | `after` | array of job ids | At most 16 unique ids, without a cycle or a finished dependency unless `include_failed` is set. |
+| `expect` | object | Replacement expectation fields: `files`, `changed`, `forbid_changed`, `min_diff_bytes`, `max_diff_bytes`, `mode`. Present lists replace the stored ones; present bounds and mode are set; absent fields stay unchanged. |
+
 `HostStats`: `load1`, `load5`, `load15`, `mem_total_kb`, `mem_available_kb`, `swap_used_kb`, `disk_free_bytes` and `disk_total_bytes` (both optional; they describe the agent's work filesystem and are omitted when it cannot be read), `uptime_secs`. Host numbers are read from `/proc`; non-Linux agents report no host stats.
 
 ### `NodeView`
@@ -118,11 +130,23 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `taints` | array of strings | Taints from the latest heartbeat. |
 | `current_job` | string or null | Job id the node holds. |
 | `cordons` | array | Providers with an unexpired cordon on this node. |
+| `cordon_details` | array of `CordonView` | The same cordons with their source, reason and timing. Always present, including `[]`, in schema 8; older controllers omit it. |
 | `reiki` | object or null | Opaque Reiki document from the heartbeat. |
 | `load1` | number or null | One-minute load from the latest host stats. |
 | `mem_available_kb` | integer or null | Available memory from the latest host stats. |
 | `mem_total_kb` | integer or null | Total memory from the latest host stats. |
 | `stuck` | integer | Number of the node's running jobs whose latest stats say `stuck`. |
+
+### `CordonView`
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `provider` | string | Cordoned provider name. |
+| `source` | string | `reiki` for a cordon with a Reiki retry estimate; `failure` for a fixed provider-failure cooldown. Existing rows upgraded from older schemas are `failure`. |
+| `reason` | string | Why the cordon was set, including the summary and retry estimate when that is known. Existing rows upgraded from older schemas say `Cordoned before upgrade`. |
+| `set_at` | integer | Unix seconds when the cordon was set. Rows upgraded from older schemas use the upgrade time. |
+| `until` | integer or null | Unix seconds when a `failure` cordon expires; null for a Reiki cordon that lifts on healthy heartbeats. |
+| `lifts_after_healthy_heartbeats` | integer or null | Number of consecutive healthy provider heartbeats that clear a Reiki cordon, currently `2`; null for a `failure` cordon. |
 
 ### `StatusView`
 
@@ -173,13 +197,14 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `GET /v1/agent/jobs/{id}/deps?epoch=N` | Return the job's dependencies in `after` order. Each entry has `job_id`, `state`, `diff_bytes` (`0` when no diff is stored), `idempotency_key`, `provider`, `model`, `node`, `started_at`, `finished_at`, `failure_class` and `summary`. Wrong node is `403`; stale epoch is `409 stale_epoch`. |
 | `GET /v1/agent/jobs/{id}/deps/{dep}/diff?epoch=N` | Return the dependency's raw `diff.patch`. A `dep` outside the job's `after` list is `403`; a missing diff is `404`; a stale epoch is `409 stale_epoch`. |
 | `GET /v1/agent/jobs/{id}/deps/{dep}/artifacts/{name}?epoch=N&tail=M` | Return one fixed dependency artifact: `diff.patch`, `report.json` or `run.log`. Any other name is `404`; a `dep` outside `after` is `403`. `tail=M` returns only the last `M` bytes. Stale epoch is `409 stale_epoch`. |
-| `POST /v1/agent/jobs/{id}/complete` body `Completion` | Finish the job and return its `JobView`. A stale epoch is `409 stale_epoch` and the result is discarded. For a provider failure, `retry_after_secs` sets the cordon length on the node, clamped to 5 seconds through 24 hours. Two healthy provider heartbeats clear such a cordon early. |
+| `POST /v1/agent/jobs/{id}/complete` body `Completion` | Finish the job and return its `JobView`. A stale epoch is `409 stale_epoch` and the result is discarded. For a provider failure, `retry_after_secs` sets the cordon length on the node, clamped to 5 seconds through 24 hours. Two healthy provider heartbeats clear such a cordon early. A stuck-policy stop may carry `stuck_mode: "cancel"|"retry"`; it is counted in `lu_jobs_stuck_stopped_total` and does not change how the outcome is stored. |
 
 A `JobSpec.base_commit` is a 40-hex commit id. The agent fetches a pack for it unless `base_source` is `clone`. With `controller`, a `404` fails the job; with `auto`, the default, a `404` falls back to cloning the spec's `repo`.
 
 `Heartbeat` may also carry an optional `provider_models` array of `{provider, model}` pairs (at most 64, unique provider names, valid names and models). Agents publish only pairs whose provider Reiki reports healthy; the controller records them on the node and uses them for `provider = "any"` jobs. Older agents that omit the field are accepted. `Heartbeat` may also carry optional `version` (at most 32 printable ASCII characters), optional `labels` (at most 32 labels, each 1–64 characters from letters, digits, `.`, `_`, `-`, `/`, with at most one `=`), optional `label_sources` (a map of probed labels to `probed`; keys must also appear in `labels`, at most 32 entries), optional `taints` (at most 8, same label syntax) plus optional `host` and `jobs` stats. Older agents that omit them are accepted; each heartbeat replaces the controller's previous stats, labels, label sources and taints for that node, so omitting them clears a stale job tree, label set and taint set. The combined stats are trimmed to 16 KiB before validation by dropping processes first and then whole jobs. Lu never interprets labels or taints; dispatch compares them exactly.
 
 ## Controller rules
+- Queue order is priority descending, then creation time ascending. A job in a configured group is dispatched only while its group has fewer than `max_running` jobs in `leased`, `running`, `recovering` or `needs_input`; a job blocked by a full group stays `queued` with `group limit (<name> <running>/<max>)` as its waiting reason. Provider, label and taint rules still apply first: priority and group caps only order eligible jobs, they never make an ineligible node eligible.
 
 - A job with `after` dependencies starts `blocked`. When a dependency becomes `done`, every blocked dependent whose dependencies are all `done` becomes `queued` in the same transaction. When a dependency becomes `failed` or `cancelled`, blocked dependents fail with `failure_class: "dependency"` and summary `dependency <id> <state>`, cascading through their own dependents. A dependent with `include_failed: true` is instead released when its other dependencies are ready; a dead dependency was accepted at submit time only for such dependents. Dependency failures never retry.
 - A dependent job with `stack_dependencies: true` (the default) stages its base commit, then the agent fetches the dependency list and applies each finished dependency's `diff.patch` in `after` order before starting the harness. An explicit `spec.collect` overrides this fallback: `files` stages inputs, while `apply` and `both` also apply them. A dependency with no diff is skipped. Each patch is tried with libgit2 apply, libgit2 three-way, then `git apply --3way` when `git` is on the agent's PATH. `spec.on_conflict = "fail"` (the default) stops before the harness and completes `Failed(Conflict)` with a summary naming the input, file and hunk; `skip` leaves the patch unapplied and records the first failing file and hunk in `INDEX.md`; `markers` leaves labelled conflict markers in the affected files and records `markers (N files)`. Later inputs still apply under `skip` and `markers`. `conflict` never retries. The job's `diff.patch` is always against its base, includes applied dependency changes and any conflict markers, and excludes `.lu`. At most 16 inputs and 64 MiB of stored diffs are accepted, checked again at stage time.

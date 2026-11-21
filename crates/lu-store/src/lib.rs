@@ -9,12 +9,14 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 8;
 
 #[cfg(test)]
 pub mod conformance;
 #[cfg(test)]
 mod model;
+
+use std::collections::HashMap;
 
 use lu_proto::{
     ArtifactName, Completion, FailureClass, Heartbeat, JobEdit, JobId, JobSpec, JobState, NodeName,
@@ -25,6 +27,35 @@ use lu_proto::{
 pub struct Now {
     pub wall_unix: i64,
     pub mono_ms: u64,
+}
+
+/// Where a provider cordon came from. Reiki-derived cordons lift after healthy heartbeats;
+/// failure-derived cordons run for their time limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CordonSource {
+    Reiki,
+    Failure,
+}
+
+impl CordonSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CordonSource::Reiki => "reiki",
+            CordonSource::Failure => "failure",
+        }
+    }
+}
+
+/// A provider cordon with the detail needed to explain it to an operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cordon {
+    pub node: NodeName,
+    pub provider: String,
+    pub source: CordonSource,
+    pub reason: String,
+    pub set_at_unix: i64,
+    /// Monotonic deadline used by dispatch; `None` only for migrated rows without a usable clock.
+    pub until_mono_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +83,8 @@ pub struct JobRecord {
     /// Size of the stored `diff.patch` in bytes when recorded. Jobs from before schema 6, or
     /// without a diff, have no size.
     pub diff_bytes: Option<u64>,
+    /// A `done` job whose expectations were not met in suspect mode.
+    pub expect_failed: bool,
     /// Dependencies that are not yet `done`; empty once the job may run.
     pub waiting_on: Vec<JobId>,
 }
@@ -137,6 +170,27 @@ pub fn missing_labels<'a>(required: &'a [String], nodes: &[NodeRecord]) -> Vec<&
         .collect()
 }
 
+/// Why a queued job cannot be placed, including a configured group that is at its cap.
+pub fn waiting_reason_with_groups(
+    job: &JobRecord,
+    nodes: &[NodeRecord],
+    group_counts: &HashMap<String, usize>,
+    group_limits: &HashMap<String, usize>,
+) -> Option<String> {
+    if job.state != JobState::Queued {
+        return None;
+    }
+    if let Some(group) = &job.spec.group {
+        if let Some(&limit) = group_limits.get(group) {
+            let running = group_counts.get(group).copied().unwrap_or(0);
+            if running >= limit {
+                return Some(format!("group limit ({group} {running}/{limit})"));
+            }
+        }
+    }
+    waiting_reason(job, nodes)
+}
+
 /// Why a queued job cannot be placed: first a missing label, then a taint no matching node is
 /// tolerated for.
 pub fn waiting_reason(job: &JobRecord, nodes: &[NodeRecord]) -> Option<String> {
@@ -220,9 +274,10 @@ pub trait Store: Send + Sync + 'static {
 
     /// Records the heartbeat and the time it was seen.
     fn heartbeat(&self, hb: &Heartbeat, now: Now) -> Result<(), StoreError>;
-    /// Leases the oldest queued job this node may run (not draining, harness usable, no job
-    /// held, labels satisfied, taints tolerated, and able to serve the primary or one fallback
-    /// provider choice), bumping the epoch.
+    /// Leases the highest-priority queued job this node may run, oldest first within a priority
+    /// (not draining, harness usable, no job held, labels satisfied, taints tolerated, able to
+    /// serve the primary or one fallback provider choice, and below its group's cap), bumping the
+    /// epoch. Provider, label and taint rules still apply first.
     fn next_assignment(
         &self,
         node: &NodeName,
@@ -288,7 +343,35 @@ pub trait Store: Send + Sync + 'static {
     fn set_draining(&self, node: &NodeName, draining: bool) -> Result<(), StoreError>;
     fn nodes(&self, now: Now, lease_ms: u64) -> Result<Vec<NodeRecord>, StoreError>;
 
+    /// All cordons, or just one node's when `node` is `Some`.
+    fn cordons(&self, node: Option<&NodeName>) -> Result<Vec<Cordon>, StoreError>;
+    /// Creates or replaces a provider cordon. Reiki cordons lift after two healthy heartbeats;
+    /// failure cordons rely on `until_mono_ms`.
+    fn set_cordon(
+        &self,
+        node: &NodeName,
+        provider: &str,
+        source: CordonSource,
+        reason: &str,
+        set_at_unix: i64,
+        until_mono_ms: i64,
+    ) -> Result<(), StoreError>;
+    /// Removes cordons for a node, optionally only one provider. Returns the providers removed.
+    fn uncordon(&self, node: &NodeName, provider: Option<&str>) -> Result<Vec<String>, StoreError>;
+
     /// Returns counts of jobs per state, including zero for absent states.
     /// Also returns total nodes, online nodes, drained nodes, and completed job counters.
     fn job_counts(&self, now: Now, lease_ms: u64) -> Result<JobCounts, StoreError>;
+
+    /// Installs the configured concurrency caps by group name. Unconfigured groups stay unlimited.
+    /// Defaults to no caps for stores that do not manage dispatch.
+    fn set_group_limits(&self, limits: HashMap<String, usize>) -> Result<(), StoreError> {
+        let _ = limits;
+        Ok(())
+    }
+
+    /// Counts jobs in `leased`, `running`, `recovering` or `needs_input` per group.
+    fn group_counts(&self) -> Result<HashMap<String, usize>, StoreError> {
+        Ok(HashMap::new())
+    }
 }

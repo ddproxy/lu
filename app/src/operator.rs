@@ -10,9 +10,10 @@ use lu_client::{
     ApiError, Client, JobView, ListRepos, LogPage, NodeStats, NodeView, RepoView, StatusView,
 };
 use lu_proto::{
-    printable, truncate_chars, ArtifactName, CollectMode, FailureClass, HarnessState, JobEdit,
-    JobId, JobSpec, JobState, NodeName, OnConflict, DEFAULT_TIMEOUT_SECS, LABEL_SOURCE_PROBED,
-    MAX_TASK_BYTES,
+    printable, truncate_chars, ArtifactName, CollectMode, ExpectEdit, ExpectMode, ExpectSpec,
+    FailureClass, HarnessState, JobEdit, JobId, JobSpec, JobState, NodeName, OnConflict,
+    StuckPolicy, DEFAULT_TIMEOUT_SECS, LABEL_SOURCE_PROBED, MAX_STUCK_AFTER_SECS, MAX_TASK_BYTES,
+    MIN_STUCK_AFTER_SECS,
 };
 use lu_tui::graph::{self, Graph};
 use lu_tui::model::Tone;
@@ -51,6 +52,12 @@ pub struct SubmitArgs {
     /// Stop the harness after this many seconds with no output.
     #[arg(long, value_parser = parse_idle_timeout)]
     pub idle_timeout: Option<u64>,
+    /// Action when the job is continuously stuck: none, cancel or retry.
+    #[arg(long, value_parser = parse_stuck_policy)]
+    pub on_stuck: Option<StuckPolicy>,
+    /// Seconds continuously stuck before acting: 60 to 86400.
+    #[arg(long, value_parser = parse_stuck_after)]
+    pub stuck_after: Option<u64>,
     /// Only run after this job is done (repeatable).
     #[arg(long = "after", value_parser = parse_job_id)]
     pub after: Vec<JobId>,
@@ -72,12 +79,40 @@ pub struct SubmitArgs {
     /// Expect an empty diff, so no `no changes` note is added when the job is done.
     #[arg(long)]
     pub allow_empty: bool,
+    /// A relative path that must exist in the working tree (repeatable).
+    #[arg(long = "expect-file")]
+    pub expect_files: Vec<String>,
+    /// A glob that at least one changed path must match (repeatable).
+    #[arg(long = "expect-changed")]
+    pub expect_changed: Vec<String>,
+    /// A glob that no changed path may match (repeatable).
+    #[arg(long = "forbid-changed")]
+    pub forbid_changed: Vec<String>,
+    /// Minimum exported diff size in bytes.
+    #[arg(long)]
+    pub min_diff_bytes: Option<u64>,
+    /// Maximum exported diff size in bytes.
+    #[arg(long)]
+    pub max_diff_bytes: Option<u64>,
+    /// How unmet expectations affect a successful harness run: suspect or fail.
+    #[arg(long = "expect-mode", value_name = "MODE")]
+    pub expect_mode: Option<ExpectMode>,
     /// Run only on a node with this label (repeatable).
     #[arg(long = "require")]
     pub require: Vec<String>,
     /// Tolerate this node taint (repeatable).
     #[arg(long = "tolerate")]
     pub tolerate: Vec<String>,
+    /// Dispatch priority, 0 (lowest) to 9 (highest); defaults to 5.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u8).range(0..=9),
+        default_value_t = lu_proto::DEFAULT_PRIORITY
+    )]
+    pub priority: u8,
+    /// Concurrency group name (1-64 chars from A-Z a-z 0-9 . _ -).
+    #[arg(long)]
+    pub group: Option<String>,
     /// Idempotency key.
     #[arg(long)]
     pub key: Option<String>,
@@ -170,6 +205,39 @@ pub struct RetryArgs {
     /// Clear the tolerated taints.
     #[arg(long = "no-tolerate")]
     pub no_tolerate: bool,
+    /// Set required working-tree paths, replacing the stored list (repeatable).
+    #[arg(long = "expect-file")]
+    pub expect_files: Vec<String>,
+    /// Set changed-path globs, replacing the stored list (repeatable).
+    #[arg(long = "expect-changed")]
+    pub expect_changed: Vec<String>,
+    /// Set forbidden changed-path globs, replacing the stored list (repeatable).
+    #[arg(long = "forbid-changed")]
+    pub forbid_changed: Vec<String>,
+    /// Set the minimum exported diff size in bytes.
+    #[arg(long)]
+    pub min_diff_bytes: Option<u64>,
+    /// Set the maximum exported diff size in bytes.
+    #[arg(long)]
+    pub max_diff_bytes: Option<u64>,
+    /// Set how unmet expectations affect a successful harness run.
+    #[arg(long = "expect-mode", value_name = "MODE")]
+    pub expect_mode: Option<ExpectMode>,
+    /// Replace the stuck policy: none, cancel or retry.
+    #[arg(long, value_parser = parse_stuck_policy)]
+    pub on_stuck: Option<StuckPolicy>,
+    /// Replace the continuous stuck threshold in seconds: 60 to 86400.
+    #[arg(long, value_parser = parse_stuck_after)]
+    pub stuck_after: Option<u64>,
+    /// Replace the dispatch priority, 0 (lowest) to 9 (highest).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
+    pub priority: Option<u8>,
+    /// Replace the concurrency group name.
+    #[arg(long, conflicts_with = "no_group")]
+    pub group: Option<String>,
+    /// Clear the concurrency group.
+    #[arg(long = "no-group", conflicts_with = "group")]
+    pub no_group: bool,
     /// Idempotency key. The new job carries none unless this is given.
     #[arg(long)]
     pub key: Option<String>,
@@ -207,6 +275,30 @@ pub struct EditArgs {
     /// Include failed and cancelled dependencies as inputs when they stored a diff.
     #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
     pub include_failed: Option<bool>,
+    /// Set required working-tree paths, replacing the stored list (repeatable).
+    #[arg(long = "expect-file")]
+    pub expect_files: Vec<String>,
+    /// Set changed-path globs, replacing the stored list (repeatable).
+    #[arg(long = "expect-changed")]
+    pub expect_changed: Vec<String>,
+    /// Set forbidden changed-path globs, replacing the stored list (repeatable).
+    #[arg(long = "forbid-changed")]
+    pub forbid_changed: Vec<String>,
+    /// Set the minimum exported diff size in bytes.
+    #[arg(long)]
+    pub min_diff_bytes: Option<u64>,
+    /// Set the maximum exported diff size in bytes.
+    #[arg(long)]
+    pub max_diff_bytes: Option<u64>,
+    /// Set how unmet expectations affect a successful harness run.
+    #[arg(long = "expect-mode", value_name = "MODE")]
+    pub expect_mode: Option<ExpectMode>,
+    /// Replace the stuck policy: none, cancel or retry.
+    #[arg(long, value_parser = parse_stuck_policy)]
+    pub on_stuck: Option<StuckPolicy>,
+    /// Replace the continuous stuck threshold in seconds: 60 to 86400.
+    #[arg(long, value_parser = parse_stuck_after)]
+    pub stuck_after: Option<u64>,
     /// Replace the conflict policy: fail, markers or skip.
     #[arg(long = "on-conflict", value_name = "MODE")]
     pub on_conflict: Option<OnConflict>,
@@ -222,6 +314,15 @@ pub struct EditArgs {
     /// Clear the tolerated taints.
     #[arg(long = "no-tolerate")]
     pub no_tolerate: bool,
+    /// Replace the dispatch priority, 0 (lowest) to 9 (highest).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
+    pub priority: Option<u8>,
+    /// Replace the concurrency group name.
+    #[arg(long, conflicts_with = "no_group")]
+    pub group: Option<String>,
+    /// Clear the concurrency group.
+    #[arg(long = "no-group", conflicts_with = "group")]
+    pub no_group: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -300,6 +401,15 @@ pub struct NodeArgs {
     pub node: NodeName,
 }
 
+#[derive(Debug, clap::Args)]
+pub struct UncordonArgs {
+    /// Node name.
+    #[arg(value_parser = parse_node)]
+    pub node: NodeName,
+    /// Provider to clear. Omit to clear every cordon on the node.
+    pub provider: Option<String>,
+}
+
 pub async fn submit(args: SubmitArgs, config: &Path, json: bool) -> ExitCode {
     finish(submit_inner(args, config, json).await)
 }
@@ -368,11 +478,23 @@ pub async fn undrain(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
     finish(drain_inner(args, config, json, false).await)
 }
 
+pub async fn uncordon(args: UncordonArgs, config: &Path, json: bool) -> ExitCode {
+    finish(uncordon_inner(args, config, json).await)
+}
+
 async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
     let task = read_task(&args)?;
     let client = connect(config)?;
     let Some(after) = resolve_after(&client, &args.after, &args.after_key).await? else {
         return Ok(ExitCode::from(EXIT_USAGE));
+    };
+    let expect = ExpectFlags {
+        files: args.expect_files,
+        changed: args.expect_changed,
+        forbid_changed: args.forbid_changed,
+        min_diff_bytes: args.min_diff_bytes,
+        max_diff_bytes: args.max_diff_bytes,
+        mode: args.expect_mode,
     };
     let spec = JobSpec {
         repo: args.repo,
@@ -381,9 +503,13 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         task,
         harness: args.harness,
         provider: args.provider,
+        priority: args.priority,
+        group: args.group,
         model: args.model,
         timeout_secs: args.timeout,
         idle_timeout_secs: args.idle_timeout,
+        on_stuck: args.on_stuck,
+        stuck_after_secs: args.stuck_after,
         idempotency_key: args.key,
         after,
         stack_dependencies: !args.no_stack,
@@ -394,6 +520,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         requires: args.require,
         tolerates: args.tolerate,
         fallbacks: args.fallbacks,
+        expect: expect.spec(),
     };
     spec.validate().map_err(|error| error.to_string())?;
 
@@ -456,9 +583,13 @@ async fn collect_inner(args: CollectArgs, config: &Path, json: bool) -> Result<E
         task,
         harness: "opencode".to_owned(),
         provider: args.provider,
+        priority: lu_proto::DEFAULT_PRIORITY,
+        group: None,
         model: args.model,
         timeout_secs: args.timeout,
         idle_timeout_secs: None,
+        on_stuck: None,
+        stuck_after_secs: None,
         idempotency_key: args.key,
         after,
         stack_dependencies: true,
@@ -469,6 +600,7 @@ async fn collect_inner(args: CollectArgs, config: &Path, json: bool) -> Result<E
         requires: Vec::new(),
         tolerates: Vec::new(),
         fallbacks: Vec::new(),
+        expect: None,
     };
     spec.validate().map_err(|error| error.to_string())?;
     submit_and_report(&client, &spec, json, args.wait).await
@@ -512,6 +644,14 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
         return Ok(ExitCode::from(EXIT_USAGE));
     }
 
+    let expect = ExpectFlags {
+        files: args.expect_files,
+        changed: args.expect_changed,
+        forbid_changed: args.forbid_changed,
+        min_diff_bytes: args.min_diff_bytes,
+        max_diff_bytes: args.max_diff_bytes,
+        mode: args.expect_mode,
+    };
     let mut spec = view.spec;
     if let Some(provider) = args.provider {
         spec.provider = Some(provider);
@@ -546,9 +686,19 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
     if args.include_failed {
         spec.include_failed = true;
     }
+    if let Some(priority) = args.priority {
+        spec.priority = priority;
+    }
+    if let Some(group) = args.group {
+        spec.group = Some(group);
+    } else if args.no_group {
+        spec.group = None;
+    }
     if let Some(on_conflict) = args.on_conflict {
         spec.on_conflict = on_conflict;
     }
+    let merged_expect = expect.merged(spec.expect.as_ref());
+    spec.expect = merged_expect;
     // A retry is a new job; only --key gives it an idempotency key.
     spec.idempotency_key = args.key;
     spec.validate().map_err(|error| error.to_string())?;
@@ -572,6 +722,14 @@ async fn edit_inner(args: EditArgs, config: &Path, json: bool) -> Result<ExitCod
             None => return Ok(ExitCode::from(EXIT_USAGE)),
         }
     };
+    let expect = ExpectFlags {
+        files: args.expect_files,
+        changed: args.expect_changed,
+        forbid_changed: args.forbid_changed,
+        min_diff_bytes: args.min_diff_bytes,
+        max_diff_bytes: args.max_diff_bytes,
+        mode: args.expect_mode,
+    };
     let edit = JobEdit {
         provider: args.provider,
         model: args.model,
@@ -581,7 +739,18 @@ async fn edit_inner(args: EditArgs, config: &Path, json: bool) -> Result<ExitCod
         after,
         collect: args.collect,
         include_failed: args.include_failed,
+        expect: expect.edit(),
         on_conflict: args.on_conflict,
+        priority: args.priority,
+        group: if args.group.is_some() {
+            args.group.map(Some)
+        } else if args.no_group {
+            Some(None)
+        } else {
+            None
+        },
+        on_stuck: args.on_stuck,
+        stuck_after_secs: args.stuck_after,
     };
     let (view, raw) = client
         .edit_with_raw(&args.id, &edit)
@@ -837,6 +1006,11 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
                     label.clone()
                 }
             }));
+            let cordons: Vec<String> = node
+                .cordons
+                .iter()
+                .map(|provider| format!("!{provider}"))
+                .collect();
             vec![
                 node.name.to_string(),
                 node.version
@@ -845,6 +1019,7 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
                     .unwrap_or_else(|| "-".to_owned()),
                 harness_name(node.harness),
                 labels_cell(&labels, 40),
+                labels_cell(&cordons, 24),
                 time(node.last_seen),
                 if node.draining { "yes" } else { "no" }.to_owned(),
             ]
@@ -856,6 +1031,7 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
             "VERSION",
             "HARNESS",
             "LABELS",
+            "CORDONS",
             "LAST_SEEN",
             "DRAINED",
         ],
@@ -926,7 +1102,14 @@ async fn node_inner(args: NodeArgs, config: &Path, json: bool) -> Result<ExitCod
         .node_stats(&args.node)
         .await
         .map_err(|error| error.to_string())?;
+    let nodes = client.nodes().await.map_err(|error| error.to_string())?;
+    let view = nodes
+        .nodes
+        .iter()
+        .find(|node| node.name == args.node)
+        .ok_or_else(|| format!("node {} not found", args.node))?;
     print_node_stats(&args.node, &stats);
+    print_cordons(view);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -963,7 +1146,7 @@ async fn graph_inner(args: GraphArgs, config: &Path, json: bool) -> Result<ExitC
         .and_then(|value| value.parse().ok())
         .unwrap_or(GRAPH_WIDTH);
     let colour = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    for line in graph::render(&graph, width) {
+    for line in graph_lines(&graph, width) {
         if colour {
             print_graph_line(&line);
         } else {
@@ -971,6 +1154,11 @@ async fn graph_inner(args: GraphArgs, config: &Path, json: bool) -> Result<ExitC
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `lu graph` keeps task titles; the dashboard calls `graph::render` directly without them.
+fn graph_lines(graph: &Graph, width: usize) -> Vec<graph::GraphLine> {
+    graph::render(graph, width, true).lines
 }
 
 pub(crate) fn graph_job(view: &JobView) -> graph::Job {
@@ -1054,6 +1242,24 @@ async fn drain_inner(
             "node '{}' not found: a node must heartbeat at least once before it can be drained or undrained",
             args.node.as_str()
         )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+async fn uncordon_inner(args: UncordonArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    match client.uncordon(&args.node, args.provider.as_deref()).await {
+        Ok(removed) => {
+            if json {
+                print_raw(&serde_json::json!({ "removed": removed }).to_string());
+            } else if removed.is_empty() {
+                println!("uncordoned {}: -", args.node);
+            } else {
+                println!("uncordoned {}: {}", args.node, removed.join(", "));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(ApiError::NotFound) => Err(format!("node '{}' not found", args.node.as_str())),
         Err(error) => Err(error.to_string()),
     }
 }
@@ -1212,6 +1418,15 @@ fn print_job(view: &JobView) {
     let rows = vec![
         ("id", view.id.to_string()),
         ("state", state_name(view.state).to_owned()),
+        ("priority", view.spec.priority.to_string()),
+        (
+            "group",
+            view.spec
+                .group
+                .as_deref()
+                .map(display_field)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
         (
             "node",
             view.node
@@ -1452,6 +1667,46 @@ fn print_node_stats(node: &NodeName, stats: &NodeStats) {
     }
 }
 
+fn short_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m", secs / 3600, secs % 3600 / 60)
+    }
+}
+
+fn print_cordons(node: &NodeView) {
+    println!("cordons");
+    if node.cordon_details.is_empty() {
+        println!("  -");
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for c in &node.cordon_details {
+        let age = now.saturating_sub(c.set_at.max(0) as u64);
+        let ago = if age == 0 {
+            "just now".to_owned()
+        } else {
+            format!("{} ago", short_duration(age))
+        };
+        let state = match (c.until, c.lifts_after_healthy_heartbeats) {
+            (Some(until), _) if until > now as i64 => {
+                format!("{} left", short_duration((until - now as i64) as u64))
+            }
+            (Some(_), _) => "expired".to_owned(),
+            (None, Some(count)) => format!("lifts on {count} healthy"),
+            (None, None) => "lifts on healthy".to_owned(),
+        };
+        println!("  {} [{}] {ago}; {state}", c.provider, c.source);
+        println!("      {}", printable(&c.reason));
+    }
+}
+
 fn disk_free_percent(free: Option<u64>, total: Option<u64>) -> Option<u64> {
     let (free, total) = (free?, total?);
     free.saturating_mul(100).checked_div(total)
@@ -1642,6 +1897,7 @@ pub(crate) fn failure_name(value: Option<FailureClass>) -> String {
 pub(crate) fn outcome_text(note: Option<&str>) -> String {
     match note {
         Some("no_changes") => "no changes".to_owned(),
+        Some("expect_failed") => "expect failed".to_owned(),
         _ => "-".to_owned(),
     }
 }
@@ -1666,6 +1922,81 @@ fn parse_template(value: &str) -> Result<String, String> {
 
 fn parse_node(value: &str) -> Result<NodeName, String> {
     NodeName::parse(value).map_err(|error| error.to_string())
+}
+
+/// The shared shape of the six expectation flags on submit, retry and edit.
+struct ExpectFlags {
+    files: Vec<String>,
+    changed: Vec<String>,
+    forbid_changed: Vec<String>,
+    min_diff_bytes: Option<u64>,
+    max_diff_bytes: Option<u64>,
+    mode: Option<ExpectMode>,
+}
+
+impl ExpectFlags {
+    fn is_empty(&self) -> bool {
+        self.files.is_empty()
+            && self.changed.is_empty()
+            && self.forbid_changed.is_empty()
+            && self.min_diff_bytes.is_none()
+            && self.max_diff_bytes.is_none()
+            && self.mode.is_none()
+    }
+
+    fn spec(&self) -> Option<ExpectSpec> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(ExpectSpec {
+            files: self.files.clone(),
+            changed: self.changed.clone(),
+            forbid_changed: self.forbid_changed.clone(),
+            min_diff_bytes: self.min_diff_bytes,
+            max_diff_bytes: self.max_diff_bytes,
+            mode: self.mode.unwrap_or_default(),
+        })
+    }
+
+    fn merged(&self, base: Option<&ExpectSpec>) -> Option<ExpectSpec> {
+        if self.is_empty() {
+            return base.cloned();
+        }
+        let mut next = base.cloned().unwrap_or_default();
+        if !self.files.is_empty() {
+            next.files = self.files.clone();
+        }
+        if !self.changed.is_empty() {
+            next.changed = self.changed.clone();
+        }
+        if !self.forbid_changed.is_empty() {
+            next.forbid_changed = self.forbid_changed.clone();
+        }
+        if let Some(min) = self.min_diff_bytes {
+            next.min_diff_bytes = Some(min);
+        }
+        if let Some(max) = self.max_diff_bytes {
+            next.max_diff_bytes = Some(max);
+        }
+        if let Some(mode) = self.mode {
+            next.mode = mode;
+        }
+        Some(next)
+    }
+
+    fn edit(&self) -> Option<ExpectEdit> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(ExpectEdit {
+            files: (!self.files.is_empty()).then(|| self.files.clone()),
+            changed: (!self.changed.is_empty()).then(|| self.changed.clone()),
+            forbid_changed: (!self.forbid_changed.is_empty()).then(|| self.forbid_changed.clone()),
+            min_diff_bytes: self.min_diff_bytes,
+            max_diff_bytes: self.max_diff_bytes,
+            mode: self.mode,
+        })
+    }
 }
 
 /// `provider` or `provider:model`; the model may contain colons, the provider cannot.
@@ -1717,6 +2048,22 @@ fn parse_limit(value: &str) -> Result<u32, String> {
     Ok(limit)
 }
 
+fn parse_stuck_policy(value: &str) -> Result<StuckPolicy, String> {
+    StuckPolicy::parse(value).map_err(|error| error.to_string())
+}
+
+fn parse_stuck_after(value: &str) -> Result<u64, String> {
+    let secs: u64 = value
+        .parse()
+        .map_err(|_| format!("stuck after must be a whole number of seconds (got {value:?})"))?;
+    if !(MIN_STUCK_AFTER_SECS..=MAX_STUCK_AFTER_SECS).contains(&secs) {
+        return Err(format!(
+            "stuck after must be {MIN_STUCK_AFTER_SECS} to {MAX_STUCK_AFTER_SECS} seconds (got {secs})"
+        ));
+    }
+    Ok(secs)
+}
+
 fn finish(result: Result<ExitCode, String>) -> ExitCode {
     match result {
         Ok(code) => code,
@@ -1724,6 +2071,39 @@ fn finish(result: Result<ExitCode, String>) -> ExitCode {
             eprintln!("lu: {message}");
             ExitCode::from(EXIT_ERROR)
         }
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use lu_tui::graph::{Job, State};
+
+    use super::graph_lines;
+
+    #[test]
+    fn the_graph_command_draws_titles_on_one_row_per_chain() {
+        let graph = lu_tui::graph::Graph::build(&[
+            Job {
+                id: "AAAAAAAAAA".to_owned(),
+                state: State::Done,
+                title: "build".to_owned(),
+                after: Vec::new(),
+            },
+            Job {
+                id: "BBBBBBBBBB".to_owned(),
+                state: State::Queued,
+                title: "test".to_owned(),
+                after: vec!["AAAAAAAAAA".to_owned()],
+            },
+        ]);
+        let lines = graph_lines(&graph, 120);
+        let text: String = lines
+            .iter()
+            .map(|line| line.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(text.contains("✓ AAAAA build ───▶ ○ BBBBB test"), "{text}");
     }
 }
 
@@ -1962,5 +2342,133 @@ mod collect_cli_tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("collect"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod expect_cli_tests {
+    use clap::Parser;
+    use lu_proto::ExpectMode;
+
+    use super::{EditArgs, RetryArgs, SubmitArgs};
+
+    #[derive(Debug, Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: Command,
+    }
+
+    #[derive(Debug, clap::Subcommand)]
+    enum Command {
+        Submit(SubmitArgs),
+        Retry(RetryArgs),
+        Edit(EditArgs),
+    }
+
+    #[test]
+    fn submit_parses_every_expectation_flag() {
+        let cli = Cli::try_parse_from([
+            "lu",
+            "submit",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+            "--expect-file",
+            "REVIEW.md",
+            "--expect-changed",
+            "src/**",
+            "--forbid-changed",
+            "Cargo.lock",
+            "--min-diff-bytes",
+            "1",
+            "--max-diff-bytes",
+            "5242880",
+            "--expect-mode",
+            "fail",
+        ])
+        .unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit");
+        };
+        assert_eq!(args.expect_files, ["REVIEW.md"]);
+        assert_eq!(args.expect_changed, ["src/**"]);
+        assert_eq!(args.forbid_changed, ["Cargo.lock"]);
+        assert_eq!(args.min_diff_bytes, Some(1));
+        assert_eq!(args.max_diff_bytes, Some(5_242_880));
+        assert_eq!(args.expect_mode, Some(ExpectMode::Fail));
+
+        let cli = Cli::try_parse_from([
+            "lu",
+            "submit",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+        ])
+        .unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit");
+        };
+        assert!(args.expect_files.is_empty());
+        assert!(args.expect_mode.is_none());
+    }
+
+    #[test]
+    fn retry_and_edit_parse_expectation_flags() {
+        let id = lu_proto::JobId::new().to_string();
+        let cli = Cli::try_parse_from([
+            "lu",
+            "retry",
+            &id,
+            "--expect-file",
+            "REVIEW.md",
+            "--expect-mode",
+            "suspect",
+        ])
+        .unwrap();
+        let Command::Retry(args) = cli.command else {
+            panic!("expected retry");
+        };
+        assert_eq!(args.expect_files, ["REVIEW.md"]);
+        assert_eq!(args.expect_mode, Some(ExpectMode::Suspect));
+
+        let cli = Cli::try_parse_from([
+            "lu",
+            "edit",
+            &id,
+            "--expect-changed",
+            "src/**",
+            "--max-diff-bytes",
+            "10",
+        ])
+        .unwrap();
+        let Command::Edit(args) = cli.command else {
+            panic!("expected edit");
+        };
+        assert_eq!(args.expect_changed, ["src/**"]);
+        assert_eq!(args.max_diff_bytes, Some(10));
+    }
+
+    #[test]
+    fn an_invalid_expect_mode_is_a_clap_error() {
+        let error = Cli::try_parse_from([
+            "lu",
+            "submit",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+            "--expect-mode",
+            "nope",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("expect-mode"), "{error}");
     }
 }

@@ -197,6 +197,8 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         opencode_password_file: None,
         harness_wrapper: Vec::new(),
         heartbeat_secs: 3,
+        on_stuck: lu_config::StuckPolicy::None,
+        stuck_after_secs: 1_800,
         reiki_health_url: None,
         reiki_token_file: None,
         provider_models: Vec::new(),
@@ -224,9 +226,14 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         include_failed: false,
         on_conflict: Default::default(),
         allow_empty: false,
+        expect: None,
         requires: Vec::new(),
+        on_stuck: None,
+        stuck_after_secs: None,
         tolerates: Vec::new(),
         fallbacks: Vec::new(),
+        priority: lu_proto::DEFAULT_PRIORITY,
+        group: None,
     };
     let controller = Arc::new(PackController {
         spec,

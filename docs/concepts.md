@@ -49,6 +49,14 @@ by the controller; see [Tokens and TLS](tokens-and-tls.md).
 | Authentication, TLS and token storage | Controller config, agent and operator clients | [Tokens and TLS](tokens-and-tls.md) |
 | HTTP routes and response shapes | Controller API | [HTTP API](api.md) |
 
+## Declaring outputs
+
+A spec's optional `expect` block declares what a successful run leaves behind: required files, globs
+that changed paths must match or must not match, and optional diff size bounds. The agent checks it
+after the harness exits, using the same uploaded diff with `.lu/` paths excluded. `suspect` mode
+keeps the job `done` and adds an `expect_failed` note; `fail` mode ends it `failed` with class
+`execution`. See [Job Lifecycle](lifecycle.md#expectations).
+
 ## A job's short life
 
 1. An operator submits a spec. The controller creates a job as `queued`, or `blocked` if any
@@ -63,4 +71,5 @@ by the controller; see [Tokens and TLS](tokens-and-tls.md).
 
 The job row is the current truth. `lu show` prints that row; `lu logs` reads the stored
 `<job id>/run.log` file, whose accepted length is tracked in the job's `log_len`. `lu top` adds a
-live view of nodes and recent jobs; with the `tui` feature it can also draw the dependency graph.
+live view of nodes and recent jobs; with the `tui` feature it can also draw the dependency graph
+in a bordered panel under the job table, with one horizontal row per chain.

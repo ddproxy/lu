@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{is_name_byte, JobId};
 use crate::label::valid_label;
 use crate::limits::{
-    DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_COLLECT_INPUTS, MAX_FALLBACKS, MAX_GIT_REF_BYTES,
-    MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS, MAX_MODEL_BYTES, MAX_NAME_BYTES,
-    MAX_REPO_BYTES, MAX_REQUIRES_LABELS, MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MAX_TOLERATES,
-    MIN_TIMEOUT_SECS,
+    DEFAULT_PRIORITY, DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_COLLECT_INPUTS,
+    MAX_EXPECT_GLOB_BYTES, MAX_EXPECT_ITEMS, MAX_EXPECT_PATH_BYTES, MAX_FALLBACKS,
+    MAX_GIT_REF_BYTES, MAX_GROUP_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS,
+    MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_PRIORITY, MAX_REPO_BYTES, MAX_REQUIRES_LABELS,
+    MAX_STUCK_AFTER_SECS, MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MAX_TOLERATES, MIN_PRIORITY,
+    MIN_STUCK_AFTER_SECS, MIN_TIMEOUT_SECS,
 };
 
 /// The provider name that asks dispatch to choose a healthy provider from the node's offer.
@@ -264,6 +266,381 @@ pub fn effective_collect(mode: Option<CollectMode>, stack_dependencies: bool) ->
     })
 }
 
+/// How unmet expectations affect a run the harness finished successfully.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpectMode {
+    /// Finish `done` with an `expect_failed` outcome note.
+    #[default]
+    Suspect,
+    /// Finish `failed` with failure class `execution`.
+    Fail,
+}
+
+/// The canonical spellings accepted by [`ExpectMode::parse`].
+pub const EXPECT_MODES: [&str; 2] = ["suspect", "fail"];
+
+impl ExpectMode {
+    /// Parses a canonical spelling, case-insensitively.
+    pub fn parse(value: &str) -> Result<Self, ExpectModeError> {
+        let text = value.trim();
+        for name in EXPECT_MODES {
+            if text.eq_ignore_ascii_case(name) {
+                return Ok(if name == "fail" {
+                    Self::Fail
+                } else {
+                    Self::Suspect
+                });
+            }
+        }
+        Err(ExpectModeError {
+            value: value.to_owned(),
+        })
+    }
+
+    /// The canonical wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Suspect => "suspect",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+impl FromStr for ExpectMode {
+    type Err = ExpectModeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl fmt::Display for ExpectMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// An `expect.mode` value that is neither `suspect` nor `fail`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectModeError {
+    value: String,
+}
+
+impl ExpectModeError {
+    /// The rejected input.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Display for ExpectModeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid expect mode {:?}; expected one of {}",
+            self.value,
+            EXPECT_MODES.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for ExpectModeError {}
+
+/// What a successful run must leave behind. Evaluated after the harness exits, against the same
+/// exported diff the job uploads; `.lu/` paths are excluded from that diff.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ExpectSpec {
+    /// Relative paths that must exist in the working tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// Glob patterns that at least one changed path must match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<String>,
+    /// Glob patterns that no changed path may match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbid_changed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_diff_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_diff_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_suspect")]
+    pub mode: ExpectMode,
+}
+
+#[derive(Deserialize)]
+struct RawExpectSpec {
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    changed: Vec<String>,
+    #[serde(default)]
+    forbid_changed: Vec<String>,
+    #[serde(default)]
+    min_diff_bytes: Option<u64>,
+    #[serde(default)]
+    max_diff_bytes: Option<u64>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+impl TryFrom<RawExpectSpec> for ExpectSpec {
+    type Error = JobSpecError;
+
+    fn try_from(raw: RawExpectSpec) -> Result<Self, Self::Error> {
+        let mode = raw
+            .mode
+            .as_deref()
+            .map(ExpectMode::parse)
+            .transpose()
+            .map_err(|error| invalid("expect", error.to_string()))?
+            .unwrap_or_default();
+        let spec = ExpectSpec {
+            files: raw.files,
+            changed: raw.changed,
+            forbid_changed: raw.forbid_changed,
+            min_diff_bytes: raw.min_diff_bytes,
+            max_diff_bytes: raw.max_diff_bytes,
+            mode,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExpectSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawExpectSpec::deserialize(deserializer)?;
+        ExpectSpec::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl ExpectSpec {
+    /// Checks list sizes, path safety, glob syntax and diff bounds.
+    pub fn validate(&self) -> Result<(), JobSpecError> {
+        for (field, values, max_bytes, glob) in [
+            ("files", &self.files, MAX_EXPECT_PATH_BYTES, false),
+            ("changed", &self.changed, MAX_EXPECT_GLOB_BYTES, true),
+            (
+                "forbid_changed",
+                &self.forbid_changed,
+                MAX_EXPECT_GLOB_BYTES,
+                true,
+            ),
+        ] {
+            if values.len() > MAX_EXPECT_ITEMS {
+                return Err(invalid(
+                    "expect",
+                    format!(
+                        "{field} must name at most {MAX_EXPECT_ITEMS} entries (got {})",
+                        values.len()
+                    ),
+                ));
+            }
+            for value in values {
+                check_expect_value(value, max_bytes, glob)
+                    .map_err(|reason| invalid("expect", format!("{field}: {reason}")))?;
+            }
+        }
+        if let (Some(min), Some(max)) = (self.min_diff_bytes, self.max_diff_bytes) {
+            if min > max {
+                return Err(invalid(
+                    "expect",
+                    format!("min_diff_bytes {min} exceeds max_diff_bytes {max}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Matches a path against a `*` / `**` / `?` glob. `*` and `?` stay within one path segment,
+    /// `**` spans segments, and dots have no special meaning.
+    pub fn glob_matches(pattern: &str, path: &str) -> bool {
+        fn segment(pattern: &str, text: &str) -> bool {
+            let mut possible = vec![false; text.chars().count() + 1];
+            possible[0] = true;
+            for ch in pattern.chars() {
+                let mut next = vec![false; possible.len()];
+                match ch {
+                    '*' => {
+                        next[0] = possible[0];
+                        for i in 1..next.len() {
+                            next[i] = possible[i] || next[i - 1];
+                        }
+                    }
+                    '?' => {
+                        next[1..].copy_from_slice(&possible[..possible.len() - 1]);
+                    }
+                    _ => {
+                        for (i, actual) in text.chars().enumerate() {
+                            next[i + 1] = possible[i] && actual == ch;
+                        }
+                    }
+                }
+                possible = next;
+            }
+            possible[possible.len() - 1]
+        }
+
+        fn parts(pattern: &[&str], path: &[&str]) -> bool {
+            let Some((head, rest)) = pattern.split_first() else {
+                return path.is_empty();
+            };
+            if *head == "**" {
+                return (0..=path.len()).any(|i| parts(rest, &path[i..]));
+            }
+            match path.split_first() {
+                Some((first, tail)) => segment(head, first) && parts(rest, tail),
+                None => false,
+            }
+        }
+
+        parts(
+            &pattern.split('/').collect::<Vec<_>>(),
+            &path.split('/').collect::<Vec<_>>(),
+        )
+    }
+}
+
+fn check_expect_value(value: &str, max_bytes: usize, glob: bool) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("must not be empty".to_owned());
+    }
+    if value.len() > max_bytes {
+        return Err(format!(
+            "must be at most {max_bytes} bytes (got {})",
+            value.len()
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err("must not contain control characters".to_owned());
+    }
+    if value.contains('\\') {
+        return Err("must use forward slashes".to_owned());
+    }
+    let components = value.split('/').collect::<Vec<_>>();
+    if components.iter().any(|part| part.is_empty()) {
+        return Err("must have no empty path components".to_owned());
+    }
+    if components.contains(&".") {
+        return Err("must not contain `.` components".to_owned());
+    }
+    if components.contains(&"..") {
+        return Err("must not contain `..` components".to_owned());
+    }
+    if glob {
+        if components.iter().any(|part| part.contains("***")) {
+            return Err("`***` is not a valid pattern".to_owned());
+        }
+        if value.contains(['[', ']']) {
+            return Err("character classes are not supported".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn is_suspect(mode: &ExpectMode) -> bool {
+    *mode == ExpectMode::Suspect
+}
+
+/// What the agent does when a job stops producing output and using CPU.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StuckPolicy {
+    /// Leave the job running. This is the default.
+    #[default]
+    None,
+    /// Stop the harness and fail the job with class `execution`.
+    Cancel,
+    /// Stop the harness and fail the job with class `node`, so it is retried.
+    Retry,
+}
+
+/// The canonical spellings of [`StuckPolicy`], in help-text order.
+pub const STUCK_POLICIES: [&str; 3] = ["none", "cancel", "retry"];
+
+impl StuckPolicy {
+    /// Parses a canonical spelling, case-insensitively.
+    pub fn parse(value: &str) -> Result<Self, StuckPolicyError> {
+        let text = value.trim();
+        for name in STUCK_POLICIES {
+            if text.eq_ignore_ascii_case(name) {
+                return Ok(match name {
+                    "none" => Self::None,
+                    "cancel" => Self::Cancel,
+                    _ => Self::Retry,
+                });
+            }
+        }
+        Err(StuckPolicyError {
+            value: value.to_owned(),
+        })
+    }
+
+    /// The canonical wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Cancel => "cancel",
+            Self::Retry => "retry",
+        }
+    }
+}
+
+impl FromStr for StuckPolicy {
+    type Err = StuckPolicyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl fmt::Display for StuckPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A `stuck policy` that is not one of the canonical spellings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StuckPolicyError {
+    value: String,
+}
+
+impl StuckPolicyError {
+    /// The rejected input.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Display for StuckPolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid stuck policy {:?}; expected one of {}",
+            self.value,
+            STUCK_POLICIES.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for StuckPolicyError {}
+
+/// Resolves the policy and threshold for a job. An absent job value uses the agent default.
+pub fn effective_stuck(
+    job_policy: Option<StuckPolicy>,
+    job_after_secs: Option<u64>,
+    default_policy: StuckPolicy,
+    default_after_secs: u64,
+) -> Option<(StuckPolicy, u64)> {
+    let policy = job_policy.unwrap_or(default_policy);
+    (policy != StuckPolicy::None).then(|| (policy, job_after_secs.unwrap_or(default_after_secs)))
+}
+
 /// A job to run. `harness` defaults to `opencode` and `timeout_secs` to an hour.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobSpec {
@@ -283,6 +660,13 @@ pub struct JobSpec {
     pub timeout_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_secs: Option<u64>,
+    /// What to do when the agent reports this job stuck. Absent uses the agent default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_stuck: Option<StuckPolicy>,
+    /// How long the job must be continuously stuck before the agent acts. Absent uses the agent
+    /// default; a value of 60 to 86400 seconds is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stuck_after_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     /// Jobs that must be `done` before this one may run.
@@ -304,6 +688,9 @@ pub struct JobSpec {
     /// Whether an empty `diff.patch` is expected, so no `no_changes` note is added.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_empty: bool,
+    /// Outputs a successful run must leave behind. Absent means no expectations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<ExpectSpec>,
     /// Labels a node must advertise before this job may run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<String>,
@@ -313,6 +700,13 @@ pub struct JobSpec {
     /// Alternatives to the primary provider and model, tried in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<Choice>,
+    /// Higher values dispatch first. Omitted means [`DEFAULT_PRIORITY`]; always serialised so
+    /// views can show it.
+    #[serde(default = "default_priority")]
+    pub priority: u8,
+    /// Optional concurrency group, capped by `[[controller.groups]]` when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -332,6 +726,11 @@ struct RawJobSpec {
     timeout_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     idle_timeout_secs: Option<u64>,
+    /// Kept as text so an invalid value is reported as an `on_stuck` field error.
+    #[serde(default)]
+    on_stuck: Option<String>,
+    #[serde(default)]
+    stuck_after_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     idempotency_key: Option<String>,
     #[serde(default)]
@@ -350,17 +749,29 @@ struct RawJobSpec {
     #[serde(default)]
     allow_empty: bool,
     #[serde(default)]
+    expect: Option<ExpectSpec>,
+    #[serde(default)]
     requires: Vec<String>,
     #[serde(default)]
     tolerates: Vec<String>,
     #[serde(default)]
     fallbacks: Vec<Choice>,
+    #[serde(default = "default_priority")]
+    priority: u8,
+    #[serde(default)]
+    group: Option<String>,
 }
 
 impl TryFrom<RawJobSpec> for JobSpec {
     type Error = JobSpecError;
 
     fn try_from(raw: RawJobSpec) -> Result<Self, Self::Error> {
+        let on_stuck = raw
+            .on_stuck
+            .as_deref()
+            .map(StuckPolicy::parse)
+            .transpose()
+            .map_err(|error| invalid("on_stuck", error.to_string()))?;
         let collect = raw
             .collect
             .as_deref()
@@ -383,6 +794,8 @@ impl TryFrom<RawJobSpec> for JobSpec {
             model: raw.model,
             timeout_secs: raw.timeout_secs,
             idle_timeout_secs: raw.idle_timeout_secs,
+            on_stuck,
+            stuck_after_secs: raw.stuck_after_secs,
             idempotency_key: raw.idempotency_key,
             after: raw.after,
             stack_dependencies: raw.stack_dependencies,
@@ -390,9 +803,12 @@ impl TryFrom<RawJobSpec> for JobSpec {
             include_failed: raw.include_failed,
             on_conflict: on_conflict.unwrap_or_default(),
             allow_empty: raw.allow_empty,
+            expect: raw.expect,
             requires: raw.requires,
             tolerates: raw.tolerates,
             fallbacks: raw.fallbacks,
+            priority: raw.priority,
+            group: raw.group,
         };
         spec.validate()?;
         Ok(spec)
@@ -425,9 +841,31 @@ impl JobSpec {
         if let Some(model) = &self.model {
             check_len("model", model, MAX_MODEL_BYTES)?;
         }
+        if !(MIN_PRIORITY..=MAX_PRIORITY).contains(&self.priority) {
+            return Err(invalid(
+                "priority",
+                format!(
+                    "must be {MIN_PRIORITY} to {MAX_PRIORITY} (got {})",
+                    self.priority
+                ),
+            ));
+        }
+        if let Some(group) = &self.group {
+            if !valid_group(group) {
+                return Err(invalid(
+                    "group",
+                    format!(
+                        "must be 1 to {MAX_GROUP_BYTES} bytes from A-Z a-z 0-9 . _ - (got {group:?})"
+                    ),
+                ));
+            }
+        }
         check_timeout("timeout_secs", self.timeout_secs, MAX_TIMEOUT_SECS)?;
         if let Some(idle) = self.idle_timeout_secs {
             check_timeout("idle_timeout_secs", idle, MAX_IDLE_TIMEOUT_SECS)?;
+        }
+        if let Some(after) = self.stuck_after_secs {
+            check_stuck_after(after)?;
         }
         if let Some(key) = &self.idempotency_key {
             validate_idempotency_key(key)?;
@@ -456,6 +894,9 @@ impl JobSpec {
                     self.after.len()
                 ),
             ));
+        }
+        if let Some(expect) = &self.expect {
+            expect.validate()?;
         }
         if self.requires.len() > MAX_REQUIRES_LABELS {
             return Err(invalid(
@@ -547,6 +988,39 @@ impl JobSpec {
     }
 }
 
+/// Changes to a job's expectations. Present lists replace the stored ones; present size bounds
+/// are set, and absent ones stay as they are.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ExpectEdit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forbid_changed: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_diff_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_diff_bytes: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_expect_mode_option"
+    )]
+    pub mode: Option<ExpectMode>,
+}
+
+fn deserialize_expect_mode_option<'de, D>(deserializer: D) -> Result<Option<ExpectMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .as_deref()
+        .map(|text| ExpectMode::parse(text).map_err(serde::de::Error::custom))
+        .transpose()
+}
+
 /// A change to a queued or blocked job. Absent fields stay as they are; a present vector replaces
 /// the stored list, so an empty vector clears it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,6 +1048,9 @@ pub struct JobEdit {
     pub collect: Option<CollectMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_failed: Option<bool>,
+    /// Replaces the expectations block, or parts of it. An empty list clears that list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<ExpectEdit>,
     /// Replaces the conflict policy. `"fail"` clears an explicit policy.
     #[serde(
         default,
@@ -581,6 +1058,25 @@ pub struct JobEdit {
         deserialize_with = "deserialize_conflict_option"
     )]
     pub on_conflict: Option<OnConflict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    /// `None` leaves the group alone, `Some(None)` clears it, `Some(Some(name))` sets it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_group_option"
+    )]
+    pub group: Option<Option<String>>,
+    /// Replaces the stuck policy. `"none"` sets an explicit never-stop policy.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_stuck_policy_option"
+    )]
+    pub on_stuck: Option<StuckPolicy>,
+    /// Replaces the continuous stuck threshold in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stuck_after_secs: Option<u64>,
 }
 
 fn deserialize_collect_option<'de, D>(deserializer: D) -> Result<Option<CollectMode>, D::Error>
@@ -591,6 +1087,51 @@ where
     value
         .as_deref()
         .map(|text| CollectMode::parse(text).map_err(serde::de::Error::custom))
+        .transpose()
+}
+
+/// Plain `Option<Option<String>>` cannot tell an absent field from a JSON `null`; here `null`
+/// must clear the group, so presence is recorded explicitly.
+fn deserialize_group_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct GroupVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for GroupVisitor {
+        type Value = Option<Option<String>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a group name or null")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            Option::<String>::deserialize(deserializer).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(GroupVisitor)
+}
+
+fn deserialize_stuck_policy_option<'de, D>(deserializer: D) -> Result<Option<StuckPolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .as_deref()
+        .map(|text| StuckPolicy::parse(text).map_err(serde::de::Error::custom))
         .transpose()
 }
 
@@ -627,6 +1168,40 @@ impl JobEdit {
         if let Some(on_conflict) = self.on_conflict {
             next.on_conflict = on_conflict;
         }
+        if let Some(expect) = &self.expect {
+            let mut merged = next.expect.take().unwrap_or_default();
+            if let Some(files) = &expect.files {
+                merged.files = files.clone();
+            }
+            if let Some(changed) = &expect.changed {
+                merged.changed = changed.clone();
+            }
+            if let Some(forbid_changed) = &expect.forbid_changed {
+                merged.forbid_changed = forbid_changed.clone();
+            }
+            if let Some(min) = expect.min_diff_bytes {
+                merged.min_diff_bytes = Some(min);
+            }
+            if let Some(max) = expect.max_diff_bytes {
+                merged.max_diff_bytes = Some(max);
+            }
+            if let Some(mode) = expect.mode {
+                merged.mode = mode;
+            }
+            next.expect = Some(merged);
+        }
+        if let Some(priority) = self.priority {
+            next.priority = priority;
+        }
+        if let Some(group) = &self.group {
+            next.group = group.clone();
+        }
+        if let Some(policy) = self.on_stuck {
+            next.on_stuck = Some(policy);
+        }
+        if let Some(after) = self.stuck_after_secs {
+            next.stuck_after_secs = Some(after);
+        }
         if next.is_any_provider() {
             if self.model.is_some() || self.fallbacks.as_ref().is_some_and(|f| !f.is_empty()) {
                 return Err(invalid("model", "must not be set with provider \"any\""));
@@ -650,8 +1225,18 @@ where
         .transpose()
 }
 
+/// Whether `value` is a usable group name: nonempty, at most [`MAX_GROUP_BYTES`], and only
+/// `A-Z a-z 0-9 . _ -`. Config and the wire use the same rule.
+pub fn valid_group(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_GROUP_BYTES && value.bytes().all(is_name_byte)
+}
+
 fn default_harness() -> String {
     "opencode".to_owned()
+}
+
+fn default_priority() -> u8 {
+    DEFAULT_PRIORITY
 }
 
 fn default_timeout_secs() -> u64 {
@@ -759,6 +1344,18 @@ fn check_timeout(field: &'static str, secs: u64, max: u64) -> Result<(), JobSpec
     Ok(())
 }
 
+fn check_stuck_after(secs: u64) -> Result<(), JobSpecError> {
+    if !(MIN_STUCK_AFTER_SECS..=MAX_STUCK_AFTER_SECS).contains(&secs) {
+        return Err(invalid(
+            "stuck_after_secs",
+            format!(
+                "must be {MIN_STUCK_AFTER_SECS} to {MAX_STUCK_AFTER_SECS} seconds (got {secs})"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,9 +1378,14 @@ mod tests {
             include_failed: false,
             on_conflict: Default::default(),
             allow_empty: false,
+            expect: None,
             requires: Vec::new(),
+            on_stuck: None,
+            stuck_after_secs: None,
             tolerates: Vec::new(),
             fallbacks: Vec::new(),
+            priority: DEFAULT_PRIORITY,
+            group: None,
         }
     }
 
@@ -1393,7 +1995,12 @@ mod tests {
             after: None,
             collect: None,
             include_failed: None,
+            expect: None,
             on_conflict: Default::default(),
+            priority: None,
+            group: None,
+            on_stuck: None,
+            stuck_after_secs: None,
         };
         let next = edit.apply(&spec).unwrap();
         assert_eq!(next.provider.as_deref(), Some("new"));
@@ -1444,5 +2051,317 @@ mod tests {
             ..JobEdit::default()
         };
         assert_eq!(edit.apply(&spec).unwrap_err().field, "after");
+    }
+
+    fn expected() -> ExpectSpec {
+        ExpectSpec {
+            files: vec!["REVIEW.md".to_owned()],
+            changed: vec!["src/**".to_owned()],
+            forbid_changed: vec!["Cargo.lock".to_owned()],
+            min_diff_bytes: Some(1),
+            max_diff_bytes: Some(5 * 1024 * 1024),
+            mode: ExpectMode::Suspect,
+        }
+    }
+
+    #[test]
+    fn expect_defaults_to_absent_and_round_trips() {
+        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let spec: JobSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.expect, None);
+        assert!(!spec.canonical_json().contains("expect"));
+
+        let mut spec = sample();
+        spec.expect = Some(expected());
+        let json = spec.canonical_json();
+        assert!(json.contains("\"expect\":{"), "{json}");
+        assert!(json.contains("\"files\":[\"REVIEW.md\"]"), "{json}");
+        assert!(json.contains("\"changed\":[\"src/**\"]"), "{json}");
+        assert!(
+            json.contains("\"forbid_changed\":[\"Cargo.lock\"]"),
+            "{json}"
+        );
+        assert!(json.contains("\"min_diff_bytes\":1"), "{json}");
+        assert!(json.contains("\"max_diff_bytes\":5242880"), "{json}");
+        let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, spec);
+        assert_eq!(parsed.canonical_json(), json);
+    }
+
+    #[test]
+    fn expect_modes_round_trip_and_default_to_suspect() {
+        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go",
+            "expect":{"files":["REVIEW.md"],"mode":"fail"}}"#;
+        let spec: JobSpec = serde_json::from_str(json).unwrap();
+        let expect = spec.expect.unwrap();
+        assert_eq!(expect.mode, ExpectMode::Fail);
+        assert_eq!(ExpectMode::parse(" SUSPECT ").unwrap(), ExpectMode::Suspect);
+        assert_eq!(ExpectMode::Fail.as_str(), "fail");
+        assert!(ExpectMode::parse("nope").is_err());
+
+        let mut spec = sample();
+        spec.expect = Some(expected());
+        let parsed: JobSpec = serde_json::from_str(&spec.canonical_json()).unwrap();
+        assert_eq!(parsed.expect.unwrap().mode, ExpectMode::Suspect);
+    }
+
+    #[test]
+    fn expect_validation_reports_the_expect_field() {
+        let mut spec = sample();
+        let mut expect = expected();
+        expect.files = vec!["../escape".to_owned()];
+        spec.expect = Some(expect);
+        assert_eq!(error_field(&spec), "expect");
+
+        let mut expect = expected();
+        expect.files = vec!["/absolute".to_owned()];
+        spec.expect = Some(expect);
+        assert_eq!(error_field(&spec), "expect");
+
+        for path in ["a/../b", "./REVIEW.md", "dir/", "", "a\\b", "a//b"] {
+            let mut expect = expected();
+            expect.files = vec![path.to_owned()];
+            spec.expect = Some(expect);
+            assert_eq!(error_field(&spec), "expect", "{path}");
+        }
+
+        let mut expect = expected();
+        expect.changed = vec!["src/**/*.rs".to_owned()];
+        spec.expect = Some(expect);
+        assert!(spec.validate().is_ok());
+
+        for pattern in ["***", "src/[ab]", "../escape", "src//x", "/abs", ""] {
+            let mut expect = expected();
+            expect.changed = vec![pattern.to_owned()];
+            spec.expect = Some(expect);
+            assert_eq!(error_field(&spec), "expect", "{pattern}");
+        }
+
+        let mut expect = expected();
+        expect.files = vec!["f".to_owned(); MAX_EXPECT_ITEMS + 1];
+        spec.expect = Some(expect);
+        assert_eq!(error_field(&spec), "expect");
+
+        let mut expect = expected();
+        expect.changed = vec!["f".to_owned(); MAX_EXPECT_ITEMS + 1];
+        spec.expect = Some(expect);
+        assert_eq!(error_field(&spec), "expect");
+
+        let mut expect = expected();
+        expect.forbid_changed = vec!["f".to_owned(); MAX_EXPECT_ITEMS + 1];
+        spec.expect = Some(expect);
+        assert_eq!(error_field(&spec), "expect");
+
+        let mut expect = expected();
+        expect.min_diff_bytes = Some(10);
+        expect.max_diff_bytes = Some(9);
+        spec.expect = Some(expect);
+        assert_eq!(error_field(&spec), "expect");
+    }
+
+    #[test]
+    fn expect_glob_matches_segments_wildcards_and_dotfiles() {
+        assert!(ExpectSpec::glob_matches("src/**", "src/main.rs"));
+        assert!(ExpectSpec::glob_matches("src/**", "src/a/b/main.rs"));
+        assert!(ExpectSpec::glob_matches("**/*.rs", "main.rs"));
+        assert!(ExpectSpec::glob_matches("**/*.rs", "src/lib.rs"));
+        assert!(ExpectSpec::glob_matches("src/*.rs", "src/main.rs"));
+        assert!(ExpectSpec::glob_matches("src/file?.rs", "src/file1.rs"));
+        assert!(ExpectSpec::glob_matches("*.md", ".hidden.md"));
+        assert!(!ExpectSpec::glob_matches("src/*.rs", "src/a/lib.rs"));
+        assert!(!ExpectSpec::glob_matches("src/*.rs", "tests/lib.rs"));
+        assert!(!ExpectSpec::glob_matches("src/file?.rs", "src/file12.rs"));
+        assert!(!ExpectSpec::glob_matches("src/**", "tests/main.rs"));
+    }
+
+    #[test]
+    fn job_edit_merges_expect_fields_and_creates_a_block() {
+        let mut spec = sample();
+        spec.expect = Some(expected());
+        let edit: JobEdit =
+            serde_json::from_str(r#"{"expect":{"changed":[],"mode":"fail","min_diff_bytes":42}}"#)
+                .unwrap();
+        let next = edit.apply(&spec).unwrap();
+        let expect = next.expect.unwrap();
+        assert!(expect.changed.is_empty());
+        assert_eq!(expect.files, vec!["REVIEW.md".to_owned()]);
+        assert_eq!(expect.mode, ExpectMode::Fail);
+        assert_eq!(expect.min_diff_bytes, Some(42));
+        assert_eq!(expect.max_diff_bytes, Some(5 * 1024 * 1024));
+
+        let edit: JobEdit = serde_json::from_str(r#"{"expect":{"files":["OUT.md"]}}"#).unwrap();
+        let next = edit.apply(&sample()).unwrap();
+        assert_eq!(next.expect.unwrap().files, vec!["OUT.md".to_owned()]);
+
+        assert!(serde_json::from_str::<JobEdit>(r#"{"expect":{"mode":"nope"}}"#).is_err());
+    }
+
+    #[test]
+    fn priority_defaults_to_five_and_bounds_are_enforced() {
+        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let spec: JobSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.priority, DEFAULT_PRIORITY);
+        assert!(spec
+            .canonical_json()
+            .contains(&format!("\"priority\":{DEFAULT_PRIORITY}")));
+
+        for priority in [MIN_PRIORITY, 1, 9, MAX_PRIORITY] {
+            let json = format!(
+                r#"{{"repo":"https://example.net/r.git","git_ref":"main","task":"go","priority":{priority}}}"#
+            );
+            let spec: JobSpec = serde_json::from_str(&json).unwrap();
+            assert_eq!(spec.priority, priority);
+            assert!(spec
+                .canonical_json()
+                .contains(&format!("\"priority\":{priority}")));
+        }
+        for priority in [255, -1] {
+            let json = format!(
+                r#"{{"repo":"https://example.net/r.git","git_ref":"main","task":"go","priority":{priority}}}"#
+            );
+            assert!(serde_json::from_str::<JobSpec>(&json).is_err());
+        }
+        let mut spec = sample();
+        spec.priority = MAX_PRIORITY + 1;
+        assert_eq!(error_field(&spec), "priority");
+        assert!(!valid_group("bad group"));
+        assert!(valid_group("a.b_c-1"));
+    }
+
+    #[test]
+    fn group_round_trips_and_is_omitted_when_absent() {
+        let mut spec = sample();
+        assert!(!spec.canonical_json().contains("group"));
+        spec.group = Some("nightly".to_owned());
+        assert!(spec.validate().is_ok());
+        let json = spec.canonical_json();
+        assert!(json.contains("\"group\":\"nightly\""));
+        let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, spec);
+        assert_eq!(parsed.canonical_json(), json);
+
+        spec.group = Some("bad group".to_owned());
+        assert_eq!(error_field(&spec), "group");
+        spec.group = Some("x".repeat(MAX_GROUP_BYTES + 1));
+        assert_eq!(error_field(&spec), "group");
+    }
+
+    #[test]
+    fn job_edit_sets_priority_and_clears_a_group_with_null() {
+        let mut spec = sample();
+        spec.group = Some("old".to_owned());
+        let edit: JobEdit = serde_json::from_str(r#"{"priority":9,"group":"new"}"#).unwrap();
+        let next = edit.apply(&spec).unwrap();
+        assert_eq!(next.priority, 9);
+        assert_eq!(next.group.as_deref(), Some("new"));
+
+        let clear: JobEdit = serde_json::from_str(r#"{"group":null}"#).unwrap();
+        let next = clear.apply(&next).unwrap();
+        assert_eq!(next.group, None);
+        assert_eq!(next.priority, 9);
+
+        let bad: JobEdit = serde_json::from_str(r#"{"priority":10}"#).unwrap();
+        assert_eq!(bad.apply(&spec).unwrap_err().field, "priority");
+        let bad: JobEdit = serde_json::from_str(r#"{"group":"bad group"}"#).unwrap();
+        assert_eq!(bad.apply(&spec).unwrap_err().field, "group");
+    }
+
+    #[test]
+    fn stuck_policy_spellings_are_canonical() {
+        for (text, policy) in [
+            ("none", StuckPolicy::None),
+            ("cancel", StuckPolicy::Cancel),
+            ("retry", StuckPolicy::Retry),
+        ] {
+            assert_eq!(StuckPolicy::parse(text).unwrap(), policy);
+            assert_eq!(
+                StuckPolicy::parse(&text.to_ascii_uppercase()).unwrap(),
+                policy
+            );
+            assert_eq!(policy.as_str(), text);
+            assert_eq!(policy.to_string(), text);
+        }
+        assert_eq!(StuckPolicy::parse("later").unwrap_err().value(), "later");
+    }
+
+    #[test]
+    fn stuck_after_secs_is_range_checked() {
+        let mut spec = sample();
+        spec.stuck_after_secs = Some(MIN_STUCK_AFTER_SECS - 1);
+        assert_eq!(error_field(&spec), "stuck_after_secs");
+        spec.stuck_after_secs = Some(MAX_STUCK_AFTER_SECS + 1);
+        assert_eq!(error_field(&spec), "stuck_after_secs");
+        spec.stuck_after_secs = Some(MIN_STUCK_AFTER_SECS);
+        assert!(spec.validate().is_ok());
+        spec.stuck_after_secs = Some(MAX_STUCK_AFTER_SECS);
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn stuck_fields_round_trip_and_report_their_field() {
+        let spec = sample();
+        let json = serde_json::to_value(&spec).unwrap();
+        assert!(json.get("on_stuck").is_none());
+        assert!(json.get("stuck_after_secs").is_none());
+
+        let mut spec = sample();
+        spec.on_stuck = Some(StuckPolicy::Cancel);
+        spec.stuck_after_secs = Some(120);
+        let decoded: JobSpec = serde_json::from_str(&spec.canonical_json()).unwrap();
+        assert_eq!(decoded, spec);
+
+        let mut value = serde_json::to_value(&spec).unwrap();
+        value["on_stuck"] = serde_json::json!("later");
+        let error = serde_json::from_value::<JobSpec>(value)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("on_stuck"), "{error}");
+
+        let mut value = serde_json::to_value(&spec).unwrap();
+        value["stuck_after_secs"] = serde_json::json!(59);
+        let error = serde_json::from_value::<JobSpec>(value)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stuck_after_secs"), "{error}");
+    }
+
+    #[test]
+    fn job_edit_replaces_stuck_fields() {
+        let spec = sample();
+        let edit = JobEdit {
+            on_stuck: Some(StuckPolicy::Retry),
+            stuck_after_secs: Some(90),
+            ..JobEdit::default()
+        };
+        let next = edit.apply(&spec).unwrap();
+        assert_eq!(next.on_stuck, Some(StuckPolicy::Retry));
+        assert_eq!(next.stuck_after_secs, Some(90));
+
+        let edit = JobEdit {
+            on_stuck: Some(StuckPolicy::None),
+            stuck_after_secs: Some(59),
+            ..JobEdit::default()
+        };
+        assert_eq!(edit.apply(&spec).unwrap_err().field, "stuck_after_secs");
+    }
+
+    #[test]
+    fn effective_stuck_resolves_job_values_then_agent_defaults() {
+        assert_eq!(
+            effective_stuck(None, None, StuckPolicy::Cancel, 600),
+            Some((StuckPolicy::Cancel, 600))
+        );
+        assert_eq!(
+            effective_stuck(Some(StuckPolicy::Retry), Some(90), StuckPolicy::Cancel, 600),
+            Some((StuckPolicy::Retry, 90))
+        );
+        assert_eq!(
+            effective_stuck(Some(StuckPolicy::None), Some(90), StuckPolicy::Cancel, 600),
+            None
+        );
+        assert_eq!(
+            effective_stuck(Some(StuckPolicy::Retry), None, StuckPolicy::None, 600),
+            Some((StuckPolicy::Retry, 600))
+        );
     }
 }

@@ -21,14 +21,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lu_client::{ApiError, Controller};
-use lu_config::{AgentConfig, BaseSource};
+use lu_config::{AgentConfig, BaseSource, StuckPolicy as ConfigStuckPolicy};
 use lu_proto::{
-    effective_collect, printable, truncate_chars, AgentEvent, ArtifactName, Completion,
-    FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobStats, NodeName, OnConflict, Outcome,
-    ProviderModel, ProviderState, ProviderStatus, HARNESS_OK_FALSE, MAX_DIFF_BYTES,
-    MAX_NODE_LABELS, MAX_SUMMARY_BYTES, MAX_TAINTS,
+    effective_collect, effective_stuck, printable, truncate_chars, AgentEvent, ArtifactName,
+    Completion, ExpectMode, ExpectSpec, FailureClass, HarnessState, Heartbeat, JobId, JobSpec,
+    JobStats, NodeName, OnConflict, Outcome, ProviderModel, ProviderState, ProviderStatus,
+    StuckPolicy, HARNESS_OK_FALSE, MAX_DIFF_BYTES, MAX_NODE_LABELS, MAX_SUMMARY_BYTES, MAX_TAINTS,
 };
-use lu_staging::{ApplyError, ConflictPolicy, Source, StageRequest, StagedDir, Staging};
+use lu_staging::{
+    ApplyError, ConflictPolicy, ExportedDiff, Source, StageRequest, StagedDir, Staging,
+};
 use lu_supervise::{CommandSpec, Limits, Outcome as SuperviseOutcome, Supervisor};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -52,6 +54,10 @@ const STOP_GRACE: Duration = Duration::from_secs(2);
 /// How long a provider-unavailable marker may stand without further output before the harness
 /// is stopped and the job is failed as a provider failure.
 pub const PROVIDER_MARKER_GRACE: Duration = Duration::from_secs(120);
+
+/// How often a stuck watcher counts continuous idle time. Observation itself still needs both
+/// output and CPU idle for [`proc::STUCK_AFTER_SECS`] before a sample counts as stuck.
+const STUCK_POLL_PERIOD: Duration = Duration::from_secs(10);
 
 /// How often a running job's provider is checked against the node's Reiki reading.
 const REIKI_WATCH_PERIOD: Duration = Duration::from_secs(5);
@@ -110,6 +116,8 @@ enum JobEnd {
     Stale,
     /// The harness went silent after a provider-unavailable marker.
     Provider,
+    /// The stuck watcher stopped the harness under this policy.
+    Stuck { policy: StuckPolicy, secs: u64 },
     /// Shutdown arrived while the job was running.
     Shutdown,
 }
@@ -120,6 +128,7 @@ enum Control {
     Stale,
     Unauthorized,
     Forbidden,
+    Stuck { policy: StuckPolicy, secs: u64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -157,6 +166,14 @@ fn offered_provider_models(
         .collect()
 }
 
+fn proto_stuck_policy(policy: ConfigStuckPolicy) -> StuckPolicy {
+    match policy {
+        ConfigStuckPolicy::None => StuckPolicy::None,
+        ConfigStuckPolicy::Cancel => StuckPolicy::Cancel,
+        ConfigStuckPolicy::Retry => StuckPolicy::Retry,
+    }
+}
+
 /// Adds the node's current harness health to a heartbeat. A crash at launch is reported as both
 /// a label (for operators) and a taint (so dispatch's existing taint rules exclude this node for
 /// jobs that need a working harness). A later successful run stops publishing both.
@@ -180,6 +197,15 @@ pub struct Agent {
     base_source: BaseSource,
     work_dir: PathBuf,
     heartbeat_secs: u64,
+    /// Defaults applied to jobs that omit their own stuck fields.
+    default_on_stuck: StuckPolicy,
+    default_stuck_after_secs: u64,
+    /// Seams for tests: how idle a job must look before it counts as stuck, how often the watcher
+    /// counts, and an optional override of the job's continuous interval.
+    stuck_detect_secs: u64,
+    stuck_poll_period: Duration,
+    stuck_after_override: Option<u64>,
+    stuck_clock: Arc<dyn proc::Clock>,
     /// How long the harness may stay silent after a provider marker before it is stopped.
     provider_marker_grace: Duration,
     reiki_watch_period: Duration,
@@ -273,6 +299,12 @@ impl Agent {
             base_source: config.base_source,
             work_dir,
             heartbeat_secs: config.heartbeat_secs,
+            default_on_stuck: proto_stuck_policy(config.on_stuck),
+            default_stuck_after_secs: config.stuck_after_secs,
+            stuck_detect_secs: proc::STUCK_AFTER_SECS,
+            stuck_poll_period: STUCK_POLL_PERIOD,
+            stuck_after_override: None,
+            stuck_clock: Arc::new(proc::RealClock),
             provider_marker_grace: PROVIDER_MARKER_GRACE,
             reiki_watch_period: REIKI_WATCH_PERIOD,
             opencode_server: config.opencode_server,
@@ -313,6 +345,22 @@ impl Agent {
             + 'static,
     {
         self.builder = Arc::new(builder);
+        self
+    }
+
+    /// Replaces stuck timing and its clock. Production never calls this.
+    #[doc(hidden)]
+    pub fn with_stuck_timing_for_tests(
+        mut self,
+        detect_secs: u64,
+        poll_period: Duration,
+        after_override: Option<u64>,
+        clock: Arc<dyn proc::Clock>,
+    ) -> Self {
+        self.stuck_detect_secs = detect_secs;
+        self.stuck_poll_period = poll_period;
+        self.stuck_after_override = after_override;
+        self.stuck_clock = clock;
         self
     }
 
@@ -404,7 +452,8 @@ impl Agent {
                                     JobEnd::Finished
                                     | JobEnd::Cancelled
                                     | JobEnd::Stale
-                                    | JobEnd::Provider => this.housekeep(false),
+                                    | JobEnd::Provider
+                                    | JobEnd::Stuck { .. } => this.housekeep(false),
                                 }
                             }
                             AgentEvent::Cancel { job_id, .. } => {
@@ -542,6 +591,13 @@ impl Agent {
                 .await?;
             return Ok(JobEnd::Finished);
         }
+        let stuck = effective_stuck(
+            spec.on_stuck,
+            spec.stuck_after_secs,
+            self.default_on_stuck,
+            self.default_stuck_after_secs,
+        )
+        .map(|(policy, after_secs)| (policy, self.stuck_after_override.unwrap_or(after_secs)));
 
         let request = StageRequest {
             job_id: job_id.to_string(),
@@ -604,6 +660,7 @@ impl Agent {
                         exit_code: None,
                         summary,
                         cancelled: false,
+                        stuck_mode: None,
                         retry_after_secs: None,
                         applied_inputs: &done,
                     })
@@ -706,6 +763,7 @@ impl Agent {
                 exit_code: None,
                 summary,
                 cancelled: false,
+                stuck_mode: None,
                 retry_after_secs: None,
                 applied_inputs: &applied,
             })
@@ -746,6 +804,7 @@ impl Agent {
                     exit_code: None,
                     summary,
                     cancelled: false,
+                    stuck_mode: None,
                     retry_after_secs: None,
                     applied_inputs: &applied,
                 })
@@ -767,10 +826,11 @@ impl Agent {
         let mut output = running.output();
         let observation = if proc::enabled() {
             running.process_group().map(|pgid| {
-                Arc::new(Mutex::new(proc::JobObservation::new(
+                Arc::new(Mutex::new(proc::JobObservation::new_with_detect_secs(
                     job_id.clone(),
                     pgid,
-                    Instant::now(),
+                    self.stuck_clock.now(),
+                    self.stuck_detect_secs,
                 )))
             })
         } else {
@@ -804,6 +864,9 @@ impl Agent {
                 harness_ok: Arc::clone(&self.harness_ok),
                 observation: observation.clone(),
                 work_dir: self.work_dir.clone(),
+                stuck: stuck.map(|(policy, after_secs)| StuckTask { policy, after_secs }),
+                stuck_poll_period: self.stuck_poll_period,
+                stuck_clock: Arc::clone(&self.stuck_clock),
             },
             control_tx,
         ));
@@ -846,6 +909,12 @@ impl Agent {
                             end = JobEnd::Stale;
                             break;
                         }
+                        Control::Stuck { policy, secs } => {
+                            info!(job = %job_id, mode = %policy.as_str(), secs, "stuck job stopped");
+                            running.stop();
+                            end = JobEnd::Stuck { policy, secs };
+                            break;
+                        }
                         Control::Unauthorized => {
                             running.stop();
                             return Err(AgentError::Unauthorized);
@@ -881,7 +950,7 @@ impl Agent {
                                 observation
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .record_output(Instant::now());
+                                    .record_output(self.stuck_clock.now());
                             }
                             tail.push(&chunk.bytes);
                             // Armed only while the newest output line is the marker: any other
@@ -960,6 +1029,8 @@ impl Agent {
                     exit_code: None,
                     summary: Some(summarise("cancelled by the controller")),
                     retry_after_secs: None,
+                    stuck_mode: None,
+                    expect_failed: false,
                 };
                 match self.controller.complete(&completion).await {
                     Ok(()) | Err(ApiError::StaleEpoch) => {}
@@ -982,7 +1053,7 @@ impl Agent {
                     .await;
                 return Ok(JobEnd::Shutdown);
             }
-            JobEnd::Finished | JobEnd::Provider => {}
+            JobEnd::Finished | JobEnd::Provider | JobEnd::Stuck { .. } => {}
         }
 
         if let Ok(Ok(LogUpload {
@@ -1018,7 +1089,32 @@ impl Agent {
                 exit_code: None,
                 summary,
                 cancelled: false,
+                stuck_mode: None,
                 retry_after_secs: reiki_retry_after,
+                applied_inputs: &applied,
+            })
+            .await?;
+            return Ok(JobEnd::Finished);
+        }
+
+        if let JobEnd::Stuck { policy, secs } = end {
+            let class = match policy {
+                StuckPolicy::Retry => FailureClass::Node,
+                StuckPolicy::None | StuckPolicy::Cancel => FailureClass::Execution,
+            };
+            self.finish(&Finish {
+                job_id: &job_id,
+                epoch,
+                spec: &spec,
+                model: model.as_deref(),
+                staged: &staged,
+                started,
+                outcome: Outcome::Failed(class),
+                exit_code: None,
+                summary: format!("stuck for {secs}s, stopped"),
+                cancelled: false,
+                retry_after_secs: None,
+                stuck_mode: Some(policy),
                 applied_inputs: &applied,
             })
             .await?;
@@ -1050,6 +1146,7 @@ impl Agent {
             exit_code,
             summary,
             cancelled: false,
+            stuck_mode: None,
             retry_after_secs: None,
             applied_inputs: &applied,
         })
@@ -1071,6 +1168,8 @@ impl Agent {
             exit_code: None,
             summary: Some(summarise(summary)),
             retry_after_secs: None,
+            stuck_mode: None,
+            expect_failed: false,
         };
         match self.controller.complete(&completion).await {
             Ok(()) => Ok(()),
@@ -1162,7 +1261,7 @@ impl Agent {
     }
 
     async fn finish(&self, finish: &Finish<'_>) -> Result<JobEnd, AgentError> {
-        let diff = match Staging::export_diff(finish.staged, MAX_DIFF_BYTES as usize) {
+        let diff = match Staging::export_diff_with_paths(finish.staged, MAX_DIFF_BYTES as usize) {
             Ok(diff) => Some(diff),
             Err(error) => {
                 warn!(
@@ -1173,10 +1272,22 @@ impl Agent {
                 None
             }
         };
-        if let Some(diff) = diff {
+        let harness_succeeded = !finish.cancelled && finish.outcome == Outcome::Done;
+        let (expect_failures, outcome, summary, expect_failed) =
+            if let (true, Some(expect)) = (harness_succeeded, finish.spec.expect.as_ref()) {
+                evaluate_expect(expect, diff.as_ref(), finish.staged.path(), &finish.summary)
+            } else {
+                (Vec::new(), finish.outcome, finish.summary.clone(), false)
+            };
+        if let Some(diff) = &diff {
             match self
                 .controller
-                .put_artifact(finish.job_id, finish.epoch, ArtifactName::DiffPatch, &diff)
+                .put_artifact(
+                    finish.job_id,
+                    finish.epoch,
+                    ArtifactName::DiffPatch,
+                    &diff.bytes,
+                )
                 .await
             {
                 Ok(()) => {}
@@ -1189,12 +1300,13 @@ impl Agent {
         }
 
         let report = report_json(
-            finish.outcome,
+            outcome,
             finish.exit_code,
             finish.started.elapsed(),
             &finish.spec.harness,
             finish.model,
             finish.applied_inputs,
+            &expect_failures,
         );
         if let Ok(report) = report {
             match self
@@ -1223,10 +1335,12 @@ impl Agent {
         let completion = Completion {
             job_id: finish.job_id.clone(),
             epoch: finish.epoch,
-            outcome: finish.outcome,
+            outcome,
             exit_code: finish.exit_code,
-            summary: Some(summarise(&finish.summary)),
+            summary: Some(summarise(&summary)),
             retry_after_secs: finish.retry_after_secs,
+            stuck_mode: finish.stuck_mode,
+            expect_failed,
         };
         match self.controller.complete(&completion).await {
             Ok(()) => Ok(JobEnd::Finished),
@@ -1279,6 +1393,7 @@ struct Finish<'a> {
     summary: String,
     cancelled: bool,
     retry_after_secs: Option<u64>,
+    stuck_mode: Option<StuckPolicy>,
     applied_inputs: &'a [AppliedInput],
 }
 
@@ -1338,6 +1453,12 @@ impl Drop for Cleanup<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StuckTask {
+    policy: StuckPolicy,
+    after_secs: u64,
+}
+
 struct ControlTask {
     controller: Arc<dyn Controller>,
     node: NodeName,
@@ -1351,6 +1472,9 @@ struct ControlTask {
     harness_ok: Arc<AtomicBool>,
     observation: Option<Arc<Mutex<proc::JobObservation>>>,
     work_dir: PathBuf,
+    stuck: Option<StuckTask>,
+    stuck_poll_period: Duration,
+    stuck_clock: Arc<dyn proc::Clock>,
 }
 
 async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
@@ -1367,6 +1491,9 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
         harness_ok,
         observation,
         work_dir,
+        stuck,
+        stuck_poll_period,
+        stuck_clock,
     } = task;
     let mut renew = tokio::time::interval(RENEW_PERIOD);
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1374,6 +1501,16 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(heartbeat_secs.max(1)));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
+    let mut stuck_interval = match stuck {
+        Some(_) => {
+            let mut interval = tokio::time::interval(stuck_poll_period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            Some(interval)
+        }
+        None => None,
+    };
+    let mut stuck_tracker = proc::StuckTracker::default();
 
     loop {
         tokio::select! {
@@ -1398,6 +1535,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                                 let _ = tx.send(Control::Forbidden).await;
                                 return;
                             }
+                            Some(Control::Stuck { .. }) => {}
                             None => {
                                 warn!(
                                     job = %job_id,
@@ -1407,6 +1545,32 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                             }
                         }
                     }
+                }
+            }
+            _ = interval_tick(&mut stuck_interval) => {
+                let Some(task) = stuck else {
+                    continue;
+                };
+                let now = stuck_clock.now();
+                let idle = observation
+                    .as_ref()
+                    .map(|observation| {
+                        let mut observation = observation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        observation
+                            .sample(Path::new("/proc"), 0, true, now)
+                            .stuck
+                    })
+                    .unwrap_or(false);
+                if let Some(secs) = stuck_tracker.observe(idle, now, task.after_secs) {
+                    let _ = tx
+                        .send(Control::Stuck {
+                            policy: task.policy,
+                            secs,
+                        })
+                        .await;
+                    return;
                 }
             }
             _ = heartbeat.tick() => {
@@ -1422,7 +1586,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                             Path::new("/proc"),
                             host.as_ref().map(|host| host.uptime_secs).unwrap_or(0),
                             true,
-                            Instant::now(),
+                            stuck_clock.now(),
                         )]
                     })
                     .unwrap_or_default();
@@ -1482,6 +1646,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                                 let _ = tx.send(Control::Forbidden).await;
                                 return;
                             }
+                            Some(Control::Stuck { .. }) => {}
                             None => {
                                 warn!(
                                     job = %job_id,
@@ -1722,6 +1887,77 @@ async fn marker_deadline_wait(deadline: Option<Instant>) {
     }
 }
 
+/// Checks the expectations against the exported diff and the staged tree. Returns the failures,
+/// the completion outcome and summary, and whether a suspect-mode note must be recorded.
+fn evaluate_expect(
+    expect: &ExpectSpec,
+    diff: Option<&ExportedDiff>,
+    worktree: &std::path::Path,
+    summary: &str,
+) -> (Vec<String>, Outcome, String, bool) {
+    let mut failures = Vec::new();
+    for path in &expect.files {
+        if !worktree.join(path).exists() {
+            failures.push(format!("missing expected file {path:?}"));
+        }
+    }
+    if let Some(exported) = diff {
+        let changed = &exported.changed_paths;
+        for pattern in &expect.changed {
+            if !changed
+                .iter()
+                .any(|path| ExpectSpec::glob_matches(pattern, path))
+            {
+                failures.push(format!("no changed path matches {pattern:?}"));
+            }
+        }
+        for pattern in &expect.forbid_changed {
+            if let Some(path) = changed
+                .iter()
+                .find(|path| ExpectSpec::glob_matches(pattern, path))
+            {
+                failures.push(format!("forbidden change {path:?} matches {pattern:?}"));
+            }
+        }
+        let bytes = exported.bytes.len() as u64;
+        if let Some(min) = expect.min_diff_bytes {
+            if bytes < min {
+                failures.push(format!("diff has {bytes} bytes, below minimum {min}"));
+            }
+        }
+        if let Some(max) = expect.max_diff_bytes {
+            if bytes > max {
+                failures.push(format!("diff has {bytes} bytes, above maximum {max}"));
+            }
+        }
+    } else {
+        failures.push("diff export failed".to_owned());
+    }
+    if failures.is_empty() {
+        return (failures, Outcome::Done, summary.to_owned(), false);
+    }
+    if expect.mode == ExpectMode::Fail {
+        let text = format!("expect failed: {}", failures[0]);
+        return (
+            failures,
+            Outcome::Failed(FailureClass::Execution),
+            text,
+            false,
+        );
+    }
+    (failures, Outcome::Done, summary.to_owned(), true)
+}
+
+/// Waits for the next stuck tick, or forever when the job has no stuck policy.
+async fn interval_tick(interval: &mut Option<tokio::time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 /// Caps and neutralises the completion summary. Whole lines are preferred, but the last bytes
 /// are kept when one line is too long.
 fn summarise(text: &str) -> String {
@@ -1755,6 +1991,7 @@ fn report_json(
     harness: &str,
     model: Option<&str>,
     applied_inputs: &[AppliedInput],
+    expect_failures: &[String],
 ) -> Result<Vec<u8>, serde_json::Error> {
     let applied_dependencies: Vec<&str> = applied_inputs
         .iter()
@@ -1768,6 +2005,7 @@ fn report_json(
         harness,
         model,
         applied_dependencies,
+        expect_failures: (!expect_failures.is_empty()).then_some(expect_failures),
     };
     serde_json::to_vec(&report)
 }
@@ -1780,6 +2018,8 @@ struct Report<'a> {
     harness: &'a str,
     model: Option<&'a str>,
     applied_dependencies: Vec<&'a str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expect_failures: Option<&'a [String]>,
 }
 
 fn create_work_dir(path: &Path) -> Result<(), AgentError> {

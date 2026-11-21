@@ -5,6 +5,28 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Expected outputs. `JobSpec.expect` declares relative `files`, `changed` and `forbid_changed` globs, `min_diff_bytes`/`max_diff_bytes` bounds and a `mode` of `suspect` (default) or `fail`. The agent evaluates them after a successful harness against the uploaded diff, excluding `.lu/`, and records unmet expectations in `report.json` under `expect_failures`. Suspect failures keep the job `done` with `outcome_note: expect_failed` and increment `lu_jobs_expect_failed_total`; fail-mode failures end in `failed` with class `execution`. A `no_changes` note takes precedence over `expect_failed`. CLI adds the expect flags to `submit`, `retry` and `edit`, and MCP adds matching arguments. Schema 8 includes the suspect flag.
+- Job priority and concurrency groups. `JobSpec.priority` (0 to 9, default 5) dispatches higher values first, then creation time. `JobSpec.group` (1 to 64 characters from `A-Z a-z 0-9 . _ -`) and `[[controller.groups]]` entries with `name` and `max_running` (1 to 64) cap concurrent `leased`, `running`, `recovering` and `needs_input` jobs per group; unconfigured groups are unlimited, and a blocked job stays `queued` with `group limit (<name> <running>/<max>)` as its waiting reason. `lu submit`, `lu retry` and `lu edit` gain `--priority` and `--group`, with `--no-group` on retry and edit; MCP submissions accept `priority` and `group`. `lu show` prints both fields, `lu ls --json` exposes them in `spec`, and metrics add `lu_group_running{group}` and `lu_group_limit{group}`. Provider, label and taint rules still apply first. No schema change: both fields live in the existing JSON spec, with expression indexes created on open.
+- Stuck-job policy. `JobSpec.on_stuck` (`none`, `cancel`, `retry`; default from `[agent]`) and `stuck_after_secs` (60–86400, default 1800) let the agent stop a job after the `lu node` output/CPU observation has stayed stuck for the configured interval. `cancel` fails as `execution`; `retry` fails as `node` and follows `max_retries`; `none` is unchanged. The CLI adds `--on-stuck` and `--stuck-after` to `submit`, `retry` and `edit`; MCP adds `on_stuck` and `stuck_after`/`stuck_after_secs` to `lu_submit`, `lu_submit_many` and `lu_retry`. Completions carry optional `stuck_mode`, and `lu_jobs_stuck_stopped_total{mode}` counts stops by mode since process start. No schema change: fields live in the stored spec JSON and in-memory counters.
+- Provider cordons now record their source, reason and set time in schema 8. `NodeView.cordon_details` exposes `{provider, source, reason, set_at, until, lifts_after_healthy_heartbeats}` alongside the unchanged `cordons` list. Reiki-derived cordons report `source: "reiki"`, a null `until` and a two-heartbeat lift count; failure-derived cordons report `source: "failure"` and a wall-clock expiry.
+- `lu node <name>` prints each cordon's source, age, reason and remaining time or lift count. `lu nodes` adds a `CORDONS` column, and `lu top` marks cordoned provider chips with `!` (orange) and shows cordon details under the tables, with Reiki `~` markers in yellow.
+- `lu uncordon <node> [<provider>]` and `POST /v1/nodes/{name}/uncordon` clear one provider cordon or every cordon on a node, returning the providers actually removed. The MCP tool `lu_uncordon` does the same and is marked destructive.
+- `lu_node_cordon_seconds_remaining{node,provider,source}` exports the remaining seconds of each active cordon; Reiki cordons that lift on healthy heartbeats export `0`.
+- `lu top` keyboard and mouse selection for the dependency graph. `Tab`/`Shift+Tab` cycle focus through Nodes, Jobs and Graph with a highlighted border; the Jobs table and graph share one selected job. In Graph focus, `h`/`l` move to a parent or child, `j`/`k` move between siblings and components, `Home`/`End` jump to the ends, and `Enter` opens the job's log. The graph panel's bottom border shows the selected job's full id, state and clipped title, and the footer lists the keys for the focused pane. Left clicks select rows or nodes, double clicks open logs, and the wheel scrolls the focused pane by three rows. Mouse capture is enabled only while the TUI runs and is restored on exit, error and panic.
+
+### Changed
+
+- Cordons created from Reiki retry estimates and fixed provider failures are now distinguishable in APIs, CLI output and the dashboard. Existing cordons upgrade to `source: "failure"` with reason `Cordoned before upgrade` and the upgrade time as their set time. The controller still clears all cordons at boot.
+- Dependency graphs are compact horizontal chains, prerequisites first: `lu top` draws them in a
+  bordered `Graph` panel with a fixed height share, and `lu graph` keeps clipped task titles.
+  Chains share one row; only real fan-outs and fan-ins use `├─▶`/`└─▶` branches and `┐`/`┘` joins.
+  The dashboard omits titles, packs unrelated single-job components into shared rows, and moves
+  hidden job and component counts into the panel title.
+
+### Fixed
+
 ## [0.3.2] - 2026-11-21
 
 ## [0.3.1] - 2026-11-20
@@ -12,6 +34,7 @@ uses semantic versioning once it reaches 1.0.
 ### Fixed
 
 - Provider cordons no longer outlive a controller restart. Their expiry is on the process's monotonic clock, so a restart made rows from the previous run look hours in the future and blocked dispatch to a healthy provider; boot recovery now clears them and Reiki health and new failures set them again.
+
 ### Added
 
 - Dependency input apply modes and conflict policies. `collect = apply` and `both` apply inputs in `after` order through libgit2 apply, libgit2 three-way and `git apply --3way` when git is on the agent's PATH. `JobSpec.on_conflict` selects `fail` (default, ends `conflict` with the input, file and hunk in the summary), `skip` (leaves the patch unapplied and records the first failing file and hunk in `INDEX.md`) or `markers` (labelled conflict markers, `markers (N files)` in the index, later inputs still applied). `INDEX.md` rows include the apply result and conflicted files; markers stay in the exported `diff.patch`, while `.lu` never does. The CLI exposes `--on-conflict` on `submit`, `retry` and `edit`; MCP exposes `on_conflict` on `lu_submit`, `lu_submit_many` and `lu_retry`. Explicit values are echoed in `JobView.spec`. No schema change.

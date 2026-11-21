@@ -99,6 +99,20 @@ impl JobView {
     }
 }
 
+/// Why a provider on a node is cordoned. `until` is a wall-clock Unix time for a failure cordon,
+/// and null for a Reiki cordon that lifts after healthy heartbeats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CordonView {
+    pub provider: String,
+    pub source: String,
+    pub reason: String,
+    pub set_at: i64,
+    #[serde(default)]
+    pub until: Option<i64>,
+    #[serde(default)]
+    pub lifts_after_healthy_heartbeats: Option<u32>,
+}
+
 /// One node's heartbeat and drain state. Nullable fields stay explicit nulls, as the controller
 /// has always sent them; only `reiki` is an opaque forwarded document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +143,9 @@ pub struct NodeView {
     pub current_job: Option<JobId>,
     #[serde(default)]
     pub cordons: Vec<String>,
+    /// The same cordons with their reason, source and timing. Older controllers omit this.
+    #[serde(default)]
+    pub cordon_details: Vec<CordonView>,
     #[serde(default)]
     pub reiki: Option<serde_json::Value>,
     #[serde(default)]
@@ -158,6 +175,7 @@ impl NodeView {
             taints: Vec::new(),
             current_job: None,
             cordons: Vec::new(),
+            cordon_details: Vec::new(),
             reiki: None,
             load1: None,
             mem_available_kb: None,
@@ -185,8 +203,13 @@ fn empty_job_spec() -> JobSpec {
         include_failed: false,
         on_conflict: Default::default(),
         allow_empty: false,
+        expect: None,
         requires: Vec::new(),
+        on_stuck: None,
+        stuck_after_secs: None,
         tolerates: Vec::new(),
         fallbacks: Vec::new(),
+        priority: crate::DEFAULT_PRIORITY,
+        group: None,
     }
 }

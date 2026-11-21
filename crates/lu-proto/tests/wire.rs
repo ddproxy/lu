@@ -5,9 +5,9 @@
 use std::str::FromStr;
 
 use lu_proto::{
-    printable, truncate_chars, AgentEvent, ArtifactName, Choice, Completion, FailureClass,
-    HarnessState, Heartbeat, JobId, JobSpec, JobState, JobView, LogChunk, NodeName, NodeView,
-    Outcome, ProviderModel, ProviderState, ProviderStatus,
+    printable, truncate_chars, AgentEvent, ArtifactName, Choice, Completion, CordonView,
+    FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobState, JobView, LogChunk, NodeName,
+    NodeView, Outcome, ProviderModel, ProviderState, ProviderStatus,
 };
 
 fn job_id() -> JobId {
@@ -23,8 +23,12 @@ fn spec() -> JobSpec {
         harness: "opencode".to_owned(),
         provider: Some("peer-a".to_owned()),
         model: None,
+        priority: lu_proto::DEFAULT_PRIORITY,
+        group: None,
         timeout_secs: 600,
         idle_timeout_secs: Some(60),
+        on_stuck: None,
+        stuck_after_secs: None,
         idempotency_key: Some("ticket:42".to_owned()),
         after: vec![JobId::new()],
         stack_dependencies: true,
@@ -38,6 +42,7 @@ fn spec() -> JobSpec {
             provider: "peer-b".to_owned(),
             model: Some("other-model".to_owned()),
         }],
+        expect: None,
     }
 }
 
@@ -71,10 +76,12 @@ fn a_submission_travels_as_an_assignment_and_comes_back_as_a_completion() {
     let completion = Completion {
         job_id: job_id(),
         epoch: 7,
+        stuck_mode: None,
         outcome: Outcome::Failed(FailureClass::Execution),
         exit_code: Some(101),
         summary: Some("harness exited non-zero".to_owned()),
         retry_after_secs: None,
+        expect_failed: false,
     };
     completion.validate().unwrap();
     assert_eq!(
@@ -151,6 +158,7 @@ fn job_and_node_views_match_the_documented_json() {
             git_ref: "main".to_owned(),
             task: "add the missing test".to_owned(),
             provider: Some("peer-a".to_owned()),
+            group: Some("nightly".to_owned()),
             timeout_secs: 600,
             idle_timeout_secs: Some(60),
             idempotency_key: Some("ticket:42".to_owned()),
@@ -160,6 +168,8 @@ fn job_and_node_views_match_the_documented_json() {
                 provider: "peer-b".to_owned(),
                 model: Some("other-model".to_owned()),
             }],
+            on_stuck: None,
+            stuck_after_secs: None,
             ..spec()
         },
         attempt: 2,
@@ -192,6 +202,8 @@ fn job_and_node_views_match_the_documented_json() {
             "task": "add the missing test",
             "harness": "opencode",
             "provider": "peer-a",
+            "priority": 5,
+            "group": "nightly",
             "timeout_secs": 600,
             "idle_timeout_secs": 60,
             "idempotency_key": "ticket:42",
@@ -241,6 +253,24 @@ fn job_and_node_views_match_the_documented_json() {
         taints: vec!["homelab".to_owned()],
         current_job: Some(job_id()),
         cordons: vec!["peer-c".to_owned()],
+        cordon_details: vec![
+            CordonView {
+                provider: "peer-c".to_owned(),
+                source: "failure".to_owned(),
+                reason: "Provider peer-c failed: timeout".to_owned(),
+                set_at: 1_700_000_020,
+                until: Some(1_700_000_620),
+                lifts_after_healthy_heartbeats: None,
+            },
+            CordonView {
+                provider: "peer-d".to_owned(),
+                source: "reiki".to_owned(),
+                reason: "Reiki cooldown for provider peer-d (retry after 300s)".to_owned(),
+                set_at: 1_700_000_025,
+                until: None,
+                lifts_after_healthy_heartbeats: Some(2),
+            },
+        ],
         reiki: Some(serde_json::json!({"status": "ok"})),
         load1: Some(1.5),
         mem_available_kb: Some(8192),
@@ -261,6 +291,24 @@ fn job_and_node_views_match_the_documented_json() {
         "taints": ["homelab"],
         "current_job": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
         "cordons": ["peer-c"],
+        "cordon_details": [
+            {
+                "provider": "peer-c",
+                "source": "failure",
+                "reason": "Provider peer-c failed: timeout",
+                "set_at": 1_700_000_020,
+                "until": 1_700_000_620,
+                "lifts_after_healthy_heartbeats": null
+            },
+            {
+                "provider": "peer-d",
+                "source": "reiki",
+                "reason": "Reiki cooldown for provider peer-d (retry after 300s)",
+                "set_at": 1_700_000_025,
+                "until": null,
+                "lifts_after_healthy_heartbeats": 2
+            }
+        ],
         "reiki": {"status": "ok"},
         "load1": 1.5,
         "mem_available_kb": 8192,
@@ -276,4 +324,44 @@ fn job_and_node_views_match_the_documented_json() {
             value
         );
     }
+}
+
+#[test]
+fn job_view_echoes_the_expect_block() {
+    let view: JobView = serde_json::from_value(serde_json::json!({
+        "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "state": "done",
+        "spec": {
+            "repo": "https://example.net/team/repo.git",
+            "git_ref": "main",
+            "task": "add the missing test",
+            "expect": {
+                "files": ["REVIEW.md"],
+                "changed": ["src/**"],
+                "forbid_changed": ["Cargo.lock"],
+                "min_diff_bytes": 1,
+                "max_diff_bytes": 5242880,
+                "mode": "fail"
+            }
+        }
+    }))
+    .unwrap();
+
+    let expected = serde_json::json!({
+        "files": ["REVIEW.md"],
+        "changed": ["src/**"],
+        "forbid_changed": ["Cargo.lock"],
+        "min_diff_bytes": 1u64,
+        "max_diff_bytes": 5242880u64,
+        "mode": "fail"
+    });
+    let value = serde_json::to_value(&view).unwrap();
+    assert_eq!(value["spec"]["expect"], expected);
+    assert_eq!(
+        serde_json::from_value::<JobView>(value)
+            .unwrap()
+            .spec
+            .expect,
+        view.spec.expect
+    );
 }

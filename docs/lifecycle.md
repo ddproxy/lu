@@ -19,8 +19,8 @@ stateDiagram-v2
     leased --> failed: non-retryable failure
     leased --> cancelled: cancel requested
     running --> done: harness succeeded
-    running --> queued: provider retry or retryable lease loss
-    running --> failed: execution, dependency or final node failure
+    running --> queued: provider retry, stuck retry or retryable lease loss
+    running --> failed: execution, dependency, stuck cancel or final node failure
     running --> recovering: lease expired
     running --> cancelled: agent honours cancel request
     recovering --> leased: dispatcher reassigns
@@ -52,7 +52,7 @@ outgoing edges.
 | `blocked` | `queued`, `cancelled`, `failed` | All dependencies become `done`; operator cancel; a dependency fails or is cancelled, which cascades. |
 | `queued` | `leased`, `blocked`, `cancelled` | Dispatch to an idle, non-draining agent; edit adds an unfinished dependency; operator cancel. |
 | `leased` | `running`, `queued`, `recovering`, `cancelled`, `failed` | Agent starts; retryable failure or lost lease; lease expiry or controller restart; cancel; non-retryable failure. |
-| `running` | `done`, `failed`, `cancelled`, `queued`, `recovering` | Harness success; terminal failure; honoured cancel; provider retry; lease expiry. |
+| `running` | `done`, `failed`, `cancelled`, `queued`, `recovering` | Harness success; terminal failure (including stuck cancel); honoured cancel; provider or stuck retry; lease expiry. |
 | `recovering` | `running`, `done`, `leased`, `queued`, `failed`, `cancelled` | Same-epoch renewal; same-epoch completion; reassignment; grace expiry with or without retry budget; operator cancel. |
 | `needs_input` | `running`, `failed`, `cancelled` | Reserved edges only; not reachable in this version. |
 | `done`, `failed`, `cancelled` | none | Terminal. |
@@ -97,9 +97,9 @@ conflict`; a cycle gets `400 bad_request`.
 
 | Class | Meaning | Requeue rule |
 | --- | --- | --- |
-| `node` | Agent lost, lease expired, harness spawn failed, harness crashed at launch (a crash banner within 3 seconds and before any harness output), workspace prepare failed, or an ordinary staging error. | Requeue while `attempt <= max_retries` (default 1, allowed 0–3); otherwise fail with `node`. |
+| `node` | Agent lost, lease expired, harness spawn failed, harness crashed at launch (a crash banner within 3 seconds and before any harness output), workspace prepare failed, an ordinary staging error, or a stuck job with the retry policy. | Requeue while `attempt <= max_retries` (default 1, allowed 0–3); otherwise fail with `node`. |
 | `provider` | All keys unavailable, a model limit, a 429, or a provider-failure marker followed by harness silence. | Requeue while `attempt <= 100`; `max_retries` is not consulted. At `attempt > 100` the job fails with `provider`. |
-| `execution` | Harness exited non-zero, timed out, produced no output, or the task itself was invalid. Staging errors naming a missing ref, authentication failure or unknown repository are also `execution`. | Never requeue. |
+| `execution` | Harness exited non-zero, timed out, produced no output, was stopped by the stuck cancel policy, or the task itself was invalid. Staging errors naming a missing ref, authentication failure or unknown repository are also `execution`. | Never requeue. |
 | `dependency` | A dependency finished `failed` or `cancelled`. | Never requeue. |
 | `conflict` | A dependency diff could not be applied to the dependent's base tree. | Never requeue. |
 
@@ -131,6 +131,18 @@ tolerates `harness_ok=false`; a later successful harness run clears both. This u
 Provider-failure detection and cordon behaviour during an outage are in
 [operations.md](operations.md#provider-cordons-and-node-drains).
 
+## Stuck jobs
+
+Stuck detection adds no state. It uses the same output/CPU observation as `lu node`: both idle
+counters must exceed 300 seconds, and the observation must stay continuous for
+`stuck_after_secs` before the agent acts. With `on_stuck = "cancel"`, it stops the harness and
+completes the running job as `execution`, which is terminal. With `on_stuck = "retry"`, it
+completes as `node`, which follows the `max_retries` requeue rule above. `on_stuck = "none"` (the
+default) leaves the job running. Both active policies upload the usual artifacts, use the summary
+`stuck for <n>s, stopped`, and send `stuck_mode` in the completion so the controller can export
+`lu_jobs_stuck_stopped_total{mode}`. Absent job fields use the agent defaults. See
+[operations.md](operations.md#stuck-jobs).
+
 ## Cancellation
 
 | State | Effect |
@@ -145,6 +157,21 @@ A `done` job whose stored diff is empty gets `outcome_note: "no_changes"` in its
 prints as `no changes` in `lu ls` and `lu show` and is marked in the TUI job list. Set
 `allow_empty: true` (`lu submit --allow-empty`) to suppress the note. The controller counts noted
 jobs in `lu_jobs_no_changes_total`, reset on restart.
+
+## Expectations
+
+A job's `expect` block declares what a successful run must leave behind: files in the working tree,
+changed paths matching globs, paths that must not change, and bounds on the exported diff size. The
+agent checks it after the harness exits successfully, against the same diff it uploads as
+`diff.patch`; `.lu/` paths are excluded. Each unmet expectation is recorded as a short string in
+`report.json` under `expect_failures`.
+
+In `suspect` mode (the default) the job stays `done` and gets `outcome_note: "expect_failed"`, which
+prints as `expect failed` in `lu ls`, `lu show` and the TUI job list. The controller counts these
+jobs in `lu_jobs_expect_failed_total`, reset on restart. In `fail` mode the job ends `failed` with
+failure class `execution` and a summary naming the first unmet expectation; it gets no note. A
+harness failure keeps its own class, and expectations are not evaluated. An empty diff gets
+`no_changes`, which takes precedence over `expect_failed` when both apply.
 
 ## Partial diffs on terminal jobs
 

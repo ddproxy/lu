@@ -11,8 +11,25 @@ use std::time::Instant;
 use lu_proto::{printable, truncate_chars, HostStats, JobId, JobStats, ProcessStats};
 
 /// A running job is stuck when neither its harness output nor its process tree has moved for
-/// longer than this.
+/// longer than this. This is the observation threshold; the policy adds a separate continuous
+/// interval before the agent acts.
 pub const STUCK_AFTER_SECS: u64 = 300;
+
+/// The clock used by stuck detection. Kept injectable so tests can advance idle time without
+/// sleeping for the production thresholds.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+/// The wall clock used in production.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RealClock;
+
+impl Clock for RealClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
 
 /// The most processes one job reports. A busy harness can start hundreds; the observer keeps
 /// the ones that have used the most CPU.
@@ -367,8 +384,19 @@ fn build_tree(entries: Vec<ProcEntry>, pgid: u32) -> SampledTree {
 }
 
 /// A job is stuck only while it is running and both kinds of idleness exceed the threshold.
+#[cfg(test)]
 pub fn is_stuck(running: bool, output_idle_secs: u64, cpu_idle_secs: u64) -> bool {
-    running && output_idle_secs > STUCK_AFTER_SECS && cpu_idle_secs > STUCK_AFTER_SECS
+    is_stuck_at(running, output_idle_secs, cpu_idle_secs, STUCK_AFTER_SECS)
+}
+
+/// The same test as [`is_stuck`] with an explicit observation threshold.
+pub fn is_stuck_at(
+    running: bool,
+    output_idle_secs: u64,
+    cpu_idle_secs: u64,
+    threshold_secs: u64,
+) -> bool {
+    running && output_idle_secs > threshold_secs && cpu_idle_secs > threshold_secs
 }
 
 /// Tracks the last time the tree's CPU total changed.
@@ -406,15 +434,24 @@ pub struct JobObservation {
     pgid: u32,
     last_output: Instant,
     cpu: CpuIdle,
+    detect_secs: u64,
 }
 
 impl JobObservation {
+    #[cfg(test)]
     pub fn new(job_id: JobId, pgid: u32, now: Instant) -> Self {
+        Self::new_with_detect_secs(job_id, pgid, now, STUCK_AFTER_SECS)
+    }
+
+    /// Builds an observation with a custom idle threshold. Tests lower it so idle jobs can be
+    /// classified without waiting five minutes.
+    pub fn new_with_detect_secs(job_id: JobId, pgid: u32, now: Instant, detect_secs: u64) -> Self {
         Self {
             job_id,
             pgid,
             last_output: now,
             cpu: CpuIdle::new(now),
+            detect_secs,
         }
     }
 
@@ -443,9 +480,29 @@ impl JobObservation {
             pgid: self.pgid,
             output_idle_secs,
             cpu_idle_secs,
-            stuck: is_stuck(running, output_idle_secs, cpu_idle_secs),
+            stuck: is_stuck_at(running, output_idle_secs, cpu_idle_secs, self.detect_secs),
             processes: tree.processes,
         }
+    }
+}
+
+/// Counts how long a job has been reported stuck without interruption. Any non-stuck sample
+/// clears the interval; reaching `after_secs` returns the elapsed time for the completion summary.
+#[derive(Debug, Clone, Default)]
+pub struct StuckTracker {
+    since: Option<Instant>,
+}
+
+impl StuckTracker {
+    /// Records one sample. `Some(secs)` means the continuous threshold was reached on this sample.
+    pub fn observe(&mut self, stuck: bool, now: Instant, after_secs: u64) -> Option<u64> {
+        if !stuck {
+            self.since = None;
+            return None;
+        }
+        let since = *self.since.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(since).as_secs();
+        (elapsed >= after_secs).then_some(elapsed)
     }
 }
 
@@ -649,5 +706,45 @@ mod tests {
         assert_eq!(job.cpu_idle_secs, 321);
         assert!(job.stuck);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_custom_threshold_changes_classification() {
+        assert!(!is_stuck_at(true, 10, 11, 10));
+        assert!(!is_stuck_at(true, 11, 10, 10));
+        assert!(is_stuck_at(true, 11, 11, 10));
+        assert!(is_stuck_at(true, 11, 11, 5));
+        let root = temp_root("stuck-threshold");
+        write_process(&root, 901, 1, 901, 0, 0, 0, 1, b"harness");
+        let now = Instant::now();
+        let mut observation = JobObservation::new_with_detect_secs(JobId::new(), 901, now, 5);
+        let job = observation.sample(&root, 1_000, true, now + Duration::from_secs(11));
+        assert!(job.stuck);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tracker_counts_continuous_stuck_time_and_resets_on_activity() {
+        let now = Instant::now();
+        let mut tracker = StuckTracker::default();
+        assert_eq!(tracker.observe(false, now, 5), None);
+        assert_eq!(tracker.observe(true, now, 5), None);
+        assert_eq!(tracker.observe(true, now + Duration::from_secs(4), 5), None);
+        assert_eq!(
+            tracker.observe(true, now + Duration::from_secs(5), 5),
+            Some(5)
+        );
+
+        let mut tracker = StuckTracker::default();
+        tracker.observe(true, now, 5);
+        assert_eq!(
+            tracker.observe(false, now + Duration::from_secs(4), 5),
+            None
+        );
+        assert_eq!(tracker.observe(true, now + Duration::from_secs(8), 5), None);
+        assert_eq!(
+            tracker.observe(true, now + Duration::from_secs(13), 5),
+            Some(5)
+        );
     }
 }

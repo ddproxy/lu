@@ -1,12 +1,15 @@
 use crate::auth::authenticate_operator;
 use crate::error::ApiError;
+use crate::routes::operator::cordon_until_wall;
 use crate::routes::with_version;
 use crate::state::AppState;
 use crate::time::now;
 use axum::extract::{Extension, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use lu_proto::StuckPolicy;
 use lu_serve::PeerAddr;
+use lu_store::CordonSource;
 use std::sync::Arc;
 
 /// Escape label value for Prometheus text format.
@@ -58,6 +61,16 @@ pub async fn metrics(
         let store = Arc::clone(&state.store);
         let lease_ms = state.lease_ms;
         move || store.job_counts(n, lease_ms)
+    })
+    .await
+    {
+        Ok(Ok(c)) => c,
+        _ => return with_version(ApiError::internal().into_response()),
+    };
+
+    let group_counts = match tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        move || store.group_counts()
     })
     .await
     {
@@ -123,6 +136,24 @@ pub async fn metrics(
     for (state, count) in &counts.jobs {
         out.push_str(&gauge("lu_jobs", &[("state", state.as_str())], *count));
         out.push('\n');
+    }
+
+    if !state.group_limits.is_empty() {
+        out.push_str("# HELP lu_group_running Jobs active in a configured group\n");
+        out.push_str("# TYPE lu_group_running gauge\n");
+        out.push_str("# HELP lu_group_limit Configured concurrency cap for a group\n");
+        out.push_str("# TYPE lu_group_limit gauge\n");
+        let mut names: Vec<_> = state.group_limits.keys().collect();
+        names.sort();
+        for name in names {
+            let label = escape_label(name);
+            let running = group_counts.get(name).copied().unwrap_or(0) as u64;
+            let limit = state.group_limits.get(name).copied().unwrap_or(0) as u64;
+            out.push_str(&gauge("lu_group_running", &[("group", &label)], running));
+            out.push('\n');
+            out.push_str(&gauge("lu_group_limit", &[("group", &label)], limit));
+            out.push('\n');
+        }
     }
 
     out.push_str("# HELP lu_nodes Total number of nodes known\n");
@@ -191,16 +222,42 @@ pub async fn metrics(
     ));
     out.push('\n');
 
+    out.push_str(
+        "# HELP lu_jobs_expect_failed_total Done jobs with unmet expectations in suspect mode\n",
+    );
+    out.push_str("# TYPE lu_jobs_expect_failed_total counter\n");
+    out.push_str(&counter(
+        "lu_jobs_expect_failed_total",
+        &[],
+        state.expect_failed_total(),
+    ));
+    out.push('\n');
+
+    out.push_str("# HELP lu_jobs_stuck_stopped_total Jobs stopped by the agent's stuck policy\n");
+    out.push_str("# TYPE lu_jobs_stuck_stopped_total counter\n");
+    for mode in [StuckPolicy::Cancel, StuckPolicy::Retry] {
+        out.push_str(&counter(
+            "lu_jobs_stuck_stopped_total",
+            &[("mode", mode.as_str())],
+            state.stuck_stopped_total(mode),
+        ));
+        out.push('\n');
+    }
+
     // lu_node_providers{node,provider,state} - need to query nodes with providers
     // Get node records
-    let nodes = match tokio::task::spawn_blocking({
+    let (nodes, cordons) = match tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         let lease_ms = state.lease_ms;
-        move || store.nodes(n, lease_ms)
+        move || {
+            let nodes = store.nodes(n, lease_ms)?;
+            let cordons = store.cordons(None)?;
+            Ok::<_, lu_store::StoreError>((nodes, cordons))
+        }
     })
     .await
     {
-        Ok(Ok(n)) => n,
+        Ok(Ok(pair)) => pair,
         _ => return with_version(ApiError::internal().into_response()),
     };
 
@@ -275,6 +332,32 @@ pub async fn metrics(
             ));
             out.push('\n');
         }
+    }
+
+    out.push_str(
+        "# HELP lu_node_cordon_seconds_remaining Seconds left on a provider cordon; 0 when it lifts on healthy heartbeats\n",
+    );
+    out.push_str("# TYPE lu_node_cordon_seconds_remaining gauge\n");
+    for cordon in &cordons {
+        let node_name = escape_label(cordon.node.as_str());
+        let provider = escape_label(&cordon.provider);
+        let source = cordon.source.as_str();
+        let remaining = match (cordon.source, cordon.until_mono_ms) {
+            (CordonSource::Failure, Some(until)) => {
+                (cordon_until_wall(until, n).saturating_sub(n.wall_unix)).max(0) as u64
+            }
+            _ => 0,
+        };
+        out.push_str(&gauge(
+            "lu_node_cordon_seconds_remaining",
+            &[
+                ("node", &node_name),
+                ("provider", &provider),
+                ("source", source),
+            ],
+            remaining,
+        ));
+        out.push('\n');
     }
 
     (

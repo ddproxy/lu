@@ -599,6 +599,7 @@ pub async fn complete_job(
     if rec_check.node.as_ref() != Some(&node) {
         return with_version(ApiError::forbidden("forbidden").into_response());
     }
+    let stuck_mode = completion.stuck_mode;
     let failure = match completion.outcome {
         lu_proto::Outcome::Done | lu_proto::Outcome::Cancelled => None,
         lu_proto::Outcome::Failed(class) => {
@@ -617,9 +618,12 @@ pub async fn complete_job(
     .await;
     match res {
         Ok(Ok(rec)) => {
-            if crate::routes::operator::outcome_note(&rec) == Some("no_changes") {
-                state.count_no_changes();
+            match crate::routes::operator::outcome_note(&rec) {
+                Some("no_changes") => state.count_no_changes(),
+                Some("expect_failed") => state.count_expect_failed(),
+                _ => {}
             }
+            state.count_stuck_stopped(stuck_mode);
             state.waiters.notify_job(rec.id.as_ref());
             state.waiters.notify_work();
             with_version(json_ok(
@@ -973,7 +977,7 @@ fn cordon_ms_for(completion: &lu_proto::Completion, default_ms: u64) -> u64 {
 #[cfg(test)]
 mod cordon_tests {
     use super::*;
-    use lu_proto::{Completion, FailureClass, JobId, Outcome};
+    use lu_proto::{Completion, FailureClass, Outcome};
 
     fn completion(outcome: Outcome, retry: Option<u64>) -> Completion {
         Completion {
@@ -983,6 +987,8 @@ mod cordon_tests {
             exit_code: None,
             summary: None,
             retry_after_secs: retry,
+            stuck_mode: None,
+            expect_failed: false,
         }
     }
 
@@ -1146,6 +1152,27 @@ mod poll_renewal_tests {
         ) -> Result<Vec<lu_store::NodeRecord>, StoreError> {
             unimplemented!()
         }
+        fn cordons(&self, _node: Option<&NodeName>) -> Result<Vec<lu_store::Cordon>, StoreError> {
+            unimplemented!()
+        }
+        fn set_cordon(
+            &self,
+            _node: &NodeName,
+            _provider: &str,
+            _source: lu_store::CordonSource,
+            _reason: &str,
+            _set_at_unix: i64,
+            _until_mono_ms: i64,
+        ) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn uncordon(
+            &self,
+            _node: &NodeName,
+            _provider: Option<&str>,
+        ) -> Result<Vec<String>, StoreError> {
+            unimplemented!()
+        }
         fn job_counts(&self, _now: Now, _lease_ms: u64) -> Result<JobCounts, StoreError> {
             unimplemented!()
         }
@@ -1181,6 +1208,7 @@ mod poll_renewal_tests {
                 token_sha256: sha256_hex("unused-operator-token"),
             }],
             repos: Vec::new(),
+            groups: Vec::new(),
         };
         let state = Arc::new(AppState::from_config(&cfg, store.clone()).unwrap());
         let body = json!({"heartbeat": {"node": "node-a", "harness": "idle", "providers": []}, "wait_secs": 0}).to_string();

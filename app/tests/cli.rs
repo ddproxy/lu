@@ -1082,7 +1082,8 @@ async fn nodes_and_drain_render_aligned_text() {
             "last_seen": 10,
             "draining": true,
             "labels": ["gpu", "php8.3", "ubuntu22.04", "x86_64", "region=eu", "tier=gold"],
-            "taints": ["homelab"]
+            "taints": ["homelab"],
+            "cordons": ["zen", "openrouter"]
         },
         {"name": "node-b", "harness": "busy", "last_seen": 12, "draining": false, "labels": []}
     ]);
@@ -1108,12 +1109,14 @@ async fn nodes_and_drain_render_aligned_text() {
     assert!(header.contains("VERSION"), "{text}");
     assert!(header.contains("HARNESS"), "{text}");
     assert!(header.contains("LABELS"), "{text}");
+    assert!(header.contains("CORDONS"), "{text}");
     assert!(text.contains("node-a"), "{text}");
     assert!(text.contains("0.1.10"), "{text}");
     assert!(
         text.contains("!homelab,gpu,php8.3,ubuntu22.04,x86_64+2"),
         "{text}"
     );
+    assert!(text.contains("!zen,!openrouter"), "{text}");
     assert!(text.contains("node-b"), "{text}");
     assert!(text.contains("yes"), "{text}");
 
@@ -1146,6 +1149,60 @@ async fn nodes_and_drain_render_aligned_text() {
     assert_eq!(paths[0], "/v1/nodes");
     assert_eq!(paths[1], "/v1/nodes/node-a/drain");
     assert_eq!(paths[2], "/v1/nodes/node-a/undrain");
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uncordon_sends_the_optional_provider_and_prints_what_was_removed() {
+    let server = start(move |record| {
+        if record.path == "/v1/nodes/node-a/uncordon" {
+            let value: Value = if record.body.is_empty() {
+                json!({"removed": ["zen", "openrouter"]})
+            } else {
+                let request: Value = serde_json::from_slice(&record.body).unwrap();
+                json!({"removed": [request["provider"].as_str().unwrap()]})
+            };
+            Reply::json(&value)
+        } else {
+            Reply::status(404)
+        }
+    })
+    .await;
+    let dir = scratch("uncordon");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+
+    let output = run_with_env(&["uncordon", "node-a", "zen"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "uncordoned node-a: zen");
+
+    let output = run_with_env(&["uncordon", "node-a"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "uncordoned node-a: zen, openrouter");
+
+    let output = run_with_env(
+        &["--json", "uncordon", "node-a", "openrouter"],
+        &envs,
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), r#"{"removed":["openrouter"]}"#);
+
+    let records = server.records.lock().unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].method, "POST");
+    assert_eq!(records[0].path, "/v1/nodes/node-a/uncordon");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&records[0].body).unwrap(),
+        json!({"provider": "zen"})
+    );
+    assert!(records[1].body.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&records[2].body).unwrap(),
+        json!({"provider": "openrouter"})
+    );
     drop(records);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1313,7 +1370,40 @@ async fn node_prints_host_numbers_and_indented_process_tree() {
         }]
     });
     let expected = stats.to_string();
-    let server = start(move |_| Reply::json(&stats)).await;
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let node_view = json!({
+        "name": "node-a",
+        "cordons": ["p1", "p2"],
+        "cordon_details": [
+            {
+                "provider": "p1",
+                "source": "failure",
+                "reason": "Provider p1 failed: timeout",
+                "set_at": wall - 10,
+                "until": wall + 50,
+                "lifts_after_healthy_heartbeats": null
+            },
+            {
+                "provider": "p2",
+                "source": "reiki",
+                "reason": "Reiki cooldown for p2",
+                "set_at": wall - 5,
+                "until": null,
+                "lifts_after_healthy_heartbeats": 2
+            }
+        ]
+    });
+    let server = start(move |record| {
+        if record.path == "/v1/nodes" {
+            Reply::json(&json!([node_view]))
+        } else {
+            Reply::json(&stats)
+        }
+    })
+    .await;
     let dir = scratch("node");
     let token = write_token(&dir, "operator.token", TOKEN);
     let envs = env_for(&server, &token);
@@ -1332,6 +1422,20 @@ async fn node_prints_host_numbers_and_indented_process_tree() {
     assert!(text.contains(&format!("job {id}")), "{text}");
     assert!(text.contains("stuck yes"), "{text}");
     assert!(text.contains("disk_free_percent  25"), "{text}");
+    assert!(text.contains("cordons"), "{text}");
+    let failure = text
+        .lines()
+        .find(|line| line.contains("p1 [failure]"))
+        .unwrap();
+    assert!(failure.contains("ago;"), "{failure:?}");
+    assert!(failure.contains("left"), "{failure:?}");
+    assert!(text.contains("Provider p1 failed: timeout"), "{text}");
+    let reiki = text
+        .lines()
+        .find(|line| line.contains("p2 [reiki]"))
+        .unwrap();
+    assert!(reiki.contains("ago;"), "{reiki:?}");
+    assert!(reiki.contains("lifts on 2 healthy"), "{reiki:?}");
     let process_line = text
         .lines()
         .find(|line| line.trim_start().starts_with("4242"))
@@ -1350,7 +1454,11 @@ async fn node_prints_host_numbers_and_indented_process_tree() {
     let paths: Vec<&str> = records.iter().map(|record| record.path.as_str()).collect();
     assert_eq!(
         paths,
-        vec!["/v1/nodes/node-a/stats", "/v1/nodes/node-a/stats"]
+        vec![
+            "/v1/nodes/node-a/stats",
+            "/v1/nodes",
+            "/v1/nodes/node-a/stats"
+        ]
     );
     drop(records);
     let _ = std::fs::remove_dir_all(&dir);

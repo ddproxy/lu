@@ -36,23 +36,27 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_build_info{version}` | gauge | Always `1`; controller build version. |
 | `lu_uptime_seconds` | gauge | Seconds since the controller process started. |
 | `lu_db_bytes` | gauge | SQLite file size, excluding `-wal` and `-shm`. |
-| `lu_schema_version` | gauge | Schema version the binary expects; currently `6`. |
+| `lu_schema_version` | gauge | Schema version the binary expects; currently `8`. |
 | `lu_recovered_on_boot` | gauge | Jobs moved to `recovering` by this process's boot recovery. |
 | `lu_queue_oldest_seconds` | gauge | Age of the oldest `queued` or `blocked` job, or `0` when none. |
 | `lu_jobs{state}` | gauge | Jobs in each of nine zero-filled states: `blocked`, `queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`. |
+| `lu_group_running{group}` | gauge | Jobs in that configured group currently `leased`, `running`, `recovering` or `needs_input`. |
+| `lu_group_limit{group}` | gauge | Configured `max_running` cap for that group. |
 | `lu_nodes` | gauge | Nodes that have sent at least one heartbeat. |
 | `lu_nodes_online` | gauge | Nodes seen within two lease periods. |
 | `lu_nodes_drained` | gauge | Nodes with the drain flag set. |
 | `lu_controller_up` | gauge | Always `1` when the route answers. |
 | `lu_repo_last_sync_seconds{repo}` | gauge | Seconds since that configured mirror synced; `0` before its first sync. |
+| `lu_jobs_stuck_stopped_total{mode}` | counter | Jobs stopped by the agent's stuck policy, by `mode` (`cancel` or `retry`), since this controller process started. |
 | `lu_jobs_completed_total{outcome}` | counter | Terminal jobs by `outcome`: `done`, `failed`, `cancelled`; derived from stored jobs and kept across restarts. |
 | `lu_jobs_no_changes_total` | counter | `done` jobs whose stored diff was empty and `allow_empty` was false, summed since this controller process started. |
+| `lu_jobs_expect_failed_total` | counter | `done` jobs whose suspect expectations failed, summed since this controller process started. |
 | `lu_node_last_seen_seconds{node}` | gauge | Seconds since that node's last heartbeat. |
 | `lu_node_labels_info{node,label}` | gauge | `1` per label in the node's latest heartbeat. |
 | `lu_node_disk_free_percent{node}` | gauge | Free space percentage on the node's work filesystem, when its latest heartbeat reported disk totals. |
 | `lu_node_providers{node,provider,state}` | gauge | `1` per reported provider; `state` is `ok`, `cooling`, `disabled` or `unknown`. |
 
-Node series describe the latest heartbeat held in memory. They disappear after a controller restart until agents report again. Provider and label series appear only for nodes that report them.
+Node series describe the latest heartbeat held in memory. They disappear after a controller restart until agents report again. Provider and label series appear only for nodes that report them. Cordon series come from the store; boot clears cordons, so they reappear only when a new failure or Reiki reading sets one. Group series appear only for named `[[controller.groups]]` entries, even when a job uses an unconfigured group name.
 
 ## `lu status`
 
@@ -68,7 +72,7 @@ lu status --json
 {
   "version": "0.2.0",
   "uptime_secs": 3600,
-  "schema_version": 6,
+  "schema_version": 8,
   "db_bytes": 81920,
   "recovered_on_boot": 2,
   "jobs": {"blocked": 0, "queued": 1, "leased": 1, "running": 2, "recovering": 0, "needs_input": 0, "done": 12, "failed": 1, "cancelled": 0},

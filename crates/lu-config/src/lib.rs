@@ -40,12 +40,49 @@ pub const MIN_DETECT_EVERY_SECS: u64 = 30;
 pub const MAX_PROVIDER_MODELS: usize = 64;
 const MAX_PROVIDER_BYTES: usize = 64;
 const MAX_MODEL_BYTES: usize = 128;
+const MAX_GROUP_BYTES: usize = 64;
+const MAX_GROUP_RUNNING: usize = 64;
 
 const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+
+const MIN_STUCK_AFTER_SECS: u64 = 60;
+const MAX_STUCK_AFTER_SECS: u64 = 86_400;
+const DEFAULT_STUCK_AFTER_SECS: u64 = 1_800;
+
+/// The agent's default response to a job that stops producing output and using CPU. A job may
+/// override this in its spec.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StuckPolicy {
+    #[default]
+    None,
+    Cancel,
+    Retry,
+}
+
+impl StuckPolicy {
+    /// The canonical wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Cancel => "cancel",
+            Self::Retry => "retry",
+        }
+    }
+}
 
 fn valid_provider_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_PROVIDER_BYTES
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The same name rule job specs use for `group`.
+fn valid_group_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_GROUP_BYTES
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
@@ -89,6 +126,9 @@ pub struct ControllerConfig {
     /// Repositories the controller mirrors and pins jobs to.
     #[serde(default)]
     pub repos: Vec<ControllerRepo>,
+    /// Concurrency caps for named job groups.
+    #[serde(default)]
+    pub groups: Vec<ControllerGroup>,
 }
 
 fn default_lease_secs() -> u64 {
@@ -115,6 +155,14 @@ fn default_max_connections_per_addr() -> usize {
 pub struct ControllerAgent {
     pub name: String,
     pub token_sha256: String,
+}
+
+/// One named group's concurrency cap. Jobs in unconfigured groups are unlimited.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerGroup {
+    pub name: String,
+    pub max_running: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -196,6 +244,12 @@ pub struct AgentConfig {
     pub harness_wrapper: Vec<String>,
     #[serde(default = "default_heartbeat_secs")]
     pub heartbeat_secs: u64,
+    /// Default for jobs that do not set `on_stuck`.
+    #[serde(default)]
+    pub on_stuck: StuckPolicy,
+    /// Default continuous stuck interval for jobs that do not set `stuck_after_secs`.
+    #[serde(default = "default_stuck_after_secs")]
+    pub stuck_after_secs: u64,
     pub reiki_health_url: Option<String>,
     pub reiki_token_file: Option<String>,
     /// Provider/model pairs this node offers to jobs that request `provider = "any"`.
@@ -220,6 +274,10 @@ pub struct AgentConfig {
 
 fn default_heartbeat_secs() -> u64 {
     15
+}
+
+fn default_stuck_after_secs() -> u64 {
+    DEFAULT_STUCK_AFTER_SECS
 }
 
 /// One probe: a command run off the heartbeat path that publishes `label` on exit 0.
@@ -546,6 +604,28 @@ impl ControllerConfig {
                 }
             }
         }
+        let mut groupnames = HashSet::new();
+        for (index, group) in self.groups.iter().enumerate() {
+            let table = format!("[[controller.groups]] #{} ({})", index + 1, group.name);
+            if !valid_group_name(&group.name) {
+                return invalid(
+                    &table,
+                    format!("name must be 1 to {MAX_GROUP_BYTES} bytes from A-Z a-z 0-9 . _ -"),
+                );
+            }
+            if !groupnames.insert(group.name.clone()) {
+                return invalid(&table, "name is used by an earlier group".to_owned());
+            }
+            if !(1..=MAX_GROUP_RUNNING).contains(&group.max_running) {
+                return invalid(
+                    &table,
+                    format!(
+                        "max_running must be 1 to {MAX_GROUP_RUNNING} (got {})",
+                        group.max_running
+                    ),
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -609,6 +689,15 @@ impl AgentConfig {
                 format!(
                     "heartbeat_secs must be 2 to 300 (got {})",
                     self.heartbeat_secs
+                ),
+            );
+        }
+        if !(MIN_STUCK_AFTER_SECS..=MAX_STUCK_AFTER_SECS).contains(&self.stuck_after_secs) {
+            return invalid(
+                "[agent]",
+                format!(
+                    "stuck_after_secs must be {MIN_STUCK_AFTER_SECS} to {MAX_STUCK_AFTER_SECS} (got {})",
+                    self.stuck_after_secs
                 ),
             );
         }
@@ -1340,12 +1429,30 @@ heartbeat_secs = 15
         assert!(c.local_repo_roots.is_empty());
         let a = Config::parse(&agent_only()).unwrap().agent.unwrap();
         assert_eq!(a.heartbeat_secs, 15);
+        assert_eq!(a.on_stuck, StuckPolicy::None);
+        assert_eq!(a.stuck_after_secs, DEFAULT_STUCK_AFTER_SECS);
         assert_eq!(a.base_source, BaseSource::Auto);
         assert!(a.labels.is_empty());
         assert!(a.taints.is_empty());
         assert!(a.label_files.is_empty());
         let cfg = Config::parse(&combined()).unwrap();
         assert_eq!(cfg.log.level, "info");
+    }
+
+    #[test]
+    fn agent_stuck_defaults_can_be_overridden_and_are_checked() {
+        let base = agent_only();
+        let configured = format!("{base}on_stuck = \"cancel\"\nstuck_after_secs = 120\n");
+        let agent = Config::parse(&configured).unwrap().agent.unwrap();
+        assert_eq!(agent.on_stuck, StuckPolicy::Cancel);
+        assert_eq!(agent.stuck_after_secs, 120);
+
+        for value in [59, 86_401] {
+            let text = format!("{base}stuck_after_secs = {value}\n");
+            expect_table(&text, "[agent]");
+        }
+        let invalid_policy = format!("{base}on_stuck = \"later\"\n");
+        assert!(Config::parse(&invalid_policy).is_err());
     }
 
     #[test]
@@ -1944,6 +2051,37 @@ heartbeat_secs = 15
             &base("name=\"mirror\"\nurl=\"https://example.net/a.git\"\nrefs=[]\n"),
             "[[controller.repos]] #1 (mirror)",
         );
+    }
+
+    #[test]
+    fn group_names_and_limits_are_validated() {
+        let base = |body: &str| {
+            format!(
+                "[controller]\nlisten=\"127.0.0.1:7600\"\ndb=\"/db\"\nartifacts_dir=\"/a\"\n[[controller.groups]]\n{body}"
+            )
+        };
+        assert!(Config::parse(&base("name=\"nightly\"\nmax_running=2\n")).is_ok());
+        expect_table(
+            &base("name=\"bad name\"\nmax_running=2\n"),
+            "[[controller.groups]] #1 (bad name)",
+        );
+        expect_table(
+            &base("name=\"nightly\"\nmax_running=0\n"),
+            "[[controller.groups]] #1 (nightly)",
+        );
+        expect_table(
+            &base("name=\"nightly\"\nmax_running=65\n"),
+            "[[controller.groups]] #1 (nightly)",
+        );
+        assert!(Config::parse(&base("name=\"nightly\"\n")).is_err());
+        let dup = format!(
+            "{}{}",
+            base("name=\"nightly\"\nmax_running=1\n"),
+            "[[controller.groups]]\nname=\"nightly\"\nmax_running=2\n"
+        );
+        let (table, reason) = invalid(Config::parse(&dup).unwrap_err());
+        assert_eq!(table, "[[controller.groups]] #2 (nightly)");
+        assert!(reason.contains("earlier group"), "{reason}");
     }
 
     #[test]

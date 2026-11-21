@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::failure::FailureClass;
 use crate::ids::JobId;
 use crate::limits::{MAX_LOG_CHUNK_BYTES, MAX_SUMMARY_BYTES};
-use crate::spec::JobSpec;
+use crate::spec::{JobSpec, StuckPolicy};
 
 /// A message from the controller to an agent, tagged by `kind`.
 // The spec is kept inline in the wire event; boxing it would ripple through every agent.
@@ -197,6 +197,17 @@ pub struct Completion {
     /// provider heartbeats.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_secs: Option<u64>,
+    /// Set when the agent stopped this job because it was stuck. The controller counts these by
+    /// mode; it does not change how the outcome is stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stuck_mode: Option<StuckPolicy>,
+    /// A suspect-mode job finished `done` with unmet expectations.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expect_failed: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Deserialize)]
@@ -209,8 +220,12 @@ struct RawCompletion {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub retry_after_secs: Option<u64>,
+    #[serde(default)]
+    pub stuck_mode: Option<StuckPolicy>,
+    #[serde(default)]
+    pub expect_failed: bool,
 }
 
 impl TryFrom<RawCompletion> for Completion {
@@ -223,6 +238,8 @@ impl TryFrom<RawCompletion> for Completion {
             exit_code: raw.exit_code,
             summary: raw.summary,
             retry_after_secs: raw.retry_after_secs,
+            stuck_mode: raw.stuck_mode,
+            expect_failed: raw.expect_failed,
         };
         c.validate()?;
         Ok(c)
@@ -289,6 +306,10 @@ mod tests {
             provider: None,
             model: None,
             timeout_secs: 3600,
+            on_stuck: None,
+            stuck_after_secs: None,
+            priority: crate::DEFAULT_PRIORITY,
+            group: None,
             idle_timeout_secs: None,
             idempotency_key: None,
             after: Vec::new(),
@@ -300,6 +321,7 @@ mod tests {
             requires: Vec::new(),
             tolerates: Vec::new(),
             fallbacks: Vec::new(),
+            expect: None,
         }
     }
 
@@ -411,8 +433,10 @@ mod tests {
             epoch: 2,
             outcome: Outcome::Done,
             exit_code: Some(0),
+            stuck_mode: None,
             summary: Some("all green".to_owned()),
             retry_after_secs: None,
+            expect_failed: false,
         };
         assert!(done.validate().is_ok());
         let json = serde_json::to_string(&done).unwrap();
@@ -425,6 +449,8 @@ mod tests {
             exit_code: Some(2),
             summary: None,
             retry_after_secs: Some(150),
+            stuck_mode: None,
+            expect_failed: false,
         };
         assert!(failed.validate().is_ok());
         let json = serde_json::to_string(&failed).unwrap();
@@ -440,6 +466,8 @@ mod tests {
             exit_code: None,
             summary: Some("s".repeat(MAX_SUMMARY_BYTES + 1)),
             retry_after_secs: None,
+            stuck_mode: None,
+            expect_failed: false,
         };
         assert_eq!(
             completion.validate().unwrap_err(),

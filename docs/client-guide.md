@@ -43,12 +43,13 @@ Global flags: `--config <path>` (default `lu.toml`) and `--json` (raw controller
 | `lu retry` | `lu retry 01AR... --provider anthropic --key retry-2` | Resubmits a finished job's spec as a new job. |
 | `lu ls` | `lu ls --state failed --limit 10` | Newest-first job list. |
 | `lu show` | `lu show 01AR...` | One job plus each dependency and its state. |
-| `lu graph` | `lu graph 01AR...` | Dependency graph for one component. |
+| `lu graph` | `lu graph 01AR...` | Horizontal dependency graph for one component, with task titles. |
 | `lu logs` | `lu logs 01AR... --follow` | Streams until the job reaches a terminal state. |
 | `lu fetch` | `lu fetch 01AR... --out results` | Writes `diff.patch`, `run.log` and `report.json`. |
 | `lu cancel` | `lu cancel 01AR...` | Requests cancellation. |
-| `lu nodes` | `lu nodes --json` | Full node views, including cordons and labels. |
-| `lu node` | `lu node node-a` | Latest host and job stats from that node's heartbeat. |
+| `lu nodes` | `lu nodes --json` | Full node views, including cordon details and labels. |
+| `lu node` | `lu node node-a` | Latest host and job stats, plus cordon source, reason, age and lift time. |
+| `lu uncordon` | `lu uncordon node-a zen` | Clear one provider cordon, or every cordon when the provider is omitted. |
 | `lu drain` / `lu undrain` | `lu undrain node-a` | Stop or resume assigning jobs to a node. |
 | `lu repos` / `lu sync` | `lu sync app` | List or refresh controller repository mirrors. |
 | `lu backup` / `lu restore` | `lu backup --out /var/backups/lu/lu.db` | Database snapshot and install. See [operations.md](operations.md). |

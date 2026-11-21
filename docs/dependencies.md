@@ -141,17 +141,22 @@ resolve both sides of every marker and write `MERGE.md`.
 ## Viewing the graph
 
 `lu graph [job]` draws components that contain at least one unfinished job, newest component
-first. Nodes are ordered newest first within a component and placed left to right by dependency
-depth; edges point from a prerequisite to the job that names it. A job id selects that job's
-component even if every job in it is finished. Display is capped at 6 components and 40 jobs,
-with a note when anything is hidden.
+first. Each chain is one horizontal row, prerequisites first: `○ build ──▶ ○ test ──▶ ◔ ship`.
+Only a real fan-out (one prerequisite, several dependents) or fan-in (several prerequisites, one
+dependent) adds rows, using `├─▶`/`└─▶` branches and `┐`/`┘` joins. A dependency outside the
+fetched set is a dim `#id…` stub at the left of its chain, and unrelated single-job components
+share a row when they fit. A job id selects that job's component even if every job in it is
+finished. Display is capped at 6 components and 40 jobs, with a note when anything is hidden.
 
-A node's title is the first non-empty line of its task, with leading `#` heading marks and a
-`Task:` or `task:` prefix removed. Colour is used only when stdout is a terminal and `NO_COLOR`
-is unset. `lu graph --json` prints:
+A node shows a state glyph and the last five id characters. Its title is the first non-empty line
+of its task, with leading `#` heading marks and a `Task:` or `task:` prefix removed; `lu graph`
+appends the title clipped to 30 characters, while the `lu top` panel shows only glyphs and ids in
+a bordered `Graph` panel. Colour is used only when stdout is a terminal and `NO_COLOR` is unset.
+`lu graph --json` prints:
 
 ```json
 {"nodes":[{"id":"...","state":"queued","title":"...","after":["..."]}]}
 ```
 
-`lu top` and the TUI dashboard also expose the graph panel; press `g` to toggle it there.
+`lu top` and the TUI dashboard also expose the graph panel; press `g` to toggle it there. The panel
+clips tall graphs and reports hidden jobs, components and rows in its title.

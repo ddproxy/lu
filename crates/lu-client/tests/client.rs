@@ -198,7 +198,12 @@ fn spec() -> JobSpec {
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),
+        on_stuck: None,
+        stuck_after_secs: None,
+        priority: lu_proto::DEFAULT_PRIORITY,
+        group: None,
         fallbacks: Vec::new(),
+        expect: None,
     }
 }
 
@@ -206,10 +211,12 @@ fn completion(id: JobId) -> Completion {
     Completion {
         job_id: id,
         epoch: 7,
+        stuck_mode: None,
         outcome: Outcome::Failed(FailureClass::Execution),
         exit_code: Some(2),
         summary: Some("bad".to_owned()),
         retry_after_secs: None,
+        expect_failed: false,
     }
 }
 

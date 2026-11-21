@@ -12,7 +12,7 @@ use lu_proto::{
 };
 
 use crate::conformance::hb;
-use crate::{JobRecord, Now, Store, StoreError};
+use crate::{CordonSource, JobRecord, Now, Store, StoreError};
 
 const OPS: usize = 300;
 const LONG_OPS: usize = 3_000;
@@ -23,6 +23,15 @@ const MAX_RETRIES: u32 = 1;
 const CORDON_MS: u64 = 1_200;
 
 const NODE_NAMES: [&str; 3] = ["node-a", "node-b", "node-c"];
+
+#[derive(Clone)]
+struct CordonModel {
+    until: u64,
+    source: CordonSource,
+    reason: String,
+    set_at_unix: i64,
+}
+
 const PROVIDERS: [&str; 2] = ["prov-a", "prov-b"];
 
 /// Fixed seeds for the normal run, generated once so a failure always reproduces.
@@ -360,7 +369,7 @@ struct Model<S: Store> {
     draining: BTreeSet<NodeName>,
     lease_until: BTreeMap<JobId, u64>,
     recovering_since: BTreeMap<JobId, u64>,
-    cordons: BTreeMap<(NodeName, String), u64>,
+    cordons: BTreeMap<(NodeName, String), CordonModel>,
     assigned_hb: BTreeMap<JobId, u64>,
     node_retries: BTreeMap<JobId, u32>,
     artifacts: BTreeMap<JobId, BTreeSet<&'static str>>,
@@ -487,9 +496,14 @@ impl<S: Store> Model<S> {
             include_failed: false,
             on_conflict: Default::default(),
             allow_empty: false,
+            on_stuck: None,
+            stuck_after_secs: None,
             requires: Vec::new(),
             tolerates: Vec::new(),
+            priority: lu_proto::DEFAULT_PRIORITY,
+            group: None,
             fallbacks: Vec::new(),
+            expect: None,
         }
     }
 
@@ -654,7 +668,7 @@ impl<S: Store> Model<S> {
     fn cordon_deadline(&self, name: &NodeName, provider: &str) -> u64 {
         self.cordons
             .get(&(name.clone(), provider.to_owned()))
-            .copied()
+            .map(|c| c.until)
             .unwrap_or(0)
     }
 
@@ -687,8 +701,15 @@ impl<S: Store> Model<S> {
         } else {
             self.records
                 .values()
-                .find(|record| {
+                .filter(|record| {
                     record.state == JobState::Queued && self.provider_eligible(&node_name, record)
+                })
+                .min_by(|a, b| {
+                    b.spec
+                        .priority
+                        .cmp(&a.spec.priority)
+                        .then(a.created_at.cmp(&b.created_at))
+                        .then(a.id.cmp(&b.id))
                 })
                 .map(|record| (record.id.clone(), record.epoch))
         };
@@ -957,6 +978,8 @@ impl<S: Store> Model<S> {
                 exit_code: Some(0),
                 summary: None,
                 retry_after_secs: None,
+                stuck_mode: None,
+                expect_failed: false,
             };
             assert_eq!(
                 self.store
@@ -1015,6 +1038,8 @@ impl<S: Store> Model<S> {
             },
             summary: Some(format!("model completion {roll}")),
             retry_after_secs,
+            stuck_mode: None,
+            expect_failed: false,
         };
         self.note(format!(
             "complete {id} state={:?} attempt={} outcome={outcome:?} retry_after={retry_after_secs:?}",
@@ -1060,9 +1085,35 @@ impl<S: Store> Model<S> {
                         if let (Some(node), Some(provider)) =
                             (record.node.clone(), record.spec.provider.clone())
                         {
+                            let source = if completion.retry_after_secs.is_some() {
+                                CordonSource::Reiki
+                            } else {
+                                CordonSource::Failure
+                            };
+                            let detail = completion
+                                .summary
+                                .as_deref()
+                                .unwrap_or("no failure summary");
+                            let reason = match source {
+                                CordonSource::Reiki => format!(
+                                    "Reiki cooldown for provider {provider}{}: {detail}",
+                                    completion
+                                        .retry_after_secs
+                                        .map(|s| format!(" (retry after {s}s)"))
+                                        .unwrap_or_default()
+                                ),
+                                CordonSource::Failure => {
+                                    format!("Provider {provider} failed: {detail}")
+                                }
+                            };
                             self.cordons.insert(
                                 (node, provider),
-                                self.now.mono_ms.saturating_add(CORDON_MS),
+                                CordonModel {
+                                    until: self.now.mono_ms.saturating_add(CORDON_MS),
+                                    source,
+                                    reason,
+                                    set_at_unix: self.now.wall_unix,
+                                },
                             );
                         }
                     }
@@ -1411,9 +1462,9 @@ impl<S: Store> Model<S> {
             assert!(record.log_len <= MAX_LOG_BYTES);
             if let Some(provider) = &record.spec.provider {
                 if let (Some(node), true) = (&record.node, active(record.state)) {
-                    if let Some(until) = self.cordons.get(&(node.clone(), provider.clone())) {
+                    if let Some(cordon) = self.cordons.get(&(node.clone(), provider.clone())) {
                         assert!(
-                            *until <= self.now.mono_ms,
+                            cordon.until <= self.now.mono_ms,
                             "active job {} is on a node with an unexpired cordon for {provider}",
                             record.id
                         );
@@ -1449,6 +1500,26 @@ impl<S: Store> Model<S> {
                 assert!(
                     record.epoch >= *epoch,
                     "artifact {name} for {id} names an epoch that went backwards"
+                );
+            }
+        }
+        let actual_cordons = self.store.cordons(None).unwrap();
+        for ((node, provider), expected) in &self.cordons {
+            if let Some(actual) = actual_cordons
+                .iter()
+                .find(|c| &c.node == node && &c.provider == provider)
+            {
+                assert_eq!(
+                    actual.source, expected.source,
+                    "cordon source for {provider}"
+                );
+                assert_eq!(
+                    actual.reason, expected.reason,
+                    "cordon reason for {provider}"
+                );
+                assert_eq!(
+                    actual.set_at_unix, expected.set_at_unix,
+                    "cordon set time for {provider}"
                 );
             }
         }

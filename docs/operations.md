@@ -26,7 +26,7 @@ systemd units are in [install.md](install.md); the agent's isolation model is in
 4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store has schema version 6. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Schema 5 adds the nullable `assigned_provider` and `assigned_model` job columns and schema 6 adds `diff_bytes`, which backs the `no changes` note; an older database upgrades on open with those columns empty. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
+The store has schema version 8. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Schema 5 adds the nullable `assigned_provider` and `assigned_model` job columns, schema 6 adds `diff_bytes`, which backs the `no changes` note, schema 7 adds `expect_failed`, which backs the `expect failed` note, and schema 8 adds `reason` and `set_at_unix` to cordons, which back their API details; an older database upgrades on open, and existing cordons get the reason `Cordoned before upgrade` and the upgrade time as their set time. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
 
@@ -159,38 +159,60 @@ When a job resolves to a `provider` (the assigned choice, or the primary when th
 
 As a fallback for a job with no provider, or a node without a Reiki feed, the agent watches a running harness's output. If the newest line matches a provider-unavailable marker (the opencode message about every key in the stream's chain, a quota message, a 429, or a rate limit) and the harness then produces no output for 120 seconds, the agent stops it the same way and completes the job as `Failed(Provider)`, with a summary naming the marker. Any other output after the marker disarms the watch.
 
+## Stuck jobs
+
+A job is *stuck* when the running harness has written no output and its process tree has used no
+CPU for more than 300 seconds — the same observation `lu node` reports as `stuck yes`. When a job
+has a stuck policy, the agent counts how long that observation has been continuous; any output or
+CPU activity resets the timer. Once it reaches `stuck_after_secs` (60 to 86400 seconds, default
+1800), the agent stops the harness process group through the cancel stop path, uploads the log,
+diff and report, and completes the job. The summary is exactly `stuck for <n>s, stopped`, where
+`<n>` is the continuous stuck time.
+
+`on_stuck` is `none` (default), `cancel` or `retry`. `cancel` completes as `failed` with
+`failure_class: "execution"`; `retry` completes with `failure_class: "node"`, so the controller
+requeues while the attempt budget allows; `none` leaves the job running. A job field that is
+absent uses the agent's `[agent] on_stuck` and `stuck_after_secs` defaults; an explicit
+`on_stuck = "none"` disables the policy. See [config.md](config.md#agent) and
+[lifecycle.md](lifecycle.md#stuck-jobs).
+
+The controller counts successful stuck completions in
+`lu_jobs_stuck_stopped_total{mode="cancel"|"retry"}`, reset on restart. See
+[monitoring.md](monitoring.md#series).
+
 ## Provider cordons and node drains
 
 These are separate mechanisms:
 
 - **Drain** stops a node taking any new job. It is set by `POST /v1/nodes/{name}/drain` and cleared by `/undrain`, and is stored in the `nodes` table. It survives a controller restart. A node must have sent a heartbeat at least once to exist; draining an unknown node returns `404 not_found`.
-- **Cordon** stops a node taking jobs whose chosen provider is cordoned. It is created when a retryable provider failure completes, keyed by the pair actually assigned rather than necessarily the primary, and it expires after `provider_cooldown_secs`. A completion with `retry_after_secs` marks the cordon Reiki-derived; two consecutive healthy provider heartbeats clear it early. A job with no provider is not blocked by a cordon.
+- **Cordon** stops a node taking jobs whose chosen provider is cordoned. It is created when a retryable provider failure completes, keyed by the pair actually assigned rather than necessarily the primary. A completion with `retry_after_secs` creates a Reiki-derived cordon that lifts after two consecutive healthy provider heartbeats; any other provider failure uses `provider_cooldown_secs` and a fixed expiry. A job with no provider is not blocked by a cordon.
 
-Cordon deadlines are stored as monotonic milliseconds. The controller does not rebase them on restart, so a surviving cordon's remaining time is approximate and may last longer than the configured cooldown if the previous process ran for a long time. `lu nodes --json` shows the currently unexpired cordons; there is no CLI command to clear one. Wait out the cooldown, let a node report the provider healthy twice, or edit the database while the controller is stopped.
+Cordon expiry is still kept as monotonic milliseconds internally so dispatch behaviour is unchanged, while `cordon_details` exposes a wall-clock `until` for fixed cooldowns. Reiki cordons expose `until: null`, `lifts_after_healthy_heartbeats: 2` and a zero-second remaining-time metric. `lu nodes --json` shows both `cordons` and `cordon_details`; human output is described below. Clearing a cordon early needs no database edit: run `lu uncordon <node> [<provider>]`, or call `POST /v1/nodes/{name}/uncordon`. On every controller start, boot recovery clears stored cordons so monotonic deadlines from a previous process cannot block dispatch.
 
 ## Reading `lu nodes`
 
-For the one-shot controller summary, see [`lu status` on the monitoring page](monitoring.md#lu-status). Human output for `lu nodes` has six columns:
+For the one-shot controller summary, see [`lu status` on the monitoring page](monitoring.md#lu-status). Human output for `lu nodes` has seven columns:
 
 ```text
-NAME    VERSION  HARNESS  LABELS                        LAST_SEEN            DRAINED
-node-a  0.2.0   idle     !homelab,gpu,php8.3,region=eu   2026-11-16 09:12:00Z no
+NAME    VERSION  HARNESS  LABELS                        CORDONS      LAST_SEEN            DRAINED
+node-a  0.2.0   idle     !homelab,gpu,php8.3,region=eu   !zen,!mistral 2026-11-16 09:12:00Z no
 ```
 
 - `NAME` is the node name bound to the agent token.
 - `VERSION` is the agent version from its latest heartbeat, or `-` for an older agent.
 - `HARNESS` is the last reported harness state (`idle`, `busy`, or `-` if unknown).
 - `LABELS` is the comma-separated label list from the latest heartbeat, with each taint shown first with a `!` prefix, or `-` for none. A label published by a probe is followed by ` (probed)`. A long list is cut to fit the column and ends with `+N` for the hidden entries.
+- `CORDONS` is the comma-separated list of cordoned providers, each with a `!` prefix, or `-` for none. It is separate from taints because a cordon can be cleared by an operator or healthy heartbeats.
 - `LAST_SEEN` is the last heartbeat time in UTC.
 - `DRAINED` shows the drain flag from the controller's node view.
 
-There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `labels`, `label_sources`, `taints`, `current_job`, `cordons`, `version` and the opaque `reiki` document. `label_sources` maps a probed label to `probed`; other labels have no entry.
+There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `labels`, `label_sources`, `taints`, `current_job`, `cordons`, `cordon_details`, `version` and the opaque `reiki` document. `label_sources` maps a probed label to `probed`; other labels have no entry. Each `cordon_details` entry carries its provider, source, reason, set time, expiry or healthy-lift count.
 
 A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, lacks a required label, reports a taint the job does not tolerate, or (when the job names a provider) cannot serve any of its provider/model choices, including a matching provider cordon, will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
 
 ## Reading `lu node`
 
-`lu node <name>` prints the latest host and job stats the node reported. The controller keeps only the most recent heartbeat's stats in memory, so they survive neither a controller restart nor an agent restart until the next heartbeat.
+`lu node <name>` prints the latest host and job stats the node reported, then its cordon details from the controller's node view. The controller keeps only the most recent heartbeat's stats in memory, so they survive neither a controller restart nor an agent restart until the next heartbeat.
 
 ```text
 node  node-a
@@ -209,12 +231,19 @@ uptime_secs       600
 job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
   PID   PPID  STATE  CPU_S  RSS_KB  AGE_S  FILES  COMMAND
   4242  1     S      7      1024    90     3      opencode run
+
+cordons
+  zen [failure] 1m10s ago; 10m0s left
+      Provider zen failed: timeout
+  mistral [reiki] 20s ago; lifts on 2 healthy
+      Reiki cooldown for mistral
 ```
 
 - `labels` lists the node's current labels; a probed one is followed by ` (probed)`. `lu node <name> --json` includes `labels` and `label_sources` in the stats body.
 - Load, memory and uptime come from the agent's `/proc` sample. `disk_free_bytes`, `disk_total_bytes` and `disk_free_percent` describe the filesystem holding the agent's `work_dir`; each is `-` when the agent cannot read it.
 - Each job is a running job owned by that node. `pgid` is the harness process group, and the process table is capped at the 64 busiest members. `COMMAND` is the first 80 characters of the command line with control characters replaced.
 - `output_idle` is seconds since the harness last wrote output; `cpu_idle` is seconds since any process in the job tree last used CPU. `stuck yes` means both are above 300 seconds while the job is still running.
+- `cordons` lists each active provider with its source, how long ago it was set and either its remaining time or its healthy-heartbeat lift count. The indented line is the stored reason. `-` means no active cordons.
 - A node that has not sent stats prints `host  -` and `jobs  -`. An unknown node is a 404 and exits `1`.
 - `lu node <name> --json` prints the exact `GET /v1/nodes/{name}/stats` body, including an empty `{}` for a known node with no stats.
 
@@ -285,9 +314,13 @@ Safety rules:
 
 With the job list focused and a running job selected, `x` opens a process pane under the lists. It shows the selected job's three liveness counters (output idle, CPU idle, uploader behind) and its process tree (`PID`, `STATE`, `CPU_S`, `RSS`, `AGE`, `COMMAND`) from `GET /v1/nodes/{name}/stats`, refreshed every two seconds while open. States `D` and `Z` are red; both idle counters above 120 seconds are orange, and a stuck job is red. The pane also draws load and memory-used sparklines for that node from the dashboard's recent samples. `Esc` or `x` closes the pane. `--once` prints the same node columns as plain text.
 
-`lu top` draws the dependency graph below the job list when the terminal is at least 24 rows tall and a component has an unfinished job. Press `g` to hide or show it. A component is a set of jobs linked by `after`, including finished jobs that connect unfinished ones; a component whose jobs are all terminal is left out.
+`lu top` draws the dependency graph in a bordered `Graph` panel below the job list when the terminal is at least 24 rows tall and a component has an unfinished job. Press `g` to hide or show it. A component is a set of jobs linked by `after`, including finished jobs that connect unfinished ones; a component whose jobs are all terminal is left out. The panel gets at most a third of the terminal height and at least three content rows; it clips long graphs instead of pushing the other panes.
 
-Each row is one job, placed left to right by depth: `0` with no dependency in the fetched set, otherwise one past its deepest dependency. Box-drawing connectors join a job to its dependencies, and an edge takes the dependency's colour. An `after` id that is not in the fetched jobs is a dim stub `#id…`. Job titles are clipped to the panel width.
+Each chain is one row, prerequisites first, for example `○ build ──▶ ○ test ──▶ ◔ ship`. Nodes show a state glyph and the last five id characters; an edge takes the prerequisite's colour. Only a real fan-out or fan-in adds rows: children stack to the right of their parent with `├─▶`/`└─▶` branches and `┐`/`┘` joins. An `after` id that is not in the fetched jobs is a dim stub `#id…` at the left of its chain. Unrelated single-job components share a row when they fit. The dashboard omits task titles from nodes; the graph panel's bottom border shows the selected job's full id, state and clipped title instead.
+
+`Tab` cycles focus through Nodes → Jobs → Graph and `Shift+Tab` moves back; the focused pane's border is highlighted. The Jobs table and the graph share one selected job, so highlighting a job in either pane highlights it in the other (a job outside the visible graph window has no graph highlight). With Graph focused, `Left`/`h` and `Right`/`l` move to the first parent or child, `Up`/`k` and `Down`/`j` move to the previous or next sibling at the same depth and then to an adjacent component, and `Home`/`End` jump to the first or last drawn node; movement stops at an edge. `Enter` opens the selected job's log from either Jobs or Graph. `d` still drains only in Nodes focus. The footer lists the keys for the current focus.
+
+Mouse capture is enabled only while `lu top` runs and is released on exit, errors and panics, leaving terminal copy and paste outside the TUI untouched. A left click on a graph node selects it and focuses Graph; a left click on a Jobs row selects that job and focuses Jobs; a left click on a Nodes row selects that node. A double click on a node or job opens its log. The wheel scrolls the focused table by three rows, or the graph window by three graph rows when the pointer is over the graph.
 
 | State | Glyph | Colour |
 | --- | --- | --- |
@@ -298,9 +331,9 @@ Each row is one job, placed left to right by depth: `0` with no dependency in th
 | `failed` | `✗` | red |
 | `cancelled` | `–` | grey |
 
-The job list uses the same colours. The graph shows at most 6 components and 40 jobs, and a dim line reports how many jobs and components were left out.
+The job list uses the same colours. The graph shows at most 6 components and 40 jobs; the panel title adds counts such as `+3 jobs, 1 component` when any were left out, and `+N rows` when a tall graph is clipped.
 
-`lu graph [JOB]` prints the same graph without the dashboard, using up to 200 jobs from the controller. `JOB` selects the component containing that job, even if every job in it is finished. Output is coloured only when stdout is a terminal and `NO_COLOR` is unset. `lu graph --json` prints `{"nodes":[{"id","state","title","after"}]}` for the shown jobs, without stubs or the summary line.
+`lu graph [JOB]` prints the same horizontal graph without the panel, keeping task titles clipped to 30 characters and using up to 200 jobs from the controller. `JOB` selects the component containing that job, even if every job in it is finished. Output is coloured only when stdout is a terminal and `NO_COLOR` is unset. `lu graph --json` prints `{"nodes":[{"id","state","title","after"}]}` for the shown jobs, without stubs or the summary line.
 
 ## Repository mirrors
 

@@ -9,7 +9,7 @@ use lu_proto::{
     MAX_COLLECT_BYTES, MAX_LOG_BYTES,
 };
 
-use crate::{Now, Store, StoreError};
+use crate::{CordonSource, Now, Store, StoreError};
 
 pub fn now(wall_unix: i64, mono_ms: u64) -> Now {
     Now { wall_unix, mono_ms }
@@ -35,7 +35,12 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),
+        on_stuck: None,
+        stuck_after_secs: None,
+        priority: lu_proto::DEFAULT_PRIORITY,
+        group: None,
         fallbacks: Vec::new(),
+        expect: None,
     }
 }
 
@@ -91,6 +96,10 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     cancel_states(&make());
     cancel_recovering_ends_it_cancelled_immediately(&make());
     assignment_and_epoch(&make());
+    higher_priority_dispatches_first(&make());
+    group_cap_holds_under_concurrent_polls(&make());
+    terminal_and_failed_jobs_free_a_group_slot(&make());
+    group_limit_is_reported_as_a_waiting_reason(&make());
     fallback_choices_route_and_clear(&make());
     primary_choice_is_preferred(&make());
     any_provider_uses_a_healthy_published_pair(&make());
@@ -108,8 +117,10 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     start_renew_log_artifact(&make());
     unreserve_log_restores_length_and_is_fenced(&make());
     held_jobs_lists_the_nodes_active_jobs(&make());
+    completion_persists_expect_failure(&make());
     complete_and_retry_cordon(&make());
     reiki_cordon_yields_to_live_health(&make());
+    cordon_details_and_uncordon(&make());
     conflict_failure_class_round_trips(&make());
     stale_epoch_rejected(&make());
     expire_and_recover(&make());
@@ -157,6 +168,8 @@ fn finish_done<S: Store>(s: &S, id: &JobId, node_name: &str, wall: i64, mono: u6
         exit_code: Some(0),
         summary: None,
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     s.complete(&comp, None, now(wall, mono + 3), 1, 1000)
         .unwrap();
@@ -179,6 +192,8 @@ fn finish_failed<S: Store>(s: &S, id: &JobId, node_name: &str, wall: i64, mono: 
         exit_code: Some(1),
         summary: Some("boom".into()),
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     s.complete(
         &comp,
@@ -208,6 +223,8 @@ fn conflict_failure_class_round_trips<S: Store>(s: &S) {
         exit_code: None,
         summary: Some("dependency dep-1 conflict in a.txt".into()),
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     s.complete(
         &comp,
@@ -795,6 +812,8 @@ fn fallback_choices_route_and_clear<S: Store>(s: &S) {
         exit_code: None,
         summary: Some("no key".to_owned()),
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     let rec = s
         .complete(
@@ -896,6 +915,8 @@ fn any_provider_skips_cordoned_and_unhealthy_pairs<S: Store>(s: &S) {
         exit_code: None,
         summary: None,
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     s.complete(
         &completion,
@@ -960,7 +981,12 @@ fn edit_job_changes_spec_and_dependency_state<S: Store>(s: &S) {
         after: Some(Vec::new()),
         collect: None,
         include_failed: None,
+        expect: None,
         on_conflict: Default::default(),
+        priority: None,
+        group: None,
+        on_stuck: None,
+        stuck_after_secs: None,
     };
     let rec = s.edit_job(&job.id, &edit, now(2, 2)).unwrap();
     assert_eq!(rec.id, job.id);
@@ -1041,6 +1067,8 @@ fn edit_job_rejects_terminal_states<S: Store>(s: &S) {
         exit_code: Some(0),
         summary: None,
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     s.complete(&completion, None, now(4, 4), 1, 1000).unwrap();
     assert!(matches!(
@@ -1397,6 +1425,8 @@ fn broken_harness_taint_excludes_jobs_until_cleared<S: Store>(s: &S) {
             exit_code: Some(0),
             summary: None,
             retry_after_secs: None,
+            stuck_mode: None,
+            expect_failed: false,
         },
         None,
         now(6, 6),
@@ -1502,9 +1532,47 @@ fn held_jobs_lists_the_nodes_active_jobs<S: Store>(s: &S) {
         exit_code: Some(0),
         summary: None,
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     s.complete(&completion, None, now(3, 3), 1, 60_000).unwrap();
     assert!(s.held_jobs(&n).unwrap().is_empty());
+}
+
+fn completion_persists_expect_failure<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (j, _) = s
+        .create_job(&spec("https://x/expect.git", None), now(1, 1))
+        .unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    s.start_job(&j.id, a.epoch, now(3, 3)).unwrap();
+    let completed = s
+        .complete(
+            &Completion {
+                job_id: j.id.clone(),
+                epoch: a.epoch,
+                outcome: Outcome::Done,
+                exit_code: Some(0),
+                summary: None,
+                retry_after_secs: None,
+                stuck_mode: None,
+                expect_failed: true,
+            },
+            None,
+            now(3, 3),
+            1,
+            60_000,
+        )
+        .unwrap();
+    assert!(completed.expect_failed);
+    assert!(s.get_job(&j.id).unwrap().expect_failed);
+    assert!(s
+        .list_jobs(Some(JobState::Done), 10, None)
+        .unwrap()
+        .iter()
+        .any(|r| r.id == j.id && r.expect_failed));
 }
 
 fn complete_and_retry_cordon<S: Store>(s: &S) {
@@ -1531,6 +1599,8 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
         exit_code: None,
         summary: Some("nope".into()),
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     let rec = s
         .complete(
@@ -1547,6 +1617,14 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
     // cordoned so cannot assign
     assert!(s.next_assignment(&n, now(5, 5), 60_000).unwrap().is_none());
     assert_eq!(s.nodes(now(5, 5), 60_000).unwrap()[0].cordons, vec!["p1"]);
+    let details = s.cordons(Some(&n)).unwrap();
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0].node, n);
+    assert_eq!(details[0].provider, "p1");
+    assert_eq!(details[0].source, CordonSource::Failure);
+    assert_eq!(details[0].reason, "Provider p1 failed: nope");
+    assert_eq!(details[0].set_at_unix, 4);
+    assert_eq!(details[0].until_mono_ms, Some(10_004));
     // A flagless cordon has no live signal, so healthy heartbeats do not clear it.
     for mono in [6i64, 7] {
         s.heartbeat(
@@ -1583,6 +1661,8 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
         exit_code: Some(1),
         summary: None,
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     let rec2 = s
         .complete(
@@ -1611,6 +1691,8 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
         exit_code: Some(0),
         summary: None,
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     let rec3 = s.complete(&comp3, None, now(4, 4), 1, 1000).unwrap();
     assert_eq!(rec3.state, JobState::Done);
@@ -1638,6 +1720,8 @@ fn reiki_cordon_yields_to_live_health<S: Store>(s: &S) {
         exit_code: None,
         summary: None,
         retry_after_secs: Some(3600),
+        stuck_mode: None,
+        expect_failed: false,
     };
     s.complete(
         &comp,
@@ -1648,6 +1732,14 @@ fn reiki_cordon_yields_to_live_health<S: Store>(s: &S) {
     )
     .unwrap();
     assert_eq!(s.nodes(now(5, 5), 60_000).unwrap()[0].cordons, vec!["p1"]);
+    let details = s.cordons(Some(&n)).unwrap();
+    assert_eq!(details.len(), 1);
+    assert_eq!(details[0].source, CordonSource::Reiki);
+    assert!(details[0]
+        .reason
+        .starts_with("Reiki cooldown for provider p1"));
+    assert!(details[0].reason.contains("3600s"));
+    assert_eq!(details[0].set_at_unix, 4);
     // A non-healthy reading breaks the streak; two healthy ones after it clear the cordon.
     s.heartbeat(
         &hb(
@@ -1665,6 +1757,26 @@ fn reiki_cordon_yields_to_live_health<S: Store>(s: &S) {
     assert!(s.nodes(now(9, 9), 60_000).unwrap()[0].cordons.is_empty());
     let a2 = s.next_assignment(&n, now(9, 9), 60_000).unwrap().unwrap();
     assert_eq!(a2.job_id, j.id);
+}
+
+fn cordon_details_and_uncordon<S: Store>(s: &S) {
+    let n = node("node-uncordon");
+    s.heartbeat(&hb("node-uncordon", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    s.set_cordon(&n, "p1", CordonSource::Failure, "manual cordon", 42, 5_000)
+        .unwrap();
+    s.set_cordon(&n, "p2", CordonSource::Reiki, "Reiki says cool", 43, 5_000)
+        .unwrap();
+    let all = s.cordons(None).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].provider, "p1");
+    assert_eq!(all[1].provider, "p2");
+    assert_eq!(s.uncordon(&n, Some("p1")).unwrap(), vec!["p1"]);
+    assert_eq!(s.cordons(Some(&n)).unwrap()[0].provider, "p2");
+    assert_eq!(s.uncordon(&n, None).unwrap(), vec!["p2"]);
+    assert!(s.cordons(Some(&n)).unwrap().is_empty());
+    assert!(s.uncordon(&n, None).unwrap().is_empty());
+    assert!(s.uncordon(&node("node-unknown"), None).unwrap().is_empty());
 }
 
 fn stale_epoch_rejected<S: Store>(s: &S) {
@@ -1700,6 +1812,8 @@ fn stale_epoch_rejected<S: Store>(s: &S) {
         exit_code: Some(0),
         summary: None,
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     assert_eq!(
         s.complete(&comp, None, now(3, 3), 1, 1000).unwrap_err(),
@@ -1918,6 +2032,8 @@ fn job_counts<S: Store>(s: &S) {
         exit_code: Some(0),
         summary: None,
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     s.complete(&comp1, None, now(7, 7), 1, 1000).unwrap();
 
@@ -1932,6 +2048,8 @@ fn job_counts<S: Store>(s: &S) {
         exit_code: Some(1),
         summary: None,
         retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
     };
     s.complete(
         &comp2,
@@ -1960,4 +2078,196 @@ fn job_counts<S: Store>(s: &S) {
     assert_eq!(states[&JobState::Running], 0);
     assert_eq!(states[&JobState::Recovering], 0);
     assert_eq!(states[&JobState::NeedsInput], 0);
+}
+
+fn higher_priority_dispatches_first<S: Store>(s: &S) {
+    let n = node("priority-node");
+    s.heartbeat(&hb("priority-node", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let mut older = spec("https://x/priority-old.git", None);
+    older.priority = 5;
+    let (old, _) = s.create_job(&older, now(1, 1)).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let mut newer = spec("https://x/priority-new.git", None);
+    newer.priority = 9;
+    let (new, _) = s.create_job(&newer, now(2, 2)).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let mut low = spec("https://x/priority-low.git", None);
+    low.priority = 1;
+    let (_, _) = s.create_job(&low, now(3, 3)).unwrap();
+
+    let first = s.next_assignment(&n, now(4, 4), 60_000).unwrap().unwrap();
+    assert_eq!(
+        first.job_id, new.id,
+        "higher priority overtakes the older job"
+    );
+    // The holder must finish before it can take another job.
+    s.start_job(&new.id, first.epoch, now(5, 5)).unwrap();
+    s.complete(
+        &Completion {
+            job_id: new.id.clone(),
+            epoch: first.epoch,
+            outcome: Outcome::Done,
+            exit_code: Some(0),
+            summary: None,
+            retry_after_secs: None,
+            stuck_mode: None,
+            expect_failed: false,
+        },
+        None,
+        now(6, 6),
+        1,
+        1000,
+    )
+    .unwrap();
+    let second = s.next_assignment(&n, now(7, 7), 60_000).unwrap().unwrap();
+    assert_eq!(second.job_id, old.id, "equal priorities use creation time");
+}
+
+fn group_cap_holds_under_concurrent_polls<S: Store>(s: &S) {
+    let limits = HashMap::from([("nightly".to_owned(), 1)]);
+    s.set_group_limits(limits.clone()).unwrap();
+    let mut sp = spec("https://x/group.git", None);
+    sp.group = Some("nightly".to_owned());
+    let (job, _) = s.create_job(&sp, now(1, 1)).unwrap();
+    for name in ["group-node-1", "group-node-2"] {
+        s.heartbeat(&hb(name, HarnessState::Idle, vec![]), now(1, 1))
+            .unwrap();
+    }
+    let assignments = std::thread::scope(|scope| {
+        let polls: Vec<_> = ["group-node-1", "group-node-2"]
+            .into_iter()
+            .map(|name| {
+                let n = node(name);
+                scope.spawn(move || s.next_assignment(&n, now(2, 2), 60_000).unwrap())
+            })
+            .collect();
+        polls
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        assignments.iter().filter(|a| a.is_some()).count(),
+        1,
+        "two concurrent polls must not both lease the group's only slot"
+    );
+    let assigned = assignments.into_iter().flatten().next().unwrap();
+    assert_eq!(assigned.job_id, job.id);
+    let counts = s.group_counts().unwrap();
+    assert_eq!(counts.get("nightly").copied(), Some(1));
+}
+
+fn terminal_and_failed_jobs_free_a_group_slot<S: Store>(s: &S) {
+    s.set_group_limits(HashMap::from([("batch".to_owned(), 1)]))
+        .unwrap();
+    let n1 = node("batch-node-1");
+    let n2 = node("batch-node-2");
+    for name in ["batch-node-1", "batch-node-2"] {
+        s.heartbeat(&hb(name, HarnessState::Idle, vec![]), now(1, 1))
+            .unwrap();
+    }
+    let make = |repo: &str| {
+        let mut sp = spec(repo, None);
+        sp.group = Some("batch".to_owned());
+        sp
+    };
+    let (a, _) = s
+        .create_job(&make("https://x/batch-a.git"), now(1, 1))
+        .unwrap();
+    let (b, _) = s
+        .create_job(&make("https://x/batch-b.git"), now(2, 2))
+        .unwrap();
+    let first = s.next_assignment(&n1, now(3, 3), 60_000).unwrap().unwrap();
+    assert_eq!(first.job_id, a.id);
+    assert!(s.next_assignment(&n2, now(4, 4), 60_000).unwrap().is_none());
+
+    // A cancel request alone keeps the slot; the agent's terminal report releases it.
+    s.cancel_job(&a.id, now(5, 5)).unwrap();
+    s.start_job(&a.id, first.epoch, now(6, 6)).unwrap();
+    s.complete(
+        &Completion {
+            job_id: a.id.clone(),
+            epoch: first.epoch,
+            outcome: Outcome::Cancelled,
+            exit_code: None,
+            summary: None,
+            retry_after_secs: None,
+            stuck_mode: None,
+            expect_failed: false,
+        },
+        None,
+        now(7, 7),
+        1,
+        1000,
+    )
+    .unwrap();
+    assert_eq!(
+        s.group_counts().unwrap().get("batch").copied().unwrap_or(0),
+        0
+    );
+    let second = s.next_assignment(&n2, now(8, 8), 60_000).unwrap().unwrap();
+    assert_eq!(second.job_id, b.id);
+
+    // A failed attempt with retries left returns to queued, so the slot is free again.
+    s.start_job(&b.id, second.epoch, now(9, 9)).unwrap();
+    s.complete(
+        &Completion {
+            job_id: b.id.clone(),
+            epoch: second.epoch,
+            outcome: Outcome::Failed(FailureClass::Execution),
+            exit_code: Some(1),
+            summary: None,
+            retry_after_secs: None,
+            stuck_mode: None,
+            expect_failed: false,
+        },
+        Some((FailureClass::Execution, None)),
+        now(10, 10),
+        1,
+        1000,
+    )
+    .unwrap();
+    assert_eq!(
+        s.group_counts().unwrap().get("batch").copied().unwrap_or(0),
+        0
+    );
+    let (c, _) = s
+        .create_job(&make("https://x/batch-c.git"), now(11, 11))
+        .unwrap();
+    let third = s
+        .next_assignment(&n1, now(12, 12), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(third.job_id, c.id);
+}
+
+fn group_limit_is_reported_as_a_waiting_reason<S: Store>(s: &S) {
+    s.set_group_limits(HashMap::from([("nightly".to_owned(), 1)]))
+        .unwrap();
+    s.heartbeat(&hb("wait-node", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let mut sp = spec("https://x/wait.git", None);
+    sp.group = Some("nightly".to_owned());
+    let (a, _) = s.create_job(&sp, now(1, 1)).unwrap();
+    let (b, _) = s.create_job(&sp, now(2, 2)).unwrap();
+    let assigned = s
+        .next_assignment(&node("wait-node"), now(3, 3), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(assigned.job_id, a.id);
+
+    let waiting = s.get_job(&b.id).unwrap();
+    let nodes = s.nodes(now(4, 4), 60_000).unwrap();
+    let counts = s.group_counts().unwrap();
+    let limits = HashMap::from([("nightly".to_owned(), 1)]);
+    assert_eq!(
+        crate::waiting_reason_with_groups(&waiting, &nodes, &counts, &limits).as_deref(),
+        Some("group limit (nightly 1/1)")
+    );
+    // Without a cap the same job has no reason to wait.
+    assert_eq!(
+        crate::waiting_reason_with_groups(&waiting, &nodes, &counts, &HashMap::new()),
+        None
+    );
 }

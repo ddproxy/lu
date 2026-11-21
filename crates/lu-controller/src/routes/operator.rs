@@ -10,27 +10,35 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lu_proto::{
-    validate_idempotency_key, ArtifactName, JobEdit, JobId, JobSpec, JobView, NodeName, NodeView,
+    validate_idempotency_key, ArtifactName, CordonView, JobEdit, JobId, JobSpec, JobView, NodeName,
+    NodeView,
 };
 use lu_serve::PeerAddr;
-use lu_store::{missing_labels, waiting_reason, JobRecord, NodeRecord, Now};
+use lu_store::{
+    missing_labels, waiting_reason_with_groups, Cordon, CordonSource, JobRecord, NodeRecord, Now,
+};
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-/// A `done` job whose recorded `diff.patch` is empty changed nothing. `allow_empty` opts out.
-/// The patch format emits no bytes for a tree with no changes, so its byte size is the signal.
+/// Notes for terminal jobs. An empty diff takes precedence over unmet expectations: it says the
+/// run changed nothing at all, which is more specific than a missing expected change.
 pub fn outcome_note(r: &JobRecord) -> Option<&'static str> {
-    if r.state == lu_proto::JobState::Done
-        && !r.spec.allow_empty
+    if r.state != lu_proto::JobState::Done {
+        return None;
+    }
+    if !r.spec.allow_empty
         && r.artifacts.contains(&ArtifactName::DiffPatch)
         && r.diff_bytes == Some(0)
     {
-        Some("no_changes")
-    } else {
-        None
+        return Some("no_changes");
     }
+    if r.expect_failed {
+        return Some("expect_failed");
+    }
+    None
 }
 
 /// Stored timestamps are Unix seconds, which are never negative in practice; the wire views use
@@ -85,7 +93,68 @@ async fn all_nodes(state: &Arc<AppState>, at: Now) -> Result<Vec<NodeRecord>, Ap
     }
 }
 
-fn node_view(n: &NodeRecord, stats: Option<&lu_proto::NodeStats>) -> NodeView {
+async fn group_counts(state: &Arc<AppState>) -> Result<HashMap<String, usize>, ApiError> {
+    let store = Arc::clone(&state.store);
+    tokio::task::spawn_blocking(move || store.group_counts())
+        .await
+        .map_err(|_| ApiError::internal())?
+        .map_err(store_err)
+}
+
+/// A view whose waiting reason includes the group cap, when the job has one.
+async fn job_view_for(state: &Arc<AppState>, rec: &JobRecord) -> Result<JobView, ApiError> {
+    let nodes = all_nodes(state, now()).await?;
+    let counts = group_counts(state).await?;
+    let reason = waiting_reason_with_groups(rec, &nodes, &counts, &state.group_limits);
+    Ok(job_view_with(rec, reason))
+}
+
+fn job_views(
+    jobs: &[JobRecord],
+    nodes: &[NodeRecord],
+    counts: &HashMap<String, usize>,
+    limits: &HashMap<String, usize>,
+) -> Vec<JobView> {
+    jobs.iter()
+        .map(|job| job_view_with(job, waiting_reason_with_groups(job, nodes, counts, limits)))
+        .collect()
+}
+
+/// Turns a monotonic deadline into the wall-clock time displayed to operators.
+pub fn cordon_until_wall(until_mono_ms: i64, at: Now) -> i64 {
+    let remaining_ms = until_mono_ms.saturating_sub(at.mono_ms as i64);
+    at.wall_unix.saturating_add(remaining_ms / 1000)
+}
+
+pub fn cordon_views(cordons: &[Cordon], at: Now) -> Vec<CordonView> {
+    cordons
+        .iter()
+        .map(|c| {
+            let (source, until, lifts_after_healthy_heartbeats) = match c.source {
+                CordonSource::Reiki => ("reiki", None, Some(2)),
+                CordonSource::Failure => (
+                    "failure",
+                    c.until_mono_ms.map(|until| cordon_until_wall(until, at)),
+                    None,
+                ),
+            };
+            CordonView {
+                provider: c.provider.clone(),
+                source: source.to_owned(),
+                reason: c.reason.clone(),
+                set_at: c.set_at_unix,
+                until,
+                lifts_after_healthy_heartbeats,
+            }
+        })
+        .collect()
+}
+
+fn node_view(
+    n: &NodeRecord,
+    stats: Option<&lu_proto::NodeStats>,
+    cordons: Vec<CordonView>,
+) -> NodeView {
     let host = stats.and_then(|stats| stats.host.as_ref());
     let stuck = stats
         .map(|stats| stats.jobs.iter().filter(|job| job.stuck).count())
@@ -104,6 +173,7 @@ fn node_view(n: &NodeRecord, stats: Option<&lu_proto::NodeStats>) -> NodeView {
         taints: n.heartbeat.taints.clone(),
         current_job: n.current_job.clone(),
         cordons: n.cordons.clone(),
+        cordon_details: cordons,
         reiki: n.heartbeat.reiki.clone(),
         load1: host.map(|host| host.load1),
         mem_available_kb: host.map(|host| host.mem_available_kb),
@@ -178,7 +248,10 @@ pub async fn create_job(
         .into_iter()
         .map(|label| format!("no node with label {label}"))
         .collect();
-    let mut body = job_view_with(&rec, waiting_reason(&rec, &nodes));
+    let mut body = match job_view_for(&state, &rec).await {
+        Ok(view) => view,
+        Err(error) => return with_version(error.into_response()),
+    };
     body.warnings = Some(warnings);
     if created {
         state.waiters.notify_work();
@@ -217,12 +290,13 @@ pub async fn list_jobs(
             Ok(nodes) => nodes,
             Err(error) => return with_version(error.into_response()),
         };
+        let counts = match group_counts(&state).await {
+            Ok(counts) => counts,
+            Err(error) => return with_version(error.into_response()),
+        };
         let jobs: Vec<JobRecord> = rec.into_iter().collect();
         let body = json!({
-            "jobs": jobs
-                .iter()
-                .map(|job| job_view_with(job, waiting_reason(job, &nodes)))
-                .collect::<Vec<_>>(),
+            "jobs": job_views(&jobs, &nodes, &counts, &state.group_limits),
             "next": null,
         });
         return with_version(json_value_ok(StatusCode::OK, body));
@@ -260,12 +334,13 @@ pub async fn list_jobs(
         Ok(nodes) => nodes,
         Err(error) => return with_version(error.into_response()),
     };
+    let counts = match group_counts(&state).await {
+        Ok(counts) => counts,
+        Err(error) => return with_version(error.into_response()),
+    };
     let next = jobs.last().map(|j| j.id.to_string());
     let body = json!({
-        "jobs": jobs
-            .iter()
-            .map(|job| job_view_with(job, waiting_reason(job, &nodes)))
-            .collect::<Vec<_>>(),
+        "jobs": job_views(&jobs, &nodes, &counts, &state.group_limits),
         "next": next,
     });
     with_version(json_value_ok(StatusCode::OK, body))
@@ -290,16 +365,10 @@ pub async fn get_job(
     })
     .await;
     match res {
-        Ok(Ok(rec)) => {
-            let nodes = match all_nodes(&state, now()).await {
-                Ok(nodes) => nodes,
-                Err(error) => return with_version(error.into_response()),
-            };
-            with_version(json_ok(
-                StatusCode::OK,
-                &job_view_with(&rec, waiting_reason(&rec, &nodes)),
-            ))
-        }
+        Ok(Ok(rec)) => match job_view_for(&state, &rec).await {
+            Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
+            Err(error) => with_version(error.into_response()),
+        },
         Ok(Err(e)) => with_version(store_err(e).into_response()),
         Err(_) => with_version(ApiError::internal().into_response()),
     }
@@ -328,14 +397,10 @@ pub async fn cancel_job(
         Ok(Ok(rec)) => {
             state.waiters.notify_job(rec.id.as_ref());
             state.waiters.notify_work();
-            let nodes = match all_nodes(&state, now()).await {
-                Ok(nodes) => nodes,
-                Err(error) => return with_version(error.into_response()),
-            };
-            with_version(json_ok(
-                StatusCode::OK,
-                &job_view_with(&rec, waiting_reason(&rec, &nodes)),
-            ))
+            match job_view_for(&state, &rec).await {
+                Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
+                Err(error) => with_version(error.into_response()),
+            }
         }
         Ok(Err(e)) => with_version(store_err(e).into_response()),
         Err(_) => with_version(ApiError::internal().into_response()),
@@ -373,14 +438,10 @@ pub async fn edit_job(
     match res {
         Ok(Ok(rec)) => {
             state.waiters.notify_work();
-            let nodes = match all_nodes(&state, now()).await {
-                Ok(nodes) => nodes,
-                Err(error) => return with_version(error.into_response()),
-            };
-            with_version(json_ok(
-                StatusCode::OK,
-                &job_view_with(&rec, waiting_reason(&rec, &nodes)),
-            ))
+            match job_view_for(&state, &rec).await {
+                Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
+                Err(error) => with_version(error.into_response()),
+            }
         }
         Ok(Err(e)) => with_version(store_err(e).into_response()),
         Err(_) => with_version(ApiError::internal().into_response()),
@@ -522,21 +583,34 @@ pub async fn list_nodes(
     let res = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         let lease_ms = state.lease_ms;
-        move || store.nodes(n, lease_ms)
+        move || {
+            let nodes = store.nodes(n, lease_ms)?;
+            let cordons = store.cordons(None)?;
+            Ok::<_, lu_store::StoreError>((nodes, cordons))
+        }
     })
     .await;
     match res {
-        Ok(Ok(nodes)) => {
+        Ok(Ok((nodes, cordons))) => {
             let stats = state
                 .stats
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
+            let views = cordon_views(&cordons, n);
             with_version(json_ok(
                 StatusCode::OK,
                 &nodes
                     .iter()
-                    .map(|n| node_view(n, stats.get(&n.name)))
+                    .map(|node| {
+                        let details = cordons
+                            .iter()
+                            .zip(views.iter())
+                            .filter(|(cordon, _)| cordon.node == node.name)
+                            .map(|(_, view)| view.clone())
+                            .collect();
+                        node_view(node, stats.get(&node.name), details)
+                    })
                     .collect::<Vec<_>>(),
             ))
         }
@@ -657,6 +731,76 @@ pub async fn set_drain(
     }
 }
 
+/// Removes provider cordons from a node. An empty body clears every cordon; `{"provider":"x"}`
+/// clears just that provider. The reply lists the providers actually removed.
+pub async fn uncordon_node(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
+        return with_version(ApiError::unauthorized().into_response());
+    }
+    let node = match NodeName::parse(&name) {
+        Ok(n) => n,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
+        Ok(b) => b,
+        Err(e) => return with_version(e.into_response()),
+    };
+    let provider = if bytes.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return with_version(ApiError::bad_request("invalid JSON").into_response()),
+        };
+        match value.get("provider") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(p)) => Some(p.clone()),
+            Some(_) => {
+                return with_version(
+                    ApiError::bad_request("provider must be a string").into_response(),
+                );
+            }
+        }
+    };
+    let at = now();
+    let check_node = node.clone();
+    let exists = tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        let lease_ms = state.lease_ms;
+        move || {
+            store
+                .nodes(at, lease_ms)
+                .map(|nodes| nodes.iter().any(|record| record.name == check_node))
+        }
+    })
+    .await;
+    match exists {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return with_version(ApiError::not_found("not found").into_response()),
+        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    }
+    let res = tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        move || store.uncordon(&node, provider.as_deref())
+    })
+    .await;
+    match res {
+        Ok(Ok(removed)) => {
+            state.waiters.notify_work();
+            with_version(json_ok(StatusCode::OK, &json!({ "removed": removed })))
+        }
+        Ok(Err(e)) => with_version(store_err(e).into_response()),
+        Err(_) => with_version(ApiError::internal().into_response()),
+    }
+}
+
 pub async fn drain_node(
     s: State<Arc<AppState>>,
     p: axum::Extension<PeerAddr>,
@@ -698,6 +842,8 @@ mod tests {
                 model: None,
                 timeout_secs: DEFAULT_TIMEOUT_SECS,
                 idle_timeout_secs: None,
+                on_stuck: None,
+                stuck_after_secs: None,
                 idempotency_key: None,
                 after: Vec::new(),
                 stack_dependencies: true,
@@ -707,7 +853,10 @@ mod tests {
                 allow_empty,
                 requires: Vec::new(),
                 tolerates: Vec::new(),
+                priority: lu_proto::DEFAULT_PRIORITY,
+                group: None,
                 fallbacks: Vec::new(),
+                expect: None,
             },
             attempt: 1,
             node: None,
@@ -726,6 +875,7 @@ mod tests {
             log_len: 0,
             diff_bytes,
             waiting_on: Vec::new(),
+            expect_failed: false,
         }
     }
 
@@ -762,6 +912,30 @@ mod tests {
         assert_eq!(outcome_note(&legacy), None);
         let running = record(JobState::Running, false, Some(0), diff());
         assert_eq!(outcome_note(&running), None);
+    }
+
+    #[test]
+    fn an_expectation_failure_on_a_done_job_gets_the_note() {
+        let mut r = record(JobState::Done, false, Some(120), diff());
+        r.expect_failed = true;
+        assert_eq!(outcome_note(&r), Some("expect_failed"));
+        assert_eq!(job_view(&r).outcome_note.as_deref(), Some("expect_failed"));
+    }
+
+    #[test]
+    fn an_empty_diff_takes_precedence_over_an_expectation_failure() {
+        let mut r = record(JobState::Done, false, Some(0), diff());
+        r.expect_failed = true;
+        assert_eq!(outcome_note(&r), Some("no_changes"));
+    }
+
+    #[test]
+    fn only_done_jobs_get_the_expectation_note() {
+        for state in [JobState::Running, JobState::Failed, JobState::Cancelled] {
+            let mut r = record(state, false, Some(120), diff());
+            r.expect_failed = true;
+            assert_eq!(outcome_note(&r), None, "{state:?}");
+        }
     }
 
     #[test]
