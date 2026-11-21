@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-21
+
 ## [0.3.1] - 2026-11-20
 
 ### Fixed
