@@ -170,9 +170,10 @@ impl SqliteStore {
     fn ensure_indexes(&self) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS jobs_dispatch_order
+            "DROP INDEX IF EXISTS jobs_dispatch_order;
+             CREATE INDEX jobs_dispatch_order
                  ON jobs(COALESCE(json_extract(spec_json, '$.priority'), 5) DESC,
-                         created_at ASC, id ASC)
+                         dispatch_seq ASC)
                  WHERE state='queued';
              CREATE INDEX IF NOT EXISTS jobs_group_active
                  ON jobs(json_extract(spec_json, '$.group'))
@@ -234,6 +235,9 @@ impl SqliteStore {
                 if v < 8 {
                     apply_v8(&tx)?;
                 }
+                if v < 9 {
+                    apply_v9(&tx)?;
+                }
                 tx.execute("DELETE FROM schema_version", [])
                     .map_err(internal)?;
                 tx.execute(
@@ -251,6 +255,7 @@ impl SqliteStore {
                 apply_v6(&tx)?;
                 apply_v7(&tx)?;
                 apply_v8(&tx)?;
+                apply_v9(&tx)?;
                 tx.execute(
                     "INSERT INTO schema_version(version) VALUES (?1)",
                     params![CURRENT_SCHEMA_VERSION],
@@ -385,6 +390,39 @@ fn apply_v8(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
              set_at_unix=CAST(strftime('%s','now') AS INTEGER) WHERE set_at_unix=0;",
     )
     .map_err(internal)?;
+    Ok(())
+}
+
+/// Persists submission order independently of wall clocks. Ids and `created_at` are still wall
+/// clock based (they are shown to people), but queue order must survive clock steps and submissions
+/// inside the same millisecond. Existing rows are backfilled in their best-known creation order.
+fn apply_v9(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let exists: bool = tx
+        .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='dispatch_seq'")
+        .map_err(internal)?
+        .exists([])
+        .map_err(internal)?;
+    if exists {
+        return Ok(());
+    }
+    tx.execute_batch("ALTER TABLE jobs ADD COLUMN dispatch_seq INTEGER NOT NULL DEFAULT 0;")
+        .map_err(internal)?;
+    let ids: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT id FROM jobs ORDER BY created_at ASC, id ASC")
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(internal)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(internal)?
+    };
+    for (seq, id) in ids.iter().enumerate() {
+        tx.execute(
+            "UPDATE jobs SET dispatch_seq=?1 WHERE id=?2",
+            params![(seq + 1) as i64, id],
+        )
+        .map_err(internal)?;
+    }
     Ok(())
 }
 
@@ -794,6 +832,15 @@ impl Store for SqliteStore {
             }
         }
         let id = JobId::new();
+        // BEGIN IMMEDIATE serialises writers, so max+1 is a stable submission sequence even when
+        // several controllers' requests create jobs concurrently.
+        let dispatch_seq: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(dispatch_seq), 0) + 1 FROM jobs",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
         let mut blocked = false;
         let collects_files =
             effective_collect(spec.collect, spec.stack_dependencies).collects_files();
@@ -855,10 +902,10 @@ impl Store for SqliteStore {
             waiting_on: Vec::new(),
         };
         tx.execute(
-            "INSERT INTO jobs(id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,lease_until_mono_ms,recovering_since_mono_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            "INSERT INTO jobs(id,dispatch_seq,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,lease_until_mono_ms,recovering_since_mono_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
-                rec.id.as_str(), state_str(rec.state), canonical, 1i64, Option::<String>::None, 0i64,
+                rec.id.as_str(), dispatch_seq, state_str(rec.state), canonical, 1i64, Option::<String>::None, 0i64,
                 rec.created_at, rec.updated_at, Option::<i64>::None, Option::<i64>::None,
                 Option::<String>::None, Option::<String>::None, Option::<i32>::None,
                 encode_artifacts(&[]), 0i64, 0i64, Option::<i64>::None, Option::<i64>::None
@@ -1355,14 +1402,15 @@ impl Store for SqliteStore {
             }
             counts
         };
-        // Higher priority first, then creation time. A spec from before the field existed has no
-        // JSON value and sorts as the default priority.
+        // Higher priority first, then submission order. `dispatch_seq` is persisted so wall
+        // clock steps and same-millisecond ids cannot reorder the queue. A spec from before the
+        // priority field existed has no JSON value and sorts as the default priority.
         let candidates: Vec<String> = {
             let mut stmt = tx
                 .prepare(
                     "SELECT id FROM jobs WHERE state='queued'
                      ORDER BY COALESCE(json_extract(spec_json, '$.priority'), 5) DESC,
-                              created_at ASC, id ASC",
+                              dispatch_seq ASC",
                 )
                 .map_err(internal)?;
             let ids = stmt
@@ -1875,6 +1923,11 @@ impl Store for SqliteStore {
         // Cordon expiries are on the same monotonic clock: a row from the last run would look
         // hours away against a fresh clock. Reiki health and new failures set them again.
         tx.execute("DELETE FROM cordons", []).map_err(internal)?;
+        // Node liveness uses that clock too. A persisted heartbeat stamp from the previous
+        // process must not make a dead node look live: -1 means "not seen this process" and
+        // is treated as offline until a fresh heartbeat arrives.
+        tx.execute("UPDATE nodes SET last_seen_mono_ms=-1", [])
+            .map_err(internal)?;
         let mut count = 0u64;
         for id in ids {
             let (mut rec, _, _) = get_job_tx(&tx, &id)?;
@@ -1935,8 +1988,8 @@ impl Store for SqliteStore {
             let (name, hb_json, last_seen_wall, last_seen_mono, draining_i) =
                 r.map_err(internal)?;
             let heartbeat: Heartbeat = serde_json::from_str(&hb_json).map_err(internal)?;
-            let online =
-                now.mono_ms.saturating_sub(last_seen_mono as u64) <= lease_ms.saturating_mul(2);
+            let online = last_seen_mono >= 0
+                && now.mono_ms.saturating_sub(last_seen_mono as u64) <= lease_ms.saturating_mul(2);
             // current job
             let current: Option<String> = conn
                 .query_row(
@@ -2107,7 +2160,7 @@ impl Store for SqliteStore {
         job_counts.nodes = nodes.max(0) as u64;
         let online = conn
             .query_row(
-                "SELECT COUNT(*) FROM nodes WHERE last_seen_mono_ms + (?1 * 2) >= ?2",
+                "SELECT COUNT(*) FROM nodes WHERE last_seen_mono_ms >= 0 AND last_seen_mono_ms + (?1 * 2) >= ?2",
                 params![lease_ms as i64, now.mono_ms as i64],
                 |r| r.get::<_, i64>(0),
             )
@@ -2537,6 +2590,80 @@ mod tests {
         assert_eq!(version, crate::SCHEMA_VERSION);
         drop(conn);
         assert_eq!(s.get_job(&id).unwrap().diff_bytes, None);
+    }
+
+    #[test]
+    fn an_old_database_gains_a_monotonic_dispatch_sequence() {
+        let p = temp_db("migrate-dispatch-seq.sqlite");
+        let first = {
+            let s = SqliteStore::open(&p).unwrap();
+            s.create_job(
+                &crate::conformance::spec("https://x/seq-first.git", None),
+                crate::conformance::now(200, 1),
+            )
+            .unwrap()
+            .0
+            .id
+        };
+        let second = {
+            let s = SqliteStore::open(&p).unwrap();
+            s.create_job(
+                &crate::conformance::spec("https://x/seq-second.git", None),
+                crate::conformance::now(100, 2),
+            )
+            .unwrap()
+            .0
+            .id
+        };
+        // Rewind to schema 8, as an operator restoring an older database would have.
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS jobs_dispatch_order;
+             ALTER TABLE jobs DROP COLUMN dispatch_seq;
+             UPDATE schema_version SET version=8;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let s = SqliteStore::open(&p).unwrap();
+        let conn = s.conn.lock().unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, crate::SCHEMA_VERSION);
+        let backfilled: i64 = conn
+            .query_row(
+                "SELECT dispatch_seq FROM jobs WHERE id=?1",
+                params![second.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let later: i64 = conn
+            .query_row(
+                "SELECT dispatch_seq FROM jobs WHERE id=?1",
+                params![first.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(backfilled < later, "backfill preserves creation order");
+        drop(conn);
+        let third = s
+            .create_job(
+                &crate::conformance::spec("https://x/seq-third.git", None),
+                crate::conformance::now(1, 3),
+            )
+            .unwrap()
+            .0
+            .id;
+        let conn = s.conn.lock().unwrap();
+        let newest: i64 = conn
+            .query_row(
+                "SELECT dispatch_seq FROM jobs WHERE id=?1",
+                params![third.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(newest > later, "a new job follows every migrated job");
     }
 
     #[test]

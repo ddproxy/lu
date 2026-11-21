@@ -26,7 +26,7 @@ systemd units are in [install.md](install.md); the agent's isolation model is in
 4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store has schema version 8. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Schema 5 adds the nullable `assigned_provider` and `assigned_model` job columns, schema 6 adds `diff_bytes`, which backs the `no changes` note, schema 7 adds `expect_failed`, which backs the `expect failed` note, and schema 8 adds `reason` and `set_at_unix` to cordons, which back their API details; an older database upgrades on open, and existing cordons get the reason `Cordoned before upgrade` and the upgrade time as their set time. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
+The store has schema version 9. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Schema 5 adds the nullable `assigned_provider` and `assigned_model` job columns, schema 6 adds `diff_bytes`, which backs the `no changes` note, schema 7 adds `expect_failed`, which backs the `expect failed` note, schema 8 adds `reason` and `set_at_unix` to cordons, which back their API details, and schema 9 adds `dispatch_seq`, the persisted submission order used by queue dispatch; an older database upgrades on open, existing cordons get the reason `Cordoned before upgrade` and the upgrade time as their set time, and existing jobs are numbered by their recorded creation order. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
 
@@ -115,8 +115,9 @@ systemctl start lu-controller.service
 ```
 
 `lu restore` verifies the snapshot, refuses a file that is not a Lu database (an empty or
-foreign SQLite file would replace your data with nothing), rejects a schema newer than the
-binary supports, and refuses when the database is still in use, so stop the controller first.
+foreign SQLite file would replace your data with nothing), checks that every Lu table required by
+its schema version is present, rejects a schema newer than the binary supports, and refuses when
+the database is still in use, so stop the controller first.
 Only one restore runs at a time. It stages the copy beside the database with the old file's
 owner and mode `0600`, moves the current database and every `-wal`, `-shm` and `-journal` file
 to `<db>.pre-restore-<unix seconds>` names, then renames the staged copy into place. Run it as
@@ -139,7 +140,7 @@ chmod 0700 /var/lib/lu/artifacts
 
 ## What a controller restart does
 
-Legal state transitions and the recovery state machine are in [lifecycle.md](lifecycle.md); this section covers the procedure around a restart. On startup the controller runs boot recovery before serving traffic:
+Legal state transitions and the recovery state machine are in [lifecycle.md](lifecycle.md); this section covers the procedure around a restart. On startup the controller runs boot recovery before binding its listener. If recovery fails, startup fails and no traffic is served, so stale leases can never be dispatched against a fresh monotonic clock:
 
 - Every job in `leased` or `running` becomes `recovering`. Its node and epoch are kept.
 - Jobs already in `recovering` stay there, but their grace timer is restarted. Lease and recovery timestamps are based on a monotonic clock that begins again with the process, so the old values are not meaningful after a restart.
@@ -212,8 +213,8 @@ node-a  0.2.0   idle     !homelab,gpu,php8.3,region=eu   !zen,!mistral 2026-11-1
 - `LAST_SEEN` is the last heartbeat time in UTC.
 - `DRAINED` shows the drain flag from the controller's node view.
 
-There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `labels`, `label_sources`, `taints`, `current_job`, `cordons`, `cordon_details`, `version` and the opaque `reiki` document. `label_sources` maps a probed label to `probed`; other labels have no entry. Each `cordon_details` entry carries its provider, source, reason, set time, expiry or healthy-lift count.
-There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods), `draining`, `providers`, `provider_models`, `labels`, `label_sources`, `taints`, `current_job`, `cordons`, `version` and the opaque `reiki` document. `label_sources` maps a probed label to `probed`; other labels have no entry.
+There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods; nodes are offline after a controller restart until their next heartbeat), `draining`, `providers`, `labels`, `label_sources`, `taints`, `current_job`, `cordons`, `cordon_details`, `version` and the opaque `reiki` document. `label_sources` maps a probed label to `probed`; other labels have no entry. Each `cordon_details` entry carries its provider, source, reason, set time, expiry or healthy-lift count.
+There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods; nodes are offline after a controller restart until their next heartbeat), `draining`, `providers`, `provider_models`, `labels`, `label_sources`, `taints`, `current_job`, `cordons`, `version` and the opaque `reiki` document. `label_sources` maps a probed label to `probed`; other labels have no entry.
 
 A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, lacks a required label, reports a taint the job does not tolerate, or (when the job names a provider) cannot serve any of its provider/model choices, including a matching provider cordon, will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lu_config::Config;
-use lu_controller::{build_router, run_background, AppState as ControllerState};
+use lu_controller::{build_router, recover_on_boot, run_background, AppState as ControllerState};
 use lu_serve::{serve, shutdown_signal, ServeOptions};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -22,6 +22,9 @@ pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot open {}: {e:?}", controller.db))?;
     let store: Arc<dyn lu_store::Store> = Arc::new(store);
     let state = Arc::new(ControllerState::from_config(controller, store)?);
+    // A recovery failure must stop startup: otherwise the process would serve stale
+    // leases that appeared unexpired against a fresh monotonic clock.
+    recover_on_boot(&state).await?;
     {
         let tls = match &config.tls {
             Some(tls) => Some(lu_serve::tls::load(
@@ -40,6 +43,7 @@ pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
             max_connections_per_addr: controller.max_connections_per_addr,
             header_read_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(60),
+            connection_idle_timeout: Duration::from_secs(120),
         };
 
         let (tx, _) = broadcast::channel::<()>(1);

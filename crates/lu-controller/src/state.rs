@@ -1,4 +1,5 @@
 use crate::auth::AuthConfig;
+use crate::limits::{TokenLimiter, PACK_CONCURRENCY, SYNC_CONCURRENCY};
 use crate::mirror::Mirror;
 use crate::repo::{LocalPathProvider, RepoProvider};
 use crate::wait::Waiters;
@@ -12,9 +13,75 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+
+const HEALTH_PROBE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct HealthCache {
+    ok: bool,
+    checked_at: Option<Instant>,
+}
+
+/// A single-flight, short-TTL cache for the unauthenticated health endpoint's DB probe. Without it
+/// an anonymous client could keep every `spawn_blocking` thread and the SQLite mutex busy.
+pub struct HealthProbe {
+    cache: Mutex<HealthCache>,
+    refresh: tokio::sync::Mutex<()>,
+}
+
+impl HealthProbe {
+    fn new() -> Self {
+        Self {
+            cache: Mutex::new(HealthCache::default()),
+            refresh: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    fn cached(&self) -> Option<bool> {
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match cache.checked_at {
+            Some(at) if at.elapsed() < HEALTH_PROBE_TTL => Some(cache.ok),
+            _ => None,
+        }
+    }
+
+    /// Returns the last known DB state, refreshing it at most once per TTL. Concurrent callers
+    /// wait for the in-flight probe rather than starting another blocking query.
+    pub async fn db_ok(&self, store: &Arc<dyn Store>) -> bool {
+        if let Some(ok) = self.cached() {
+            return ok;
+        }
+        let _guard = self.refresh.lock().await;
+        if let Some(ok) = self.cached() {
+            return ok;
+        }
+        let store = Arc::clone(store);
+        let ok = tokio::task::spawn_blocking(move || store.list_jobs(None, 1, None).is_ok())
+            .await
+            .unwrap_or(false);
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.ok = ok;
+        cache.checked_at = Some(Instant::now());
+        ok
+    }
+}
 
 pub struct AppState {
     pub store: Arc<dyn Store>,
+    /// Shared, rate-limited DB probe for `/v1/health`.
+    pub health: HealthProbe,
+    /// Bounds concurrent mirror syncs and base packs, and their per-principal rates.
+    pub sync_slots: Arc<Semaphore>,
+    pub pack_slots: Arc<Semaphore>,
+    pub sync_limiter: Arc<TokenLimiter>,
+    pub pack_limiter: Arc<TokenLimiter>,
     /// The SQLite file, for size reporting and diagnostics.
     pub db_path: PathBuf,
     pub started: Instant,
@@ -87,6 +154,11 @@ impl AppState {
             .map_err(|e| format!("cannot install group limits: {e:?}"))?;
         Ok(Self {
             store,
+            health: HealthProbe::new(),
+            sync_slots: Arc::new(Semaphore::new(SYNC_CONCURRENCY)),
+            pack_slots: Arc::new(Semaphore::new(PACK_CONCURRENCY)),
+            sync_limiter: Arc::new(TokenLimiter::new()),
+            pack_limiter: Arc::new(TokenLimiter::new()),
             db_path: PathBuf::from(&cfg.db),
             started: Instant::now(),
             recovered_on_boot: AtomicU64::new(0),

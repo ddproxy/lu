@@ -1,5 +1,7 @@
 use crate::auth::authenticate_operator;
 use crate::error::{ApiError, ErrorCode};
+use crate::limits::SYNC_PER_TOKEN;
+use crate::routes::file_body::{file_len, into_response, stream_range};
 use crate::routes::{
     json_ok, json_value_ok, parse_job_state, read_raw_limited, store_err, with_version,
     MAX_JSON_BODY,
@@ -19,8 +21,6 @@ use lu_store::{
 };
 use serde_json::json;
 use std::collections::HashMap;
-use std::fs;
-use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 /// Notes for terminal jobs. An empty diff takes precedence over unmet expectations: it says the
@@ -473,17 +473,19 @@ pub async fn get_artifact(
         .artifacts_dir
         .join(job_id.to_string())
         .join(art.file_name());
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            let ct = if matches!(art, ArtifactName::ReportJson) {
-                "application/json"
-            } else {
-                "application/octet-stream"
-            };
-            let res = (StatusCode::OK, [(header::CONTENT_TYPE, ct)], bytes).into_response();
-            with_version(res)
-        }
-        Err(_) => with_version(ApiError::not_found("not found").into_response()),
+    let ct = if matches!(art, ArtifactName::ReportJson) {
+        "application/json"
+    } else {
+        "application/octet-stream"
+    };
+    let result = async {
+        let len = file_len(&path, art.max_bytes()).await?;
+        stream_range(&path, art.max_bytes(), 0, len).await
+    }
+    .await;
+    match result {
+        Ok(file) => with_version(into_response(file, ct)),
+        Err(error) => with_version(error.into_response()),
     }
 }
 
@@ -540,34 +542,23 @@ pub async fn get_logs(
         }
     };
     let path = state.artifacts_dir.join(job_id.to_string()).join("run.log");
-    let data = if offset >= rec.log_len {
-        Vec::new()
+    let requested = rec.log_len.saturating_sub(offset);
+    let (body, len) = if requested == 0 {
+        (axum::body::Body::empty(), 0)
     } else {
-        let remaining = rec.log_len - offset;
-        match tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-            let mut f = fs::File::open(&path)?;
-            f.seek(SeekFrom::Start(offset))?;
-            let mut buf = Vec::new();
-            f.take(remaining).read_to_end(&mut buf)?;
-            Ok(buf)
-        })
-        .await
-        {
-            Ok(Ok(b)) => b,
-            _ => Vec::new(),
+        match stream_range(&path, lu_proto::MAX_LOG_BYTES, offset, requested).await {
+            Ok(file) => (file.body, file.len),
+            Err(error) => return with_version(error.into_response()),
         }
     };
-    let mut res = (StatusCode::OK, [(header::CONTENT_TYPE, "text/plain")], data).into_response();
-    res.headers_mut().insert(
-        "x-lu-log-length",
-        header::HeaderValue::from_str(&rec.log_len.to_string())
-            .unwrap_or(header::HeaderValue::from_static("0")),
-    );
-    res.headers_mut().insert(
-        "x-lu-state",
-        header::HeaderValue::from_str(rec.state.as_str())
-            .unwrap_or(header::HeaderValue::from_static("queued")),
-    );
+    let res = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .header(header::CONTENT_LENGTH, len.to_string())
+        .header("x-lu-log-length", rec.log_len.to_string())
+        .header("x-lu-state", rec.state.as_str())
+        .body(body)
+        .expect("valid log response headers");
     with_version(res)
 }
 
@@ -677,11 +668,21 @@ pub async fn sync_repo(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
-    }
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(operator) => operator,
+        Err(_) => return with_version(ApiError::unauthorized().into_response()),
+    };
     if state.mirror.repo(&name).is_none() {
         return with_version(ApiError::not_found("not found").into_response());
+    }
+    // A sync runs git and touches disk. Keep one in flight and a small per-operator budget;
+    // contention is a retryable 429 rather than queued blocking work.
+    let Ok(slot) = Arc::clone(&state.sync_slots).try_acquire_owned() else {
+        return with_version(ApiError::rate_limited(1).into_response());
+    };
+    if let Err(retry_after) = state.sync_limiter.allow(&operator, SYNC_PER_TOKEN) {
+        drop(slot);
+        return with_version(ApiError::rate_limited(retry_after).into_response());
     }
     let mirror = Arc::clone(&state.mirror);
     let result = tokio::task::spawn_blocking(move || mirror.sync(&name)).await;

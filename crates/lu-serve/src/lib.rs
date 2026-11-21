@@ -1,5 +1,6 @@
 //! HTTP(S) listener. The accept loop caps connections globally and per remote address, times out
-//! a client that never finishes its headers, and drains in-flight connections on shutdown.
+//! a client that never finishes its headers, watches the whole connection for stalls (including
+//! a client that never reads a response), and drains in-flight connections on shutdown.
 
 mod limit;
 mod request_id;
@@ -8,8 +9,8 @@ pub mod tls;
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::response::IntoResponse;
@@ -26,6 +27,8 @@ pub use shutdown::shutdown_signal;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+const WATCHDOG_CHECK: Duration = Duration::from_millis(250);
+const WATCHDOG_MIN_CHECK: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServeOptions {
@@ -34,6 +37,9 @@ pub struct ServeOptions {
     pub header_read_timeout: Duration,
     /// Longest a handler may take; a request that overruns it gets a 408.
     pub request_timeout: Duration,
+    /// Longest a connection may be quiet between requests, or stalled while writing a response.
+    /// An active request is allowed `request_timeout + connection_idle_timeout`.
+    pub connection_idle_timeout: Duration,
 }
 
 /// The remote socket address of a connection. The listener puts it in every request's
@@ -78,11 +84,10 @@ pub async fn serve(
         };
         let router = router.clone();
         let tls = tls.clone();
-        let timeouts = (options.header_read_timeout, options.request_timeout);
         tokio::spawn(async move {
             let _slot = slot;
             let _addr_slot = addr_slot;
-            if let Err(error) = handle(stream, peer, router, tls, timeouts).await {
+            if let Err(error) = handle(stream, peer, router, tls, options).await {
                 tracing::debug!(%peer, %error, "connection ended with an error");
             }
         });
@@ -105,48 +110,126 @@ async fn handle(
     peer: SocketAddr,
     router: Router,
     tls: Option<Arc<rustls::ServerConfig>>,
-    timeouts: (Duration, Duration),
+    options: ServeOptions,
 ) -> Result<(), BoxError> {
     match tls {
-        None => connection(stream, router, peer, timeouts).await?,
+        None => connection(stream, router, peer, options).await?,
         Some(config) => {
             let accept = tokio_rustls::TlsAcceptor::from(config).accept(stream);
             let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, accept)
                 .await
                 .map_err(|_| "TLS handshake timed out")??;
-            connection(stream, router, peer, timeouts).await?;
+            connection(stream, router, peer, options).await?;
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct Activity {
+    last: Instant,
+    in_flight: usize,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            last: Instant::now(),
+            in_flight: 0,
+        }
+    }
+}
+
+fn activity_lock(activity: &Mutex<Activity>) -> std::sync::MutexGuard<'_, Activity> {
+    activity
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 async fn connection<IO>(
     io: IO,
     router: Router,
     peer: SocketAddr,
-    (header_read_timeout, request_timeout): (Duration, Duration),
-) -> Result<(), hyper::Error>
+    options: ServeOptions,
+) -> Result<(), BoxError>
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let activity = Arc::new(Mutex::new(Activity::new()));
+    let service_activity = Arc::clone(&activity);
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let mut router = router.clone();
+        let activity = Arc::clone(&service_activity);
+        let request_timeout = options.request_timeout;
         let mut req = req.map(Body::new);
         req.extensions_mut().insert(PeerAddr(peer));
         async move {
-            match tokio::time::timeout(request_timeout, router.call(req)).await {
+            {
+                let mut active = activity_lock(&activity);
+                active.in_flight += 1;
+                active.last = Instant::now();
+            }
+            let response = match tokio::time::timeout(request_timeout, router.call(req)).await {
                 Ok(response) => response,
                 Err(_) => Ok((
                     axum::http::StatusCode::REQUEST_TIMEOUT,
                     "request timed out\n",
                 )
                     .into_response()),
+            };
+            {
+                let mut active = activity_lock(&activity);
+                active.in_flight = active.in_flight.saturating_sub(1);
+                active.last = Instant::now();
             }
+            response
         }
     });
-    hyper::server::conn::http1::Builder::new()
+    let connection = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
-        .header_read_timeout(header_read_timeout)
-        .serve_connection(TokioIo::new(io), service)
-        .await
+        .header_read_timeout(options.header_read_timeout)
+        .serve_connection(TokioIo::new(io), service);
+    idle_watchdog(
+        connection,
+        Arc::clone(&activity),
+        options.connection_idle_timeout,
+        options.request_timeout,
+    )
+    .await
+}
+
+/// A whole-connection watchdog. The per-request timeout guards handler work; this one also covers
+/// a client that stops reading a response or goes quiet on a keep-alive connection. An in-flight
+/// request gets `request_timeout` of grace so a 25-second log wait is not mistaken for a stall.
+async fn idle_watchdog<F, T>(
+    connection: F,
+    activity: Arc<Mutex<Activity>>,
+    idle_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<T, BoxError>
+where
+    F: Future<Output = Result<T, hyper::Error>>,
+{
+    let mut connection = Box::pin(connection);
+    let check_every = idle_timeout.min(WATCHDOG_CHECK).max(WATCHDOG_MIN_CHECK);
+    let mut ticker = tokio::time::interval(check_every);
+    loop {
+        tokio::select! {
+            result = &mut connection => return result.map_err(Into::into),
+            _ = ticker.tick() => {
+                let (last, in_flight) = {
+                    let active = activity_lock(&activity);
+                    (active.last, active.in_flight)
+                };
+                let allowance = if in_flight > 0 {
+                    request_timeout.saturating_add(idle_timeout)
+                } else {
+                    idle_timeout
+                };
+                if last.elapsed() >= allowance {
+                    return Err(format!("connection idle for {allowance:?}").into());
+                }
+            }
+        }
+    }
 }

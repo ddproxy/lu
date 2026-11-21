@@ -25,7 +25,7 @@ flowchart TD
 | Token file refused | Owner, mode, type | Regular file, owned by the effective user, mode `0600` or tighter, no symlink or FIFO; at most 64 KiB for an agent token, 8 KiB for an operator token. |
 | `401 unauthorized` | Token value, scope, hash | Missing, unknown and wrong-scope tokens all return `401`. Use an operator token for CLI/MCP and an agent token for agent routes. |
 | `403 forbidden` | Node binding | A valid agent token is bound to one node; another node's job or heartbeat is refused. |
-| `429 rate_limited` | `Retry-After` and source address | Ten failed token checks in 60 seconds block an address for the rest of the window. |
+| `429 rate_limited` | `Retry-After`, source address and route | Ten failed token checks in 60 seconds block an address for the rest of the window. Separately, one mirror sync at a time and six per operator per minute, or four base packs at a time and thirty per agent per minute, return `429` when the slot or budget is exhausted. |
 | TLS key refused | `[tls] key` | Regular file, owned by the controller user, mode `0600` or tighter, no symlink. |
 | `cannot listen …` | `[controller] listen` | Use a socket address such as `127.0.0.1:7600`; a non-loopback address needs `[tls]`. |
 | Database directory error | `[controller] db` parent | Create the parent directory and give the controller write access. |
@@ -115,7 +115,7 @@ The first call is `-32602` because `limit` is at most 100. The second returns a 
 
 ## Recovery and backups
 
-The store expects schema version `8`. A newer database is refused at startup; downgrades are not supported. Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
+The store expects schema version `9`. A newer database is refused at startup; downgrades are not supported. Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
 
 `lu backup` and `lu restore` procedures, including interrupted restores and artifact snapshots, are in [operations.md](operations.md#backup-and-restore).
 

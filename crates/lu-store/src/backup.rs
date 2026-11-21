@@ -17,6 +17,8 @@ pub struct BackupInfo {
     pub bytes: u64,
     pub schema_version: Option<i64>,
     pub jobs: u64,
+    /// User tables in the file, used to reject a foreign SQLite file that borrows a Lu version.
+    pub tables: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,17 +136,35 @@ pub fn backup(db: &Path, out: &Path, force: bool) -> Result<BackupInfo, String> 
     result
 }
 
-/// A backup must be a Lu database: a known schema version and a jobs table. An empty or foreign
-/// SQLite file passes `integrity_check`, and installing one would replace the data with nothing.
+/// A backup must be a Lu database: a known schema version and every table that version creates.
+/// An empty or foreign SQLite file passes `integrity_check`, and installing one would replace the
+/// data with a file where every job query fails. A forged version row alone is not enough.
 fn require_lu_database(info: &BackupInfo) -> Result<(), String> {
-    match info.schema_version {
-        Some(version) if (1..=SCHEMA_VERSION).contains(&version) => Ok(()),
-        Some(version) if version > SCHEMA_VERSION => Err(format!(
-            "backup schema version {version} is newer than supported {SCHEMA_VERSION}"
-        )),
-        Some(version) => Err(format!("backup schema version {version} is not valid")),
-        None => Err("the file is not a Lu database (no schema version)".to_owned()),
+    let version = match info.schema_version {
+        Some(version) if (1..=SCHEMA_VERSION).contains(&version) => version,
+        Some(version) if version > SCHEMA_VERSION => {
+            return Err(format!(
+                "backup schema version {version} is newer than supported {SCHEMA_VERSION}"
+            ))
+        }
+        Some(version) => return Err(format!("backup schema version {version} is not valid")),
+        None => return Err("the file is not a Lu database (no schema version)".to_owned()),
+    };
+    // `job_deps` arrived with schema 2; requiring it of a schema-1 backup would reject a file
+    // this binary can otherwise migrate. Every other table exists from schema 1 onwards.
+    let mut required = vec!["schema_version", "jobs", "nodes", "cordons", "idempotency"];
+    if version >= 2 {
+        required.push("job_deps");
     }
+    if let Some(missing) = required
+        .into_iter()
+        .find(|name| !info.tables.iter().any(|table| table == name))
+    {
+        return Err(format!(
+            "the file is not a Lu database (missing {missing} table)"
+        ));
+    }
+    Ok(())
 }
 
 /// Installs `backup` at `db` after checking it and moving the current database aside. The new
@@ -316,7 +336,17 @@ fn read_info(db: &Path) -> Result<BackupInfo, String> {
     let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| format!("cannot open {}: {error}", db.display()))?;
     let schema_version = schema_version(&conn)?;
-    let jobs = if table_exists(&conn, "jobs")? {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut tables = Vec::new();
+    for row in rows {
+        tables.push(row.map_err(|error| error.to_string())?);
+    }
+    let jobs = if tables.iter().any(|table| table == "jobs") {
         count(&conn, "SELECT COUNT(*) FROM jobs")?
     } else {
         0
@@ -327,6 +357,7 @@ fn read_info(db: &Path) -> Result<BackupInfo, String> {
             .len(),
         schema_version,
         jobs,
+        tables,
     })
 }
 
@@ -546,6 +577,46 @@ mod tests {
         let target = dir.join("target.db");
         let error = restore(&out, &target).unwrap_err();
         assert!(error.contains("newer"), "{error}");
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_refuses_a_backup_with_a_forced_version_but_no_jobs_table() {
+        let dir = temp_dir("missing-jobs");
+        let source = dir.join("source.db");
+        let copy = dir.join("copy.db");
+        {
+            let _store = crate::sqlite::SqliteStore::open(&source).unwrap();
+        }
+        backup(&source, &copy, false).unwrap();
+        let conn = Connection::open(&copy).unwrap();
+        conn.execute("DROP TABLE jobs", []).unwrap();
+        drop(conn);
+        let target = dir.join("target.db");
+        fs::write(&target, b"keep me").unwrap();
+        let error = restore(&copy, &target).unwrap_err();
+        assert!(error.contains("not a Lu database"), "{error}");
+        assert!(error.contains("jobs"), "{error}");
+        assert_eq!(fs::read(&target).unwrap(), b"keep me");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_refuses_a_backup_missing_another_schema_table() {
+        let dir = temp_dir("missing-deps");
+        let source = dir.join("source.db");
+        let copy = dir.join("copy.db");
+        {
+            let _store = crate::sqlite::SqliteStore::open(&source).unwrap();
+        }
+        backup(&source, &copy, false).unwrap();
+        let conn = Connection::open(&copy).unwrap();
+        conn.execute("DROP TABLE job_deps", []).unwrap();
+        drop(conn);
+        let target = dir.join("target.db");
+        let error = restore(&copy, &target).unwrap_err();
+        assert!(error.contains("job_deps"), "{error}");
         assert!(!target.exists());
         let _ = fs::remove_dir_all(&dir);
     }

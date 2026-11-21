@@ -86,7 +86,9 @@ Inputs are the job's `after` dependencies. A `done` dependency is always an inpu
 `diff.patch`; without the opt-in, a dead dependency still fails its dependents as described above.
 `--include-failed` is also accepted by `lu retry` and `lu edit`. At most 16 inputs and 64 MiB of
 stored diffs are allowed; the controller checks the limit at submit time when sizes are known and
-the agent re-checks it before staging.
+the agent re-checks it before staging. Each `GIT binary patch` side is preflighted before libgit2
+inflates it: a declared or actual inflated size above 256 MiB is refused, and malformed or
+size-mismatched binary data fails staging under every conflict policy.
 
 With `files` or `both`, the agent writes `.lu/inputs/INDEX.md` and one directory per input, named
 from a safe idempotency key (or a short job id, with `-2`, `-3`, … for duplicates). Each directory
@@ -95,7 +97,7 @@ state, node, failure class, changed-file count, diff bytes, apply result and con
 `run.log` keeps only the last 256 KiB and the index notes when a log was capped. Files are `0600`,
 directories `0700` and symlinks are refused. Text from another job is untrusted: it is sanitised in
 the index and never used as a path or command. `.lu` is added to `.git/info/exclude` and stripped
-from the exported `diff.patch`; a tracked `.lu` path is a staging error.
+from the exported `diff.patch`; a tracked `.lu` path at any depth is a staging error.
 
 ### Conflict handling
 

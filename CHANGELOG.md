@@ -5,6 +5,24 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- `lu restore` now verifies that a snapshot contains every Lu table for its schema version, not just a matching schema version stamp. A file with a forged or stale version but missing `jobs`, `nodes`, `cordons`, `idempotency` or `job_deps` tables is refused before it can replace the live database.
+- Input diffs with `GIT binary patch` blocks are bounded before libgit2 inflates them: a declared or actual inflated side above 256 MiB is refused, and malformed or size-mismatched binary data is a staging error even under `skip` or `markers` conflict policies.
+- The controller now runs boot recovery before binding its listener and exits on a recovery error instead of logging and serving. This prevents a fresh monotonic clock from making stale leases look unexpired and dispatching the same job twice.
+- Artifact uploads recheck the job's node and epoch immediately before the atomic file rename. A lease transfer that happens after the artifact is recorded now returns `409 stale_epoch` instead of overwriting the newer attempt's file.
+- Long-poll and log-wait wakeups no longer miss a change that lands between reading state and registering the waiter: notifications store a permit as well as waking already-registered waiters.
+- `GET /v1/health` now shares one 5-second, single-flight SQLite probe. Concurrent anonymous checks can no longer turn the unauthenticated endpoint into unbounded blocking database work.
+- Repository syncs and base-pack generation are bounded: one mirror sync and four base packs at a time, with per-principal budgets of 6 and 30 per minute. Contention returns `429 rate_limited` with `Retry-After` instead of queueing more git work.
+- HTTP connections now have a whole-connection idle/watchdog timeout in addition to the per-request timeout. A client that stops reading a response or goes quiet on a keep-alive connection loses its connection and its slot; an active request keeps the connection alive.
+- Artifact and log downloads are streamed rather than read whole into memory. Reads enforce the stored per-file caps and seek straight to `len - tail` for tail requests, so a large log no longer has to be loaded to return its last bytes.
+- Queue dispatch now follows submission order even when the wall clock steps back. Schema 9 adds a persisted monotonic `dispatch_seq`; older databases are migrated on open and existing jobs are numbered by their recorded creation order.
+- Node liveness no longer survives a controller restart. Boot recovery clears persisted monotonic heartbeat stamps, so `online`, the `lu nodes` JSON view and `lu_nodes_online` stay false until each agent heartbeats again instead of trusting a process-local clock stamp from the previous process.
+- Staging now applies the same git hardening to every invocation, including `git apply --3way`: system and global config are skipped, hooks disabled, transports restricted, and inherited config, askpass, proxy and repository-location variables scrubbed.
+- Tracked `.lu` paths are rejected and `.lu` paths at any depth are stripped from exported diffs, so a nested `.lu` directory cannot smuggle files into or out of a job's patch.
+- Artifact and log reads and log appends refuse symlinks instead of following them out of the job directory; reads also reject non-regular files, and log directories are checked for symlinks before opening the log.
+- The security policy lists all supported releases (0.1.x through 0.4.x) and directs private reports to the forge's vulnerability-reporting channel instead of a placeholder email address.
+
 ## [0.4.0] - 2026-11-21
 
 ### Added

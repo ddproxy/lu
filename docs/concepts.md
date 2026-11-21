@@ -53,7 +53,7 @@ by the controller; see [Tokens and TLS](tokens-and-tls.md).
 
 A spec's optional `expect` block declares what a successful run leaves behind: required files, globs
 that changed paths must match or must not match, and optional diff size bounds. The agent checks it
-after the harness exits, using the same uploaded diff with `.lu/` paths excluded. `suspect` mode
+after the harness exits, using the same uploaded diff with `.lu/` paths at any depth excluded. `suspect` mode
 keeps the job `done` and adds an `expect_failed` note; `fail` mode ends it `failed` with class
 `execution`. See [Job Lifecycle](lifecycle.md#expectations).
 

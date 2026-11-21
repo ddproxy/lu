@@ -14,6 +14,11 @@ pub struct WaitGroup {
 
 impl WaitGroup {
     fn notify_waiters(&self) {
+        // `notify_waiters` only wakes futures that have already registered. `notify_one`
+        // stores a permit when nobody is waiting yet, so a change that lands between a
+        // caller's state check and its `notified()` registration is not lost. Waking one
+        // first also avoids leaving a stale permit when waiters are already registered.
+        self.notify.notify_one();
         self.notify.notify_waiters();
     }
 }
@@ -159,5 +164,47 @@ impl Waiters {
             _ = group.notify.notified() => true,
             _ = tokio::time::sleep(timeout) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_work_change_before_registration_still_wakes_the_waiter() {
+        let waiters = Arc::new(Waiters::new());
+        waiters.notify_work();
+        // The permit from `notify_one` must survive until `notified()` is registered.
+        assert!(waiters.wait_work(Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn a_job_change_before_registration_still_wakes_the_waiter() {
+        let waiters = Arc::new(Waiters::new());
+        waiters.notify_job("job");
+        let (_permit, group) = waiters.try_acquire_log("job").unwrap();
+        assert!(Waiters::wait_job(&group, Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn a_notification_after_registration_still_wakes_all_waiters() {
+        let group = WaitGroup {
+            notify: Notify::new(),
+            _count: AtomicUsize::new(0),
+        };
+        let mut first = Box::pin(group.notify.notified());
+        let mut second = Box::pin(group.notify.notified());
+        // Poll once so both futures are registered before the notification is sent.
+        let _ = tokio::time::timeout(Duration::ZERO, first.as_mut()).await;
+        let _ = tokio::time::timeout(Duration::ZERO, second.as_mut()).await;
+        group.notify_waiters();
+        assert!(tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .is_ok());
+        assert!(tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .is_ok());
     }
 }

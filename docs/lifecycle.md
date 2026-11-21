@@ -76,7 +76,7 @@ outgoing edges.
 - After `recovery_grace_secs` (default 30, allowed 0–600), the controller requeues the job or
   fails it with class `node`, incrementing the attempt and clearing the node.
 
-Dispatch considers only `queued` jobs, oldest id first. The node must have a current heartbeat,
+Dispatch considers only `queued` jobs, earliest submission first. The node must have a current heartbeat,
 must be idle and not draining, and must not already hold a `leased`, `running` or `recovering`
 job. The job's required labels must be a subset of the node's labels; if it names a provider, the
 node must offer it and no `(node, provider)` cordon may be active. A job with `provider = "any"`
@@ -163,7 +163,7 @@ jobs in `lu_jobs_no_changes_total`, reset on restart.
 A job's `expect` block declares what a successful run must leave behind: files in the working tree,
 changed paths matching globs, paths that must not change, and bounds on the exported diff size. The
 agent checks it after the harness exits successfully, against the same diff it uploads as
-`diff.patch`; `.lu/` paths are excluded. Each unmet expectation is recorded as a short string in
+`diff.patch`; `.lu/` paths at any depth are excluded. Each unmet expectation is recorded as a short string in
 `report.json` under `expect_failures`.
 
 In `suspect` mode (the default) the job stays `done` and gets `outcome_note: "expect_failed"`, which

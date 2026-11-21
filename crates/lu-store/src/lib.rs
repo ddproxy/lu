@@ -9,7 +9,7 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 #[cfg(test)]
 pub mod conformance;
@@ -274,7 +274,7 @@ pub trait Store: Send + Sync + 'static {
 
     /// Records the heartbeat and the time it was seen.
     fn heartbeat(&self, hb: &Heartbeat, now: Now) -> Result<(), StoreError>;
-    /// Leases the highest-priority queued job this node may run, oldest first within a priority
+    /// Leases the highest-priority queued job this node may run, earliest submission first within a priority
     /// (not draining, harness usable, no job held, labels satisfied, taints tolerated, able to
     /// serve the primary or one fallback provider choice, and below its group's cap), bumping the
     /// epoch. Provider, label and taint rules still apply first.

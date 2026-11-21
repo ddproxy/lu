@@ -1,6 +1,9 @@
 //! Job ids and node names. A job id is 26 Crockford base32 characters: a 48-bit millisecond
 //! prefix (so ids sort by creation time), then 80 random bits. A node name is a short, restricted
 //! token. Both serialise as plain strings and refuse malformed input on deserialise.
+//!
+//! Ids are identifiers, not queue order: dispatch uses the store's persisted submission sequence,
+//! which is unaffected by wall-clock steps and same-millisecond ids.
 
 use std::fmt;
 use std::str::FromStr;

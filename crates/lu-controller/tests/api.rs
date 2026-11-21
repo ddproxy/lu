@@ -1,10 +1,11 @@
 use git2::Signature;
 use lu_auth::sha256_hex;
 use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator, ControllerRepo};
-use lu_controller::{build_router, run_background, AppState};
+use lu_controller::limits::{PACK_PER_TOKEN, SYNC_PER_TOKEN};
+use lu_controller::{build_router, recover_on_boot, run_background, AppState};
 use lu_proto::{
     Choice, JobEdit, JobId, JobSpec, NodeName, StuckPolicy, MAX_AFTER_JOBS, MAX_FALLBACKS,
-    MAX_LOG_BYTES, MAX_REQUIRES_LABELS, MAX_TOLERATES,
+    MAX_LOG_BYTES, MAX_REPORT_BYTES, MAX_REQUIRES_LABELS, MAX_TOLERATES,
 };
 use lu_serve::{serve, ServeOptions};
 use lu_store::sqlite::SqliteStore;
@@ -94,6 +95,7 @@ async fn start_server_full(
     let mut state = AppState::from_config(&cfg, store.clone()).unwrap();
     state.max_pack_bytes = pack_cap.unwrap_or(lu_staging::PACK_CAP_BYTES);
     let state = Arc::new(state);
+    recover_on_boot(&state).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, _) = broadcast::channel::<()>(4);
@@ -104,6 +106,7 @@ async fn start_server_full(
         max_connections_per_addr: 16,
         header_read_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(10),
+        connection_idle_timeout: Duration::from_secs(30),
     };
     let bg_state = Arc::clone(&state);
     let bg = tokio::spawn(async move {
@@ -1730,6 +1733,30 @@ async fn agent_dependency_routes_list_and_serve_diffs() {
     .await;
     assert_eq!(status(&r), 200, "{r}");
     assert_eq!(body_str(&r), "tput");
+
+    // A large log is seeked to its tail rather than read into memory, and a file above the
+    // documented cap is refused even for a tail request.
+    let mut big = vec![b'x'; 1024 * 1024];
+    big.extend_from_slice(b"0123456789abcdef");
+    std::fs::write(dep_dir.join("run.log"), &big).unwrap();
+    let r = raw_request(
+        srv.addr,
+        &artifact(AGENT_A_TOKEN, epoch, "run.log", "&tail=16"),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(body_str(&r), "0123456789abcdef");
+    std::fs::File::create(dep_dir.join("run.log"))
+        .unwrap()
+        .set_len(MAX_LOG_BYTES + 1)
+        .unwrap();
+    let r = raw_request(
+        srv.addr,
+        &artifact(AGENT_A_TOKEN, epoch, "run.log", "&tail=16"),
+    )
+    .await;
+    assert_eq!(status(&r), 413, "{r}");
+
     assert_eq!(
         status(&raw_request(srv.addr, &artifact(AGENT_A_TOKEN, epoch, "evil.txt", ""),).await),
         404
@@ -2532,6 +2559,107 @@ async fn get_logs_stops_at_the_stored_length() {
     let _ = srv.shutdown.send(());
 }
 
+#[tokio::test]
+async fn artifact_reads_refuse_files_over_the_stored_cap() {
+    let srv = start_server().await;
+    let id = JobId::new();
+    let dir = srv._artifacts_dir.join(id.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("report.json");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(MAX_REPORT_BYTES + 1)
+        .unwrap();
+
+    let r = raw_request(
+        srv.addr,
+        &operator_get(&format!("/v1/jobs/{id}/artifacts/report.json")),
+    )
+    .await;
+    assert_eq!(status(&r), 413, "{r}");
+    assert!(body_str(&r).contains("too_large"), "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn log_reads_refuse_files_over_the_stored_cap() {
+    let srv = start_server().await;
+    let (id, epoch) = assigned_epoch(&srv, &sample_spec(None)).await;
+    srv.store
+        .reserve_log(&JobId::parse(&id).unwrap(), epoch, 0, 1)
+        .unwrap();
+    let dir = srv._artifacts_dir.join(&id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::File::create(dir.join("run.log"))
+        .unwrap()
+        .set_len(MAX_LOG_BYTES + 1)
+        .unwrap();
+
+    let r = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}/logs"))).await;
+    assert_eq!(status(&r), 413, "{r}");
+    assert!(body_str(&r).contains("too_large"), "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn symlinked_artifact_and_log_reads_are_refused() {
+    let srv = start_server().await;
+    let (id, job_id, epoch) = assign_and_start(&srv).await;
+    let dir = srv._artifacts_dir.join(&id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = srv._artifacts_dir.join("secret.txt");
+    std::fs::write(&secret, b"top secret\n").unwrap();
+    std::os::unix::fs::symlink(&secret, dir.join("report.json")).unwrap();
+    std::os::unix::fs::symlink(&secret, dir.join("run.log")).unwrap();
+    srv.store.reserve_log(&job_id, epoch, 0, 11).unwrap();
+
+    let r = raw_request(
+        srv.addr,
+        &operator_get(&format!("/v1/jobs/{id}/artifacts/report.json")),
+    )
+    .await;
+    assert_eq!(status(&r), 404, "{r}");
+    assert!(!body_str(&r).contains("top secret"), "{r}");
+
+    let r = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}/logs"))).await;
+    assert_eq!(status(&r), 404, "{r}");
+    assert!(!body_str(&r).contains("top secret"), "{r}");
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn log_append_does_not_follow_a_symlink() {
+    let srv = start_server().await;
+    let (id, job_id, epoch) = assign_and_start(&srv).await;
+    let dir = srv._artifacts_dir.join(&id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = srv._artifacts_dir.join("secret.txt");
+    std::fs::write(&secret, b"keep-me\n").unwrap();
+    std::os::unix::fs::symlink(&secret, dir.join("run.log")).unwrap();
+
+    let chunk = b"overwritten\n";
+    let req = format!(
+        "POST /v1/agent/jobs/{id}/log?epoch={epoch}&offset=0 HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n",
+        chunk.len()
+    );
+    let mut packet = req.into_bytes();
+    packet.extend_from_slice(chunk);
+    let r = raw_request_bytes(srv.addr, &packet).await;
+    assert_eq!(
+        status(&String::from_utf8_lossy(&r)),
+        500,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
+    assert_eq!(std::fs::read(&secret).unwrap(), b"keep-me\n");
+    assert_eq!(srv.store.get_job(&job_id).unwrap().log_len, 0);
+    let _ = srv.shutdown.send(());
+}
+
 fn repo_with_two_commits(root: &std::path::Path) -> (String, String) {
     let dir = root.join("source");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2697,6 +2825,37 @@ async fn base_route_serves_a_pack_with_auth_node_and_epoch_fencing() {
 }
 
 #[tokio::test]
+async fn base_packs_are_rate_limited_per_agent() {
+    let root = tempfile::tempdir().unwrap();
+    let (repo, commit) = repo_with_two_commits(root.path());
+    let srv = start_server_with(vec![root.path().to_string_lossy().into_owned()], None).await;
+    let mut spec = sample_spec(None);
+    spec.repo = repo;
+    spec.base_commit = Some(commit);
+    let (id, epoch) = assigned_epoch(&srv, &spec).await;
+
+    for _ in 0..PACK_PER_TOKEN {
+        srv.state
+            .pack_limiter
+            .allow("node-a", PACK_PER_TOKEN)
+            .unwrap();
+    }
+    let r = base_request(srv.addr, &id, epoch, AGENT_A_TOKEN).await;
+    assert_eq!(
+        response_status(&r),
+        429,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
+    let err: serde_json::Value =
+        serde_json::from_slice(response_body(&r)).expect("rate limit returns JSON");
+    assert_eq!(err["error"], "rate_limited", "{err}");
+    assert!(response_header(&r, "retry-after").is_some());
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
 async fn a_mirrored_repository_pins_at_submit_and_serves_its_base_from_the_mirror() {
     let repo_tmp = tempfile::tempdir().unwrap();
     let (url, _first, second) = local_repo(repo_tmp.path());
@@ -2826,6 +2985,40 @@ async fn configured_repositories_sync_list_and_pin_branch_tag_and_commit() {
     )
     .await;
     assert_eq!(status(&r), 401, "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn repository_sync_is_rate_limited_per_operator() {
+    let repo_tmp = tempfile::tempdir().unwrap();
+    let (url, _first, _second) = local_repo(repo_tmp.path());
+    let srv = start_server_with_repos(vec![repo_entry(&url)]).await;
+
+    for _ in 0..SYNC_PER_TOKEN {
+        srv.state.sync_limiter.allow("ops", SYNC_PER_TOKEN).unwrap();
+    }
+    assert!(srv.state.sync_limiter.allow("ops", SYNC_PER_TOKEN).is_err());
+    let r = raw_request(srv.addr, &operator_post("/v1/repos/local/sync")).await;
+    assert_eq!(status(&r), 429, "{r}");
+    assert!(body_str(&r).contains("rate_limited"), "{r}");
+    assert!(header_value(&r, "retry-after").is_some(), "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn repository_sync_is_refused_while_another_sync_holds_the_slot() {
+    let repo_tmp = tempfile::tempdir().unwrap();
+    let (url, _first, _second) = local_repo(repo_tmp.path());
+    let srv = start_server_with_repos(vec![repo_entry(&url)]).await;
+    let _busy = Arc::clone(&srv.state.sync_slots)
+        .try_acquire_owned()
+        .unwrap();
+
+    let r = raw_request(srv.addr, &operator_post("/v1/repos/local/sync")).await;
+    assert_eq!(status(&r), 429, "{r}");
+    assert!(body_str(&r).contains("rate_limited"), "{r}");
 
     let _ = srv.shutdown.send(());
 }

@@ -98,8 +98,11 @@ a job on node-b, even if it guesses the job id and epoch.
 Lease expiry is a safety mechanism governed by the lease epoch and node binding. If an agent is
 slow, paused or partitioned for `lease_secs`, the job becomes `recovering`; after
 `recovery_grace_secs` it is requeued or failed. A late completion from the old lease arrives with
-a stale epoch and changes nothing. On controller restart, `leased` and `running` jobs enter the
-same recovery path so each job reaches a terminal state or a retry.
+a stale epoch and changes nothing. Artifact uploads check the epoch before reading the body, when
+recording the artifact, and again immediately before the atomic file rename, so a lease transfer
+during the upload returns `409 stale_epoch` without overwriting the newer attempt's file. On
+controller restart, `leased` and `running` jobs enter the same recovery path so each job reaches a
+terminal state or a retry; a recovery error stops startup before any request is served.
 
 ## What the agent treats as untrusted
 
@@ -124,8 +127,10 @@ no system or global config, no hooks and no inherited askpass or ssh command, wi
 timeout and a size cap. A repository credential is read at fetch time, passed through a
 short-lived private askpass helper, and scrubbed from any stderr before it becomes an error. A restart clears helpers left by a crash.
 
-Staging invokes `git` directly with prompts disabled, a restricted transport allowlist
-(`file`, `https`, `ssh`), and system config skipped. The harness is launched directly in its own
+Every staging `git` invocation, including three-way applies, runs with prompts disabled, a
+restricted transport allowlist (`file`, `https`, `ssh`), system and global config skipped, hooks
+disabled, and inherited config, askpass, proxy and repository-location environment scrubbed. The
+harness is launched directly in its own
 process group with an inherited environment of `PATH`, `HOME` and `LANG`, stdin closed, and
 capped output. Timeouts and idle-output detection bound a harness that never finishes. Those
 controls apply at the process and filesystem level. A harness needing a stronger boundary runs
@@ -179,12 +184,19 @@ credentials of the jobs that ran there.
 ## Denial of service and resource limits
 
 The controller caps JSON bodies at 1 MiB, a log chunk at 64 KiB plus framing, a diff at 10 MiB,
-a report at 1 MiB, and total job log storage at 50 MiB. It limits concurrent connections
+a report at 1 MiB, and total job log storage at 50 MiB. Before applying an input diff, the agent
+also bounds each `GIT binary patch` side to 256 MiB of inflated data and refuses malformed or
+size-mismatched binary patch data regardless of the conflict policy. It limits concurrent connections
 globally (`max_connections`) and per source address (`max_connections_per_addr`), times out
-header reads and requests, and drains for a fixed 10 seconds on shutdown. `lu-supervise` enforces
-its own run, idle and output limits on the harness.
+header reads and requests, closes a connection that is quiet or stuck writing for 120 seconds, and
+drains for a fixed 10 seconds on shutdown. The unauthenticated health check shares one 5-second,
+single-flight DB probe instead of querying SQLite on every request. Mirror syncs are limited to one
+at a time and six per operator per minute; base packs to four at a time and thirty per agent per
+minute. Both return `429 rate_limited` on contention. Artifact and log downloads are streamed under
+the same per-file caps instead of being read whole into memory. `lu-supervise` enforces its own run,
+idle and output limits on the harness.
 
-These are per-request and per-connection limits. Disk use follows the number of jobs an operator
+These are per-request, per-connection and per-principal limits. Disk use follows the number of jobs an operator
 submits and the artifacts an agent uploads within the per-file caps. Filesystem quotas, a
 dedicated volume and monitoring bound that growth. The login throttle works per source address
 alongside network access control.

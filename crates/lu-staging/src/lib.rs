@@ -10,6 +10,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use flate2::read::ZlibDecoder;
+
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
@@ -224,11 +226,8 @@ pub const INPUTS_DIR: &str = ".lu/inputs";
 
 /// Whether a diff path is inside `.lu/`, the tree-local collection directory.
 pub fn is_lu_path(path: &Path) -> bool {
-    path.components().find_map(|part| match part {
-        Component::Normal(name) => Some(name),
-        Component::CurDir => None,
-        _ => Some(OsStr::new("")),
-    }) == Some(OsStr::new(".lu"))
+    path.components()
+        .any(|part| matches!(part, Component::Normal(name) if name == OsStr::new(".lu")))
 }
 
 /// Picks a safe directory name for one collected input. A hostile or empty idempotency key falls
@@ -408,6 +407,11 @@ impl StagedDir {
 
 /// Largest base pack the controller will generate and the agent will accept.
 pub const PACK_CAP_BYTES: usize = 256 * 1024 * 1024;
+
+/// Largest inflated size a binary patch may declare or actually produce. libgit2 inflates a
+/// binary patch before it checks the declared length, so the on-disk 10 MiB patch cap alone
+/// cannot bound memory use when applying an untrusted dependency diff.
+pub const DIFF_INFLATED_CAP_BYTES: u64 = 256 * 1024 * 1024;
 
 fn git_err(error: git2::Error) -> StageError {
     StageError::Git {
@@ -722,7 +726,129 @@ impl Staging {
     pub fn apply_dependency_diff(staged: &StagedDir, patch: &[u8]) -> Result<(), ApplyError> {
         Self::apply_input_diff(staged, patch, "input", ConflictPolicy::Fail).map(|_| ())
     }
+}
 
+/// The base85 alphabet git uses inside `GIT binary patch` blocks.
+const BINARY_PATCH_BASE85: &[u8; 85] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+
+fn binary_patch_base85_value(byte: u8) -> Option<u64> {
+    BINARY_PATCH_BASE85
+        .iter()
+        .position(|&candidate| candidate == byte)
+        .map(|value| value as u64)
+}
+
+/// Decodes one base85 line of a binary patch. The first byte is the number of decoded bytes,
+/// as in git's patch writer: `A` is 1, `Z` is 26 and `a` is 27.
+fn decode_binary_patch_line(line: &[u8]) -> Result<Vec<u8>, String> {
+    let (&length, encoded) = line
+        .split_first()
+        .ok_or_else(|| "empty binary patch line".to_owned())?;
+    let decoded_len = match length {
+        b'A'..=b'Z' => usize::from(length - b'A') + 1,
+        b'a'..=b'z' => usize::from(length - b'a') + 27,
+        _ => return Err(format!("invalid binary patch line length {length:?}")),
+    };
+    let encoded_len = decoded_len.div_ceil(4) * 5;
+    if encoded.len() < encoded_len {
+        return Err("truncated binary patch data".to_owned());
+    }
+    let mut decoded = Vec::with_capacity(decoded_len);
+    for block in encoded[..encoded_len].as_chunks::<5>().0 {
+        let mut acc = 0u64;
+        for &byte in block {
+            let digit = binary_patch_base85_value(byte)
+                .ok_or_else(|| "invalid binary patch base85 data".to_owned())?;
+            acc = acc
+                .checked_mul(85)
+                .and_then(|acc| acc.checked_add(digit))
+                .ok_or_else(|| "invalid binary patch base85 data".to_owned())?;
+        }
+        for shift in [24, 16, 8, 0] {
+            if decoded.len() < decoded_len {
+                decoded.push((acc >> shift) as u8);
+            }
+        }
+    }
+    Ok(decoded)
+}
+
+/// Checks one side of a `GIT binary patch` block. `lines` is positioned at the `literal N` or
+/// `delta N` header and is advanced past the block's trailing blank line.
+fn preflight_binary_side<'a>(
+    lines: &mut impl Iterator<Item = &'a [u8]>,
+    cap: u64,
+) -> Result<(), String> {
+    let header = lines
+        .next()
+        .ok_or_else(|| "truncated binary patch".to_owned())?;
+    let space = header
+        .iter()
+        .position(|&byte| byte == b' ')
+        .ok_or_else(|| "invalid binary patch header".to_owned())?;
+    let (kind, declared_size) = header.split_at(space);
+    let declared_size = &declared_size[1..];
+    if kind != b"literal" && kind != b"delta" {
+        return Err(format!("unknown binary patch type {kind:?}"));
+    }
+    let declared: u64 = std::str::from_utf8(declared_size)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| "invalid binary patch size".to_owned())?;
+    if declared > cap {
+        return Err(format!(
+            "binary patch inflated size {declared} exceeds the {cap}-byte cap"
+        ));
+    }
+    let mut compressed = Vec::new();
+    for line in lines.by_ref() {
+        if line.is_empty() {
+            break;
+        }
+        compressed.extend_from_slice(&decode_binary_patch_line(line)?);
+    }
+    if compressed.is_empty() {
+        // A zero-length side has no data lines; that is how git encodes an unchanged side.
+        return if declared == 0 {
+            Ok(())
+        } else {
+            Err("binary patch has no data for its declared size".to_owned())
+        };
+    }
+    // `take` stops one byte past the declaration, so a lying patch cannot make us allocate more
+    // than the cap even when its compressed payload expands much further.
+    let mut inflater = ZlibDecoder::new(&compressed[..]).take(declared.saturating_add(1));
+    let mut inflated = Vec::new();
+    inflater
+        .read_to_end(&mut inflated)
+        .map_err(|error| format!("invalid binary patch data: {error}"))?;
+    let actual = inflated.len() as u64;
+    if actual != declared {
+        return Err(format!(
+            "binary patch inflated size {actual} does not match declared {declared}"
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects binary patches whose declared or actual inflated size exceeds `cap` before libgit2
+/// gets a chance to inflate them. Also fails closed on malformed binary patch data; a size cap
+/// is not a conflict policy and must not be bypassed by `on_conflict = skip` or `markers`.
+pub fn check_patch_inflate(patch: &[u8], cap: u64) -> Result<(), ApplyError> {
+    let mut lines = patch.split(|&byte| byte == b'\n').peekable();
+    while let Some(line) = lines.next() {
+        if line != b"GIT binary patch" {
+            continue;
+        }
+        preflight_binary_side(&mut lines, cap)
+            .and_then(|()| preflight_binary_side(&mut lines, cap))
+            .map_err(|detail| ApplyError::Git(format!("unsafe binary patch: {detail}")))?;
+    }
+    Ok(())
+}
+
+impl Staging {
     /// Apply one collected input's diff under `policy`. `name` labels conflict markers.
     ///
     /// Every strategy is tried in order: libgit2 apply, libgit2 three-way, then the git binary's
@@ -737,6 +863,9 @@ impl Staging {
         let label = conflict_label(name);
         let repo = git2::Repository::open(staged.path())
             .map_err(|e| ApplyError::Git(format!("failed to open repository: {e}")))?;
+        // libgit2 inflates binary patch payloads before checking their declared length. Refuse
+        // oversized or lying patches before `from_buffer`/`apply` can allocate for them.
+        check_patch_inflate(patch, DIFF_INFLATED_CAP_BYTES)?;
         let diff = match git2::Diff::from_buffer(patch) {
             Ok(diff) => diff,
             Err(error) => {
@@ -1256,8 +1385,10 @@ fn patch_location(patch: &[u8]) -> Option<(String, usize)> {
 /// Applies a patch with the git binary's fuzzy three-way apply. A missing git binary is reported
 /// as an ordinary error; the caller turns it into a conflict after exhausting all strategies.
 fn git_apply_3way(dir: &Path, patch: &[u8]) -> Result<(), String> {
-    let mut child = Command::new("git")
-        .args(["apply", "--3way", "-"])
+    let mut cmd = Command::new("git");
+    cmd.args(["apply", "--3way", "-"]);
+    harden(&mut cmd);
+    let mut child = cmd
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1511,14 +1642,33 @@ where
 }
 
 /// Limits what git may do on our behalf when we invoke git: only these transports (no
-/// `ext::` command transport), never a terminal prompt, and no pager or external helper
-/// settings from the environment.
+/// `ext::` command transport), never a terminal prompt, no system/global config, no hooks,
+/// and no pager, askpass, proxy or inherited `GIT_CONFIG_*` settings that could run helpers.
 fn harden(cmd: &mut Command) {
     cmd.env("GIT_ALLOW_PROTOCOL", "file:https:ssh")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_EXTERNAL_DIFF", "")
         .env("GIT_PAGER", "cat")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "http.followRedirects")
+        .env("GIT_CONFIG_VALUE_1", "false")
+        .env_remove("GIT_SSL_NO_VERIFY")
+        .env_remove("GIT_SSH")
+        .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_PROXY_COMMAND")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
 }
 
 fn format_git_failure(cmd: &str, status: std::process::ExitStatus, stderr: &str) -> String {
@@ -1774,6 +1924,10 @@ mod tests {
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.net")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.net")
             .output()
             .unwrap();
         assert!(
@@ -1781,6 +1935,48 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// Every git invocation must ignore global config and inherited `GIT_CONFIG_*` values;
+    /// otherwise a helper or URL rewrite from the agent's environment can run as the agent.
+    #[test]
+    fn git_hardening_scrubs_global_config_and_inherited_config_env() {
+        let tmp = TestDir::new("git-hardening");
+        let global = tmp.path.join("global.gitconfig");
+        fs::write(
+            &global,
+            "[url \"https://evil.invalid/\"]\n\tinsteadOf = https://good.invalid/\n",
+        )
+        .unwrap();
+
+        let run = |args: &[&str], inherited: &[(&str, &str)]| {
+            let mut cmd = Command::new("git");
+            cmd.args(args);
+            for (key, value) in inherited {
+                cmd.env(key, value);
+            }
+            harden(&mut cmd);
+            cmd.output().unwrap()
+        };
+
+        let inherited = [
+            ("GIT_CONFIG_GLOBAL", global.to_str().unwrap()),
+            (
+                "GIT_CONFIG_PARAMETERS",
+                "'url.https://evil.invalid/.insteadOf=evil:'",
+            ),
+            ("GIT_CONFIG_COUNT", "3"),
+            ("GIT_CONFIG_KEY_2", "core.hooksPath"),
+            ("GIT_CONFIG_VALUE_2", "/evil/hooks"),
+        ];
+        let out = run(&["config", "--get-regexp", "^url\\."], &inherited);
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("evil"),
+            "inherited url rewrite survived: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let out = run(&["config", "--get", "core.hooksPath"], &inherited);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "/dev/null");
     }
 
     fn source_repo(root: &Path) -> PathBuf {
@@ -1809,6 +2005,77 @@ mod tests {
         assert!(out.status.success());
         fs::write(repo.join("README.md"), "test\n").unwrap();
         out.stdout
+    }
+
+    fn binary_patch_from(repo: &Path) -> Vec<u8> {
+        fs::write(repo.join("blob.bin"), vec![0u8; 4096]).unwrap();
+        git(repo, &["add", "-N", "blob.bin"]);
+        let out = Command::new("git")
+            .args(["diff", "--no-color", "--binary", "HEAD", "--", "blob.bin"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        // `git add -N` leaves an intent-to-add index entry; clear it so callers can
+        // reuse the same fixture repository for staging.
+        git(repo, &["reset", "-q", "HEAD", "--", "blob.bin"]);
+        fs::remove_file(repo.join("blob.bin")).unwrap();
+        out.stdout
+    }
+
+    /// Rewrites the first non-zero `literal N` header of a binary patch, keeping its payload.
+    fn rewrite_declared_size(patch: &[u8], size: u64) -> Vec<u8> {
+        let text = String::from_utf8(patch.to_vec()).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        let line = lines
+            .iter_mut()
+            .find(|line| line.strip_prefix("literal ").is_some_and(|n| n != "0"))
+            .unwrap_or_else(|| panic!("no literal header in patch: {text:?}"));
+        *line = format!("literal {size}");
+        let mut out = lines.join("\n").into_bytes();
+        out.push(b'\n');
+        out
+    }
+
+    fn staged_repo(root: &Path) -> StagedDir {
+        let source = source_repo(root);
+        let work = root.join("work");
+        fs::create_dir(&work).unwrap();
+        Staging::new(&work)
+            .unwrap()
+            .stage(StageRequest {
+                job_id: "job".to_owned(),
+                source: Source::Path(source),
+                git_ref: "main".to_owned(),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_binary_patch_declaring_more_than_the_inflate_cap_is_refused() {
+        let tmp = TestDir::new("inflate-cap");
+        let repo = source_repo(&tmp.path.join("patch"));
+        let patch = rewrite_declared_size(&binary_patch_from(&repo), DIFF_INFLATED_CAP_BYTES + 1);
+        let staged = staged_repo(&tmp.path);
+        let error =
+            Staging::apply_input_diff(&staged, &patch, "input", ConflictPolicy::Fail).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("exceeds") && message.contains("cap"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_binary_patch_that_expands_past_its_declared_size_is_refused() {
+        let tmp = TestDir::new("inflate-mismatch");
+        let repo = source_repo(&tmp.path.join("patch"));
+        let patch = rewrite_declared_size(&binary_patch_from(&repo), 1);
+        let staged = staged_repo(&tmp.path);
+        let error =
+            Staging::apply_input_diff(&staged, &patch, "input", ConflictPolicy::Skip).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("does not match declared"), "{message}");
     }
 
     #[test]
@@ -1933,6 +2200,64 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, StageError::TrackedLuPath(_)), "{error}");
         assert!(error.to_string().contains(".lu/"), "{error}");
+    }
+
+    #[test]
+    fn a_nested_tracked_lu_path_is_a_stage_error() {
+        let tmp = TestDir::new("tracked-lu-nested");
+        let repo = tmp.path.join("source");
+        source_repo(&tmp.path);
+        git(&repo, &["checkout", "-q", "-b", "with-nested-lu"]);
+        fs::create_dir_all(repo.join("sub/.lu")).unwrap();
+        fs::write(repo.join("sub/.lu/tracked.txt"), "secret\n").unwrap();
+        git(&repo, &["add", "sub/.lu/tracked.txt"]);
+        git(&repo, &["commit", "-q", "-m", "track nested lu"]);
+
+        let work = tmp.path.join("work");
+        fs::create_dir(&work).unwrap();
+        let staging = Staging::new(&work).unwrap();
+        let error = staging
+            .stage(StageRequest {
+                job_id: "job".to_owned(),
+                source: Source::Path(repo),
+                git_ref: "with-nested-lu".to_owned(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, StageError::TrackedLuPath(_)), "{error}");
+        assert!(error.to_string().contains(".lu/"), "{error}");
+    }
+
+    #[test]
+    fn nested_lu_paths_are_excluded_from_the_exported_diff() {
+        let tmp = TestDir::new("diff-nested-lu");
+        let repo = source_repo(&tmp.path);
+        let work = tmp.path.join("work");
+        fs::create_dir(&work).unwrap();
+        let staging = Staging::new(&work).unwrap();
+        let staged = staging
+            .stage(StageRequest {
+                job_id: "job".to_owned(),
+                source: Source::Path(repo),
+                git_ref: "main".to_owned(),
+            })
+            .unwrap();
+
+        fs::create_dir_all(staged.path().join("sub/.lu")).unwrap();
+        fs::write(staged.path().join("sub/.lu/config"), "secret\n").unwrap();
+        fs::write(staged.path().join("visible.txt"), "output\n").unwrap();
+        let exported = Staging::export_diff_with_paths(&staged, 1 << 20).unwrap();
+        assert!(exported.changed_paths.iter().any(|p| p == "visible.txt"));
+        assert!(
+            exported
+                .changed_paths
+                .iter()
+                .all(|p| !p.split('/').any(|part| part == ".lu")),
+            "{:?}",
+            exported.changed_paths
+        );
+        let patch = String::from_utf8_lossy(&exported.bytes);
+        assert!(!patch.contains("sub/.lu/config"), "{patch}");
+        assert!(!patch.contains("secret"), "{patch}");
     }
 
     #[test]

@@ -40,6 +40,7 @@
     - { title: Tokens and TLS, url: /docs/tokens-and-tls.html }
     - { title: Token rotation, url: /docs/tokens-and-tls.html#rotation }
     - { title: Security, url: /docs/security.html }
+    - { title: Security scanning, url: /docs/security-scanning.html }
 - title: Reference
   items:
     - { title: HTTP API, url: /docs/api.html }

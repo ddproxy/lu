@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod file_body;
 pub mod health;
 pub mod metrics;
 pub mod operator;

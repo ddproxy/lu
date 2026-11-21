@@ -4,7 +4,7 @@ A job runs on a node that is idle, not draining and able to serve what the job n
 
 ## Priority and groups
 
-`--priority N` sets an integer from 0 (lowest) to 9 (highest); the default is 5. Dispatch takes the highest priority first and, within a priority, the oldest job first. A newly submitted high-priority job overtakes older, lower-priority queued jobs.
+`--priority N` sets an integer from 0 (lowest) to 9 (highest); the default is 5. Dispatch takes the highest priority first and, within a priority, the earliest submitted job first (persisted submission order, not wall-clock id order). A newly submitted high-priority job overtakes older, lower-priority queued jobs.
 
 `--group NAME` marks a job as part of a concurrency group. Names are 1-64 characters from `A-Z a-z 0-9 . _ -`. A controller can cap a group with `[[controller.groups]]`; jobs in unconfigured groups are unlimited. Jobs count toward the cap while `leased`, `running`, `recovering` or `needs_input`. A queued job blocked by a full group stays queued and reports `group limit (<name> <running>/<max>)` in `waiting_reason`. Cancellation and failure release the slot.
 

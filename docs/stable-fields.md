@@ -16,10 +16,10 @@ The controller chooses every artifact path. An agent cannot supply a name or dir
 | Item | Stable value |
 | --- | --- |
 | File names | Exactly `diff.patch`, `run.log`, `report.json`. |
-| Path | `<artifacts_dir>/<job id>/<file name>`. |
+| Path | `<artifacts_dir>/<job id>/<file name>`; symlinks are refused on reads and appends. |
 | Job view | `artifacts` lists the fixed names currently stored. |
 | Route | `GET /v1/jobs/{id}/artifacts/{name}` accepts one of the three names. Any other name, or a name not stored, is `404`. |
-| Modes | Files `0600`, job directories `0700`. |
+| Modes | Files `0600`, job directories `0700`; symlinks are refused rather than followed. |
 | Size caps | `diff.patch` 10 MiB, `run.log` 50 MiB, `report.json` 1 MiB. |
 
 `lu fetch` always tries those three names in that order and prints `skipped <name>: not found` for
@@ -50,7 +50,7 @@ parse human CLI output when the JSON response is available.
 | Unknown `JobSpec` fields ignored | `CHANGELOG.md` 0.1.14; other request bodies still reject unknown fields. |
 | Additive spec and view fields | 0.2.0 fallbacks, `assigned_provider`, `assigned_model`; 0.3.0 `collect`, `include_failed`, taints, `label_sources`, `provider_models`, `diff_bytes`, `outcome_note`; 0.3.1 `on_conflict`. |
 | Additive heartbeat and node fields | Changelog entries repeatedly say "No schema change" because pairs, labels, taints and `label_sources` travel in stored heartbeat data. |
-| Storage schema changes | Schema 5 and 6 added nullable columns for assigned providers and `diff_bytes`; older databases upgrade on open. Clients see additive JSON fields, not a new response shape. |
+| Storage schema changes | Schemas 5 and 6 added nullable columns for assigned providers and `diff_bytes`; schema 7 added `expect_failed`, schema 8 added cordon details, and schema 9 added `dispatch_seq` for persisted FIFO dispatch. Older databases upgrade on open. Clients see additive JSON fields, not a new response shape. |
 
 ## How changes are announced
 

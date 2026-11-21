@@ -36,14 +36,14 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_build_info{version}` | gauge | Always `1`; controller build version. |
 | `lu_uptime_seconds` | gauge | Seconds since the controller process started. |
 | `lu_db_bytes` | gauge | SQLite file size, excluding `-wal` and `-shm`. |
-| `lu_schema_version` | gauge | Schema version the binary expects; currently `8`. |
+| `lu_schema_version` | gauge | Schema version the binary expects; currently `9`. |
 | `lu_recovered_on_boot` | gauge | Jobs moved to `recovering` by this process's boot recovery. |
 | `lu_queue_oldest_seconds` | gauge | Age of the oldest `queued` or `blocked` job, or `0` when none. |
 | `lu_jobs{state}` | gauge | Jobs in each of nine zero-filled states: `blocked`, `queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`. |
 | `lu_group_running{group}` | gauge | Jobs in that configured group currently `leased`, `running`, `recovering` or `needs_input`. |
 | `lu_group_limit{group}` | gauge | Configured `max_running` cap for that group. |
 | `lu_nodes` | gauge | Nodes that have sent at least one heartbeat. |
-| `lu_nodes_online` | gauge | Nodes seen within two lease periods. |
+| `lu_nodes_online` | gauge | Nodes seen by this controller process within two lease periods; a restart clears prior liveness. |
 | `lu_nodes_drained` | gauge | Nodes with the drain flag set. |
 | `lu_controller_up` | gauge | Always `1` when the route answers. |
 | `lu_repo_last_sync_seconds{repo}` | gauge | Seconds since that configured mirror synced; `0` before its first sync. |
@@ -72,7 +72,7 @@ lu status --json
 {
   "version": "0.2.0",
   "uptime_secs": 3600,
-  "schema_version": 8,
+  "schema_version": 9,
   "db_bytes": 81920,
   "recovered_on_boot": 2,
   "jobs": {"blocked": 0, "queued": 1, "leased": 1, "running": 2, "recovering": 0, "needs_input": 0, "done": 12, "failed": 1, "cancelled": 0},

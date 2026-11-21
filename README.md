@@ -1,5 +1,11 @@
 # lu
 
+[![CI](https://github.com/ddproxy/lu/actions/workflows/ci.yml/badge.svg)](https://github.com/ddproxy/lu/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/ddproxy/lu/actions/workflows/codeql.yml/badge.svg)](https://github.com/ddproxy/lu/actions/workflows/codeql.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/ddproxy/lu/badge)](https://scorecard.dev/viewer/?uri=github.com/ddproxy/lu)
+[![Release](https://img.shields.io/github/v/release/ddproxy/lu)](https://github.com/ddproxy/lu/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/ddproxy/lu)](LICENSE)
+
 Lu is a small job queue for finite coding-agent work against git repositories. An operator
 submits a repo, ref and task; the controller stores jobs in SQLite and hands out leases. An agent
 stages a fresh checkout and runs the `opencode` harness, then uploads `diff.patch`, `run.log` and
@@ -203,6 +209,25 @@ Write tools: `lu_submit`, `lu_submit_many`, `lu_cancel`, `lu_retry`, `lu_drain`,
 
 - The agent runs the harness as the agent process's user; there is no built-in per-job user isolation. Use `harness_wrapper` to start it as another account, and see `docs/security.md`.
 
+## Security
+
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). The scanning
+workflows, where their findings appear, and the release verification steps are in
+[Security scanning](docs/security-scanning.md).
+
+### Verify a release
+
+Download the archive, its `.sha256` file and the CycloneDX SBOM from the release, then:
+
+```sh
+tag=v0.4.0
+target=x86_64-unknown-linux-musl
+asset="lu-${tag}-${target}.tar.gz"
+
+sha256sum -c "${asset}.sha256"
+gh attestation verify "$asset" --repo ddproxy/lu
+```
+
 ## Crates
 
 | Crate | Purpose |
@@ -259,6 +284,7 @@ MIT. See `LICENSE`.
 
 - [Tokens and TLS](docs/tokens-and-tls.md)
 - [Security](docs/security.md)
+- [Security scanning](docs/security-scanning.md)
 
 ### Reference
 

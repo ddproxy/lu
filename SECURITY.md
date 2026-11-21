@@ -2,29 +2,42 @@
 
 ## Reporting a vulnerability
 
-Email **security@example.net**. This is a placeholder address: replace it with the team's real
-security contact before publishing a release. If the project is hosted on a forge with private
-vulnerability reporting, that channel is preferable to email.
+Report vulnerabilities privately through the project's forge security channel: **Security →
+Report a vulnerability** (GitHub private vulnerability reporting). Use that channel instead of a
+public issue or an email address; it keeps the report confidential and gives the maintainers a
+private thread for follow-up. If private reporting is not enabled for this repository, contact a
+maintainer privately and ask for the current security address rather than guessing one.
+Report suspected vulnerabilities through GitHub private vulnerability reporting: use the
+**Report a vulnerability** button on the [Security tab](https://github.com/ddproxy/lu/security)
+or [submit a private advisory](https://github.com/ddproxy/lu/security/advisories/new). Do not
+open a public issue.
 
-Please do not open a public issue for a suspected vulnerability. Include the affected version,
-the configuration and platform, reproduction steps, and the impact you believe it has. Do not
-send real bearer tokens, TLS private keys or job contents; redact them. If a token or key may
-have leaked, rotate it as well as reporting it.
+Include the affected version, the configuration and platform, reproduction steps, and the impact
+you believe it has. Do not send real bearer tokens, TLS private keys or job contents; redact them.
+If a token or key may have leaked, rotate it as well as reporting it.
 
-We aim to acknowledge a report within three working days and to agree a disclosure date after a
-fix is available. This is a small project without a paid security team, so these are targets,
-not contractual guarantees.
+We aim to acknowledge a report within three working days and give an initial assessment within
+ten working days. We agree a disclosure date once a fix is available.
 
 ## Supported versions
 
+Only the [latest release](https://github.com/ddproxy/lu/releases/latest) receives security fixes.
+Older releases are not supported: upgrade to the latest release.
+
 | Version | Supported |
 | --- | --- |
+| 0.4.x | yes |
+| 0.3.x | yes |
 | 0.2.x | yes |
 | 0.1.x | yes |
 | earlier | no |
+| Latest release | yes |
+| Older releases | no |
 
-These are pre-1.0 releases. Security fixes may be issued as a new patch release rather than
-backported to older patch releases. Always run the newest supported release you can.
+## Security scanning
+
+The scanning workflows, where their findings appear, and how to verify a release are described in
+[Security scanning](docs/security-scanning.md).
 
 ## Scope
 

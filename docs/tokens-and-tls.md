@@ -60,7 +60,7 @@ write naming another node's job, gets `403 forbidden`.
 
 Ten failed token checks from one address within 60 seconds block that address for the rest of the
 window and return `429 rate_limited` with a retry delay. IPv6 addresses are counted by `/64`, and
-IPv4-mapped IPv6 addresses count as IPv4. Successes do not reset the count.
+IPv4-mapped IPv6 addresses count as IPv4. Successes do not reset the count. Separately, successful operator and agent requests are charged against per-principal budgets for mirror syncs and base packs; those also return `429 rate_limited` with `Retry-After` when exhausted.
 
 ## TLS modes
 

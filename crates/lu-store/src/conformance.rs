@@ -97,6 +97,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     cancel_recovering_ends_it_cancelled_immediately(&make());
     assignment_and_epoch(&make());
     higher_priority_dispatches_first(&make());
+    dispatch_follows_submission_order_when_the_clock_steps_back(&make());
     group_cap_holds_under_concurrent_polls(&make());
     terminal_and_failed_jobs_free_a_group_slot(&make());
     group_limit_is_reported_as_a_waiting_reason(&make());
@@ -128,6 +129,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     recovery_grace_survives_a_young_clock(&make());
     a_recovering_job_resumes_or_finishes_for_its_holder(&make());
     nodes_view(&make());
+    node_liveness_is_not_carried_over_a_restart(&make());
     drain_unknown_node_is_rejected(&make());
     blocked_on_submit_and_unblocked_on_done(&make());
     dependencies_already_done_queue_immediately(&make());
@@ -1935,6 +1937,35 @@ fn nodes_view<S: Store>(s: &S) {
     // create cordon via provider failure
 }
 
+/// A monotonic stamp persisted by the previous controller process must not make a node that has
+/// not heartbeated since the restart look online in `nodes` or `job_counts`.
+fn node_liveness_is_not_carried_over_a_restart<S: Store>(s: &S) {
+    s.heartbeat(
+        &hb("node-a", HarnessState::Idle, vec![]),
+        now(20, 1_000_000),
+    )
+    .unwrap();
+    assert!(s.nodes(now(20, 1_000_100), 1000).unwrap()[0].online);
+    assert_eq!(
+        s.job_counts(now(20, 1_000_100), 1000).unwrap().nodes_online,
+        1
+    );
+
+    // A fresh process starts its monotonic clock near zero. The old stamp would otherwise be
+    // far in the "future" and saturating_sub would report a fresh heartbeat.
+    s.recover_on_boot(now(20, 0)).unwrap();
+    assert!(
+        !s.nodes(now(20, 0), 1000).unwrap()[0].online,
+        "a node from the previous process must be offline"
+    );
+    assert_eq!(s.job_counts(now(20, 0), 1000).unwrap().nodes_online, 0);
+
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(20, 100))
+        .unwrap();
+    assert!(s.nodes(now(20, 200), 1000).unwrap()[0].online);
+    assert_eq!(s.job_counts(now(20, 200), 1000).unwrap().nodes_online, 1);
+}
+
 /// A job that only just began recovering must wait out the grace even when the clock is near zero.
 fn recovery_grace_survives_a_young_clock<S: Store>(s: &S) {
     let (rec, _) = s
@@ -2122,6 +2153,27 @@ fn higher_priority_dispatches_first<S: Store>(s: &S) {
     .unwrap();
     let second = s.next_assignment(&n, now(7, 7), 60_000).unwrap().unwrap();
     assert_eq!(second.job_id, old.id, "equal priorities use creation time");
+}
+
+/// Queue order is submission order, not the order of wall-clock timestamps embedded in job ids or
+/// recorded in `created_at`: a clock step must not let a later submission overtake an older one.
+fn dispatch_follows_submission_order_when_the_clock_steps_back<S: Store>(s: &S) {
+    let n = node("fifo-node");
+    s.heartbeat(&hb("fifo-node", HarnessState::Idle, vec![]), now(10, 10))
+        .unwrap();
+    let (first, _) = s
+        .create_job(&spec("https://x/fifo-first.git", None), now(10_000, 10))
+        .unwrap();
+    let (second, _) = s
+        .create_job(&spec("https://x/fifo-second.git", None), now(100, 20))
+        .unwrap();
+
+    let assigned = s.next_assignment(&n, now(11, 30), 60_000).unwrap().unwrap();
+    assert_eq!(
+        assigned.job_id, first.id,
+        "a clock step back must not put the later job {} ahead of {}",
+        second.id, first.id
+    );
 }
 
 fn group_cap_holds_under_concurrent_polls<S: Store>(s: &S) {

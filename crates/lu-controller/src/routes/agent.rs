@@ -1,5 +1,7 @@
 use crate::auth::authenticate_agent;
 use crate::error::ApiError;
+use crate::limits::PACK_PER_TOKEN;
+use crate::routes::file_body::{file_len, into_response, stream_range};
 use crate::routes::{
     json_ok, read_json, read_raw_limited, store_err, with_version, MAX_DIFF_BODY, MAX_JSON_BODY,
     MAX_LOG_CHUNK_BODY, MAX_REPORT_BODY,
@@ -304,14 +306,19 @@ async fn write_log_chunk(path: &std::path::Path, offset: u64, bytes: &[u8]) -> s
             .mode(0o700)
             .create(parent)
             .await?;
+        let meta = tokio::fs::symlink_metadata(parent).await?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact job directory is not a real directory",
+            ));
+        }
     }
-    let mut f = tokio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .await?;
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.create(true).truncate(false).write(true).mode(0o600);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW);
+    let mut f = opts.open(path).await?;
     // A partial write that failed may have left bytes past the stored length. Trim them so a
     // retry lands exactly at the reserved offset.
     if f.metadata().await?.len() > offset {
@@ -535,6 +542,24 @@ async fn put_artifact_impl(
         Ok(_) => {}
         Err(lu_staging::ArtifactError::AlreadyExists(_)) => {}
         Err(_) => return with_version(ApiError::internal().into_response()),
+    }
+    // The store's epoch check above cannot cover a lease transfer that happens while we are
+    // writing. Recheck immediately before the atomic rename so a holder that lost the job
+    // between `record_artifact` and `write` cannot overwrite the newer attempt's artifact.
+    let rec_final = {
+        let store = Arc::clone(&state.store);
+        let jid = job_id.clone();
+        match tokio::task::spawn_blocking(move || store.get_job(&jid)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return with_version(store_err(e).into_response()),
+            Err(_) => return with_version(ApiError::internal().into_response()),
+        }
+    };
+    if rec_final.node.as_ref() != Some(&node) {
+        return with_version(ApiError::forbidden("forbidden").into_response());
+    }
+    if rec_final.epoch != epoch {
+        return with_version(ApiError::stale_epoch().into_response());
     }
     let res_write = tokio::task::spawn_blocking({
         let ad = ad.clone();
@@ -760,17 +785,16 @@ pub async fn get_dep_diff(
     if !rec.spec.after.contains(&dep_id) {
         return with_version(ApiError::forbidden("forbidden").into_response());
     }
-    match tokio::fs::read(dependency_diff_path(&state, &dep_id)).await {
-        Ok(bytes) => {
-            let res = (
-                StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-                bytes,
-            )
-                .into_response();
-            with_version(res)
-        }
-        Err(_) => with_version(ApiError::not_found("not found").into_response()),
+    let path = dependency_diff_path(&state, &dep_id);
+    let cap = ArtifactName::DiffPatch.max_bytes();
+    let result = async {
+        let len = file_len(&path, cap).await?;
+        stream_range(&path, cap, 0, len).await
+    }
+    .await;
+    match result {
+        Ok(file) => with_version(into_response(file, "application/octet-stream")),
+        Err(error) => with_version(error.into_response()),
     }
 }
 
@@ -827,26 +851,18 @@ pub async fn get_dep_artifact(
         .artifacts_dir
         .join(dep_id.to_string())
         .join(artifact.file_name());
-    let bytes = match tokio::fs::read(path).await {
-        Ok(bytes) => bytes,
-        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
-    };
-    let bytes = match tail {
-        Some(tail) => {
-            let skip = bytes
-                .len()
-                .saturating_sub(usize::try_from(tail).unwrap_or(usize::MAX));
-            bytes[skip..].to_vec()
-        }
-        None => bytes,
-    };
-    let res = (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        bytes,
-    )
-        .into_response();
-    with_version(res)
+    let cap = artifact.max_bytes();
+    let result = async {
+        let len = file_len(&path, cap).await?;
+        let count = tail.map(|tail| tail.min(len)).unwrap_or(len);
+        // Seek straight to the tail; never read (or hold) the prefix in memory.
+        stream_range(&path, cap, len - count, count).await
+    }
+    .await;
+    match result {
+        Ok(file) => with_version(into_response(file, "application/octet-stream")),
+        Err(error) => with_version(error.into_response()),
+    }
 }
 
 pub async fn put_diff_artifact(
@@ -912,6 +928,15 @@ pub async fn job_base(
     let Ok(oid) = git2::Oid::from_str(commit_id) else {
         return with_version(ApiError::not_found("invalid base commit").into_response());
     };
+    // Packing walks trees and copies objects. Only a few may run at once, and each node has a
+    // small budget, so repeated requests cannot monopolise the controller's CPU and disk.
+    let Ok(slot) = Arc::clone(&state.pack_slots).try_acquire_owned() else {
+        return with_version(ApiError::rate_limited(1).into_response());
+    };
+    if let Err(retry_after) = state.pack_limiter.allow(node.as_ref(), PACK_PER_TOKEN) {
+        drop(slot);
+        return with_version(ApiError::rate_limited(retry_after).into_response());
+    }
 
     let packed = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
@@ -1015,7 +1040,10 @@ mod poll_renewal_tests {
     use axum::extract::State;
     use lu_auth::sha256_hex;
     use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator};
-    use lu_proto::{ArtifactName, Completion, Heartbeat, JobSpec, NodeName};
+    use lu_proto::{
+        ArtifactName, Completion, Heartbeat, JobSpec, JobState, NodeName, DEFAULT_PRIORITY,
+        DEFAULT_TIMEOUT_SECS,
+    };
     use lu_store::{JobCounts, JobRecord, Now, Store, StoreError};
     use std::net::SocketAddr;
     use std::sync::Mutex;
@@ -1027,14 +1055,68 @@ mod poll_renewal_tests {
         cancels: Vec<(JobId, u64)>,
         held: Vec<(JobId, u64)>,
         renewed: Mutex<Vec<(JobId, u64)>>,
+        /// Epochs returned by successive `get_job` calls, used to script a lease transfer.
+        epochs: Mutex<Vec<u64>>,
     }
 
     impl Store for RecordingStore {
         fn create_job(&self, _spec: &JobSpec, _now: Now) -> Result<(JobRecord, bool), StoreError> {
             unimplemented!()
         }
-        fn get_job(&self, _id: &JobId) -> Result<JobRecord, StoreError> {
-            unimplemented!()
+        fn get_job(&self, id: &JobId) -> Result<JobRecord, StoreError> {
+            let mut epochs = self
+                .epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let epoch = epochs.remove(0);
+            Ok(JobRecord {
+                id: id.clone(),
+                state: JobState::Running,
+                spec: JobSpec {
+                    repo: "https://example.net/repo.git".to_owned(),
+                    git_ref: "main".to_owned(),
+                    base_commit: None,
+                    task: "run tests".to_owned(),
+                    harness: "opencode".to_owned(),
+                    provider: None,
+                    model: None,
+                    timeout_secs: DEFAULT_TIMEOUT_SECS,
+                    idle_timeout_secs: None,
+                    on_stuck: None,
+                    stuck_after_secs: None,
+                    idempotency_key: None,
+                    after: Vec::new(),
+                    stack_dependencies: true,
+                    collect: None,
+                    include_failed: false,
+                    on_conflict: Default::default(),
+                    allow_empty: false,
+                    requires: Vec::new(),
+                    tolerates: Vec::new(),
+                    priority: DEFAULT_PRIORITY,
+                    group: None,
+                    fallbacks: Vec::new(),
+                    expect: None,
+                },
+                attempt: 1,
+                node: Some(NodeName::parse("node-a").unwrap()),
+                assigned_provider: None,
+                assigned_model: None,
+                epoch,
+                created_at: 1,
+                updated_at: 2,
+                started_at: Some(2),
+                finished_at: None,
+                failure_class: None,
+                summary: None,
+                exit_code: None,
+                artifacts: Vec::new(),
+                cancel_requested: false,
+                log_len: 0,
+                diff_bytes: None,
+                expect_failed: false,
+                waiting_on: Vec::new(),
+            })
         }
         fn job_by_key(&self, _key: &str) -> Option<JobRecord> {
             None
@@ -1116,7 +1198,7 @@ mod poll_renewal_tests {
             _name: ArtifactName,
             _bytes: u64,
         ) -> Result<(), StoreError> {
-            unimplemented!()
+            Ok(())
         }
         fn complete(
             &self,
@@ -1187,6 +1269,7 @@ mod poll_renewal_tests {
             cancels: vec![(cancel.clone(), 3)],
             held: vec![(cancel.clone(), 3), (other.clone(), 7)],
             renewed: Mutex::new(Vec::new()),
+            epochs: Mutex::new(Vec::new()),
         });
         let cfg = ControllerConfig {
             listen: "127.0.0.1:0".to_owned(),
@@ -1232,5 +1315,64 @@ mod poll_renewal_tests {
                 .clone(),
             vec![(cancel, 3), (other, 7)]
         );
+    }
+
+    #[tokio::test]
+    async fn a_lease_transfer_between_checks_cannot_overwrite_the_new_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let job_id = JobId::new();
+        let store = Arc::new(RecordingStore {
+            epochs: Mutex::new(vec![1, 2]),
+            ..Default::default()
+        });
+        let cfg = ControllerConfig {
+            listen: "127.0.0.1:0".to_owned(),
+            db: tmp.path().join("lu.db").display().to_string(),
+            artifacts_dir: tmp.path().join("artifacts").display().to_string(),
+            lease_secs: 6,
+            max_retries: 1,
+            provider_cooldown_secs: 60,
+            recovery_grace_secs: 1,
+            max_connections: 8,
+            max_connections_per_addr: 4,
+            local_repo_roots: Vec::new(),
+            agents: vec![ControllerAgent {
+                name: "node-a".to_owned(),
+                token_sha256: sha256_hex(TOKEN),
+            }],
+            operators: vec![ControllerOperator {
+                name: "ops".to_owned(),
+                token_sha256: sha256_hex("unused-operator-token"),
+            }],
+            repos: Vec::new(),
+            groups: Vec::new(),
+        };
+        let state = Arc::new(AppState::from_config(&cfg, store).unwrap());
+        let dir = tmp.path().join("artifacts").join(job_id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("diff.patch");
+        std::fs::write(&path, b"newer attempt\n").unwrap();
+
+        let uri = format!("/v1/agent/jobs/{job_id}/artifacts/diff.patch?epoch=1");
+        let req = axum::extract::Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(axum::body::Body::from("stale attempt\n"))
+            .unwrap();
+        let headers = req.headers().clone();
+        let peer = axum::Extension(PeerAddr("127.0.0.1:4000".parse::<SocketAddr>().unwrap()));
+        let res = put_diff_artifact(
+            State(state),
+            peer,
+            headers,
+            Path(job_id.to_string()),
+            req.uri().clone(),
+            req,
+        )
+        .await;
+
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(std::fs::read(&path).unwrap(), b"newer attempt\n");
     }
 }

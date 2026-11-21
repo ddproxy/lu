@@ -363,6 +363,10 @@ struct Model<S: Store> {
     now: Now,
     log: SharedLog,
     seq: u64,
+    /// Submission order, kept from the id returned by each successful create. Dispatch uses the
+    /// store's persisted sequence, not wall-clock timestamps.
+    submit_order: BTreeMap<JobId, u64>,
+    next_submit: u64,
     records: BTreeMap<JobId, JobRecord>,
     nodes: BTreeMap<NodeName, Heartbeat>,
     node_generation: BTreeMap<NodeName, u64>,
@@ -393,6 +397,8 @@ impl<S: Store> Model<S> {
             },
             log,
             seq: 0,
+            submit_order: BTreeMap::new(),
+            next_submit: 1,
             records: BTreeMap::new(),
             nodes: BTreeMap::new(),
             node_generation: BTreeMap::new(),
@@ -605,6 +611,9 @@ impl<S: Store> Model<S> {
                 assert!(record.artifacts.is_empty());
                 assert_eq!(record.spec, spec);
                 self.artifacts.insert(record.id.clone(), BTreeSet::new());
+                self.submit_order
+                    .insert(record.id.clone(), self.next_submit);
+                self.next_submit = self.next_submit.saturating_add(1);
                 self.node_retries.insert(record.id.clone(), 0);
                 for dep in &record.spec.after {
                     self.dependents
@@ -705,11 +714,11 @@ impl<S: Store> Model<S> {
                     record.state == JobState::Queued && self.provider_eligible(&node_name, record)
                 })
                 .min_by(|a, b| {
-                    b.spec
-                        .priority
-                        .cmp(&a.spec.priority)
-                        .then(a.created_at.cmp(&b.created_at))
-                        .then(a.id.cmp(&b.id))
+                    b.spec.priority.cmp(&a.spec.priority).then(
+                        self.submit_order
+                            .get(&a.id)
+                            .cmp(&self.submit_order.get(&b.id)),
+                    )
                 })
                 .map(|record| (record.id.clone(), record.epoch))
         };

@@ -1,0 +1,11 @@
+[package]
+name = "check-workflows"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone tool: the root workspace does not build it.
+[workspace]
+
+[dependencies]
+serde_yaml = "=0.9.34"

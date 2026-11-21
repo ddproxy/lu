@@ -25,6 +25,14 @@ fn router() -> Router {
             }),
         )
         .route(
+            "/delay",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                "late"
+            }),
+        )
+        .route("/big", get(|| async { vec![b'x'; 8 * 1024 * 1024] }))
+        .route(
             "/peer",
             get(|Extension(PeerAddr(peer)): Extension<PeerAddr>| async move { peer.to_string() }),
         );
@@ -37,6 +45,7 @@ fn options(max_connections: usize, per_addr: usize) -> ServeOptions {
         max_connections_per_addr: per_addr,
         header_read_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
+        connection_idle_timeout: Duration::from_secs(30),
     }
 }
 
@@ -255,6 +264,56 @@ async fn a_handler_that_overruns_the_request_timeout_gets_a_408() {
     assert!(
         status_line(&ok).contains("200"),
         "other requests still work: {ok}"
+    );
+    server.stop.send(()).unwrap();
+    let _ = server.task.await;
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_loses_the_connection() {
+    let mut short = options(8, 4);
+    short.connection_idle_timeout = Duration::from_millis(200);
+    let server = start(short, None).await;
+    let mut stream = TcpStream::connect(server.addr).await.unwrap();
+    stream
+        .write_all(get_request("/big", "").as_bytes())
+        .await
+        .unwrap();
+    // Let the response fill the socket buffer and the server block on the write.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut out = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut out)).await;
+    assert!(read.is_ok(), "the stalled connection was closed: {read:?}");
+    assert!(
+        out.len() < 8 * 1024 * 1024,
+        "the response should have been cut short, got {} bytes",
+        out.len()
+    );
+    server.stop.send(()).unwrap();
+    let _ = server.task.await;
+}
+
+#[tokio::test]
+async fn keep_alive_requests_outlive_the_idle_watchdog_while_active() {
+    let mut short = options(8, 4);
+    short.connection_idle_timeout = Duration::from_millis(100);
+    let server = start(short, None).await;
+    let mut stream = TcpStream::connect(server.addr).await.unwrap();
+    let pipelined = concat!(
+        "GET /delay HTTP/1.1\r\nHost: test\r\n\r\n",
+        "GET /ping HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(pipelined.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut out))
+        .await
+        .expect("both responses arrive")
+        .unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(
+        text.matches("HTTP/1.1 200").count(),
+        2,
+        "an active request must not trip the idle watchdog: {text}"
     );
     server.stop.send(()).unwrap();
     let _ = server.task.await;

@@ -24,7 +24,10 @@ impl ControllerRuntime {
         build_router(Arc::clone(&self.state))
     }
 
-    /// Runs boot recovery and periodic lease maintenance until `shutdown` resolves.
+    /// Runs periodic lease maintenance until `shutdown` resolves.
+    ///
+    /// Boot recovery must be run separately (and awaited) before the service starts:
+    /// recovering with stale leases can otherwise reassign work twice.
     pub async fn run_background(&self, shutdown: impl Future<Output = ()>) {
         run_background(Arc::clone(&self.state), shutdown).await;
     }
@@ -136,7 +139,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     with_request_ids(app)
 }
 
-pub async fn recover_on_boot(state: &Arc<AppState>) {
+/// Moves every leased or running job to `recovering` before any requests are served.
+///
+/// Failure is fatal to startup: serving with stale leases would let a new process
+/// hand the same job to a second agent after the old process's monotonic clock
+/// has reset.
+pub async fn recover_on_boot(state: &Arc<AppState>) -> Result<u64, String> {
     let n = now();
     let res = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
@@ -150,9 +158,10 @@ pub async fn recover_on_boot(state: &Arc<AppState>) {
                 tracing::info!(count, "recovered jobs on boot");
                 state.waiters.notify_work();
             }
+            Ok(count)
         }
-        Ok(Err(e)) => tracing::warn!(?e, "recover_on_boot failed"),
-        Err(e) => tracing::warn!(%e, "recover_on_boot task failed"),
+        Ok(Err(e)) => Err(format!("recover_on_boot failed: {e:?}")),
+        Err(e) => Err(format!("recover_on_boot task failed: {e}")),
     }
 }
 
@@ -199,7 +208,6 @@ pub async fn maintenance_tick(state: &Arc<AppState>) {
 }
 
 pub async fn run_background(state: Arc<AppState>, shutdown: impl Future<Output = ()>) {
-    recover_on_boot(&state).await;
     let interval = std::time::Duration::from_secs(background_interval_secs(state.lease_secs));
     tokio::pin!(shutdown);
     let mut ticker = tokio::time::interval(interval);
@@ -214,5 +222,153 @@ pub async fn run_background(state: Arc<AppState>, shutdown: impl Future<Output =
                 maintenance_tick(&state).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lu_config::ControllerConfig;
+    use lu_proto::{ArtifactName, Completion, FailureClass, JobEdit, JobId, JobSpec, NodeName};
+    use lu_store::{CordonSource, JobRecord, Now, Store, StoreError};
+    use std::collections::HashMap;
+
+    struct FailingRecoveryStore;
+
+    impl Store for FailingRecoveryStore {
+        fn create_job(&self, _: &JobSpec, _: Now) -> Result<(JobRecord, bool), StoreError> {
+            unimplemented!()
+        }
+        fn get_job(&self, _: &JobId) -> Result<JobRecord, StoreError> {
+            unimplemented!()
+        }
+        fn job_by_key(&self, _: &str) -> Option<JobRecord> {
+            None
+        }
+        fn list_jobs(
+            &self,
+            _: Option<lu_proto::JobState>,
+            _: usize,
+            _: Option<&JobId>,
+        ) -> Result<Vec<JobRecord>, StoreError> {
+            unimplemented!()
+        }
+        fn cancel_job(&self, _: &JobId, _: Now) -> Result<JobRecord, StoreError> {
+            unimplemented!()
+        }
+        fn edit_job(&self, _: &JobId, _: &JobEdit, _: Now) -> Result<JobRecord, StoreError> {
+            unimplemented!()
+        }
+        fn heartbeat(&self, _: &lu_proto::Heartbeat, _: Now) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn next_assignment(
+            &self,
+            _: &NodeName,
+            _: Now,
+            _: u64,
+        ) -> Result<Option<lu_store::Assignment>, StoreError> {
+            unimplemented!()
+        }
+        fn pending_cancels(&self, _: &NodeName) -> Result<Vec<(JobId, u64)>, StoreError> {
+            unimplemented!()
+        }
+        fn held_jobs(&self, _: &NodeName) -> Result<Vec<(JobId, u64)>, StoreError> {
+            unimplemented!()
+        }
+        fn start_job(&self, _: &JobId, _: u64, _: Now) -> Result<JobRecord, StoreError> {
+            unimplemented!()
+        }
+        fn renew_lease(&self, _: &JobId, _: u64, _: Now, _: u64) -> Result<bool, StoreError> {
+            unimplemented!()
+        }
+        fn reserve_log(&self, _: &JobId, _: u64, _: u64, _: u64) -> Result<u64, StoreError> {
+            unimplemented!()
+        }
+        fn unreserve_log(&self, _: &JobId, _: u64, _: u64, _: u64) -> Result<u64, StoreError> {
+            unimplemented!()
+        }
+        fn record_artifact(
+            &self,
+            _: &JobId,
+            _: u64,
+            _: ArtifactName,
+            _: u64,
+        ) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn complete(
+            &self,
+            _: &Completion,
+            _: Option<(FailureClass, Option<String>)>,
+            _: Now,
+            _: u32,
+            _: u64,
+        ) -> Result<JobRecord, StoreError> {
+            unimplemented!()
+        }
+        fn expire_leases(&self, _: Now) -> Result<Vec<JobId>, StoreError> {
+            unimplemented!()
+        }
+        fn requeue_recovering(&self, _: Now, _: u64, _: u32) -> Result<Vec<JobId>, StoreError> {
+            unimplemented!()
+        }
+        fn recover_on_boot(&self, _: Now) -> Result<u64, StoreError> {
+            Err(StoreError::Internal("recovery unavailable".to_owned()))
+        }
+        fn set_draining(&self, _: &NodeName, _: bool) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn nodes(&self, _: Now, _: u64) -> Result<Vec<lu_store::NodeRecord>, StoreError> {
+            unimplemented!()
+        }
+        fn cordons(&self, _: Option<&NodeName>) -> Result<Vec<lu_store::Cordon>, StoreError> {
+            unimplemented!()
+        }
+        fn set_cordon(
+            &self,
+            _: &NodeName,
+            _: &str,
+            _: CordonSource,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn uncordon(&self, _: &NodeName, _: Option<&str>) -> Result<Vec<String>, StoreError> {
+            unimplemented!()
+        }
+        fn job_counts(&self, _: Now, _: u64) -> Result<lu_store::JobCounts, StoreError> {
+            unimplemented!()
+        }
+        fn set_group_limits(&self, _: HashMap<String, usize>) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_recovery_failure_stops_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ControllerConfig {
+            listen: "127.0.0.1:0".to_owned(),
+            db: tmp.path().join("lu.db").display().to_string(),
+            artifacts_dir: tmp.path().join("artifacts").display().to_string(),
+            lease_secs: 6,
+            max_retries: 1,
+            provider_cooldown_secs: 60,
+            recovery_grace_secs: 1,
+            max_connections: 8,
+            max_connections_per_addr: 4,
+            local_repo_roots: Vec::new(),
+            agents: Vec::new(),
+            operators: Vec::new(),
+            repos: Vec::new(),
+            groups: Vec::new(),
+        };
+        let state = Arc::new(AppState::from_config(&cfg, Arc::new(FailingRecoveryStore)).unwrap());
+        let error = recover_on_boot(&state).await.unwrap_err();
+        assert!(error.contains("recovery unavailable"), "{error}");
+        assert_eq!(state.recovered_on_boot(), 0);
     }
 }
