@@ -62,7 +62,7 @@ If a dependency patch cannot be applied, the job finishes `failed` with
 `failure_class: "conflict"` and a summary such as:
 
 ```text
-dependency <id> could not be applied; conflicts: src/main.rs, tests/main.rs
+input build (01ARZ3NDEKTSV4RRFFQ69G5FAV) could not be applied; conflicts: src/main.rs, tests/main.rs
 ```
 
 An unreadable or otherwise invalid patch is also a conflict; its detail is appended to the

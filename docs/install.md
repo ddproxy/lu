@@ -1,6 +1,6 @@
 # Install
 
-Lu ships as one statically linked binary. Build from source or use a release archive, then write a controller config, start the controller and add agents. Config keys are in [config.md](config.md); service details are in [operations.md](operations.md).
+Release archives contain a statically linked `lu`, built for musl targets. A plain `make build` produces a release binary for the host toolchain; it is not necessarily statically linked. Build from source or use a release archive, then write a controller config, start the controller and add agents. Config keys are in [config.md](config.md); service details are in [operations.md](operations.md).
 
 ```mermaid
 flowchart LR
@@ -127,7 +127,7 @@ systemctl enable --now lu-agent.service
 lu nodes
 ```
 
-The unit's `Description` and the sample config's leading comment still say there is no agent runtime; those comments are stale. Its `ExecStart=/usr/local/bin/lu agent --config /etc/lu/agent.toml` is the correct command. The agent stores provider credentials on its own host; see [security.md](security.md).
+The contributed unit starts the agent as `lu` with `ExecStart=/usr/local/bin/lu agent --config /etc/lu/agent.toml` and the `lu-harness` supplementary group. The sample config is a deployment template for `/etc/lu/agent.toml`: set `name`, `controller_url`, `token_file`, `work_dir` and `harness` before enabling the unit. The agent stores provider credentials on its own host; see [security.md](security.md).
 
 For a foreground check without systemd:
 

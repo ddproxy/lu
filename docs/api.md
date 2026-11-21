@@ -2,6 +2,9 @@
 
 The controller serves JSON over HTTPS; plain HTTP is accepted only on loopback. Routes use `Authorization: Bearer <token>` except `GET /v1/health`. Tokens have `operator` or `agent` scope; an agent token is bound to one node name. Missing, unknown and wrong-scope tokens all get `401 unauthorized` with `WWW-Authenticate: Bearer`, so a probe cannot tell them apart. A valid agent token used for another node's job or heartbeat gets `403 forbidden`. JSON bodies are capped at 1 MiB, log chunks at 64 KiB plus framing, diffs at 10 MiB plus framing and reports at 1 MiB plus framing. Errors are `{"error":"<code>","message":"<text>"}` with an optional `length` field (for example, a log-offset conflict). Codes are `bad_request`, `unauthorized`, `forbidden`, `not_found`, `unprocessable`, `conflict`, `stale_epoch`, `too_large`, `rate_limited` and `internal`. Times in JSON are integer Unix seconds. Job ids are 26-character Crockford base32 strings. Unknown `JobSpec` fields are ignored; other request bodies reject unknown fields.
 
+Compatibility rules for these fields and the fixed artifact names are in
+[stable fields](stable-fields.md).
+
 Agents poll; the controller has no push channel. Lease expiry uses the controller's monotonic clock.
 
 Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file (`$XDG_CONFIG_HOME/lu/operator.toml`, `~/.config/lu/operator.toml` or `/etc/lu/operator.toml`). An agent token on an operator route gets `401`; `--config` is not an operator credential source.

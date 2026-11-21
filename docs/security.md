@@ -72,8 +72,10 @@ successful request does not reset the count.
 For token generation, hash configuration, private-file rules and rotation, see
 [Tokens and TLS](tokens-and-tls.md#token-files-and-hashes). The controller stores only SHA-256
 hashes, so the value hashed into `token_sha256` is the same byte sequence the client later sends
-as the bearer token; the same private-file rules cover `reiki_token_file` when that optional
-health check is configured.
+as the bearer token. `reiki_token_file`, when the optional Reiki health check is configured, uses
+those rules: a regular file owned by the agent account, mode `0600` or tighter with no group or
+other bits, no symlink or FIFO, opened with `O_NOFOLLOW | O_NONBLOCK`. It holds one token line,
+read at most 4 KiB when used and 64 KiB when the config loads.
 
 ## TLS and transport
 

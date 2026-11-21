@@ -36,8 +36,9 @@ put `target/release` on `PATH` or run `make install` first.
    ```
 
 2. Write `$HOME/lu-demo/lu.toml`, replacing the two hash placeholders with the values printed
-   for the token files. The agent's `work_dir` is created with mode `0700` on first start if it
-   does not exist; if it does exist, it must be a real directory, not a symlink.
+   for the token files. The agent creates `work_dir` recursively with mode `0700` at first start
+   if it is missing. An existing path must be a real directory, not a symlink; staging rejects `/`
+   and bare top-level directories such as `/srv`.
 
    ```toml
    [controller]
@@ -108,10 +109,11 @@ put `target/release` on `PATH` or run `make install` first.
    ```
 
    `lu ls` uses the header `ID STATE NODE ATTEMPT AFTER CREATED NOTE`. `lu show` prints key/value
-   rows (`id`, `state`, `node`, `attempt`, `epoch`, `created_at`, `started_at`, `finished_at`,
-   `failure`, `waiting`, `summary`, `diff_bytes`, `outcome_note`). Terminal jobs report
-   `diff_bytes`, so a failed job that wrote files before failing still advertises its partial
-   diff. `lu logs --follow` streams stored output and stops when the job reaches a terminal state.
+   rows (`id`, `state`, `node`, `assigned_provider`, `fallbacks`, `tolerates`, `attempt`, `epoch`,
+   `created_at`, `started_at`, `finished_at`, `failure`, `waiting`, `summary`, `outcome_note`,
+   `diff_bytes`). Terminal jobs report `diff_bytes`, so a failed job that wrote files before failing
+   still advertises its partial diff. `lu logs --follow` streams stored output and stops when the job
+   reaches a terminal state.
    `lu fetch` prints one `saved <path>` line per file: `results/diff.patch`, `results/run.log` and
    `results/report.json`. It also fetches artifacts of failed jobs.
 
@@ -219,17 +221,49 @@ MIT. See `LICENSE`.
 
 ## Documentation
 
+- [Quickstart: one shell, ten minutes](docs/quickstart.md)
+### Quickstart
+
+- [Quickstart](#quickstart)
+- [Worked examples](docs/examples.md)
+
+### Concepts
+
 - [Concepts](docs/concepts.md)
 - [Job Lifecycle](docs/lifecycle.md)
 - [Dependencies](docs/dependencies.md)
 - [Choosing where a job runs](docs/dispatch.md)
+
+### Install
+
 - [Install](docs/install.md)
-- [Tokens and TLS](docs/tokens-and-tls.md)
+
+### Configuration
+
 - [Configuration](docs/config.md)
+- [Running the opencode harness](docs/opencode-harness.md)
 - [HTTP API](docs/api.md)
 - [Client guide](docs/client-guide.md)
 - [MCP server](docs/mcp.md)
+
+### Operate
+
+- [Lu with Reiki](docs/reiki.md)
 - [Operations](docs/operations.md)
+- [Adding a node safely](docs/onboarding-nodes.md)
 - [Monitoring](docs/monitoring.md)
 - [Troubleshooting](docs/troubleshooting.md)
+- [What Lu does not protect against](docs/limits.md)
+
+### Security
+
+- [Tokens and TLS](docs/tokens-and-tls.md)
 - [Security](docs/security.md)
+
+### Reference
+
+- [HTTP API](docs/api.md)
+- [Stable fields](docs/stable-fields.md)
+- [Client guide](docs/client-guide.md)
+- [MCP server](docs/mcp.md)
+- [FAQ](docs/faq.md)
