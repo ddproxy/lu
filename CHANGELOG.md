@@ -5,6 +5,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Updated dependencies: `getrandom` 0.4, `sha2` 0.11, `toml` 1.2, and minor/patch bumps of `clap`, `flate2`, `libc` and `serde_json`.
+
 ### Fixed
 
 - `lu restore` now verifies that a snapshot contains every Lu table for its schema version, not just a matching schema version stamp. A file with a forged or stale version but missing `jobs`, `nodes`, `cordons`, `idempotency` or `job_deps` tables is refused before it can replace the live database.
