@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-21
+
 ### Added
 
 - Expected outputs. `JobSpec.expect` declares relative `files`, `changed` and `forbid_changed` globs, `min_diff_bytes`/`max_diff_bytes` bounds and a `mode` of `suspect` (default) or `fail`. The agent evaluates them after a successful harness against the uploaded diff, excluding `.lu/`, and records unmet expectations in `report.json` under `expect_failures`. Suspect failures keep the job `done` with `outcome_note: expect_failed` and increment `lu_jobs_expect_failed_total`; fail-mode failures end in `failed` with class `execution`. A `no_changes` note takes precedence over `expect_failed`. CLI adds the expect flags to `submit`, `retry` and `edit`, and MCP adds matching arguments. Schema 8 includes the suspect flag.
