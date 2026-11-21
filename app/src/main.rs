@@ -6,6 +6,7 @@ mod logging;
 mod mcp;
 mod operator;
 mod service;
+mod templates;
 #[cfg(feature = "tui")]
 mod top;
 
@@ -56,6 +57,8 @@ enum Command {
     Agent,
     /// Submit a job.
     Submit(operator::SubmitArgs),
+    /// Create one collection job from earlier inputs (keys or ids).
+    Collect(operator::CollectArgs),
     /// Resubmit a finished job's spec as a new job.
     Retry(operator::RetryArgs),
     /// Change the provider, model, fallbacks, labels, taints or dependencies of a queued or blocked job.
@@ -111,6 +114,7 @@ async fn main() -> ExitCode {
             Err(error) => fail(&error),
         },
         Command::Submit(args) => operator::submit(args, &cli.config, json).await,
+        Command::Collect(args) => operator::collect(args, &cli.config, json).await,
         Command::Retry(args) => operator::retry(args, &cli.config, json).await,
         Command::Edit(args) => operator::edit(args, &cli.config, json).await,
         Command::Ls(args) => operator::ls(args, &cli.config, json).await,

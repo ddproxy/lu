@@ -30,6 +30,7 @@ fn spec() -> JobSpec {
         stack_dependencies: true,
         collect: None,
         include_failed: false,
+        on_conflict: Default::default(),
         allow_empty: false,
         requires: vec!["php8.3".to_owned()],
         tolerates: Vec::new(),

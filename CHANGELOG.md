@@ -10,6 +10,10 @@ uses semantic versioning once it reaches 1.0.
 ### Fixed
 
 - Provider cordons no longer outlive a controller restart. Their expiry is on the process's monotonic clock, so a restart made rows from the previous run look hours in the future and blocked dispatch to a healthy provider; boot recovery now clears them and Reiki health and new failures set them again.
+### Added
+
+- Dependency input apply modes and conflict policies. `collect = apply` and `both` apply inputs in `after` order through libgit2 apply, libgit2 three-way and `git apply --3way` when git is on the agent's PATH. `JobSpec.on_conflict` selects `fail` (default, ends `conflict` with the input, file and hunk in the summary), `skip` (leaves the patch unapplied and records the first failing file and hunk in `INDEX.md`) or `markers` (labelled conflict markers, `markers (N files)` in the index, later inputs still applied). `INDEX.md` rows include the apply result and conflicted files; markers stay in the exported `diff.patch`, while `.lu` never does. The CLI exposes `--on-conflict` on `submit`, `retry` and `edit`; MCP exposes `on_conflict` on `lu_submit`, `lu_submit_many` and `lu_retry`. Explicit values are echoed in `JobView.spec`. No schema change.
+- `lu collect <key-or-id>...` creates one merge, test or review job from the named inputs, with `collect = both`, `on_conflict = markers` and `include_failed` set only when a failed input stored a diff. Built-in `merge`, `test` and `review` prompts live in a `templates` module and are overridden at `$XDG_CONFIG_HOME/lu/templates/<name>.md` (or `$HOME/.config/lu/templates/<name>.md`) read at submit time with a 64 KiB cap. `--task-file` text is appended under `## Extra instructions` within the 256 KiB task cap.
 
 ## [0.3.0] - 2026-11-20
 

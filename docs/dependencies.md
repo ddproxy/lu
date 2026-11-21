@@ -76,11 +76,10 @@ but the harness runs on the dependent's own base tree alone and no dependency di
 
 `--collect <mode>` stages dependency artifacts under `.lu/inputs` before the harness starts. The
 modes are `none` (default), `files`, `apply` and `both`; aliases `off`, `false`, `diffs`, `diff`,
-`patches` and `patch` are accepted. An explicit `collect` wins over `stack_dependencies`, so
+`patches` and `patch` are accepted. An explicit mode wins over `stack_dependencies`, so
 `--no-stack --collect files` collects files without applying diffs. When `collect` is absent,
-`stack_dependencies` keeps its old meaning: `true` behaves like `apply`, `false` like `none`.
-`apply` and `both` use the existing stacking path; in this part of the design neither applies a
-dependency diff that was not already applied by `stack_dependencies`.
+`stack_dependencies` keeps its meaning: `true` behaves like `apply`, `false` like `none`. `apply`
+and `both` apply each input's `diff.patch` in `after` order.
 
 Inputs are the job's `after` dependencies. A `done` dependency is always an input. A `failed` or
 `cancelled` dependency becomes an input only when `--include-failed` is set and that job stored a
@@ -92,11 +91,52 @@ the agent re-checks it before staging.
 With `files` or `both`, the agent writes `.lu/inputs/INDEX.md` and one directory per input, named
 from a safe idempotency key (or a short job id, with `-2`, `-3`, … for duplicates). Each directory
 contains `diff.patch`, `report.json`, `run.log` and `meta.json`. `INDEX.md` lists the key, job id,
-state, node, failure class, changed-file count and diff bytes; `run.log` keeps only the last
-256 KiB and the index notes when a log was capped. Files are `0600`, directories `0700` and
-symlinks are refused. Text from another job is untrusted: it is sanitised in the index and never
-used as a path or command. `.lu` is added to `.git/info/exclude` and stripped from the exported
-`diff.patch`; a tracked `.lu` path is a staging error rather than being silently removed.
+state, node, failure class, changed-file count, diff bytes, apply result and conflicted files;
+`run.log` keeps only the last 256 KiB and the index notes when a log was capped. Files are `0600`,
+directories `0700` and symlinks are refused. Text from another job is untrusted: it is sanitised in
+the index and never used as a path or command. `.lu` is added to `.git/info/exclude` and stripped
+from the exported `diff.patch`; a tracked `.lu` path is a staging error.
+
+### Conflict handling
+
+`--on-conflict <policy>` (`on_conflict` in the API, also on `lu retry` and `lu edit`) controls a
+patch that does not apply:
+
+- `fail` (default): the job ends `conflict`; the summary names the input, file and hunk. Earlier
+  inputs remain in `diff.patch` and `applied_dependencies`.
+- `skip`: the patch is left unapplied. Its `INDEX.md` row says `skipped` with the first failing
+  file and hunk; later inputs still apply.
+- `markers`: a three-way merge leaves standard `<<<<<<<`, `=======` and `>>>>>>>` markers labelled
+  with the input name. The row says `markers (N files)` (`markers (1 file)` for one path), later
+  inputs still apply, and the markers remain in the exported `diff.patch`.
+
+Each input is tried with libgit2 apply, libgit2 three-way, then `git apply --3way` when `git` is on
+the agent's PATH. This last step handles patches libgit2 rejects but git accepts.
+
+`lu collect <key-or-id>... --repo R --ref REF [--template merge|test|review] [--task-file F]`
+creates one job with those inputs, `collect = both` and `on_conflict = markers`. Keys resolve like
+`--after-key`; `include_failed` is set only when an input is failed with a stored diff. Optional
+`--key`, `--provider`, `--model`, `--timeout` and `--wait` behave as on `lu submit`. Templates are
+built into the binary and can be overridden by `$XDG_CONFIG_HOME/lu/templates/<name>.md` (or
+`$HOME/.config/lu/templates/<name>.md`), read at submit time and capped at 64 KiB. `--task-file`
+is appended under `## Extra instructions` and capped at `MAX_TASK_BYTES` (256 KiB).
+
+### Worked three-input merge
+
+```sh
+lu submit --key a --repo /srv/demo --ref main --task "add README"
+lu submit --key b --after-key a --collect both --on-conflict markers \
+  --repo /srv/demo --ref main --task "edit the same README line"
+lu submit --key c --after-key b --collect both --on-conflict markers \
+  --repo /srv/demo --ref main --task "add docs/notes.md"
+lu collect a b c --repo /srv/demo --ref main --template merge
+```
+
+The collection job stages all three inputs in `a`, `b`, `c` order. Input `a` applies; `b` leaves
+markers in `README.md` and its row reads `markers (1 file)`; `c` still applies. `INDEX.md` records
+each result and the conflicted path, and the collection job's `diff.patch` includes the marked
+`README.md` and the new `docs/notes.md`. The `merge` prompt tells the harness to read the index,
+resolve both sides of every marker and write `MERGE.md`.
 
 ## Viewing the graph
 

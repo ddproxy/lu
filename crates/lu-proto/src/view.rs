@@ -183,6 +183,7 @@ fn empty_job_spec() -> JobSpec {
         stack_dependencies: true,
         collect: None,
         include_failed: false,
+        on_conflict: Default::default(),
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),

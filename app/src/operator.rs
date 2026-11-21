@@ -11,7 +11,8 @@ use lu_client::{
 };
 use lu_proto::{
     printable, truncate_chars, ArtifactName, CollectMode, FailureClass, HarnessState, JobEdit,
-    JobId, JobSpec, JobState, NodeName, LABEL_SOURCE_PROBED, MAX_TASK_BYTES,
+    JobId, JobSpec, JobState, NodeName, OnConflict, DEFAULT_TIMEOUT_SECS, LABEL_SOURCE_PROBED,
+    MAX_TASK_BYTES,
 };
 use lu_tui::graph::{self, Graph};
 use lu_tui::model::Tone;
@@ -65,6 +66,9 @@ pub struct SubmitArgs {
     /// Treat failed and cancelled dependencies as inputs when they stored a diff.
     #[arg(long)]
     pub include_failed: bool,
+    /// How to handle an input that does not apply: fail, markers or skip.
+    #[arg(long = "on-conflict", value_name = "MODE", default_value_t = OnConflict::Fail)]
+    pub on_conflict: OnConflict,
     /// Expect an empty diff, so no `no changes` note is added when the job is done.
     #[arg(long)]
     pub allow_empty: bool,
@@ -83,6 +87,40 @@ pub struct SubmitArgs {
     /// Read the task from a file.
     #[arg(long = "task-file", conflicts_with = "task")]
     pub task_file: Option<PathBuf>,
+    /// Wait for the job to finish.
+    #[arg(long)]
+    pub wait: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CollectArgs {
+    /// Earlier jobs to collect, as job ids or idempotency keys (repeatable).
+    #[arg(required = true)]
+    pub inputs: Vec<String>,
+    /// Repository URL or absolute local path.
+    #[arg(long)]
+    pub repo: String,
+    /// Git ref to check out.
+    #[arg(long = "ref")]
+    pub git_ref: String,
+    /// Built-in prompt template: merge, test or review.
+    #[arg(long, value_parser = parse_template, default_value = "merge")]
+    pub template: String,
+    /// Extra instructions appended to the template prompt.
+    #[arg(long = "task-file")]
+    pub task_file: Option<PathBuf>,
+    /// Idempotency key.
+    #[arg(long)]
+    pub key: Option<String>,
+    /// Provider name.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Model name.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Job timeout in seconds.
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
+    pub timeout: u64,
     /// Wait for the job to finish.
     #[arg(long)]
     pub wait: bool,
@@ -117,6 +155,9 @@ pub struct RetryArgs {
     /// Treat failed and cancelled dependencies as inputs when they stored a diff.
     #[arg(long)]
     pub include_failed: bool,
+    /// Replace the conflict policy: fail, markers or skip.
+    #[arg(long = "on-conflict", value_name = "MODE")]
+    pub on_conflict: Option<OnConflict>,
     /// Replace the label requirements (repeatable).
     #[arg(long = "require", conflicts_with = "no_require")]
     pub require: Vec<String>,
@@ -166,6 +207,9 @@ pub struct EditArgs {
     /// Include failed and cancelled dependencies as inputs when they stored a diff.
     #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
     pub include_failed: Option<bool>,
+    /// Replace the conflict policy: fail, markers or skip.
+    #[arg(long = "on-conflict", value_name = "MODE")]
+    pub on_conflict: Option<OnConflict>,
     /// Replace the label requirements (repeatable).
     #[arg(long = "require", conflicts_with = "no_require")]
     pub require: Vec<String>,
@@ -260,6 +304,10 @@ pub async fn submit(args: SubmitArgs, config: &Path, json: bool) -> ExitCode {
     finish(submit_inner(args, config, json).await)
 }
 
+pub async fn collect(args: CollectArgs, config: &Path, json: bool) -> ExitCode {
+    finish(collect_inner(args, config, json).await)
+}
+
 pub async fn retry(args: RetryArgs, config: &Path, json: bool) -> ExitCode {
     finish(retry_inner(args, config, json).await)
 }
@@ -341,6 +389,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         stack_dependencies: !args.no_stack,
         collect: args.collect,
         include_failed: args.include_failed,
+        on_conflict: args.on_conflict,
         allow_empty: args.allow_empty,
         requires: args.require,
         tolerates: args.tolerate,
@@ -348,6 +397,80 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
     };
     spec.validate().map_err(|error| error.to_string())?;
 
+    submit_and_report(&client, &spec, json, args.wait).await
+}
+
+async fn collect_inner(args: CollectArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let mut task = crate::templates::prompt(&args.template)?;
+    if let Some(path) = &args.task_file {
+        let file = std::fs::File::open(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let extra = read_bounded(file, MAX_TASK_BYTES)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let base = task.trim_end().to_owned();
+        task = format!("{base}\n\n## Extra instructions\n\n{extra}");
+    }
+    if task.len() > MAX_TASK_BYTES {
+        eprintln!("lu: collected prompt is larger than {MAX_TASK_BYTES} bytes");
+        return Ok(ExitCode::from(EXIT_USAGE));
+    }
+
+    let client = connect(config)?;
+    let mut after = Vec::with_capacity(args.inputs.len());
+    let mut include_failed = false;
+    for input in &args.inputs {
+        let view = if let Ok(id) = JobId::parse(input) {
+            match client.get_job(&id).await {
+                Ok(view) => view,
+                Err(ApiError::NotFound) => {
+                    eprintln!("lu: no job with id {input:?}");
+                    return Ok(ExitCode::from(EXIT_USAGE));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        } else {
+            match client
+                .job_by_key(input)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                Some(view) => view,
+                None => {
+                    eprintln!("lu: no job with idempotency key {input:?}");
+                    return Ok(ExitCode::from(EXIT_USAGE));
+                }
+            }
+        };
+        if view.state == JobState::Failed && view.diff_bytes.unwrap_or(0) > 0 {
+            include_failed = true;
+        }
+        if !after.contains(&view.id) {
+            after.push(view.id);
+        }
+    }
+
+    let spec = JobSpec {
+        repo: args.repo,
+        git_ref: args.git_ref,
+        base_commit: None,
+        task,
+        harness: "opencode".to_owned(),
+        provider: args.provider,
+        model: args.model,
+        timeout_secs: args.timeout,
+        idle_timeout_secs: None,
+        idempotency_key: args.key,
+        after,
+        stack_dependencies: true,
+        collect: Some(CollectMode::Both),
+        include_failed,
+        on_conflict: OnConflict::Markers,
+        allow_empty: false,
+        requires: Vec::new(),
+        tolerates: Vec::new(),
+        fallbacks: Vec::new(),
+    };
+    spec.validate().map_err(|error| error.to_string())?;
     submit_and_report(&client, &spec, json, args.wait).await
 }
 
@@ -423,6 +546,9 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
     if args.include_failed {
         spec.include_failed = true;
     }
+    if let Some(on_conflict) = args.on_conflict {
+        spec.on_conflict = on_conflict;
+    }
     // A retry is a new job; only --key gives it an idempotency key.
     spec.idempotency_key = args.key;
     spec.validate().map_err(|error| error.to_string())?;
@@ -455,6 +581,7 @@ async fn edit_inner(args: EditArgs, config: &Path, json: bool) -> Result<ExitCod
         after,
         collect: args.collect,
         include_failed: args.include_failed,
+        on_conflict: args.on_conflict,
     };
     let (view, raw) = client
         .edit_with_raw(&args.id, &edit)
@@ -1527,6 +1654,16 @@ fn parse_job_id(value: &str) -> Result<JobId, String> {
     JobId::parse(value).map_err(|error| error.to_string())
 }
 
+fn parse_template(value: &str) -> Result<String, String> {
+    if crate::templates::builtin(value).is_some() {
+        return Ok(value.to_owned());
+    }
+    Err(format!(
+        "unknown template {value:?}; expected {}",
+        crate::templates::NAMES.join(", ")
+    ))
+}
+
 fn parse_node(value: &str) -> Result<NodeName, String> {
     NodeName::parse(value).map_err(|error| error.to_string())
 }
@@ -1625,9 +1762,9 @@ mod time_tests {
 #[cfg(test)]
 mod collect_cli_tests {
     use clap::Parser;
-    use lu_proto::CollectMode;
+    use lu_proto::{CollectMode, OnConflict};
 
-    use super::{EditArgs, RetryArgs, SubmitArgs};
+    use super::{CollectArgs, EditArgs, RetryArgs, SubmitArgs};
 
     #[derive(Debug, Parser)]
     struct Cli {
@@ -1638,6 +1775,7 @@ mod collect_cli_tests {
     #[derive(Debug, clap::Subcommand)]
     enum Command {
         Submit(SubmitArgs),
+        Collect(CollectArgs),
         Retry(RetryArgs),
         Edit(EditArgs),
     }
@@ -1656,6 +1794,8 @@ mod collect_cli_tests {
             "--collect",
             "files",
             "--include-failed",
+            "--on-conflict",
+            "markers",
         ])
         .unwrap();
         let Command::Submit(args) = cli.command else {
@@ -1663,6 +1803,7 @@ mod collect_cli_tests {
         };
         assert_eq!(args.collect, Some(CollectMode::Files));
         assert!(args.include_failed);
+        assert_eq!(args.on_conflict, OnConflict::Markers);
 
         let cli = Cli::try_parse_from([
             "lu",
@@ -1680,19 +1821,29 @@ mod collect_cli_tests {
         };
         assert_eq!(args.collect, None);
         assert!(!args.include_failed);
+        assert_eq!(args.on_conflict, OnConflict::Fail);
     }
 
     #[test]
     fn retry_and_edit_parse_collect_and_include_failed() {
         let id = lu_proto::JobId::new().to_string();
-        let cli =
-            Cli::try_parse_from(["lu", "retry", &id, "--collect", "patch", "--include-failed"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "lu",
+            "retry",
+            &id,
+            "--collect",
+            "patch",
+            "--include-failed",
+            "--on-conflict",
+            "skip",
+        ])
+        .unwrap();
         let Command::Retry(args) = cli.command else {
             panic!("expected retry");
         };
         assert_eq!(args.collect, Some(CollectMode::Files));
         assert!(args.include_failed);
+        assert_eq!(args.on_conflict, Some(OnConflict::Skip));
 
         let cli = Cli::try_parse_from([
             "lu",
@@ -1702,6 +1853,8 @@ mod collect_cli_tests {
             "both",
             "--include-failed",
             "false",
+            "--on-conflict",
+            "fail",
         ])
         .unwrap();
         let Command::Edit(args) = cli.command else {
@@ -1709,12 +1862,88 @@ mod collect_cli_tests {
         };
         assert_eq!(args.collect, Some(CollectMode::Both));
         assert_eq!(args.include_failed, Some(false));
+        assert_eq!(args.on_conflict, Some(OnConflict::Fail));
 
         let cli = Cli::try_parse_from(["lu", "edit", &id, "--include-failed"]).unwrap();
         let Command::Edit(args) = cli.command else {
             panic!("expected edit");
         };
         assert_eq!(args.include_failed, Some(true));
+    }
+
+    #[test]
+    fn collect_parses_inputs_template_and_options() {
+        let cli = Cli::try_parse_from([
+            "lu",
+            "collect",
+            "build",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+            "--template",
+            "review",
+            "--task-file",
+            "/tmp/extra.md",
+            "--key",
+            "combined",
+            "--provider",
+            "p",
+            "--model",
+            "m",
+            "--timeout",
+            "90",
+            "--wait",
+        ])
+        .unwrap();
+        let Command::Collect(args) = cli.command else {
+            panic!("expected collect");
+        };
+        assert_eq!(args.inputs, ["build", "01ARZ3NDEKTSV4RRFFQ69G5FAV"]);
+        assert_eq!(args.template, "review");
+        assert_eq!(
+            args.task_file,
+            Some(std::path::PathBuf::from("/tmp/extra.md"))
+        );
+        assert_eq!(args.key.as_deref(), Some("combined"));
+        assert_eq!(args.provider.as_deref(), Some("p"));
+        assert_eq!(args.model.as_deref(), Some("m"));
+        assert_eq!(args.timeout, 90);
+        assert!(args.wait);
+
+        let cli = Cli::try_parse_from([
+            "lu",
+            "collect",
+            "build",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+        ])
+        .unwrap();
+        let Command::Collect(args) = cli.command else {
+            panic!("expected collect");
+        };
+        assert_eq!(args.template, "merge");
+        assert!(!args.wait);
+    }
+
+    #[test]
+    fn an_unknown_template_is_a_clap_error() {
+        let error = Cli::try_parse_from([
+            "lu",
+            "collect",
+            "build",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+            "--template",
+            "nope",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("template"), "{error}");
     }
 
     #[test]

@@ -24,11 +24,11 @@ use lu_client::{ApiError, Controller};
 use lu_config::{AgentConfig, BaseSource};
 use lu_proto::{
     effective_collect, printable, truncate_chars, AgentEvent, ArtifactName, Completion,
-    FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobStats, NodeName, Outcome,
+    FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobStats, NodeName, OnConflict, Outcome,
     ProviderModel, ProviderState, ProviderStatus, HARNESS_OK_FALSE, MAX_DIFF_BYTES,
     MAX_NODE_LABELS, MAX_SUMMARY_BYTES, MAX_TAINTS,
 };
-use lu_staging::{ApplyError, Source, StageRequest, StagedDir, Staging};
+use lu_staging::{ApplyError, ConflictPolicy, Source, StageRequest, StagedDir, Staging};
 use lu_supervise::{CommandSpec, Limits, Outcome as SuperviseOutcome, Supervisor};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -571,19 +571,28 @@ impl Agent {
         };
 
         let mode = effective_collect(spec.collect, spec.stack_dependencies);
+        let policy = match spec.on_conflict {
+            OnConflict::Fail => ConflictPolicy::Fail,
+            OnConflict::Markers => ConflictPolicy::Markers,
+            OnConflict::Skip => ConflictPolicy::Skip,
+        };
         let mut applied = Vec::new();
         if mode.applies_diffs() {
-            match self.apply_dependencies(&job_id, epoch, &staged).await? {
+            match self
+                .apply_dependencies(&job_id, epoch, &staged, policy, spec.include_failed)
+                .await?
+            {
                 DependencyApply::Applied(deps) => applied = deps,
                 DependencyApply::Stale => return Ok(JobEnd::Stale),
                 DependencyApply::Conflict {
+                    input,
                     dependency,
                     paths,
                     applied: done,
                     detail,
                 } => {
                     let summary =
-                        dependency_conflict_summary(&dependency, &paths, detail.as_deref());
+                        dependency_conflict_summary(&input, &dependency, &paths, detail.as_deref());
                     self.finish(&Finish {
                         job_id: &job_id,
                         epoch,
@@ -596,7 +605,7 @@ impl Agent {
                         summary,
                         cancelled: false,
                         retry_after_secs: None,
-                        applied_dependencies: &done,
+                        applied_inputs: &done,
                     })
                     .await?;
                     return Ok(JobEnd::Finished);
@@ -698,7 +707,7 @@ impl Agent {
                 summary,
                 cancelled: false,
                 retry_after_secs: None,
-                applied_dependencies: &applied,
+                applied_inputs: &applied,
             })
             .await?;
             return Ok(JobEnd::Finished);
@@ -738,7 +747,7 @@ impl Agent {
                     summary,
                     cancelled: false,
                     retry_after_secs: None,
-                    applied_dependencies: &applied,
+                    applied_inputs: &applied,
                 })
                 .await?;
                 return Ok(JobEnd::Finished);
@@ -1010,7 +1019,7 @@ impl Agent {
                 summary,
                 cancelled: false,
                 retry_after_secs: reiki_retry_after,
-                applied_dependencies: &applied,
+                applied_inputs: &applied,
             })
             .await?;
             return Ok(JobEnd::Finished);
@@ -1042,7 +1051,7 @@ impl Agent {
             summary,
             cancelled: false,
             retry_after_secs: None,
-            applied_dependencies: &applied,
+            applied_inputs: &applied,
         })
         .await?;
         Ok(JobEnd::Finished)
@@ -1084,6 +1093,8 @@ impl Agent {
         job_id: &JobId,
         epoch: u64,
         staged: &StagedDir,
+        policy: ConflictPolicy,
+        include_failed: bool,
     ) -> Result<DependencyApply, AgentError> {
         let deps = match self.controller.deps(job_id, epoch).await {
             Ok(deps) => deps,
@@ -1096,11 +1107,16 @@ impl Agent {
                 )))
             }
         };
+        let names = collect::input_names(&deps, include_failed);
         let mut applied = Vec::new();
         for dep in deps {
             if dep.diff_bytes == 0 {
                 continue;
             }
+            let name = names
+                .get(dep.job_id.as_str())
+                .cloned()
+                .unwrap_or_else(|| dep.job_id.to_string());
             let bytes = match self.controller.dep_diff(job_id, &dep.job_id, epoch).await {
                 Ok(bytes) => bytes,
                 Err(ApiError::NotFound) => continue,
@@ -1114,10 +1130,17 @@ impl Agent {
                     )))
                 }
             };
-            match Staging::apply_dependency_diff(staged, &bytes) {
-                Ok(()) => applied.push(dep.job_id.to_string()),
+            match Staging::apply_input_diff(staged, &bytes, &name, policy) {
+                Ok(result) => applied.push(AppliedInput {
+                    job_id: dep.job_id.to_string(),
+                    name,
+                    applied: result.applied,
+                    conflicted_paths: result.conflicted_paths,
+                    detail: result.detail,
+                }),
                 Err(ApplyError::Conflict { paths, detail }) => {
                     return Ok(DependencyApply::Conflict {
+                        input: name,
                         dependency: dep.job_id.to_string(),
                         paths,
                         applied,
@@ -1126,6 +1149,7 @@ impl Agent {
                 }
                 Err(error) => {
                     return Ok(DependencyApply::Conflict {
+                        input: name,
                         dependency: dep.job_id.to_string(),
                         paths: Vec::new(),
                         applied,
@@ -1170,7 +1194,7 @@ impl Agent {
             finish.started.elapsed(),
             &finish.spec.harness,
             finish.model,
-            finish.applied_dependencies,
+            finish.applied_inputs,
         );
         if let Ok(report) = report {
             match self
@@ -1255,22 +1279,38 @@ struct Finish<'a> {
     summary: String,
     cancelled: bool,
     retry_after_secs: Option<u64>,
-    applied_dependencies: &'a [String],
+    applied_inputs: &'a [AppliedInput],
+}
+
+/// One collected input's apply outcome, shared by the job summary, `INDEX.md`, and `meta.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedInput {
+    pub(crate) job_id: String,
+    pub(crate) name: String,
+    pub(crate) applied: bool,
+    pub(crate) conflicted_paths: Vec<String>,
+    pub(crate) detail: Option<String>,
 }
 
 enum DependencyApply {
-    Applied(Vec<String>),
+    Applied(Vec<AppliedInput>),
     Conflict {
+        input: String,
         dependency: String,
         paths: Vec<String>,
-        applied: Vec<String>,
+        applied: Vec<AppliedInput>,
         detail: Option<String>,
     },
     Stale,
 }
 
-fn dependency_conflict_summary(dependency: &str, paths: &[String], detail: Option<&str>) -> String {
-    let mut summary = format!("dependency {dependency} could not be applied");
+fn dependency_conflict_summary(
+    input: &str,
+    dependency: &str,
+    paths: &[String],
+    detail: Option<&str>,
+) -> String {
+    let mut summary = format!("input {input} ({dependency}) could not be applied");
     if !paths.is_empty() {
         summary.push_str("; conflicts: ");
         summary.push_str(&paths.join(", "));
@@ -1714,8 +1754,13 @@ fn report_json(
     duration: Duration,
     harness: &str,
     model: Option<&str>,
-    applied_dependencies: &[String],
+    applied_inputs: &[AppliedInput],
 ) -> Result<Vec<u8>, serde_json::Error> {
+    let applied_dependencies: Vec<&str> = applied_inputs
+        .iter()
+        .filter(|input| input.applied)
+        .map(|input| input.job_id.as_str())
+        .collect();
     let report = Report {
         exit_code,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
@@ -1734,7 +1779,7 @@ struct Report<'a> {
     outcome: Outcome,
     harness: &'a str,
     model: Option<&'a str>,
-    applied_dependencies: &'a [String],
+    applied_dependencies: Vec<&'a str>,
 }
 
 fn create_work_dir(path: &Path) -> Result<(), AgentError> {

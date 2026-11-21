@@ -150,6 +150,28 @@ impl fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
+/// What an agent does when a collected input does not apply cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    /// Stop before the harness and report the conflict.
+    Fail,
+    /// Leave labelled conflict markers in the worktree and keep applying later inputs.
+    Markers,
+    /// Leave this input unapplied and keep applying later inputs.
+    Skip,
+}
+
+/// How one collected input was applied to a staged checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputApplyResult {
+    /// Whether any part of the input's patch reached the worktree. Marker conflicts count.
+    pub applied: bool,
+    /// Files carrying conflict markers, in merge order.
+    pub conflicted_paths: Vec<String>,
+    /// First failing file and hunk, or another short reason, when the patch was not clean.
+    pub detail: Option<String>,
+}
+
 /// A validated job identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JobId(String);
@@ -663,19 +685,36 @@ impl Staging {
         Ok(out)
     }
 
-    /// Apply a dependency's `diff.patch` to a staged checkout.
-    ///
-    /// A clean apply is tried first. If the patch no longer matches because earlier dependencies
-    /// changed the same file, a three-way merge reconstructs the dependency's side from the base
-    /// tree and merges it with the checkout. libgit2's three-way preparation uses an exact hunk
-    /// match, so a patch that `git apply --3way` accepts after searching for an offset can fail
-    /// here. In that case a plain apply is retried, then `git apply --3way` when a git binary is
-    /// available. A failed final attempt changes nothing and reports the failing hunk and file.
+    /// Apply a dependency's `diff.patch` to a staged checkout, with the default `fail` policy.
     pub fn apply_dependency_diff(staged: &StagedDir, patch: &[u8]) -> Result<(), ApplyError> {
+        Self::apply_input_diff(staged, patch, "input", ConflictPolicy::Fail).map(|_| ())
+    }
+
+    /// Apply one collected input's diff under `policy`. `name` labels conflict markers.
+    ///
+    /// Every strategy is tried in order: libgit2 apply, libgit2 three-way, then the git binary's
+    /// fuzzy three-way apply. A clean apply contributes its whole patch; a conflict under
+    /// `markers` contributes both sides in the worktree, so later inputs still apply on top.
+    pub fn apply_input_diff(
+        staged: &StagedDir,
+        patch: &[u8],
+        name: &str,
+        policy: ConflictPolicy,
+    ) -> Result<InputApplyResult, ApplyError> {
+        let label = conflict_label(name);
         let repo = git2::Repository::open(staged.path())
             .map_err(|e| ApplyError::Git(format!("failed to open repository: {e}")))?;
-        let diff = git2::Diff::from_buffer(patch)
-            .map_err(|e| ApplyError::Git(format!("invalid diff: {e}")))?;
+        let diff = match git2::Diff::from_buffer(patch) {
+            Ok(diff) => diff,
+            Err(error) => {
+                let detail = format!("invalid diff: {error}; {}", hunk_detail(patch));
+                return match policy {
+                    ConflictPolicy::Fail => Err(ApplyError::Git(format!("invalid diff: {error}"))),
+                    _ => Ok(unapplied(policy, Vec::new(), detail)),
+                };
+            }
+        };
+        let hunk = hunk_detail(patch);
 
         let mut check = git2::ApplyOptions::new();
         check.check(true);
@@ -687,9 +726,23 @@ impl Staging {
             let before = worktree_tree(&repo)?;
             if let Err(e) = repo.apply(&diff, git2::ApplyLocation::WorkDir, None) {
                 restore_tree(&repo, &before)?;
-                return Err(ApplyError::Git(format!("failed to apply diff: {e}")));
+                reset_index_to_head(&repo)?;
+                return match policy {
+                    ConflictPolicy::Fail => {
+                        Err(ApplyError::Git(format!("failed to apply diff: {e}")))
+                    }
+                    _ => Ok(unapplied(
+                        policy,
+                        Vec::new(),
+                        format!("failed to apply diff: {e}; {hunk}"),
+                    )),
+                };
             }
-            return Ok(());
+            return Ok(InputApplyResult {
+                applied: true,
+                conflicted_paths: Vec::new(),
+                detail: None,
+            });
         }
 
         let base = head_tree(&repo)?;
@@ -697,31 +750,50 @@ impl Staging {
         let mut theirs_index = match repo.apply_to_tree(&base, &diff, None) {
             Ok(index) => index,
             Err(e) => {
-                // libgit2 requires an exact hunk offset here. Try the less strict strategies in
-                // order: plain apply (no check flag), then the git binary's fuzzy three-way apply.
-                let before = worktree_tree(&repo)?;
+                // libgit2 needs an exact hunk offset here. Try a plain apply, then the git
+                // binary's fuzzy three-way apply before giving up on this input.
                 let plain = repo.apply(&diff, git2::ApplyLocation::WorkDir, None);
                 if plain.is_ok() {
-                    return Ok(());
+                    reset_index_to_head(&repo)?;
+                    return Ok(InputApplyResult {
+                        applied: true,
+                        conflicted_paths: Vec::new(),
+                        detail: None,
+                    });
                 }
                 let plain_error = plain.err().map(|e| e.to_string()).unwrap_or_default();
                 match git_apply_3way(staged.path(), patch) {
-                    Ok(()) => return Ok(()),
-                    Err(git_error) => {
-                        restore_tree(&repo, &before)?;
-                        let (file, line) =
-                            patch_location(patch).unwrap_or_else(|| ("unknown file".to_owned(), 0));
-                        let detail = format!(
-                            "failed to prepare three-way merge: hunk at line {line} in {file}: {e}; plain apply: {plain_error}; git apply --3way: {git_error}"
-                        );
-                        return Err(ApplyError::Conflict {
-                            paths: if file == "unknown file" {
-                                Vec::new()
-                            } else {
-                                vec![file]
-                            },
-                            detail: Some(detail),
+                    Ok(()) => {
+                        reset_index_to_head(&repo)?;
+                        return Ok(InputApplyResult {
+                            applied: true,
+                            conflicted_paths: Vec::new(),
+                            detail: None,
                         });
+                    }
+                    Err(git_error) => {
+                        let paths = index_conflict_paths(&repo)?;
+                        if !paths.is_empty() && policy == ConflictPolicy::Markers {
+                            relabel_git_conflicts(&repo, &paths, &label)?;
+                            reset_index_to_head(&repo)?;
+                            return Ok(InputApplyResult {
+                                applied: true,
+                                conflicted_paths: paths,
+                                detail: Some(hunk),
+                            });
+                        }
+                        restore_tree(&repo, &ours)?;
+                        reset_index_to_head(&repo)?;
+                        let detail = format!(
+                            "failed to prepare three-way merge: {hunk}: {e}; plain apply: {plain_error}; git apply --3way: {git_error}"
+                        );
+                        return match policy {
+                            ConflictPolicy::Fail => Err(ApplyError::Conflict {
+                                paths: patch_paths(patch),
+                                detail: Some(detail),
+                            }),
+                            _ => Ok(unapplied(policy, Vec::new(), detail)),
+                        };
                     }
                 }
             }
@@ -736,30 +808,31 @@ impl Staging {
             .merge_trees(&base, &ours, &theirs, None)
             .map_err(|e| ApplyError::Git(format!("failed to merge trees: {e}")))?;
 
-        let mut paths = Vec::new();
-        {
-            let conflicts = merged
-                .conflicts()
-                .map_err(|e| ApplyError::Git(format!("failed to inspect merge: {e}")))?;
-            for conflict in conflicts {
-                let conflict = conflict
-                    .map_err(|e| ApplyError::Git(format!("failed to inspect merge: {e}")))?;
-                if let Some(entry) = conflict.our.or(conflict.their).or(conflict.ancestor) {
-                    let path = String::from_utf8_lossy(&entry.path).into_owned();
-                    if !paths.contains(&path) {
-                        paths.push(path);
-                        if paths.len() == 20 {
-                            break;
-                        }
-                    }
-                }
+        if policy == ConflictPolicy::Skip {
+            let paths = merge_conflict_paths(&merged)?;
+            if !paths.is_empty() {
+                return Ok(unapplied(policy, paths, hunk));
             }
-        }
-        if !paths.is_empty() {
-            return Err(ApplyError::Conflict {
-                paths,
-                detail: None,
-            });
+        } else {
+            let paths = merge_conflict_paths(&merged)?;
+            if !paths.is_empty() {
+                return match policy {
+                    ConflictPolicy::Fail => Err(ApplyError::Conflict {
+                        paths,
+                        detail: Some(hunk),
+                    }),
+                    ConflictPolicy::Markers => {
+                        let paths = write_merge_conflict_markers(&repo, &merged, &label)?;
+                        reset_index_to_head(&repo)?;
+                        Ok(InputApplyResult {
+                            applied: true,
+                            conflicted_paths: paths,
+                            detail: Some(hunk),
+                        })
+                    }
+                    ConflictPolicy::Skip => unreachable!("handled above"),
+                };
+            }
         }
 
         let merged_oid = merged
@@ -772,11 +845,223 @@ impl Staging {
         checkout.force().remove_untracked(true);
         repo.checkout_tree(merged.as_object(), Some(&mut checkout))
             .map_err(|e| ApplyError::Git(format!("failed to check out merge: {e}")))?;
-        Ok(())
+        reset_index_to_head(&repo)?;
+        Ok(InputApplyResult {
+            applied: true,
+            conflicted_paths: Vec::new(),
+            detail: None,
+        })
     }
+}
 
+fn hunk_detail(patch: &[u8]) -> String {
+    match patch_location(patch) {
+        Some((file, line)) if file != "unknown file" => {
+            format!("hunk at line {line} in {file}")
+        }
+        _ => "hunk location unknown".to_owned(),
+    }
+}
+
+fn patch_paths(patch: &[u8]) -> Vec<String> {
+    match patch_location(patch) {
+        Some((file, _)) if file != "unknown file" => vec![file],
+        _ => Vec::new(),
+    }
+}
+
+fn conflict_label(name: &str) -> String {
+    let mut label: String = name
+        .bytes()
+        .take(64)
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"._-:".contains(&byte) {
+                byte as char
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if label.is_empty() {
+        label.push_str("input");
+    }
+    label
+}
+
+fn unapplied(
+    policy: ConflictPolicy,
+    conflicted_paths: Vec<String>,
+    detail: String,
+) -> InputApplyResult {
+    debug_assert!(policy != ConflictPolicy::Fail);
+    InputApplyResult {
+        applied: false,
+        conflicted_paths,
+        detail: Some(detail),
+    }
+}
+
+fn reset_index_to_head(repo: &git2::Repository) -> Result<(), ApplyError> {
+    let head = head_tree(repo)?;
+    let mut index = repo
+        .index()
+        .map_err(|e| ApplyError::Git(format!("failed to open index: {e}")))?;
+    index
+        .read_tree(&head)
+        .map_err(|e| ApplyError::Git(format!("failed to reset index: {e}")))?;
+    index
+        .write()
+        .map_err(|e| ApplyError::Git(format!("failed to write index: {e}")))
+}
+
+fn merge_conflict_paths(merged: &git2::Index) -> Result<Vec<String>, ApplyError> {
+    let mut paths = Vec::new();
+    let conflicts = merged
+        .conflicts()
+        .map_err(|e| ApplyError::Git(format!("failed to inspect merge: {e}")))?;
+    for conflict in conflicts {
+        let conflict =
+            conflict.map_err(|e| ApplyError::Git(format!("failed to inspect merge: {e}")))?;
+        if let Some(entry) = conflict.our.or(conflict.their).or(conflict.ancestor) {
+            let path = String::from_utf8_lossy(&entry.path).into_owned();
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn index_conflict_paths(repo: &git2::Repository) -> Result<Vec<String>, ApplyError> {
+    let index = repo
+        .index()
+        .map_err(|e| ApplyError::Git(format!("failed to open index: {e}")))?;
+    merge_conflict_paths(&index)
+}
+
+fn write_merge_conflict_markers(
+    repo: &git2::Repository,
+    merged: &git2::Index,
+    label: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let mut paths = Vec::new();
+    let conflicts = merged
+        .conflicts()
+        .map_err(|e| ApplyError::Git(format!("failed to inspect merge: {e}")))?;
+    for conflict in conflicts {
+        let conflict =
+            conflict.map_err(|e| ApplyError::Git(format!("failed to inspect merge: {e}")))?;
+        let our = conflict.our.as_ref().map(|entry| entry.id);
+        let their = conflict.their.as_ref().map(|entry| entry.id);
+        let entry = conflict
+            .our
+            .as_ref()
+            .or(conflict.their.as_ref())
+            .or(conflict.ancestor.as_ref())
+            .ok_or_else(|| ApplyError::Git("merge conflict has no file entry".to_owned()))?;
+        let path = String::from_utf8_lossy(&entry.path).into_owned();
+        let ours = blob_bytes(repo, our)?;
+        let theirs = blob_bytes(repo, their)?;
+        write_marker_file(repo, &path, &ours, &theirs, label)?;
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn blob_bytes(repo: &git2::Repository, id: Option<git2::Oid>) -> Result<Vec<u8>, ApplyError> {
+    match id {
+        Some(id) => Ok(repo
+            .find_blob(id)
+            .map_err(|e| ApplyError::Git(format!("failed to read merge blob: {e}")))?
+            .content()
+            .to_vec()),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn safe_worktree_path(repo: &git2::Repository, path: &str) -> Result<PathBuf, ApplyError> {
+    let relative = Path::new(path);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::RootDir))
+        || is_lu_path(relative)
+    {
+        return Err(ApplyError::Git(format!("unsafe conflict path {path:?}")));
+    }
+    let full = repo
+        .workdir()
+        .ok_or_else(|| ApplyError::Git("staged checkout has no worktree".to_owned()))?
+        .join(relative);
+    refuse_symlink(&full).map_err(|e| ApplyError::Git(format!("unsafe conflict path: {e}")))?;
+    Ok(full)
+}
+
+fn write_marker_file(
+    repo: &git2::Repository,
+    path: &str,
+    ours: &[u8],
+    theirs: &[u8],
+    label: &str,
+) -> Result<(), ApplyError> {
+    let full = safe_worktree_path(repo, path)?;
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| ApplyError::Git(format!("failed to create conflict directory: {e}")))?;
+    }
+    let mut out = Vec::with_capacity(ours.len() + theirs.len() + 64);
+    out.extend_from_slice(b"<<<<<<< HEAD\n");
+    out.extend_from_slice(ours);
+    if !ours.ends_with(b"\n") && !ours.is_empty() {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(b"=======\n");
+    out.extend_from_slice(theirs);
+    if !theirs.ends_with(b"\n") && !theirs.is_empty() {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(format!(">>>>>>> {label}\n").as_bytes());
+    fs::write(&full, out)
+        .map_err(|e| ApplyError::Git(format!("failed to write conflict markers: {e}")))
+}
+
+fn relabel_git_conflicts(
+    repo: &git2::Repository,
+    paths: &[String],
+    label: &str,
+) -> Result<(), ApplyError> {
+    for path in paths {
+        let full = safe_worktree_path(repo, path)?;
+        let text = match fs::read_to_string(&full) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(ApplyError::Git(format!(
+                    "failed to read conflict file {path:?}: {e}"
+                )))
+            }
+        };
+        let mut out = String::with_capacity(text.len() + 32);
+        for line in text.split_inclusive('\n') {
+            if line.trim_end_matches(['\r', '\n']).starts_with(">>>>>>> ") {
+                out.push_str(">>>>>>> ");
+                out.push_str(label);
+                out.push('\n');
+            } else {
+                out.push_str(line);
+            }
+        }
+        fs::write(&full, out)
+            .map_err(|e| ApplyError::Git(format!("failed to relabel conflict file: {e}")))?;
+    }
+    Ok(())
+}
+
+impl Staging {
     /// Remove `<work_root>/<job_id>` safely.
-    ///
     /// A missing directory is not an error.
     /// Lets `gid` write the working tree of a staged checkout and never the `.git` directory.
     ///

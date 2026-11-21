@@ -31,6 +31,7 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         stack_dependencies: true,
         collect: None,
         include_failed: false,
+        on_conflict: Default::default(),
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),
@@ -959,6 +960,7 @@ fn edit_job_changes_spec_and_dependency_state<S: Store>(s: &S) {
         after: Some(Vec::new()),
         collect: None,
         include_failed: None,
+        on_conflict: Default::default(),
     };
     let rec = s.edit_job(&job.id, &edit, now(2, 2)).unwrap();
     assert_eq!(rec.id, job.id);

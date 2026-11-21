@@ -222,6 +222,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         stack_dependencies: true,
         collect: None,
         include_failed: false,
+        on_conflict: Default::default(),
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),

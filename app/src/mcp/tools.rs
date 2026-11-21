@@ -5,8 +5,8 @@ use std::collections::{HashSet, VecDeque};
 use lu_client::{ApiError, Client, JobView, ListNodes, NodeStats, NodeView};
 use lu_proto::{
     truncate_chars, ArtifactName, Choice, CollectMode, HarnessState, JobId, JobSpec, JobState,
-    NodeName, DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_FALLBACKS, MAX_IDLE_TIMEOUT_SECS,
-    MAX_REQUIRES_LABELS, MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
+    NodeName, OnConflict, DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_FALLBACKS,
+    MAX_IDLE_TIMEOUT_SECS, MAX_REQUIRES_LABELS, MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
 };
 use lu_tui::graph::{self, Graph};
 use serde_json::{json, Map, Value};
@@ -240,6 +240,11 @@ const INCLUDE_FAILED_FIELD: Field = optional(
     "boolean",
     "Include failed and cancelled dependencies as inputs when they stored a diff",
 );
+const ON_CONFLICT_FIELD: Field = optional(
+    "on_conflict",
+    "string",
+    "Handle input patches that do not apply: fail, markers or skip; defaults to fail",
+);
 const HARNESS_FIELD: Field = optional("harness", "string", "Harness name");
 const REQUIRE_FIELD: Field = spec_bounds(array(
     "require",
@@ -278,6 +283,7 @@ static JOB_FIELDS: &[Field] = &[
     NO_STACK_FIELD,
     COLLECT_FIELD,
     INCLUDE_FAILED_FIELD,
+    ON_CONFLICT_FIELD,
     TIMEOUT_SECS_FIELD,
     TIMEOUT_FIELD,
     IDLE_TIMEOUT_SECS_FIELD,
@@ -389,6 +395,7 @@ const TOOLS: &[ToolDef] = &[
             NO_STACK_FIELD,
             COLLECT_FIELD,
             INCLUDE_FAILED_FIELD,
+            ON_CONFLICT_FIELD,
             AFTER_FIELD,
             AFTER_KEYS_FIELD,
             TIMEOUT_SECS_FIELD,
@@ -463,6 +470,7 @@ const TOOLS: &[ToolDef] = &[
             NO_STACK_FIELD,
             COLLECT_FIELD,
             INCLUDE_FAILED_FIELD,
+            ON_CONFLICT_FIELD,
             AFTER_FIELD,
             AFTER_KEYS_FIELD,
             RETRY_TIMEOUT_SECS_FIELD,
@@ -814,6 +822,15 @@ fn spec_collect(args: &Value) -> Result<Option<CollectMode>, ToolError> {
         .transpose()
 }
 
+/// `on_conflict` is parsed by `lu-proto`, so the CLI and MCP accept the same spellings.
+fn spec_on_conflict(args: &Value) -> Result<OnConflict, ToolError> {
+    match args.get("on_conflict") {
+        Some(value) => OnConflict::parse(value.as_str().unwrap_or_default())
+            .map_err(|error| ToolError::Failed(error.to_string())),
+        None => Ok(OnConflict::Fail),
+    }
+}
+
 fn spec_fallbacks(args: &Value) -> Vec<Choice> {
     args.get("fallbacks")
         .and_then(Value::as_array)
@@ -856,6 +873,7 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
             .get("include_failed")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        on_conflict: spec_on_conflict(args)?,
         allow_empty: false,
         requires: field_strings(args, "require"),
         tolerates: Vec::new(),
@@ -950,6 +968,7 @@ fn submit_output(view: &JobView) -> ToolOutput {
                 "stack_dependencies": view.spec.stack_dependencies,
                 "collect": view.spec.collect.map(|mode| mode.as_str()),
                 "include_failed": view.spec.include_failed,
+                "on_conflict": view.spec.on_conflict.as_str(),
                 "timeout_secs": view.spec.timeout_secs,
                 "idle_timeout_secs": view.spec.idle_timeout_secs,
                 "idempotency_key": view.spec.idempotency_key.as_deref().map(clean)
@@ -1322,6 +1341,9 @@ async fn retry(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     }
     if let Some(include_failed) = args.get("include_failed").and_then(Value::as_bool) {
         spec.include_failed = include_failed;
+    }
+    if args.get("on_conflict").is_some() {
+        spec.on_conflict = spec_on_conflict(args)?;
     }
     if args.get("after").is_some() || args.get("after_keys").is_some() {
         let ids = parse_ids(&field_strings(args, "after"))?;

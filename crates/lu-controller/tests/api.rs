@@ -190,6 +190,7 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         stack_dependencies: true,
         collect: None,
         include_failed: false,
+        on_conflict: Default::default(),
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),
@@ -556,6 +557,7 @@ async fn post_edit_changes_a_queued_job_and_rejects_bad_states() {
         after: None,
         collect: None,
         include_failed: None,
+        on_conflict: Default::default(),
     };
     let r = edit_job(srv.addr, &id, &edit).await;
     assert_eq!(status(&r), 200, "{r}");

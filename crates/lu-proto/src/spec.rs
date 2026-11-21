@@ -58,8 +58,6 @@ pub struct Choice {
 ///
 /// `None` keeps the old behaviour: no `.lu/inputs` directory and no explicit stacking. An absent
 /// `collect` on the wire falls back to `stack_dependencies`, so existing specs keep applying diffs.
-/// `Apply` and `Both` are accepted now but only collect into `.lu/inputs`; automatic stacking is
-/// still controlled by `stack_dependencies` until the next part of the design is implemented.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CollectMode {
@@ -122,11 +120,95 @@ impl CollectMode {
         matches!(self, Self::Files | Self::Both)
     }
 
-    /// Whether dependency diffs are applied to the job's tree. Part 1 stages files only.
+    /// Whether dependency diffs are applied to the job's tree.
     pub fn applies_diffs(self) -> bool {
         matches!(self, Self::Apply | Self::Both)
     }
 }
+
+/// What to do when an input patch does not apply cleanly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnConflict {
+    /// Stop before the harness and end the job as `conflict`.
+    #[default]
+    Fail,
+    /// Leave standard conflict markers in the affected files and continue with later inputs.
+    Markers,
+    /// Leave the patch unapplied and continue with later inputs.
+    Skip,
+}
+
+/// The canonical spellings accepted by [`OnConflict::parse`], in help-text order.
+pub const ON_CONFLICT_MODES: [&str; 3] = ["fail", "markers", "skip"];
+
+impl OnConflict {
+    /// Parses a canonical spelling, case-insensitively.
+    pub fn parse(value: &str) -> Result<Self, OnConflictError> {
+        let text = value.trim();
+        for name in ON_CONFLICT_MODES {
+            if text.eq_ignore_ascii_case(name) {
+                return Ok(match name {
+                    "fail" => Self::Fail,
+                    "markers" => Self::Markers,
+                    _ => Self::Skip,
+                });
+            }
+        }
+        Err(OnConflictError {
+            value: value.to_owned(),
+        })
+    }
+
+    /// The canonical wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fail => "fail",
+            Self::Markers => "markers",
+            Self::Skip => "skip",
+        }
+    }
+}
+
+impl FromStr for OnConflict {
+    type Err = OnConflictError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl fmt::Display for OnConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// An `on_conflict` value that is not a canonical mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnConflictError {
+    value: String,
+}
+
+impl OnConflictError {
+    /// The rejected input.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Display for OnConflictError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid on_conflict mode {:?}; expected one of {}",
+            self.value,
+            ON_CONFLICT_MODES.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for OnConflictError {}
 
 impl FromStr for CollectMode {
     type Err = CollectModeError;
@@ -216,6 +298,9 @@ pub struct JobSpec {
     /// Include `failed` and `cancelled` dependencies as inputs when they stored a diff.
     #[serde(default, skip_serializing_if = "is_false")]
     pub include_failed: bool,
+    /// How to handle an input patch that does not apply cleanly.
+    #[serde(default, skip_serializing_if = "is_default_conflict")]
+    pub on_conflict: OnConflict,
     /// Whether an empty `diff.patch` is expected, so no `no_changes` note is added.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_empty: bool,
@@ -259,6 +344,9 @@ struct RawJobSpec {
     collect: Option<String>,
     #[serde(default)]
     include_failed: bool,
+    /// Kept as text so an invalid value is reported as an `on_conflict` field error.
+    #[serde(default)]
+    on_conflict: Option<String>,
     #[serde(default)]
     allow_empty: bool,
     #[serde(default)]
@@ -279,6 +367,12 @@ impl TryFrom<RawJobSpec> for JobSpec {
             .map(CollectMode::parse)
             .transpose()
             .map_err(|error| invalid("collect", error.to_string()))?;
+        let on_conflict = raw
+            .on_conflict
+            .as_deref()
+            .map(OnConflict::parse)
+            .transpose()
+            .map_err(|error| invalid("on_conflict", error.to_string()))?;
         let spec = JobSpec {
             repo: raw.repo,
             git_ref: raw.git_ref,
@@ -294,6 +388,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
             stack_dependencies: raw.stack_dependencies,
             collect,
             include_failed: raw.include_failed,
+            on_conflict: on_conflict.unwrap_or_default(),
             allow_empty: raw.allow_empty,
             requires: raw.requires,
             tolerates: raw.tolerates,
@@ -479,6 +574,13 @@ pub struct JobEdit {
     pub collect: Option<CollectMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_failed: Option<bool>,
+    /// Replaces the conflict policy. `"fail"` clears an explicit policy.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_conflict_option"
+    )]
+    pub on_conflict: Option<OnConflict>,
 }
 
 fn deserialize_collect_option<'de, D>(deserializer: D) -> Result<Option<CollectMode>, D::Error>
@@ -522,6 +624,9 @@ impl JobEdit {
         if let Some(include_failed) = self.include_failed {
             next.include_failed = include_failed;
         }
+        if let Some(on_conflict) = self.on_conflict {
+            next.on_conflict = on_conflict;
+        }
         if next.is_any_provider() {
             if self.model.is_some() || self.fallbacks.as_ref().is_some_and(|f| !f.is_empty()) {
                 return Err(invalid("model", "must not be set with provider \"any\""));
@@ -532,6 +637,17 @@ impl JobEdit {
         next.validate()?;
         Ok(next)
     }
+}
+
+fn deserialize_conflict_option<'de, D>(deserializer: D) -> Result<Option<OnConflict>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .as_deref()
+        .map(|text| OnConflict::parse(text).map_err(serde::de::Error::custom))
+        .transpose()
 }
 
 fn default_harness() -> String {
@@ -552,6 +668,10 @@ fn is_true(value: &bool) -> bool {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_default_conflict(value: &OnConflict) -> bool {
+    *value == OnConflict::Fail
 }
 
 fn invalid(field: &'static str, reason: impl Into<String>) -> JobSpecError {
@@ -659,6 +779,7 @@ mod tests {
             stack_dependencies: true,
             collect: None,
             include_failed: false,
+            on_conflict: Default::default(),
             allow_empty: false,
             requires: Vec::new(),
             tolerates: Vec::new(),
@@ -1077,6 +1198,73 @@ mod tests {
     }
 
     #[test]
+    fn conflict_modes_parse_without_aliases_and_round_trip() {
+        for (text, mode) in [
+            ("fail", OnConflict::Fail),
+            ("MARKERS", OnConflict::Markers),
+            ("Skip", OnConflict::Skip),
+        ] {
+            assert_eq!(OnConflict::parse(text).unwrap(), mode, "{text}");
+            assert_eq!(text.parse::<OnConflict>().unwrap(), mode, "{text}");
+            assert_eq!(mode.as_str().parse::<OnConflict>().unwrap(), mode);
+            assert_eq!(mode.to_string(), mode.as_str());
+        }
+        let error = OnConflict::parse("nope").unwrap_err();
+        assert_eq!(error.value(), "nope");
+        assert!(error.to_string().contains("fail, markers, skip"));
+        assert!(OnConflict::parse(" three-way ").is_err());
+    }
+
+    #[test]
+    fn on_conflict_defaults_to_fail_and_is_omitted_from_canonical_json() {
+        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let spec: JobSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.on_conflict, OnConflict::Fail);
+        assert!(!spec.canonical_json().contains("on_conflict"));
+
+        for mode in [OnConflict::Fail, OnConflict::Markers, OnConflict::Skip] {
+            let mut spec = sample();
+            spec.on_conflict = mode;
+            let json = spec.canonical_json();
+            assert_eq!(
+                json.contains("\"on_conflict\""),
+                mode != OnConflict::Fail,
+                "{json}"
+            );
+            let parsed: JobSpec = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, spec);
+            assert_eq!(parsed.canonical_json(), json);
+        }
+    }
+
+    #[test]
+    fn invalid_on_conflict_is_reported_by_field_on_the_wire() {
+        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go","on_conflict":"merge"}"#;
+        let error = serde_json::from_str::<JobSpec>(json).unwrap_err();
+        assert!(error.to_string().contains("on_conflict"), "{error}");
+
+        let edit: Result<JobEdit, _> = serde_json::from_str(r#"{"on_conflict":"merge"}"#);
+        assert!(edit.is_err());
+    }
+
+    #[test]
+    fn on_conflict_round_trips_through_job_edit() {
+        let spec = sample();
+        let edit: JobEdit = serde_json::from_str(r#"{"on_conflict":"markers"}"#).unwrap();
+        let next = edit.apply(&spec).unwrap();
+        assert_eq!(next.on_conflict, OnConflict::Markers);
+
+        let clear: JobEdit = serde_json::from_str(r#"{"on_conflict":"fail"}"#).unwrap();
+        let next = clear.apply(&next).unwrap();
+        assert_eq!(next.on_conflict, OnConflict::Fail);
+
+        let mut spec = sample();
+        spec.on_conflict = OnConflict::Skip;
+        let edit = JobEdit::default();
+        assert_eq!(edit.apply(&spec).unwrap().on_conflict, OnConflict::Skip);
+    }
+
+    #[test]
     fn allow_empty_defaults_false_and_is_omitted_when_false() {
         let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
         let spec: JobSpec = serde_json::from_str(json).unwrap();
@@ -1205,6 +1393,7 @@ mod tests {
             after: None,
             collect: None,
             include_failed: None,
+            on_conflict: Default::default(),
         };
         let next = edit.apply(&spec).unwrap();
         assert_eq!(next.provider.as_deref(), Some("new"));

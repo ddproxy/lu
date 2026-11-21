@@ -37,7 +37,8 @@ pub use node::{
 pub use sanitize::{printable, truncate_chars};
 pub use spec::{
     effective_collect, validate_idempotency_key, Choice, CollectMode, CollectModeError, JobEdit,
-    JobSpec, JobSpecError, ANY_PROVIDER, COLLECT_ALIASES, COLLECT_MODES,
+    JobSpec, JobSpecError, OnConflict, OnConflictError, ANY_PROVIDER, COLLECT_ALIASES,
+    COLLECT_MODES, ON_CONFLICT_MODES,
 };
 pub use state::{CancelEffect, JobState, ParseJobStateError};
 pub use view::{JobView, NodeView};

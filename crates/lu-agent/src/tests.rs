@@ -11,7 +11,7 @@ use lu_client::{ApiError, Controller, DependencyView, PollRequest};
 use lu_config::BaseSource;
 use lu_proto::{
     AgentEvent, ArtifactName, Completion, FailureClass, HarnessState, JobId, JobSpec, JobState,
-    LogChunk, NodeName, Outcome, HARNESS_OK_FALSE, MAX_LOG_BYTES,
+    LogChunk, NodeName, OnConflict, Outcome, HARNESS_OK_FALSE, MAX_LOG_BYTES,
 };
 use lu_staging::Staging;
 use lu_supervise::CommandSpec;
@@ -322,6 +322,7 @@ fn test_spec(repo: &str) -> JobSpec {
         stack_dependencies: true,
         collect: None,
         include_failed: false,
+        on_conflict: Default::default(),
         allow_empty: false,
         requires: Vec::new(),
         tolerates: Vec::new(),
@@ -1343,6 +1344,170 @@ async fn dependency_without_a_diff_is_skipped() {
     let report: serde_json::Value =
         serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
     assert_eq!(report["applied_dependencies"], json!([]));
+}
+
+/// Three inputs from one base: the second conflicts with the first, the third is independent.
+fn three_conflicting_inputs(
+    f: &Fixture,
+) -> (JobId, JobId, JobId, JobId, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let job_id = JobId::new();
+    let dep1 = JobId::new();
+    let dep2 = JobId::new();
+    let dep3 = JobId::new();
+    std::fs::write(f.repo_dir.join("notes.md"), "base\n").unwrap();
+    git(&f.repo_dir, &["add", "notes.md"]);
+    git(&f.repo_dir, &["commit", "-q", "-m", "notes"]);
+    let first = make_diff(&f.repo_dir, "README.md", "test\n", "one\n");
+    let second = make_diff(&f.repo_dir, "README.md", "test\n", "two\n");
+    let third = make_diff(&f.repo_dir, "notes.md", "base\n", "third\n");
+    (job_id, dep1, dep2, dep3, first, second, third)
+}
+
+fn conflict_controller(
+    job_id: &JobId,
+    repo: &str,
+    deps: &[DependencyView],
+    diffs: &[Vec<u8>],
+    mode: OnConflict,
+) -> Arc<FakeController> {
+    let mut spec = test_spec(repo);
+    spec.after = deps.iter().map(|dep| dep.job_id.clone()).collect();
+    spec.on_conflict = mode;
+    let controller = assigned_controller(job_id, spec);
+    controller.push_deps(Ok(deps.to_vec()));
+    for diff in diffs {
+        controller.push_dep_diff(Ok(diff.clone()));
+    }
+    controller
+}
+
+#[tokio::test]
+async fn fail_policy_names_the_conflicting_input_and_hunk() {
+    let f = fixture();
+    let (job_id, dep1, dep2, dep3, first, second, third) = three_conflicting_inputs(&f);
+    let deps = vec![
+        dependency(&dep1, &first),
+        dependency(&dep2, &second),
+        dependency(&dep3, &third),
+    ];
+    let controller = conflict_controller(
+        &job_id,
+        &f.repo_dir.to_string_lossy(),
+        &deps,
+        &[first, second, third],
+        OnConflict::Fail,
+    );
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo harness-ran"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert!(
+        !calls.iter().any(|c| matches!(c, Call::Start { .. })),
+        "a conflict must stop before the harness: {calls:?}"
+    );
+    let done = completions(&calls);
+    assert_eq!(
+        done[0].outcome,
+        Outcome::Failed(FailureClass::Conflict),
+        "{done:?}"
+    );
+    let summary = done[0].summary.as_deref().unwrap_or("");
+    assert!(summary.contains(dep2.as_str()), "{summary}");
+    assert!(summary.contains("README.md"), "{summary}");
+    assert!(summary.contains("hunk at line"), "{summary}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    assert_eq!(report["applied_dependencies"], json!([dep1.to_string()]));
+}
+
+#[tokio::test]
+async fn skip_policy_omits_the_bad_patch_and_applies_later_inputs() {
+    let f = fixture();
+    let (job_id, dep1, dep2, dep3, first, second, third) = three_conflicting_inputs(&f);
+    let deps = vec![
+        dependency(&dep1, &first),
+        dependency(&dep2, &second),
+        dependency(&dep3, &third),
+    ];
+    let controller = conflict_controller(
+        &job_id,
+        &f.repo_dir.to_string_lossy(),
+        &deps,
+        &[first, second, third],
+        OnConflict::Skip,
+    );
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("grep -q '^one$' README.md && ! grep -q '^two$' README.md && grep -q '^third$' notes.md"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+    let diff = String::from_utf8(artifact(&calls, ArtifactName::DiffPatch)).unwrap();
+    assert!(diff.contains("+one"), "{diff}");
+    assert!(!diff.contains("+two"), "{diff}");
+    assert!(diff.contains("+third"), "{diff}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    assert_eq!(
+        report["applied_dependencies"],
+        json!([dep1.to_string(), dep3.to_string()])
+    );
+}
+
+#[tokio::test]
+async fn markers_policy_keeps_both_sides_and_exports_them() {
+    let f = fixture();
+    let (job_id, dep1, dep2, dep3, first, second, third) = three_conflicting_inputs(&f);
+    let deps = vec![
+        dependency(&dep1, &first),
+        dependency(&dep2, &second),
+        dependency(&dep3, &third),
+    ];
+    let controller = conflict_controller(
+        &job_id,
+        &f.repo_dir.to_string_lossy(),
+        &deps,
+        &[first, second, third],
+        OnConflict::Markers,
+    );
+    let script = format!(
+        "grep -q '^<<<<<<< HEAD$' README.md && grep -q '^one$' README.md && grep -q '^two$' README.md && grep -q '^>>>>>>> {}$' README.md && grep -q '^third$' notes.md",
+        dep2
+    );
+    let agent = fast_agent(&f.work_dir, controller.clone(), move |_| {
+        CommandSpec::new("sh").arg("-c").arg(script.as_str())
+    });
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+    let diff = String::from_utf8(artifact(&calls, ArtifactName::DiffPatch)).unwrap();
+    assert!(diff.contains("+<<<<<<< HEAD"), "{diff}");
+    assert!(diff.contains("+one"), "{diff}");
+    assert!(diff.contains("+two"), "{diff}");
+    assert!(diff.contains(&format!("+>>>>>>> {dep2}")), "{diff}");
+    assert!(diff.contains("+third"), "{diff}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    assert_eq!(
+        report["applied_dependencies"],
+        json!([dep1.to_string(), dep2.to_string(), dep3.to_string()])
+    );
 }
 
 #[tokio::test]

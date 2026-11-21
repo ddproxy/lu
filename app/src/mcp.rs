@@ -552,6 +552,7 @@ mod tests {
                 "no_stack",
                 "collect",
                 "include_failed",
+                "on_conflict",
                 "timeout",
                 "timeout_secs",
                 "idle_timeout",
@@ -570,6 +571,7 @@ mod tests {
             assert_eq!(props["no_stack"]["type"], "boolean");
             assert_eq!(props["collect"]["type"], "string");
             assert_eq!(props["include_failed"]["type"], "boolean");
+            assert_eq!(props["on_conflict"]["type"], "string");
             assert_eq!(props["harness"]["type"], "string");
             if name == "lu_submit_many" || name == "lu_submit" {
                 assert_eq!(props["timeout_secs"]["default"], 3600);
@@ -963,6 +965,7 @@ mod tests {
                     "no_stack": true,
                     "collect": "both",
                     "include_failed": true,
+                    "on_conflict": "markers",
                     "after": [dependency],
                     "after_keys": ["dep-key"],
                     "timeout": 120,
@@ -987,6 +990,7 @@ mod tests {
         assert_eq!(body["stack_dependencies"], false);
         assert_eq!(body["collect"], "both");
         assert_eq!(body["include_failed"], true);
+        assert_eq!(body["on_conflict"], "markers");
         assert_eq!(body["after"], json!([dependency]));
         assert_eq!(body["timeout_secs"], 120);
         assert_eq!(body["idle_timeout_secs"], 60);
@@ -1002,6 +1006,7 @@ mod tests {
         assert_eq!(structured["spec"]["stack_dependencies"], false);
         assert_eq!(structured["spec"]["collect"], "both");
         assert_eq!(structured["spec"]["include_failed"], true);
+        assert_eq!(structured["spec"]["on_conflict"], "markers");
         assert_eq!(structured["spec"]["timeout_secs"], 120);
         assert_eq!(structured["spec"]["idle_timeout_secs"], 60);
         assert_eq!(structured["spec"]["harness"], "claude");
@@ -1032,6 +1037,7 @@ mod tests {
         job["no_stack"] = json!(true);
         job["collect"] = json!("files");
         job["include_failed"] = json!(true);
+        job["on_conflict"] = json!("skip");
         job["after_keys"] = json!(["dep-key"]);
         job["timeout"] = json!(90);
         job["timeout_secs"] = json!(999);
@@ -1051,6 +1057,7 @@ mod tests {
         assert_eq!(body["stack_dependencies"], false);
         assert_eq!(body["collect"], "files");
         assert_eq!(body["include_failed"], true);
+        assert_eq!(body["on_conflict"], "skip");
         assert_eq!(body["after"], json!([dependency]));
         assert_eq!(body["timeout_secs"], 90);
         assert_eq!(body["idle_timeout_secs"], 30);
@@ -1067,7 +1074,7 @@ mod tests {
             "provider": "primary", "harness": "opencode",
             "requires": ["gpu"], "fallbacks": [{"provider": "copilot"}],
             "stack_dependencies": false, "collect": "files", "include_failed": false,
-            "timeout_secs": 500, "idle_timeout_secs": 250,
+            "on_conflict": "skip", "timeout_secs": 500, "idle_timeout_secs": 250,
             "after": [dependency], "idempotency_key": "old-key"
         });
         let done_path = format!("/v1/jobs/{done}");
@@ -1097,6 +1104,7 @@ mod tests {
         assert_eq!(structured["spec"]["stack_dependencies"], false);
         assert_eq!(structured["spec"]["collect"], "files");
         assert_eq!(structured["spec"]["include_failed"], false);
+        assert_eq!(structured["spec"]["on_conflict"], "skip");
         assert_eq!(structured["spec"]["timeout_secs"], 500);
         assert_eq!(structured["spec"]["idle_timeout_secs"], 250);
         assert_eq!(structured["spec"]["harness"], "opencode");
@@ -1112,6 +1120,7 @@ mod tests {
                     "no_stack": false,
                     "collect": "apply",
                     "include_failed": true,
+                    "on_conflict": "markers",
                     "after": [],
                     "timeout": 90,
                     "idle_timeout": 30,
@@ -1126,6 +1135,7 @@ mod tests {
         assert_eq!(structured["spec"]["stack_dependencies"], true);
         assert_eq!(structured["spec"]["collect"], "apply");
         assert_eq!(structured["spec"]["include_failed"], true);
+        assert_eq!(structured["spec"]["on_conflict"], "markers");
         assert_eq!(structured["after"], json!([]));
         assert_eq!(structured["spec"]["timeout_secs"], 90);
         assert_eq!(structured["spec"]["idle_timeout_secs"], 30);
@@ -1219,6 +1229,11 @@ mod tests {
             ),
             (
                 "lu_submit",
+                json!({"on_conflict": "nope"}),
+                "invalid on_conflict mode \"nope\"; expected one of fail, markers, skip",
+            ),
+            (
+                "lu_submit",
                 json!({"after_keys": keys}),
                 "after: must name at most 16 jobs (got 17)",
             ),
@@ -1239,6 +1254,11 @@ mod tests {
                 "lu_retry",
                 json!({"id": done, "collect": "nope"}),
                 "invalid collect mode \"nope\"; expected one of none, files, apply, both (aliases: off, false, diffs, diff, patches, patch)",
+            ),
+            (
+                "lu_retry",
+                json!({"id": done, "on_conflict": "nope"}),
+                "invalid on_conflict mode \"nope\"; expected one of fail, markers, skip",
             ),
         ];
         for (name, extra, expected) in cases.drain(..) {

@@ -1957,3 +1957,262 @@ async fn submit_accepts_any_and_rejects_a_model_or_fallback() {
     assert_eq!(server.records.lock().unwrap().len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn collected_view(id: &str, state: &str, diff_bytes: u64) -> Value {
+    let mut view = job_json(id, state);
+    view["diff_bytes"] = json!(diff_bytes);
+    view
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collect_resolves_keys_and_ids_and_sets_the_collection_spec() {
+    let build = job_id();
+    let test = job_id();
+    let direct = job_id();
+    let new_id = job_id();
+    let entries = [
+        ("build".to_owned(), build.clone()),
+        ("test".to_owned(), test.clone()),
+    ]
+    .to_vec();
+    let views = [
+        collected_view(&build, "done", 120),
+        collected_view(&test, "failed", 40),
+        collected_view(&direct, "done", 10),
+    ]
+    .to_vec();
+    let reply_id = new_id.clone();
+    let test_id = test.clone();
+    let server = start(move |record| {
+        if record.method == "GET" {
+            if let Some(id) = record.path.strip_prefix("/v1/jobs/") {
+                let view = views
+                    .iter()
+                    .find(|view| view["id"] == json!(id))
+                    .cloned()
+                    .unwrap_or_else(|| job_json(id, "done"));
+                return Reply::json(&view);
+            }
+            let key = record
+                .query
+                .as_deref()
+                .and_then(|q| q.strip_prefix("key="))
+                .unwrap_or("");
+            let jobs: Vec<Value> = entries
+                .iter()
+                .filter(|(name, _)| name == key)
+                .map(|(_, id)| {
+                    collected_view(
+                        id,
+                        if id == &test_id { "failed" } else { "done" },
+                        if id == &test_id { 40 } else { 120 },
+                    )
+                })
+                .collect();
+            return Reply::json(&json!({"jobs": jobs, "next": null}));
+        }
+        Reply::json(&job_json(&reply_id, "blocked"))
+    })
+    .await;
+    let dir = scratch("collect-resolve");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let mut envs = env_for(&server, &token);
+    envs.push((
+        "XDG_CONFIG_HOME".to_owned(),
+        dir.join("no-config").display().to_string(),
+    ));
+    let output = run_with_env(
+        &[
+            "collect",
+            "build",
+            "test",
+            &direct,
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--template",
+            "test",
+            "--key",
+            "combined",
+            "--provider",
+            "peer-a",
+            "--model",
+            "m1",
+            "--timeout",
+            "90",
+        ],
+        &envs,
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), new_id);
+    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap().last().unwrap().body)
+        .expect("POST body");
+    assert_eq!(spec["after"], json!([build, test, direct]));
+    assert_eq!(spec["collect"], json!("both"));
+    assert_eq!(spec["on_conflict"], json!("markers"));
+    assert_eq!(spec["include_failed"], json!(true));
+    assert_eq!(spec["idempotency_key"], json!("combined"));
+    assert_eq!(spec["provider"], json!("peer-a"));
+    assert_eq!(spec["model"], json!("m1"));
+    assert_eq!(spec["timeout_secs"], json!(90));
+    let task = spec["task"].as_str().unwrap();
+    assert!(task.contains("Run the repository's checks"), "{task}");
+    assert!(!task.contains("## Extra instructions"), "{task}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collect_reads_template_override_and_appends_task_file() {
+    let dep = job_id();
+    let new_id = job_id();
+    let dep_id = dep.clone();
+    let server = start(move |record| {
+        if record.method == "GET" {
+            return Reply::json(&json!({
+                "jobs": [collected_view(&dep_id, "done", 10)],
+                "next": null
+            }));
+        }
+        Reply::json(&job_json(&new_id, "blocked"))
+    })
+    .await;
+    let dir = scratch("collect-override");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let template = dir.join("lu").join("templates").join("merge.md");
+    std::fs::create_dir_all(template.parent().unwrap()).unwrap();
+    std::fs::write(&template, "OVERRIDE PROMPT\n").unwrap();
+    let extra = dir.join("extra.md");
+    std::fs::write(&extra, "Extra line\n").unwrap();
+    let mut envs = env_for(&server, &token);
+    envs.push(("XDG_CONFIG_HOME".to_owned(), dir.display().to_string()));
+    let output = run_with_env(
+        &[
+            "collect",
+            "the-key",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+            "--task-file",
+            extra.to_str().unwrap(),
+        ],
+        &envs,
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap().last().unwrap().body)
+        .expect("POST body");
+    assert_eq!(
+        spec["task"],
+        json!("OVERRIDE PROMPT\n\n## Extra instructions\n\nExtra line\n")
+    );
+    assert_eq!(spec["after"], json!([dep]));
+    assert!(spec["include_failed"].is_null(), "{spec}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collect_unknown_key_is_a_usage_error_without_submitting() {
+    let new_id = job_id();
+    let server = start(move |record| {
+        if record.method == "GET" {
+            return Reply::json(&json!({"jobs": [], "next": null}));
+        }
+        Reply::json(&job_json(&new_id, "blocked"))
+    })
+    .await;
+    let dir = scratch("collect-missing-key");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &[
+            "collect",
+            "no-such-key",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+        ],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("no-such-key"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert!(server
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|record| record.method == "GET"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collect_enforces_template_and_task_file_caps() {
+    let dir = scratch("collect-caps");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let template = dir.join("lu").join("templates").join("merge.md");
+    std::fs::create_dir_all(template.parent().unwrap()).unwrap();
+    std::fs::write(&template, "x".repeat(64 * 1024 + 1)).unwrap();
+    let server = server_for_caps().await;
+    let mut envs = env_for(&server, &token);
+    envs.push(("XDG_CONFIG_HOME".to_owned(), dir.display().to_string()));
+    let output = run_with_env(
+        &[
+            "collect",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+        ],
+        &envs,
+        None,
+        &dir,
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("larger than 65536 bytes"),
+        "{}",
+        stderr(&output)
+    );
+
+    std::fs::write(&template, "ok\n").unwrap();
+    let task_file = dir.join("huge.md");
+    std::fs::write(&task_file, "y".repeat(256 * 1024 + 1)).unwrap();
+    let output = run_with_env(
+        &[
+            "collect",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+            "--task-file",
+            task_file.to_str().unwrap(),
+        ],
+        &envs,
+        None,
+        &dir,
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("larger than 262144 bytes"),
+        "{}",
+        stderr(&output)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+async fn server_for_caps() -> TestServer {
+    start(|_| Reply::json(&job_json(&job_id(), "done"))).await
+}
