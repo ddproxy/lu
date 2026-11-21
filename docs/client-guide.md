@@ -57,7 +57,7 @@ Global flags: `--config <path>` (default `lu.toml`) and `--json` (raw controller
 | `lu agent` | `lu agent --config /etc/lu/agent.toml` | Runs the node poll loop; needs an `[agent]` config. |
 | `lu top` | `lu top --once` | Terminal dashboard; requires a `tui` build. |
 
-`--repo` and `--ref` are required for `submit`. The task comes from `--task`, `--task-file` or stdin. Repeat `--after <id>` or `--after-key <key>` for dependencies (16 total), and `--require <label>` for node labels (8 total). `--no-stack` runs on the base tree without dependency diffs.
+`--repo` and `--ref` are required for `submit`. The task comes from `--task`, `--task-file` or stdin. Repeat `--after <id>` or `--after-key <key>` for dependencies (16 total), and `--require <label>` for node labels (8 total). `--collect` controls dependency inputs (`none`, `files`, `apply`, `both`; default `apply`).
 
 Worked example — dependency chain by key:
 

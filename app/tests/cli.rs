@@ -429,52 +429,6 @@ async fn submit_after_and_after_key_resolve_to_one_dependency() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn submit_no_stack_sets_and_default_omits_the_field() {
-    let id = job_id();
-    let body = job_json(&id, "queued");
-    let server = start(move |_| Reply::json(&body)).await;
-    let dir = scratch("submit-no-stack");
-    let token = write_token(&dir, "operator.token", TOKEN);
-
-    let output = run_with_env(
-        &[
-            "submit",
-            "--repo",
-            "https://example.net/repo.git",
-            "--ref",
-            "main",
-            "--no-stack",
-        ],
-        &env_for(&server, &token),
-        Some("run the tests\n"),
-        &dir,
-    );
-    assert!(output.status.success(), "{}", stderr(&output));
-    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap()[0].body).unwrap();
-    assert_eq!(spec["stack_dependencies"], json!(false));
-
-    let output = run_with_env(
-        &[
-            "submit",
-            "--repo",
-            "https://example.net/repo.git",
-            "--ref",
-            "main",
-        ],
-        &env_for(&server, &token),
-        Some("run the tests\n"),
-        &dir,
-    );
-    assert!(output.status.success(), "{}", stderr(&output));
-    let spec: Value = serde_json::from_slice(&server.records.lock().unwrap()[1].body).unwrap();
-    assert!(
-        spec.get("stack_dependencies").is_none(),
-        "the default must be omitted: {spec}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_allow_empty_sets_and_default_omits_the_field() {
     let id = job_id();
     let body = job_json(&id, "queued");
@@ -1083,7 +1037,10 @@ async fn nodes_and_drain_render_aligned_text() {
             "draining": true,
             "labels": ["gpu", "php8.3", "ubuntu22.04", "x86_64", "region=eu", "tier=gold"],
             "taints": ["homelab"],
-            "cordons": ["zen", "openrouter"]
+            "cordon_details": [
+                {"provider": "zen", "source": "failure", "reason": "cooldown", "set_at": 0, "until": 20, "lifts_after_healthy_heartbeats": null},
+                {"provider": "openrouter", "source": "failure", "reason": "cooldown", "set_at": 0, "until": 20, "lifts_after_healthy_heartbeats": null}
+            ]
         },
         {"name": "node-b", "harness": "busy", "last_seen": 12, "draining": false, "labels": []}
     ]);
@@ -1376,7 +1333,6 @@ async fn node_prints_host_numbers_and_indented_process_tree() {
         .as_secs();
     let node_view = json!({
         "name": "node-a",
-        "cordons": ["p1", "p2"],
         "cordon_details": [
             {
                 "provider": "p1",

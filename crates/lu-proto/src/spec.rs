@@ -57,15 +57,12 @@ pub struct Choice {
 }
 
 /// What a job stages from its dependencies before the harness starts.
-///
-/// `None` keeps the old behaviour: no `.lu/inputs` directory and no explicit stacking. An absent
-/// `collect` on the wire falls back to `stack_dependencies`, so existing specs keep applying diffs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CollectMode {
-    #[default]
     None,
     Files,
+    #[default]
     Apply,
     Both,
 }
@@ -256,15 +253,6 @@ impl fmt::Display for CollectModeError {
 }
 
 impl std::error::Error for CollectModeError {}
-
-/// Resolves the effective mode: an explicit `collect` always wins over `stack_dependencies`.
-pub fn effective_collect(mode: Option<CollectMode>, stack_dependencies: bool) -> CollectMode {
-    mode.unwrap_or(if stack_dependencies {
-        CollectMode::Apply
-    } else {
-        CollectMode::None
-    })
-}
 
 /// How unmet expectations affect a run the harness finished successfully.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -672,13 +660,9 @@ pub struct JobSpec {
     /// Jobs that must be `done` before this one may run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<JobId>,
-    /// Whether dependency diffs are applied to this job's base tree.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub stack_dependencies: bool,
-    /// Which dependency artifacts to stage under `.lu/inputs`. Absent means
-    /// [`effective_collect`] falls back to `stack_dependencies`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub collect: Option<CollectMode>,
+    /// Which dependency artifacts to stage under `.lu/inputs`.
+    #[serde(default, skip_serializing_if = "is_apply")]
+    pub collect: CollectMode,
     /// Include `failed` and `cancelled` dependencies as inputs when they stored a diff.
     #[serde(default, skip_serializing_if = "is_false")]
     pub include_failed: bool,
@@ -710,6 +694,7 @@ pub struct JobSpec {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawJobSpec {
     repo: String,
     git_ref: String,
@@ -735,11 +720,9 @@ struct RawJobSpec {
     idempotency_key: Option<String>,
     #[serde(default)]
     after: Vec<JobId>,
-    #[serde(default = "default_true")]
-    stack_dependencies: bool,
     /// Kept as text so an invalid value is reported as a `collect` field error, with the same
     /// aliases the CLI and MCP accept.
-    #[serde(default, alias = "collect_mode")]
+    #[serde(default)]
     collect: Option<String>,
     #[serde(default)]
     include_failed: bool,
@@ -798,8 +781,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
             stuck_after_secs: raw.stuck_after_secs,
             idempotency_key: raw.idempotency_key,
             after: raw.after,
-            stack_dependencies: raw.stack_dependencies,
-            collect,
+            collect: collect.unwrap_or_default(),
             include_failed: raw.include_failed,
             on_conflict: on_conflict.unwrap_or_default(),
             allow_empty: raw.allow_empty,
@@ -884,9 +866,7 @@ impl JobSpec {
                 return Err(invalid("after", format!("duplicate job {id}")));
             }
         }
-        if self.collect.is_some_and(CollectMode::collects_files)
-            && self.after.len() > MAX_COLLECT_INPUTS
-        {
+        if self.collect.collects_files() && self.after.len() > MAX_COLLECT_INPUTS {
             return Err(invalid(
                 "collect",
                 format!(
@@ -1160,7 +1140,7 @@ impl JobEdit {
             next.after = after.clone();
         }
         if let Some(collect) = self.collect {
-            next.collect = Some(collect);
+            next.collect = collect;
         }
         if let Some(include_failed) = self.include_failed {
             next.include_failed = include_failed;
@@ -1243,12 +1223,8 @@ fn default_timeout_secs() -> u64 {
     DEFAULT_TIMEOUT_SECS
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn is_true(value: &bool) -> bool {
-    *value
+fn is_apply(value: &CollectMode) -> bool {
+    *value == CollectMode::Apply
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1373,8 +1349,7 @@ mod tests {
             idle_timeout_secs: None,
             idempotency_key: None,
             after: Vec::new(),
-            stack_dependencies: true,
-            collect: None,
+            collect: CollectMode::Apply,
             include_failed: false,
             on_conflict: Default::default(),
             allow_empty: false,
@@ -1584,7 +1559,7 @@ mod tests {
         assert_eq!(spec.provider, None);
         assert_eq!(spec.base_commit, None);
         assert!(spec.after.is_empty());
-        assert!(spec.stack_dependencies);
+        assert_eq!(spec.collect, CollectMode::Apply);
         assert!(spec.requires.is_empty());
         assert!(spec.tolerates.is_empty());
         assert!(spec.fallbacks.is_empty());
@@ -1610,11 +1585,16 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_are_ignored_for_forward_compatibility() {
+    fn unknown_fields_are_rejected() {
         let json =
             r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go","surprise":1}"#;
-        let spec: JobSpec = serde_json::from_str(json).unwrap();
-        assert!(spec.validate().is_ok());
+        let err = serde_json::from_str::<JobSpec>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown field") || err.contains("surprise"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1679,16 +1659,16 @@ mod tests {
     }
 
     #[test]
-    fn stacking_defaults_true_and_is_omitted_only_when_true() {
+    fn collect_defaults_to_apply_and_is_omitted_only_when_apply() {
         let mut spec = sample();
-        assert!(spec.stack_dependencies);
-        assert!(!spec.canonical_json().contains("stack_dependencies"));
+        assert_eq!(spec.collect, CollectMode::Apply);
+        assert!(!spec.canonical_json().contains("\"collect\""));
 
-        spec.stack_dependencies = false;
+        spec.collect = CollectMode::None;
         let json = spec.canonical_json();
-        assert!(json.contains("\"stack_dependencies\":false"), "{json}");
+        assert!(json.contains("\"collect\":\"none\""), "{json}");
         let parsed: JobSpec = serde_json::from_str(&json).unwrap();
-        assert!(!parsed.stack_dependencies);
+        assert_eq!(parsed.collect, CollectMode::None);
         assert_eq!(parsed, spec);
     }
 
@@ -1714,32 +1694,24 @@ mod tests {
     }
 
     #[test]
-    fn explicit_collect_overrides_stack_dependencies() {
-        assert_eq!(effective_collect(None, true), CollectMode::Apply);
-        assert_eq!(effective_collect(None, false), CollectMode::None);
-        assert_eq!(
-            effective_collect(Some(CollectMode::None), true),
-            CollectMode::None
-        );
-        assert_eq!(
-            effective_collect(Some(CollectMode::Files), true),
-            CollectMode::Files
-        );
+    fn collect_mode_flags() {
         assert!(CollectMode::Files.collects_files());
         assert!(!CollectMode::Files.applies_diffs());
         assert!(CollectMode::Apply.applies_diffs());
         assert!(!CollectMode::Apply.collects_files());
         assert!(CollectMode::Both.collects_files());
         assert!(CollectMode::Both.applies_diffs());
+        assert!(!CollectMode::None.collects_files());
+        assert!(!CollectMode::None.applies_diffs());
     }
 
     #[test]
-    fn collect_defaults_to_absent_and_round_trips_every_mode() {
+    fn collect_defaults_to_apply_and_round_trips_every_mode() {
         let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
         let spec: JobSpec = serde_json::from_str(json).unwrap();
-        assert_eq!(spec.collect, None);
+        assert_eq!(spec.collect, CollectMode::Apply);
         assert!(!spec.include_failed);
-        assert!(!spec.canonical_json().contains("collect"));
+        assert!(!spec.canonical_json().contains("\"collect\""));
         assert!(!spec.canonical_json().contains("include_failed"));
 
         for mode in [
@@ -1749,13 +1721,17 @@ mod tests {
             CollectMode::Both,
         ] {
             let mut spec = sample();
-            spec.collect = Some(mode);
+            spec.collect = mode;
             spec.include_failed = true;
             let json = spec.canonical_json();
-            assert!(
-                json.contains(&format!("\"collect\":\"{}\"", mode.as_str())),
-                "{json}"
-            );
+            if mode == CollectMode::Apply {
+                assert!(!json.contains("\"collect\""), "{json}");
+            } else {
+                assert!(
+                    json.contains(&format!("\"collect\":\"{}\"", mode.as_str())),
+                    "{json}"
+                );
+            }
             assert!(json.contains("\"include_failed\":true"), "{json}");
             let parsed: JobSpec = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, spec);
@@ -1784,19 +1760,19 @@ mod tests {
         let edit: JobEdit =
             serde_json::from_str(r#"{"collect":"diffs","include_failed":true}"#).unwrap();
         let next = edit.apply(&spec).unwrap();
-        assert_eq!(next.collect, Some(CollectMode::Files));
+        assert_eq!(next.collect, CollectMode::Files);
         assert!(next.include_failed);
 
         let clear: JobEdit =
             serde_json::from_str(r#"{"collect":"none","include_failed":false}"#).unwrap();
         let next = clear.apply(&next).unwrap();
-        assert_eq!(next.collect, Some(CollectMode::None));
+        assert_eq!(next.collect, CollectMode::None);
         assert!(!next.include_failed);
 
         let mut spec = sample();
-        spec.collect = Some(CollectMode::Files);
+        spec.collect = CollectMode::Files;
         let edit = JobEdit::default();
-        assert_eq!(edit.apply(&spec).unwrap().collect, Some(CollectMode::Files));
+        assert_eq!(edit.apply(&spec).unwrap().collect, CollectMode::Files);
     }
 
     #[test]

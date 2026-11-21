@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only hook used by the cargo-fuzz harness to exercise the same redaction path as Client.
+fuzzing = []
+
 [dependencies]
 lu-config = { path = "../lu-config" }
 lu-proto = { path = "../lu-proto" }

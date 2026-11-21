@@ -127,7 +127,9 @@ pub fn backup(db: &Path, out: &Path, force: bool) -> Result<BackupInfo, String> 
         drop(source);
         sync_file(out)?;
         verify_integrity(out, "integrity_check")?;
-        read_info(out)
+        let info = read_info(out)?;
+        require_lu_database(&info)?;
+        Ok(info)
     })();
     if result.is_err() {
         // A partial file must not be mistaken for a backup.
@@ -136,33 +138,31 @@ pub fn backup(db: &Path, out: &Path, force: bool) -> Result<BackupInfo, String> 
     result
 }
 
-/// A backup must be a Lu database: a known schema version and every table that version creates.
+/// A backup must be a Lu database: the supported schema version and every table that version creates.
 /// An empty or foreign SQLite file passes `integrity_check`, and installing one would replace the
 /// data with a file where every job query fails. A forged version row alone is not enough.
 fn require_lu_database(info: &BackupInfo) -> Result<(), String> {
-    let version = match info.schema_version {
-        Some(version) if (1..=SCHEMA_VERSION).contains(&version) => version,
-        Some(version) if version > SCHEMA_VERSION => {
-            return Err(format!(
-                "backup schema version {version} is newer than supported {SCHEMA_VERSION}"
-            ))
-        }
-        Some(version) => return Err(format!("backup schema version {version} is not valid")),
-        None => return Err("the file is not a Lu database (no schema version)".to_owned()),
+    let Some(version) = info.schema_version else {
+        return Err("the file is not a Lu database (no schema version)".to_owned());
     };
-    // `job_deps` arrived with schema 2; requiring it of a schema-1 backup would reject a file
-    // this binary can otherwise migrate. Every other table exists from schema 1 onwards.
-    let mut required = vec!["schema_version", "jobs", "nodes", "cordons", "idempotency"];
-    if version >= 2 {
-        required.push("job_deps");
-    }
-    if let Some(missing) = required
-        .into_iter()
-        .find(|name| !info.tables.iter().any(|table| table == name))
-    {
+    if version != SCHEMA_VERSION {
         return Err(format!(
-            "the file is not a Lu database (missing {missing} table)"
+            "backup schema version {version} is not supported; create a new database (this binary supports schema version {SCHEMA_VERSION})"
         ));
+    }
+    for required in [
+        "schema_version",
+        "jobs",
+        "nodes",
+        "cordons",
+        "idempotency",
+        "job_deps",
+    ] {
+        if !info.tables.iter().any(|table| table == required) {
+            return Err(format!(
+                "the file is not a Lu database (missing {required} table)"
+            ));
+        }
     }
     Ok(())
 }
@@ -473,8 +473,7 @@ mod tests {
             idle_timeout_secs: None,
             idempotency_key: None,
             after: Vec::new(),
-            stack_dependencies: true,
-            collect: None,
+            collect: lu_proto::CollectMode::Apply,
             include_failed: false,
             on_conflict: Default::default(),
             allow_empty: false,
@@ -562,21 +561,35 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_newer_schema() {
-        let dir = temp_dir("newer");
+    fn refuses_unsupported_schema_version() {
+        let dir = temp_dir("unsupported-schema");
         let db = dir.join("lu.db");
-        let out = dir.join("newer.db");
+        let out = dir.join("copy.db");
+        let copy = dir.join("manual.db");
         {
             let _store = crate::sqlite::SqliteStore::open(&db).unwrap();
         }
         let conn = Connection::open(&db).unwrap();
-        conn.execute("UPDATE schema_version SET version=999", [])
+        conn.execute("UPDATE schema_version SET version=9", [])
             .unwrap();
         drop(conn);
-        backup(&db, &out, false).unwrap();
+        let error = backup(&db, &out, false).unwrap_err();
+        assert!(error.contains("not supported"), "{error}");
+        assert!(error.contains("create a new database"), "{error}");
+        assert!(!out.exists());
+
+        // A foreign file with a bad schema version is also refused on restore.
+        let conn = Connection::open(&copy).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version(version INTEGER); INSERT INTO schema_version(version) VALUES (9);
+             CREATE TABLE jobs(x); CREATE TABLE nodes(x); CREATE TABLE cordons(x); CREATE TABLE idempotency(x); CREATE TABLE job_deps(x);",
+        )
+        .unwrap();
+        drop(conn);
         let target = dir.join("target.db");
-        let error = restore(&out, &target).unwrap_err();
-        assert!(error.contains("newer"), "{error}");
+        let error = restore(&copy, &target).unwrap_err();
+        assert!(error.contains("not supported"), "{error}");
+        assert!(error.contains("create a new database"), "{error}");
         assert!(!target.exists());
         let _ = fs::remove_dir_all(&dir);
     }

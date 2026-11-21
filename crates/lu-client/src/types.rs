@@ -108,7 +108,7 @@ pub struct StatusView {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PollRequest {
-    #[serde(alias = "name", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<NodeName>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub harness: Option<HarnessState>,
@@ -131,7 +131,7 @@ pub struct PollRequest {
     pub label_sources: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub taints: Vec<String>,
-    #[serde(alias = "wait", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_secs: Option<u64>,
 }
 

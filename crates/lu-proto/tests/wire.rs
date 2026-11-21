@@ -31,8 +31,7 @@ fn spec() -> JobSpec {
         stuck_after_secs: None,
         idempotency_key: Some("ticket:42".to_owned()),
         after: vec![JobId::new()],
-        stack_dependencies: true,
-        collect: None,
+        collect: lu_proto::CollectMode::Apply,
         include_failed: false,
         on_conflict: Default::default(),
         allow_empty: false,
@@ -252,7 +251,6 @@ fn job_and_node_views_match_the_documented_json() {
         label_sources: std::collections::BTreeMap::from([("gpu".to_owned(), "probed".to_owned())]),
         taints: vec!["homelab".to_owned()],
         current_job: Some(job_id()),
-        cordons: vec!["peer-c".to_owned()],
         cordon_details: vec![
             CordonView {
                 provider: "peer-c".to_owned(),
@@ -290,7 +288,6 @@ fn job_and_node_views_match_the_documented_json() {
         "label_sources": {"gpu": "probed"},
         "taints": ["homelab"],
         "current_job": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "cordons": ["peer-c"],
         "cordon_details": [
             {
                 "provider": "peer-c",

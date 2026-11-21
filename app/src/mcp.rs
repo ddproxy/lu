@@ -255,12 +255,13 @@ mod tests {
             "name": "node-a", "version": "1.2.3", "harness": "busy",
             "labels": ["gpu", "linux"],
             "providers": [{"name": "opencode", "state": "cooling", "soonest_secs": 7}],
-            "last_seen": 12, "draining": false, "cordons": ["copilot"],
+            "last_seen": 12, "draining": false,
+            "cordon_details": [{"provider":"copilot","source":"failure","reason":"cooldown","set_at":0,"until":20,"lifts_after_healthy_heartbeats":null}],
             "load1": 0.5, "mem_available_kb": 1000, "mem_total_kb": 2000, "stuck": 1
         }, {
             "name": "node-old", "version": "1.2.3", "harness": "idle",
             "labels": [],
-            "providers": [], "last_seen": 0, "draining": false, "cordons": [],
+            "providers": [], "last_seen": 0, "draining": false, "cordon_details": [],
             "load1": null, "mem_available_kb": null, "mem_total_kb": null, "stuck": 0
         }]});
         let node_stats = json!({
@@ -553,7 +554,6 @@ mod tests {
                 "require",
                 "fallbacks",
                 "after_keys",
-                "no_stack",
                 "collect",
                 "include_failed",
                 "on_conflict",
@@ -587,7 +587,6 @@ mod tests {
             assert_eq!(props["timeout"]["maximum"], 86400);
             assert_eq!(props["idle_timeout"]["minimum"], 1);
             assert_eq!(props["idle_timeout"]["maximum"], 86400);
-            assert_eq!(props["no_stack"]["type"], "boolean");
             assert_eq!(props["collect"]["type"], "string");
             assert_eq!(props["include_failed"]["type"], "boolean");
             assert_eq!(props["on_conflict"]["type"], "string");
@@ -985,7 +984,6 @@ mod tests {
                         {"provider": "copilot", "model": "gpt"},
                         {"provider": "codex"}
                     ],
-                    "no_stack": true,
                     "collect": "both",
                     "include_failed": true,
                     "on_conflict": "markers",
@@ -1019,7 +1017,6 @@ mod tests {
                 {"provider": "codex"}
             ])
         );
-        assert_eq!(body["stack_dependencies"], false);
         assert_eq!(body["collect"], "both");
         assert_eq!(body["include_failed"], true);
         assert_eq!(body["on_conflict"], "markers");
@@ -1048,7 +1045,6 @@ mod tests {
                 {"provider": "codex", "model": null}
             ])
         );
-        assert_eq!(structured["spec"]["stack_dependencies"], false);
         assert_eq!(structured["spec"]["collect"], "both");
         assert_eq!(structured["spec"]["include_failed"], true);
         assert_eq!(structured["spec"]["on_conflict"], "markers");
@@ -1082,7 +1078,6 @@ mod tests {
         let mut job = batch_job("a", json!([]));
         job["require"] = json!(["gpu"]);
         job["fallbacks"] = json!([{"provider": "copilot", "model": "gpt"}]);
-        job["no_stack"] = json!(true);
         job["collect"] = json!("files");
         job["include_failed"] = json!(true);
         job["on_conflict"] = json!("skip");
@@ -1104,7 +1099,6 @@ mod tests {
             body["fallbacks"],
             json!([{"provider": "copilot", "model": "gpt"}])
         );
-        assert_eq!(body["stack_dependencies"], false);
         assert_eq!(body["collect"], "files");
         assert_eq!(body["include_failed"], true);
         assert_eq!(body["on_conflict"], "skip");
@@ -1125,7 +1119,7 @@ mod tests {
             "repo": "/srv/repo", "git_ref": "main", "task": "go",
             "provider": "primary", "harness": "opencode",
             "requires": ["gpu"], "fallbacks": [{"provider": "copilot"}],
-            "stack_dependencies": false, "collect": "files", "include_failed": false,
+            "collect": "files", "include_failed": false,
             "on_conflict": "skip", "timeout_secs": 500, "idle_timeout_secs": 250,
             "on_stuck": "cancel", "stuck_after_secs": 300,
             "after": [dependency], "idempotency_key": "old-key"
@@ -1154,7 +1148,6 @@ mod tests {
             structured["spec"]["fallbacks"],
             json!([{"provider": "copilot", "model": null}])
         );
-        assert_eq!(structured["spec"]["stack_dependencies"], false);
         assert_eq!(structured["spec"]["collect"], "files");
         assert_eq!(structured["spec"]["include_failed"], false);
         assert_eq!(structured["spec"]["on_conflict"], "skip");
@@ -1172,7 +1165,6 @@ mod tests {
                     "id": done,
                     "require": [],
                     "fallbacks": [],
-                    "no_stack": false,
                     "collect": "apply",
                     "include_failed": true,
                     "on_conflict": "markers",
@@ -1189,7 +1181,6 @@ mod tests {
         assert!(!failed, "{text}");
         assert_eq!(structured["spec"]["requires"], json!([]));
         assert_eq!(structured["spec"]["fallbacks"], json!([]));
-        assert_eq!(structured["spec"]["stack_dependencies"], true);
         assert_eq!(structured["spec"]["collect"], "apply");
         assert_eq!(structured["spec"]["include_failed"], true);
         assert_eq!(structured["spec"]["on_conflict"], "markers");
@@ -1201,7 +1192,7 @@ mod tests {
         assert_eq!(structured["spec"]["harness"], "claude");
         let bodies = post_bodies(&server);
         assert_eq!(bodies.len(), 2);
-        assert!(bodies[1].get("stack_dependencies").is_none());
+        assert!(bodies[1].get("collect").is_none() || bodies[1]["collect"] == "apply");
     }
 
     #[tokio::test]
@@ -1386,13 +1377,10 @@ mod tests {
             assert_eq!(text, expected, "{name}");
         }
 
-        for (args, fragment) in [
-            (json!({"no_stack": "yes"}), "no_stack must be a boolean"),
-            (
-                json!({"fallbacks": [{"model": "gpt"}]}),
-                "fallbacks[0].provider",
-            ),
-        ] {
+        for (args, fragment) in [(
+            json!({"fallbacks": [{"model": "gpt"}]}),
+            "fallbacks[0].provider",
+        )] {
             let mut call = base.clone();
             call.as_object_mut().unwrap().extend(
                 args.as_object()

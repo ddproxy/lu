@@ -46,7 +46,7 @@ pub(crate) async fn collect_inputs(
     applied: &[AppliedInput],
     staged: &StagedDir,
 ) -> Result<CollectOutcome, AgentError> {
-    let mode = lu_proto::effective_collect(spec.collect, spec.stack_dependencies);
+    let mode = spec.collect;
     if !mode.collects_files() {
         return Ok(CollectOutcome::Collected);
     }

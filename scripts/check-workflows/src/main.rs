@@ -158,6 +158,7 @@ fn expected_permissions(workflow: &str, job: &str) -> Option<Permissions> {
         ],
         ("dependency-review.yml", "dependency-review") => READ,
         ("audit.yml", "cargo-deny") => READ,
+        ("fuzz.yml", "fuzz") => READ,
         ("release.yml", "create") => &[("contents", "write")],
         ("release.yml", "build" | "sbom") => READ,
         ("release.yml", "publish") => &[

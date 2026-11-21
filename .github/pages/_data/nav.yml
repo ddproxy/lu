@@ -44,7 +44,6 @@
 - title: Reference
   items:
     - { title: HTTP API, url: /docs/api.html }
-    - { title: Stable fields, url: /docs/stable-fields.html }
     - { title: Client guide, url: /docs/client-guide.html }
     - { title: MCP server, url: /docs/mcp.html }
     - { title: FAQ, url: /docs/faq.html }

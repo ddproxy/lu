@@ -1,0 +1,7 @@
+[agent]
+name = "fuzz-node"
+controller_url = "https://controller.example.invalid"
+token_file = "/etc/lu/token"
+ca_file = "/etc/lu/ca.pem"
+work_dir = "/var/lib/lu/work"
+harness = "opencode"

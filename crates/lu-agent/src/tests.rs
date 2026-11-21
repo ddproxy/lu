@@ -321,8 +321,7 @@ fn test_spec(repo: &str) -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: None,
         after: Vec::new(),
-        stack_dependencies: true,
-        collect: None,
+        collect: lu_proto::CollectMode::Apply,
         include_failed: false,
         on_conflict: Default::default(),
         allow_empty: false,
@@ -1691,14 +1690,14 @@ async fn markers_policy_keeps_both_sides_and_exports_them() {
 }
 
 #[tokio::test]
-async fn no_stack_leaves_the_base_tree_alone() {
+async fn collect_none_leaves_the_base_tree_alone() {
     let f = fixture();
     let job_id = JobId::new();
     let dep = JobId::new();
     let diff = make_diff(&f.repo_dir, "README.md", "test\n", "test\ndep\n");
     let mut spec = test_spec(&f.repo_dir.to_string_lossy());
     spec.after = vec![dep.clone()];
-    spec.stack_dependencies = false;
+    spec.collect = lu_proto::CollectMode::None;
     let controller = assigned_controller(&job_id, spec);
     controller.push_deps(Ok(vec![dependency(&dep, &diff)]));
 

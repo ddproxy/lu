@@ -13,11 +13,27 @@ licence and source policy; the dependency-review allow list mirrors it.
 | `scorecard.yml` | OpenSSF Scorecard checks, published publicly | Push to `main`, weekly | Security tab → Code scanning (SARIF), the README Scorecard badge and the `scorecard-results` artifact (5 days) |
 | `dependency-review.yml` | Dependency changes with high-severity advisories or licences outside the `deny.toml` allow list | Pull request | Pull request checks |
 | `audit.yml` | `cargo deny check` of advisories, bans, licences and sources | Push, pull request, daily | Pull request checks and the Actions tab |
+| `fuzz.yml` | libFuzzer runs of the untrusted-input parsers, 120 seconds per target | Weekly, manual dispatch | Actions tab and the `fuzz-crashes-<target>` artifacts (7 days) |
 | `release.yml` | CycloneDX SBOM and build provenance attestation for release archives | Tag `v*` | Release assets and `gh attestation verify` |
 
 Scorecard runs only on github.com. For the threat model and hardening notes, see
 [Security](security.md); reporting is covered by
 [SECURITY.md](https://github.com/ddproxy/lu/blob/main/SECURITY.md).
+
+## Fuzz locally
+
+The `fuzz/` crate is a separate workspace of cargo-fuzz targets for parsers that handle untrusted
+input: `patch_inflate`, `patch_apply`, `staging_path`, `artifact_path`, `job_spec`, `config_toml`,
+`ids`, `wire_request` and `secret_scrub`. It uses hand-written seeds in `fuzz/corpus/<target>/`.
+
+```sh
+cargo install cargo-fuzz --locked --version 0.13.2
+cargo +nightly fuzz run job_spec -- -max_total_time=30
+```
+
+Replace `job_spec` with any target above. Crashing inputs are written to
+`fuzz/artifacts/<target>/`; keep them out of `fuzz/corpus/` until the fault is fixed. The weekly
+workflow runs every target for 120 seconds and uploads any crashes as artifacts.
 
 ## Verify a release
 

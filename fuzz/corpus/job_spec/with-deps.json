@@ -1,0 +1,1 @@
+{"repo":"/tmp/repo","git_ref":"main","task":"fix","harness":"opencode","timeout_secs":60,"after":["01ARZ3NDEKTSV4RRFFQ69G5FAV"],"collect":"diffs","priority":5,"group":"g1"}
