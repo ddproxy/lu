@@ -5,6 +5,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.5.0]
+
+Requires: a new controller database (the schema was reset; recreate it before upgrading).
+
 ### Changed
 
 - Renamed the node agent to Ting. The crate is now `tuishou-ting` (library) and the binary is `ting`; the heartbeat `agent_version` field is unchanged and now reports the Ting package version. The scoped harness MCP server is `ting mcp`, whose `serverInfo.name` is `ting`. The `[agent]` config table, wire routes, node views and `agent_version` field are unchanged; no schema version bump.
