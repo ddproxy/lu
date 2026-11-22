@@ -1,6 +1,6 @@
 [package]
 name = "lu"
-description = "Lu: a job queue and dispatcher for dev peers (controller, agent and CLI in one binary)"
+description = "Lu: a job queue and dispatcher for dev peers (controller and operator CLI)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,20 +11,31 @@ publish.workspace = true
 # The `top` subcommand. The model and `lu graph` build without a terminal library.
 tui = ["lu-tui/tui"]
 
+[[bin]]
+name = "lu"
+path = "src/main.rs"
+
+[[bin]]
+name = "ting"
+path = "src/bin/ting.rs"
+
 [dependencies]
+lu-audit = { path = "../crates/lu-audit" }
 lu-config = { path = "../crates/lu-config" }
 lu-auth = { path = "../crates/lu-auth" }
 lu-serve = { path = "../crates/lu-serve" }
 lu-controller = { path = "../crates/lu-controller" }
 lu-store = { path = "../crates/lu-store" }
 lu-client = { path = "../crates/lu-client" }
-lu-agent = { path = "../crates/lu-agent" }
+tuishou-ting = { path = "../crates/tuishou-ting" }
 lu-proto = { path = "../crates/lu-proto" }
 lu-tui = { path = "../crates/lu-tui" }
 axum.workspace = true
 clap = { workspace = true }
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+toml.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

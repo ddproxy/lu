@@ -8,15 +8,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lu_proto::{
-    AgentEvent, ArtifactName, Completion, JobEdit, JobId, JobSpec, JobState, LogChunk, NodeName,
+    valid_group, AgentEvent, ArtifactName, Completion, JobEdit, JobId, JobSpec, JobState, LogChunk,
+    NodeName, ScopeRequest, ScopeResponse, MAX_GROUP_RUNNING,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
 use crate::error::{body_excerpt, ApiError};
 use crate::types::{
-    CompletionBody, DependencyView, JobView, ListJobs, ListNodes, ListRepos, LogPage, NodeStats,
-    NodeView, PollRequest, RepoView, StatusView, MAX_JSON_BYTES,
+    CompletionBody, DependencyView, JobView, ListDrafts, ListJobs, ListNodes, ListRepos, LogPage,
+    NodeStats, NodeView, PollRequest, RepoView, StatusView, WorkspaceCleanResult, WorkspaceRelease,
+    MAX_JSON_BYTES,
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -203,6 +205,22 @@ impl Client {
         self.success(reply)
     }
 
+    /// Forwards one job-scoped action. Deliberately not retried: a timeout may still have created
+    /// a child, and the harness is expected to check the result instead of blindly repeating it.
+    pub async fn scope(&self, request: &ScopeRequest) -> Result<ScopeResponse> {
+        let body = serde_json::to_vec(request).map_err(|error| ApiError::Decode {
+            message: format!("could not encode the scope request: {error}"),
+        })?;
+        let route = format!("v1/scope/{}", request.action.as_str());
+        let reply = self
+            .send(Method::POST, &route, Some(body), &[], &[], false)
+            .await?;
+        let reply = self.success(reply)?;
+        serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+            message: format!("invalid scope response: {error}"),
+        })
+    }
+
     pub async fn list_jobs(&self, state: Option<JobState>, limit: Option<u32>) -> Result<ListJobs> {
         let mut query = Vec::new();
         if let Some(state) = state {
@@ -216,6 +234,25 @@ impl Client {
             .await?;
         let reply = self.success(reply)?;
         self.scrub(parse_job_list(&reply.body))
+    }
+
+    /// Draft jobs, oldest first. Operator-only, like every other cross-job listing.
+    pub async fn drafts(&self, limit: Option<u32>) -> Result<ListJobs> {
+        let query = limit
+            .map(|limit| vec![("limit".to_owned(), limit.to_string())])
+            .unwrap_or_default();
+        let reply = self
+            .send(Method::GET, "v1/drafts", None, &query, &[], true)
+            .await?;
+        let reply = self.success(reply)?;
+        let page: ListDrafts =
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("invalid draft list: {error}"),
+            })?;
+        self.scrub(Ok(ListJobs {
+            jobs: page.drafts,
+            next: page.next,
+        }))
     }
 
     /// The job submitted with an idempotency key, if the controller knows one.
@@ -251,6 +288,16 @@ impl Client {
     pub async fn get_job(&self, id: &JobId) -> Result<JobView> {
         let route = format!("v1/jobs/{id}");
         let reply = self.send(Method::GET, &route, None, &[], &[], true).await?;
+        let reply = self.success(reply)?;
+        self.scrub(parse_job(&reply.body))
+    }
+
+    /// Asks the controller to publish this job's diff. The response is the updated job view.
+    pub async fn publish(&self, id: &JobId) -> Result<JobView> {
+        let route = format!("v1/jobs/{id}/publish");
+        let reply = self
+            .send(Method::POST, &route, None, &[], &[], true)
+            .await?;
         let reply = self.success(reply)?;
         self.scrub(parse_job(&reply.body))
     }
@@ -324,9 +371,19 @@ impl Client {
     }
 
     pub async fn cancel(&self, id: &JobId) -> Result<JobView> {
+        self.cancel_with_children(id, true).await
+    }
+
+    /// `keep_children = false` leaves descendants running; the default cascade cancels them.
+    pub async fn cancel_with_children(&self, id: &JobId, keep_children: bool) -> Result<JobView> {
         let route = format!("v1/jobs/{id}/cancel");
+        let query = if keep_children {
+            &[("keep_children".to_owned(), "1".to_owned())][..]
+        } else {
+            &[][..]
+        };
         let reply = self
-            .send(Method::POST, &route, None, &[], &[], false)
+            .send(Method::POST, &route, None, query, &[], false)
             .await?;
         self.cancel_reply(reply, id)
     }
@@ -371,6 +428,62 @@ impl Client {
             .send(Method::POST, &route, Some(body), &[], &[], false)
             .await?;
         self.success(reply)
+    }
+
+    /// Moves a draft to `queued` (or `blocked` when it has unresolved dependencies).
+    /// An optional edit is applied atomically with the approval.
+    pub async fn approve_draft(&self, id: &JobId, edit: Option<&JobEdit>) -> Result<JobView> {
+        let mut body = serde_json::Map::new();
+        if let Some(edit) = edit {
+            body.insert(
+                "edit".to_owned(),
+                serde_json::to_value(edit).map_err(|error| ApiError::Decode {
+                    message: format!("could not encode the job edit: {error}"),
+                })?,
+            );
+        }
+        let route = format!("v1/drafts/{id}/approve");
+        let reply = self
+            .send(
+                Method::POST,
+                &route,
+                Some(serde_json::to_vec(&body).map_err(|error| ApiError::Decode {
+                    message: format!("could not encode the approval: {error}"),
+                })?),
+                &[],
+                &[],
+                true,
+            )
+            .await?;
+        let reply = self.success(reply)?;
+        self.scrub(parse_job(&reply.body))
+    }
+
+    /// Rejects a draft. `reason` is only used for a coarse audit category; free-form text is
+    /// never recorded or logged.
+    pub async fn reject_draft(&self, id: &JobId, reason: Option<&str>) -> Result<JobView> {
+        let mut body = serde_json::Map::new();
+        if let Some(reason) = reason {
+            body.insert(
+                "reason".to_owned(),
+                serde_json::Value::String(reason.to_owned()),
+            );
+        }
+        let route = format!("v1/drafts/{id}/reject");
+        let reply = self
+            .send(
+                Method::POST,
+                &route,
+                Some(serde_json::to_vec(&body).map_err(|error| ApiError::Decode {
+                    message: format!("could not encode the rejection: {error}"),
+                })?),
+                &[],
+                &[],
+                true,
+            )
+            .await?;
+        let reply = self.success(reply)?;
+        self.scrub(parse_job(&reply.body))
     }
 
     pub async fn nodes(&self) -> Result<ListNodes> {
@@ -467,6 +580,47 @@ impl Client {
         self.success(reply)
     }
 
+    /// Changes one group's runtime concurrency cap. The cap affects dispatch immediately and is
+    /// process-local to the controller; the configured value returns after a restart.
+    pub async fn set_group_limit(&self, group: &str, max_running: usize) -> Result<usize> {
+        if !valid_group(group) {
+            return Err(ApiError::Config {
+                message: "group must be 1 to 64 chars from A-Z a-z 0-9 . _ -".to_owned(),
+            });
+        }
+        if !(1..=MAX_GROUP_RUNNING).contains(&max_running) {
+            return Err(ApiError::Config {
+                message: format!("max_running must be 1 to {MAX_GROUP_RUNNING}"),
+            });
+        }
+        let body = serde_json::to_vec(&serde_json::json!({ "max_running": max_running })).map_err(
+            |error| ApiError::Decode {
+                message: format!("could not encode the group limit: {error}"),
+            },
+        )?;
+        let route = format!("v1/groups/{group}/limit");
+        let reply = self
+            .send(Method::PUT, &route, Some(body), &[], &[], false)
+            .await?;
+        let reply = self.success(reply)?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct GroupLimitReply {
+            group: String,
+            max_running: usize,
+        }
+        let view: GroupLimitReply =
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode the group limit reply: {error}"),
+            })?;
+        if view.group != group || view.max_running != max_running {
+            return Err(ApiError::Decode {
+                message: "group limit reply did not match the request".to_owned(),
+            });
+        }
+        Ok(view.max_running)
+    }
+
     /// The latest host and job stats the controller holds for a node. Unknown nodes are
     /// [`ApiError::NotFound`]; a known node that has not reported stats yields an empty value.
     pub async fn node_stats(&self, node: &NodeName) -> Result<NodeStats> {
@@ -488,6 +642,33 @@ impl Client {
         let route = format!("v1/nodes/{node}/stats");
         let reply = self.send(Method::GET, &route, None, &[], &[], true).await?;
         self.success(reply)
+    }
+
+    /// Asks a node's agent to delete its kept workspaces. The request is queued for the next
+    /// poll; the reply says how many workspaces were queued, refused or missing.
+    pub async fn clean_workspaces(
+        &self,
+        node: &NodeName,
+        all: bool,
+        job: Option<&JobId>,
+    ) -> Result<WorkspaceCleanResult> {
+        let route = format!("v1/nodes/{node}/workspaces/clean");
+        let mut query = Vec::new();
+        if all {
+            query.push(("all".to_owned(), "true".to_owned()));
+        }
+        if let Some(job) = job {
+            query.push(("job".to_owned(), job.to_string()));
+        }
+        let reply = self
+            .send(Method::POST, &route, None, &query, &[], false)
+            .await?;
+        let reply = self.success(reply)?;
+        self.scrub(
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode the workspace clean result: {error}"),
+            }),
+        )
     }
 
     pub async fn set_drain(&self, node: &NodeName, drain: bool) -> Result<NodeView> {
@@ -597,6 +778,27 @@ impl Client {
         if !request.taints.is_empty() {
             heartbeat["taints"] = serde_json::json!(request.taints);
         }
+        if request.workspace_bytes != 0 {
+            heartbeat["workspace_bytes"] = serde_json::json!(request.workspace_bytes);
+        }
+        if request.workspace_count != 0 {
+            heartbeat["workspace_count"] = serde_json::json!(request.workspace_count);
+        }
+        if request.workspace_reclaimed_bytes_total != 0 {
+            heartbeat["workspace_reclaimed_bytes_total"] =
+                serde_json::json!(request.workspace_reclaimed_bytes_total);
+        }
+        if request.workspace_evictions_total != 0 {
+            heartbeat["workspace_evictions_total"] =
+                serde_json::json!(request.workspace_evictions_total);
+        }
+        if request.workspace_delete_errors_total != 0 {
+            heartbeat["workspace_delete_errors_total"] =
+                serde_json::json!(request.workspace_delete_errors_total);
+        }
+        if !request.workspaces.is_empty() {
+            heartbeat["workspaces"] = serde_json::json!(request.workspaces);
+        }
         let body = serde_json::to_vec(&serde_json::json!({
             "heartbeat": heartbeat,
             "wait_secs": request.wait_secs.unwrap_or(0),
@@ -659,6 +861,13 @@ impl Client {
     /// Appends `chunk.data` at byte offset `chunk.seq` of the job's log. A wrong offset is a
     /// [`ApiError::Conflict`] carrying the length the controller holds.
     pub async fn append_log(&self, chunk: &LogChunk) -> Result<()> {
+        self.append_log_with_length(chunk).await.map(|_| ())
+    }
+
+    /// Like [`Client::append_log`], but returns the controller's stored log length. The controller
+    /// may scrub bytes before storing them, so this can differ from `chunk.seq + chunk.data.len()`.
+    /// Controllers without the response header fall back to that unscrubbed length.
+    pub async fn append_log_with_length(&self, chunk: &LogChunk) -> Result<u64> {
         chunk.validate().map_err(|_| ApiError::TooLarge {
             limit: lu_proto::MAX_LOG_CHUNK_BYTES as u64,
         })?;
@@ -682,7 +891,15 @@ impl Client {
                 false,
             )
             .await?;
-        self.success(reply).map(|_| ())
+        let reply = self.success(reply)?;
+        let fallback = chunk.seq.saturating_add(chunk.data.len() as u64);
+        let stored = reply
+            .headers
+            .get("x-lu-log-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(fallback);
+        Ok(stored)
     }
 
     pub async fn put_artifact(
@@ -771,6 +988,22 @@ impl Client {
         self.scrub(
             serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
                 message: format!("could not decode the dependency list: {error}"),
+            }),
+        )
+    }
+
+    /// Whether the controller has stored this job's final artifacts and all dependants are done,
+    /// so the agent may delete the workspace.
+    pub async fn workspace_release(&self, id: &JobId, epoch: u64) -> Result<WorkspaceRelease> {
+        let route = format!("v1/agent/jobs/{id}/workspace/release");
+        let query = [("epoch".to_owned(), epoch.to_string())];
+        let reply = self
+            .send(Method::GET, &route, None, &query, &[], true)
+            .await?;
+        let reply = self.success(reply)?;
+        self.scrub(
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode the workspace release: {error}"),
             }),
         )
     }
@@ -1054,6 +1287,17 @@ pub trait Controller: Send + Sync {
         &'a self,
         chunk: &'a LogChunk,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    /// Returns the controller's stored log length after a successful append. The default matches
+    /// controllers that do not scrub; fakes need not override it.
+    fn append_log_len<'a>(
+        &'a self,
+        chunk: &'a LogChunk,
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
+        Box::pin(async move {
+            self.append_log(chunk).await?;
+            Ok(chunk.seq.saturating_add(chunk.data.len() as u64))
+        })
+    }
     fn put_artifact<'a>(
         &'a self,
         id: &'a JobId,
@@ -1072,6 +1316,20 @@ pub trait Controller: Send + Sync {
         id: &'a JobId,
         epoch: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyView>>> + Send + 'a>>;
+    /// Confirms that the controller has stored the job's final artifacts and that any dependants
+    /// have finished. The default keeps fakes valid: they have no stored artifacts to wait for.
+    fn workspace_release<'a>(
+        &'a self,
+        _id: &'a JobId,
+        _epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<WorkspaceRelease>> + Send + 'a>> {
+        Box::pin(async {
+            Ok(WorkspaceRelease {
+                can_delete: true,
+                reason: "no dependants".to_owned(),
+            })
+        })
+    }
     fn dep_diff<'a>(
         &'a self,
         id: &'a JobId,
@@ -1094,9 +1352,23 @@ pub trait Controller: Send + Sync {
         &'a self,
         completion: &'a Completion,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    /// Job-scoped forwarding. The default keeps test fakes valid; the real client implements it.
+    fn scope<'a>(
+        &'a self,
+        _request: &'a ScopeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ScopeResponse>> + Send + 'a>> {
+        Box::pin(async { Err(ApiError::Forbidden) })
+    }
 }
 
 impl Controller for Client {
+    fn scope<'a>(
+        &'a self,
+        request: &'a ScopeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ScopeResponse>> + Send + 'a>> {
+        Box::pin(async move { Client::scope(self, request).await })
+    }
+
     fn poll<'a>(
         &'a self,
         request: &'a PollRequest,
@@ -1127,6 +1399,13 @@ impl Controller for Client {
         Box::pin(async move { Client::append_log(self, chunk).await })
     }
 
+    fn append_log_len<'a>(
+        &'a self,
+        chunk: &'a LogChunk,
+    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + 'a>> {
+        Box::pin(async move { Client::append_log_with_length(self, chunk).await })
+    }
+
     fn put_artifact<'a>(
         &'a self,
         id: &'a JobId,
@@ -1147,6 +1426,14 @@ impl Controller for Client {
         epoch: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyView>>> + Send + 'a>> {
         Box::pin(async move { Client::deps(self, id, epoch).await })
+    }
+
+    fn workspace_release<'a>(
+        &'a self,
+        id: &'a JobId,
+        epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<WorkspaceRelease>> + Send + 'a>> {
+        Box::pin(async move { Client::workspace_release(self, id, epoch).await })
     }
 
     fn dep_diff<'a>(
@@ -1229,6 +1516,13 @@ fn error_from_reply(reply: &HttpReply) -> ApiError {
         (_, Some("not_found")) | (StatusCode::NOT_FOUND, _) => ApiError::NotFound,
         (_, Some("too_large")) | (StatusCode::PAYLOAD_TOO_LARGE, _) => ApiError::TooLarge {
             limit: value.as_ref().and_then(conflict_length).unwrap_or(0),
+        },
+        (_, Some("limit_exceeded")) => ApiError::LimitExceeded {
+            limit: value
+                .as_ref()
+                .and_then(|v| v.get("limit").and_then(Value::as_str))
+                .unwrap_or("scope")
+                .to_owned(),
         },
         (StatusCode::MOVED_PERMANENTLY, _)
         | (StatusCode::FOUND, _)

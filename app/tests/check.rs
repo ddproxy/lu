@@ -211,6 +211,47 @@ token_sha256 = "{HASH_A}"
 }
 
 #[test]
+fn check_rejects_an_invalid_scrub_pattern() {
+    let dir = scratch("scrub-pattern");
+    let token = write_token(&dir, "agent.token");
+    let cfg = dir.join("c.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"[agent]
+name = "peer-a"
+controller_url = "https://lu.example.net:7600"
+token_file = "{token}"
+work_dir = "/srv/work/lu"
+harness = "opencode"
+
+[artifacts]
+scrub = true
+
+[[artifacts.extra_rules]]
+name = "broken"
+pattern = "(["
+"#
+        ),
+    )
+    .unwrap();
+    let out = bin()
+        .args(["--config", cfg.to_str().unwrap(), "check"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("[artifacts] config"), "{stderr}");
+    assert!(stderr.contains("broken"), "{stderr}");
+    assert!(stderr.contains("invalid pattern"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn check_reports_database_checks_when_the_database_exists() {
     let dir = scratch("database");
     let db = dir.join("lu.db");

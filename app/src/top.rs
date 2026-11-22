@@ -85,7 +85,10 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
         .list_jobs(None, Some(JOBS_SHOWN))
         .await
         .map_err(|e| e.to_string())?;
+    let status = client.status().await.map_err(|e| e.to_string())?;
     Ok(Snapshot {
+        drafts: status.drafts,
+        oldest_draft_secs: status.oldest_draft_secs,
         controller_version: client.controller_version(),
         nodes: nodes
             .nodes
@@ -122,6 +125,11 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
                 mem_available_kb: node.mem_available_kb,
                 mem_total_kb: node.mem_total_kb,
                 stuck: node.stuck,
+                workspace_bytes: node.workspace_bytes,
+                workspace_count: node.workspace_count,
+                workspace_reclaimed_bytes_total: node.workspace_reclaimed_bytes_total,
+                workspace_evictions_total: node.workspace_evictions_total,
+                workspace_delete_errors_total: node.workspace_delete_errors_total,
                 labels: node.labels.clone(),
             })
             .collect(),
@@ -136,19 +144,34 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
                 attempt: job.attempt,
                 age_secs: now.saturating_sub(job.created_at),
                 model: job.spec.model.clone(),
-                note: match job.outcome_note.as_deref() {
-                    Some("no_changes") => "no changes".to_owned(),
-                    Some("expect_failed") => "expect failed".to_owned(),
-                    _ => match (&job.failure_class, &job.summary) {
-                        (Some(_), Some(summary)) => format!(
-                            "{}: {}",
-                            operator::failure_name(job.failure_class),
-                            plain_summary(summary)
-                        ),
-                        (Some(_), None) => operator::failure_name(job.failure_class),
-                        (None, Some(summary)) => plain_summary(summary),
-                        (None, None) => String::new(),
-                    },
+                note: {
+                    let mut note = match job.outcome_note.as_deref() {
+                        Some("no_changes") => "no changes".to_owned(),
+                        Some("expect_failed") => "expect failed".to_owned(),
+                        _ => match (&job.failure_class, &job.summary) {
+                            (Some(_), Some(summary)) => format!(
+                                "{}: {}",
+                                operator::failure_name(job.failure_class),
+                                plain_summary(summary)
+                            ),
+                            (Some(_), None) => operator::failure_name(job.failure_class),
+                            (None, Some(summary)) => plain_summary(summary),
+                            (None, None) => String::new(),
+                        },
+                    };
+                    if job.parent_job_id.is_some() {
+                        if !note.is_empty() {
+                            note.push(' ');
+                        }
+                        note.push_str(&format!("scope:d{}", job.depth));
+                    }
+                    if let Some(publish) = &job.publish {
+                        if !note.is_empty() {
+                            note.push(' ');
+                        }
+                        note.push_str(&format!("publish:{}:{}", publish.detail, publish.branch));
+                    }
+                    note
                 },
                 after: job.after.iter().map(ToString::to_string).collect(),
             })

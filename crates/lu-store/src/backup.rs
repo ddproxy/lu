@@ -462,6 +462,11 @@ mod tests {
 
     fn spec(n: u32) -> JobSpec {
         JobSpec {
+            source: lu_proto::SourceSpec {
+                repo: format!("https://example.net/r{n}.git"),
+                git_ref: "main".to_owned(),
+                base: None,
+            },
             repo: format!("https://example.net/r{n}.git"),
             git_ref: "main".to_owned(),
             base_commit: None,
@@ -483,6 +488,17 @@ mod tests {
             stuck_after_secs: None,
             priority: lu_proto::DEFAULT_PRIORITY,
             group: None,
+            allow_spawn: false,
+            spawn_inherit: false,
+            spawn_repos: Vec::new(),
+            workspace: None,
+            cache_dirs: Vec::new(),
+            context: None,
+            origin: None,
+            origin_ref: None,
+            untrusted_context: false,
+            draft: false,
+            publish: None,
             fallbacks: Vec::new(),
             expect: None,
         }

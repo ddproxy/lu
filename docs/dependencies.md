@@ -37,6 +37,9 @@ lu submit --key ship --after-key test --after-key lint \
   the dependent instead of failing it with `failure_class: "dependency"`.
 - `lu retry <id> --after ... --after-key ...` replaces the dependency list on the new job. An old
   job must be terminal first.
+- `lu submit --batch ... --chain` depends each job on all earlier jobs in the batch. Checklist
+  `after:` hints and sidecar `after_keys` add dependencies; hints may name earlier batch slugs or
+  existing job keys. See [Batch submissions](batch.md#dependencies).
 
 ## Waiting and promotion
 
@@ -56,7 +59,9 @@ By default the agent stages the dependent's base tree, then fetches each depende
 `diff.patch` in `after` order and applies it to that tree. Empty or missing diffs are skipped.
 The harness then runs on the combined tree, and the dependent's exported diff includes the
 applied dependency changes. The list of applied dependency ids is recorded in `report.json` under
-`applied_dependencies`.
+`applied_dependencies`. Stacking uses the controller's stored patch, so a dependency's workspace is
+not kept just because a dependent is running; the agent waits for controller release before an
+ephemeral deletion. See [workspaces.md](workspaces.md).
 
 If a dependency patch cannot be applied, the job finishes `failed` with
 `failure_class: "conflict"` and a summary such as:

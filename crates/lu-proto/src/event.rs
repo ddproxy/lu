@@ -32,6 +32,13 @@ pub enum AgentEvent {
         job_id: JobId,
         epoch: u64,
     },
+    /// An operator asked the agent to delete kept workspaces. Running jobs are never touched.
+    CleanWorkspaces {
+        #[serde(default)]
+        all: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job: Option<JobId>,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -55,6 +62,13 @@ enum RawAgentEvent {
     Cancel {
         job_id: JobId,
         epoch: u64,
+    },
+    /// An operator asked the agent to delete kept workspaces. Running jobs are never touched.
+    CleanWorkspaces {
+        #[serde(default)]
+        all: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job: Option<JobId>,
     },
 }
 
@@ -85,6 +99,7 @@ impl TryFrom<RawAgentEvent> for AgentEvent {
                 message,
             },
             RawAgentEvent::Cancel { job_id, epoch } => AgentEvent::Cancel { job_id, epoch },
+            RawAgentEvent::CleanWorkspaces { all, job } => AgentEvent::CleanWorkspaces { all, job },
         })
     }
 }
@@ -298,6 +313,11 @@ mod tests {
 
     fn spec() -> JobSpec {
         JobSpec {
+            source: crate::SourceSpec {
+                repo: "https://example.net/repo.git".to_owned(),
+                git_ref: "main".to_owned(),
+                base: None,
+            },
             repo: "https://example.net/repo.git".to_owned(),
             git_ref: "main".to_owned(),
             base_commit: None,
@@ -310,6 +330,17 @@ mod tests {
             stuck_after_secs: None,
             priority: crate::DEFAULT_PRIORITY,
             group: None,
+            allow_spawn: false,
+            spawn_inherit: false,
+            spawn_repos: Vec::new(),
+            workspace: None,
+            cache_dirs: Vec::new(),
+            context: None,
+            origin: None,
+            origin_ref: None,
+            untrusted_context: false,
+            draft: false,
+            publish: None,
             idle_timeout_secs: None,
             idempotency_key: None,
             after: Vec::new(),

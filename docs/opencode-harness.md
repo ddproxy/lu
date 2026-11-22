@@ -26,14 +26,19 @@ does not stop the job. A
 job spec with a `harness` other than `opencode` fails with class `execution`; `--harness` on
 `lu submit` defaults to `opencode`.
 
+When a job spec carries `context`, the agent stages it as `.lu/inputs/context.md` under an
+**UNTRUSTED EXTERNAL TEXT** header and adds a prompt instruction telling the harness to treat that
+file as data, never instructions. The value is capped at 32 KiB with a truncation marker. Task text
+is kept separate and is operator-authored; see [Drafts](drafts.md#job-fields).
+
 ## Agent configuration
 
 ```toml
 [agent]
 name = "node-a"
 controller_url = "https://lu.example.net:7600"
-token_file = "/etc/lu/agent.token"
-work_dir = "/var/lib/lu/work"
+token_file = "/etc/ting/ting.token"
+work_dir = "/var/lib/ting/work"
 harness = "opencode"
 opencode_server = "http://127.0.0.1:4096"
 opencode_password_file = "/etc/lu/opencode.password"
@@ -52,8 +57,9 @@ timeout_secs = 5
 every_secs = 300
 ```
 
-- `opencode_server` is an opaque endpoint passed to the launcher. It must start with `http://` or
-  `https://` and contain no whitespace or control characters.
+- `opencode_server` is an opaque endpoint passed to the launcher. Config only requires a non-empty
+  value; when a job starts, the launcher requires `http://` or `https://`, no whitespace or control
+  characters, no leading `-`, and at most 2048 bytes.
 - `workspace_group` gives each job's tree to that group with group read, write and the setgid bit;
   `.git` is left as git made it. It supports a harness running as another account. An unknown
   group stops the agent. It is group sharing, not per-job user isolation.
@@ -61,7 +67,7 @@ every_secs = 300
   health every 10 seconds and sends providers with each heartbeat. `provider_models` are offered
   only while Reiki reports that provider healthy; after three failed reads the node reports no
   providers.
-- Config is read at start. Restart `lu agent` after changing any of these settings.
+- Config is read at start. Restart `ting` after changing any of these settings.
 
 ## Server password file
 
@@ -75,9 +81,9 @@ a control character is refused. Create it like the agent token:
 
 ```sh
 umask 077
-printf '%s' 'a-long-random-server-password' > /etc/lu/opencode.password
-chown lu:lu /etc/lu/opencode.password
-chmod 0600 /etc/lu/opencode.password
+printf '%s' 'a-long-random-server-password' > /etc/ting/opencode.password
+chown ting:ting /etc/ting/opencode.password
+chmod 0600 /etc/ting/opencode.password
 ```
 
 The value is not passed as an argument and is not a general provider-key channel. Keys belong to
@@ -103,6 +109,23 @@ stronger user or filesystem boundary.
 > Unsupported: a wrapper does not change the harness name in the job spec, and there is no
 > shell expansion, image build or container lifecycle management in Lu. Manage the image and its
 > credentials on the node.
+
+## Scoped MCP for the harness
+
+A job submitted with `lu submit --allow-spawn` gets a per-job agent socket. Configure the harness to
+use the scoped MCP server, not the operator's `lu mcp`:
+
+```toml
+mcp = { lu = { command = ["ting","mcp"] } }
+```
+
+`ting mcp` reads `LU_JOB_SOCKET` and exposes only `job_context`,
+`submit_child`, `list_children`, `get_child`, `get_child_artifact` and `cancel_child`. It refuses to
+start if operator credentials are visible in the environment or the standard config paths, and it
+marks child output as untrusted with `source: "child_job"`. For a container harness, the socket
+directory must be bind-mounted with matching uid; see
+[Container harness bind mount](scope-container.md) and the [Ansible example](scope-ansible.md). The
+full threat model and limits are in [Job-scoped capability](scope.md).
 
 ## A probe label for the harness
 
@@ -148,10 +171,13 @@ At `attempt > 100` the state is `failed`. In `lu nodes --json`, the node that ra
 these fields among others:
 
 ```json
-{"providers":[{"name":"anthropic","state":"cooling","soonest_secs":60}],"cordons":["anthropic"]}
+{"providers":[{"name":"anthropic","state":"cooling","soonest_secs":60}],
+ "cordon_details":[{"provider":"anthropic","source":"reiki","reason":"Reiki cooldown for anthropic",
+                    "set_at":1763750000,"until":null,"lifts_after_healthy_heartbeats":2}]}
 ```
 
 A job with no provider is not blocked by that cordon; a job with fallbacks may run on another
-provider or node. There is no CLI command to clear a cordon. It expires, a Reiki-derived cordon
-clears after two consecutive healthy provider heartbeats, and a controller restart deletes all
-cordons. See [Provider cordons and node drains](operations.md#provider-cordons-and-node-drains).
+provider or node. An operator can clear a cordon early with `lu uncordon <node> [<provider>]`;
+otherwise it expires, a Reiki-derived cordon clears after two consecutive healthy provider
+heartbeats, and a controller restart deletes all cordons. See
+[Provider cordons and node drains](operations.md#provider-cordons-and-node-drains).

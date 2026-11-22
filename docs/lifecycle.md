@@ -5,8 +5,13 @@ only propose starts, renewals, uploads and completions, all fenced by the job's 
 
 ```mermaid
 stateDiagram-v2
+    [*] --> draft: intake or operator submits a draft
     [*] --> blocked: submit with unfinished dependencies
     [*] --> queued: submit with all dependencies done
+    draft --> queued: approve with dependencies done
+    draft --> blocked: approve with dependencies unmet
+    draft --> cancelled: reject
+    draft --> expired: ttl elapsed
     blocked --> queued: last dependency done
     blocked --> failed: dependency failed
     blocked --> cancelled: cancel
@@ -35,27 +40,30 @@ stateDiagram-v2
     done --> [*]
     failed --> [*]
     cancelled --> [*]
+    expired --> [*]
     note right of needs_input
       Reserved in this version;
       no code path enters it.
     end note
 ```
 
-`needs_input` is part of the wire enum and the transition table, but it is reserved and
-unreachable in this version. The terminal states are `done`, `failed` and `cancelled`; they have no
-outgoing edges.
+The state list is exactly `draft`, `blocked`, `queued`, `leased`, `running`, `recovering`,
+`needs_input`, `done`, `failed`, `cancelled`, `expired`. `needs_input` is part of the wire enum and
+the transition table, but it is reserved and unreachable in this version. The terminal states are
+`done`, `failed`, `cancelled` and `expired`; they have no outgoing edges.
 
 ## Transition reference
 
 | From | Allowed targets | What causes it |
 | --- | --- | --- |
+| `draft` | `queued`, `blocked`, `cancelled`, `expired` | Operator approval with all dependencies done or with unmet dependencies; rejection; `ttl` elapsed. Never dispatched in this state. |
 | `blocked` | `queued`, `cancelled`, `failed` | All dependencies become `done`; operator cancel; a dependency fails or is cancelled, which cascades. |
 | `queued` | `leased`, `blocked`, `cancelled` | Dispatch to an idle, non-draining agent; edit adds an unfinished dependency; operator cancel. |
 | `leased` | `running`, `queued`, `recovering`, `cancelled`, `failed` | Agent starts; retryable failure or lost lease; lease expiry or controller restart; cancel; non-retryable failure. |
 | `running` | `done`, `failed`, `cancelled`, `queued`, `recovering` | Harness success; terminal failure (including stuck cancel); honoured cancel; provider or stuck retry; lease expiry. |
 | `recovering` | `running`, `done`, `leased`, `queued`, `failed`, `cancelled` | Same-epoch renewal; same-epoch completion; reassignment; grace expiry with or without retry budget; operator cancel. |
 | `needs_input` | `running`, `failed`, `cancelled` | Reserved edges only; not reachable in this version. |
-| `done`, `failed`, `cancelled` | none | Terminal. |
+| `done`, `failed`, `cancelled`, `expired` | none | Terminal. |
 
 ## Leases and epochs
 
@@ -76,9 +84,11 @@ outgoing edges.
 - After `recovery_grace_secs` (default 30, allowed 0–600), the controller requeues the job or
   fails it with class `node`, incrementing the attempt and clearing the node.
 
-Dispatch considers only `queued` jobs, earliest submission first. The node must have a current heartbeat,
-must be idle and not draining, and must not already hold a `leased`, `running` or `recovering`
-job. The job's required labels must be a subset of the node's labels; if it names a provider, the
+Dispatch considers only `queued` jobs, highest `priority` first and then earliest submission;
+`draft` and `expired` jobs are never assigned.
+The node must have a current heartbeat, must be idle and not draining, and must not already hold a
+`leased`, `running` or `recovering` job. The job's required labels must be a subset of the node's
+labels; if it names a provider, the
 node must offer it and no `(node, provider)` cordon may be active. A job with `provider = "any"`
 takes the first healthy, uncordoned pair from the node's published `provider_models`, and records
 it as the assigned provider and model. With no eligible pair the job stays `queued` with a
@@ -92,6 +102,23 @@ stay attached, and its assignment is cleared for fresh dispatch. Edited dependen
 like submission dependencies: at most 16, no cycle and no finished job. The job becomes `blocked`
 when any new dependency is unfinished and `queued` when all are `done`. Other states get `409
 conflict`; a cycle gets `400 bad_request`.
+
+## Drafts
+
+A `draft` is created by intake or by an operator who submits a job in draft mode. It is stored and
+visible, and an operator can edit it, but it is never dispatched: no lease, agent event or harness
+run happens until approval. Approval moves `draft` to `queued` when all dependencies are `done`,
+or to `blocked` when they are not; rejection moves it to `cancelled`. A draft that is still a draft
+after the `[drafts] ttl` (default 7 days) moves to `expired`, which is terminal. Expired drafts are
+removed oldest first when the store needs room; an over-limit draft creation is refused with a
+typed error.
+
+Draft text has two provenance classes. `task` is operator-authored (an intake rule builds it from
+an operator-written `task_template`); `context` is external data copied from the event. The agent
+stages `context` as `.lu/inputs/context.md` under an **UNTRUSTED EXTERNAL TEXT** header and the
+prompt tells the harness to treat it as data. `context` is capped at 32 KiB with a truncation
+marker. The operator commands, API routes and MCP access are in [drafts.md](drafts.md); the event
+rules that create drafts are in [intake.md](intake.md).
 
 ## Failure classes and retries
 
@@ -147,9 +174,9 @@ default) leaves the job running. Both active policies upload the usual artifacts
 
 | State | Effect |
 | --- | --- |
-| `blocked`, `queued`, `recovering` | Immediate `cancelled` with a finished time; blocked dependents fail with class `dependency`. |
+| `draft`, `blocked`, `queued`, `recovering` | Immediate `cancelled` with a finished time; blocked dependents fail with class `dependency`. A draft is normally cancelled by `lu reject`. |
 | `leased`, `running`, `needs_input` | `cancel_requested` is set. The job stays in its state until the agent stops the harness and reports `Cancelled`; then it becomes `cancelled` and dependents fail. |
-| `done`, `failed`, `cancelled` | Refused with `409 conflict`. |
+| `done`, `failed`, `cancelled`, `expired` | Refused with `409 conflict`. |
 
 ## Empty diffs
 
@@ -175,10 +202,14 @@ harness failure keeps its own class, and expectations are not evaluated. An empt
 
 ## Partial diffs on terminal jobs
 
-Every terminal `JobView` (`done`, `failed`, `cancelled`) carries `diff_bytes`: the size of the
-stored `diff.patch`, or null when there is none. A job that wrote files before failing still keeps
+The `done`, `failed` and `cancelled` `JobView`s carry `diff_bytes`: the size of the
+stored `diff.patch`, or `0` when none is stored. A job that wrote files before failing still keeps
 that diff, and `lu fetch` downloads it alongside the log and report; the job's `state` and
 `failure_class` still mark it unsuccessful. `lu show` prints `diff_bytes` as a row.
+
+## Workspace cleanup
+
+Terminal jobs do not immediately lose their working tree. The agent's workspace policy decides whether to delete it at once, keep failures for a TTL, or keep it for a longer TTL, with disk-pressure eviction for kept trees. An ephemeral tree waits until the controller has stored the final artifacts and no active dependant needs the workspace; dependants use the stored `diff.patch`, so stacking and collection never require keeping it. See [workspaces.md](workspaces.md) for policies, configuration and operator commands.
 
 ## Observing progress
 

@@ -6,9 +6,9 @@ A job runs on a node that is idle, not draining and able to serve what the job n
 
 `--priority N` sets an integer from 0 (lowest) to 9 (highest); the default is 5. Dispatch takes the highest priority first and, within a priority, the earliest submitted job first (persisted submission order, not wall-clock id order). A newly submitted high-priority job overtakes older, lower-priority queued jobs.
 
-`--group NAME` marks a job as part of a concurrency group. Names are 1-64 characters from `A-Z a-z 0-9 . _ -`. A controller can cap a group with `[[controller.groups]]`; jobs in unconfigured groups are unlimited. Jobs count toward the cap while `leased`, `running`, `recovering` or `needs_input`. A queued job blocked by a full group stays queued and reports `group limit (<name> <running>/<max>)` in `waiting_reason`. Cancellation and failure release the slot.
+`--group NAME` marks a job as part of a concurrency group. Names are 1-64 characters from `A-Z a-z 0-9 . _ -`. A controller can cap a group with `[[controller.groups]]` or set a runtime cap with `PUT /v1/groups/{name}/limit`; jobs in uncapped groups are unlimited. Runtime caps stay in controller memory and return to configured values on restart. Jobs count toward the cap while `leased`, `running`, `recovering` or `needs_input`. A queued job blocked by a full group stays queued and reports `group limit (<name> <running>/<max>)` in `waiting_reason`. Cancellation and failure release the slot.
 
-Both fields are optional; omitting them keeps the previous dispatch behaviour. The provider, label and taint rules described below still apply first: priority and group limits only order eligible jobs, they never bypass node eligibility.
+Both fields are optional; omitting them keeps the previous dispatch behaviour. The provider, label and taint rules described below still decide node eligibility; priority orders queued jobs and a group cap blocks dispatch, neither bypasses node eligibility.
 
 ## Labels and providers
 

@@ -10,8 +10,6 @@ permissions: {}
 
 jobs:
   cargo-deny:
-    # The ruleset requires a check named Audit; keep the name in step with the other repositories.
-    name: Audit
     runs-on: ubuntu-latest
     permissions:
       contents: read

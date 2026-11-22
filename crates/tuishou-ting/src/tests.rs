@@ -13,7 +13,7 @@ use lu_config::BaseSource;
 use lu_proto::{
     AgentEvent, ArtifactName, Completion, ExpectMode, ExpectSpec, FailureClass, HarnessState,
     JobId, JobSpec, JobState, LogChunk, NodeName, OnConflict, Outcome, StuckPolicy,
-    HARNESS_OK_FALSE, MAX_LOG_BYTES,
+    WorkspacePolicy, WorkspaceState, HARNESS_OK_FALSE, MAX_LOG_BYTES,
 };
 use lu_staging::{ExportedDiff, Staging};
 use lu_supervise::CommandSpec;
@@ -21,7 +21,10 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use super::{evaluate_expect, Agent, AgentError};
+use super::{
+    evaluate_expect, housekeeping, workspaces::FsDeleter, workspaces::RealClock,
+    workspaces::Registry, workspaces::Settings, Agent, AgentError,
+};
 
 const TEST_HEARTBEAT_SECS: u64 = 5;
 const IDLE_POLL: Duration = Duration::from_millis(10);
@@ -32,7 +35,7 @@ type BaseReply = Result<Option<(String, Vec<u8>)>, ApiError>;
 
 /// A recorded call to the fake controller.
 #[derive(Debug, Clone, PartialEq)]
-enum Call {
+pub(crate) enum Call {
     Poll(Box<PollRequest>),
     JobBase {
         job_id: JobId,
@@ -63,10 +66,11 @@ enum Call {
         epoch: u64,
     },
     Complete(Completion),
+    Scope(Box<lu_proto::ScopeRequest>),
 }
 
 /// A fake controller that records calls and returns scripted replies.
-struct FakeController {
+pub(crate) struct FakeController {
     calls: Mutex<Vec<Call>>,
     poll_replies: Mutex<VecDeque<Result<Vec<AgentEvent>, ApiError>>>,
     base_replies: Mutex<VecDeque<BaseReply>>,
@@ -77,10 +81,11 @@ struct FakeController {
     deps_replies: Mutex<VecDeque<Result<Vec<DependencyView>, ApiError>>>,
     dep_diff_replies: Mutex<VecDeque<Result<Vec<u8>, ApiError>>>,
     complete_replies: Mutex<VecDeque<Result<(), ApiError>>>,
+    scope_replies: Mutex<VecDeque<Result<lu_proto::ScopeResponse, ApiError>>>,
 }
 
 impl FakeController {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
             poll_replies: Mutex::new(VecDeque::new()),
@@ -92,19 +97,20 @@ impl FakeController {
             deps_replies: Mutex::new(VecDeque::new()),
             dep_diff_replies: Mutex::new(VecDeque::new()),
             complete_replies: Mutex::new(VecDeque::new()),
+            scope_replies: Mutex::new(VecDeque::new()),
         }
     }
 
-    fn record(&self, call: Call) {
+    pub(crate) fn record(&self, call: Call) {
         self.calls.lock().unwrap().push(call);
     }
 
-    fn take_calls(&self) -> Vec<Call> {
+    pub(crate) fn take_calls(&self) -> Vec<Call> {
         std::mem::take(&mut *self.calls.lock().unwrap())
     }
 
     /// Runs `f` over the recorded calls without taking them.
-    fn check<R>(&self, f: impl FnOnce(&[Call]) -> R) -> R {
+    pub(crate) fn check<R>(&self, f: impl FnOnce(&[Call]) -> R) -> R {
         f(&self.calls.lock().unwrap())
     }
 
@@ -142,6 +148,10 @@ impl FakeController {
 
     fn push_complete(&self, reply: Result<(), ApiError>) {
         self.complete_replies.lock().unwrap().push_back(reply);
+    }
+
+    pub(crate) fn push_scope(&self, reply: Result<lu_proto::ScopeResponse, ApiError>) {
+        self.scope_replies.lock().unwrap().push_back(reply);
     }
 
     fn pop_poll(&self) -> Option<Result<Vec<AgentEvent>, ApiError>> {
@@ -305,11 +315,39 @@ impl Controller for FakeController {
         self.record(Call::Complete(completion));
         Box::pin(async move { self.pop_complete().unwrap_or(Ok(())) })
     }
+
+    fn scope<'a>(
+        &'a self,
+        request: &'a lu_proto::ScopeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<lu_proto::ScopeResponse, ApiError>> + Send + 'a>> {
+        self.record(Call::Scope(Box::new(request.clone())));
+        Box::pin(async move {
+            self.scope_replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(lu_proto::ScopeResponse::new(
+                        lu_proto::ScopeResult::JobContext {
+                            job_id: JobId::new(),
+                            state: "running".to_owned(),
+                            spec: Box::new(test_spec("https://example.invalid/repo.git")),
+                            dependencies: Vec::new(),
+                        },
+                    ))
+                })
+        })
+    }
 }
 
 /// Builds a minimal valid JobSpec for testing.
 fn test_spec(repo: &str) -> JobSpec {
     JobSpec {
+        source: lu_proto::SourceSpec {
+            repo: repo.to_owned(),
+            git_ref: "main".to_owned(),
+            base: None,
+        },
         repo: repo.to_owned(),
         git_ref: "main".to_owned(),
         base_commit: None,
@@ -331,6 +369,17 @@ fn test_spec(repo: &str) -> JobSpec {
         stuck_after_secs: None,
         priority: lu_proto::DEFAULT_PRIORITY,
         group: None,
+        allow_spawn: false,
+        spawn_inherit: false,
+        spawn_repos: Vec::new(),
+        workspace: None,
+        cache_dirs: Vec::new(),
+        context: None,
+        origin: None,
+        origin_ref: None,
+        untrusted_context: false,
+        draft: false,
+        publish: None,
         fallbacks: Vec::new(),
         expect: None,
     }
@@ -344,6 +393,15 @@ fn make_agent(
 ) -> Agent {
     let staging = Staging::new(work_dir).unwrap();
     let node = NodeName::parse("node-a").unwrap();
+    let workspaces = Arc::new(
+        Registry::new(
+            Settings::new(work_dir.to_path_buf()),
+            Arc::new(RealClock),
+            Arc::new(FsDeleter),
+            Arc::new(housekeeping::disk_space as fn(&Path) -> Option<housekeeping::DiskSpace>),
+        )
+        .unwrap(),
+    );
     Agent {
         node,
         controller,
@@ -365,7 +423,9 @@ fn make_agent(
         reiki_watch_period: super::REIKI_WATCH_PERIOD,
         opencode_server: None,
         workspace_gid: None,
+        harness_owner: None,
         opencode_password: None,
+        workspaces,
         reiki_probe: None,
         health: Default::default(),
         provider_models: Arc::new(Vec::new()),
@@ -1092,6 +1152,7 @@ fn kind(call: &Call) -> &'static str {
         Call::Deps { .. } => "deps",
         Call::DepDiff { .. } => "dep_diff",
         Call::Complete(_) => "complete",
+        Call::Scope(_) => "scope",
     }
 }
 
@@ -2137,6 +2198,7 @@ async fn job_whose_ref_does_not_exist_completes_execution_failure() {
     let job_id = JobId::new();
     let mut spec = test_spec(&f.repo_dir.to_string_lossy());
     spec.git_ref = "no-such-ref".to_owned();
+    spec.source.git_ref = "no-such-ref".to_owned();
     let controller = assigned_controller(&job_id, spec);
     let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo should not run"));
     let calls = run_job(
@@ -2308,6 +2370,46 @@ async fn heartbeats_carry_the_providers_the_local_reiki_reports() {
     assert_eq!(names, ["zen", "openrouter"]);
     assert_eq!(carried.providers[1].soonest_secs, Some(60));
     assert!(carried.reiki.is_some(), "the document is forwarded too");
+    let _ = stop.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+}
+
+#[tokio::test]
+async fn heartbeats_carry_workspace_counters_and_listing() {
+    let f = fixture();
+    let controller = Arc::new(FakeController::new());
+    for _ in 0..200 {
+        controller.push_poll(Ok(Vec::new()));
+    }
+    let agent = make_agent(&f.work_dir, controller.clone(), sh("true"));
+    let job = JobId::new();
+    let path = agent.workspaces.path_for(&job);
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join("blob.txt"), vec![b'x'; 32]).unwrap();
+    agent.workspaces.register(&job, 1, WorkspacePolicy::Keep);
+    let (stop, handle) = run_agent_with_shutdown(agent);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let carried = loop {
+        let found = controller.check(|calls| {
+            calls.iter().find_map(|call| match call {
+                Call::Poll(request) if request.workspace_count > 0 => {
+                    Some(request.as_ref().clone())
+                }
+                _ => None,
+            })
+        });
+        if let Some(request) = found {
+            break request;
+        }
+        assert!(Instant::now() < deadline, "no heartbeat carried workspaces");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(carried.workspace_bytes >= 32);
+    assert_eq!(carried.workspace_count, 1);
+    assert_eq!(carried.workspaces.len(), 1);
+    assert_eq!(carried.workspaces[0].job_key, job.to_string());
+    assert_eq!(carried.workspaces[0].state, WorkspaceState::Running);
+    assert_eq!(carried.workspaces[0].policy, WorkspacePolicy::Keep);
     let _ = stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 }
@@ -2604,6 +2706,7 @@ async fn auto_base_source_falls_back_to_clone_when_the_controller_has_no_base() 
     let job_id = JobId::new();
     let mut spec = test_spec(&repo_dir.to_string_lossy());
     spec.base_commit = Some("a".repeat(40));
+    spec.source.base = Some("a".repeat(40));
     let controller = controller_with_assign(job_id.clone(), EPOCH, spec);
     controller.push_base(Err(ApiError::NotFound));
 
@@ -2630,6 +2733,7 @@ async fn controller_base_source_fails_the_node_when_the_controller_has_no_base()
     let job_id = JobId::new();
     let mut spec = test_spec(&repo_dir.to_string_lossy());
     spec.base_commit = Some("a".repeat(40));
+    spec.source.base = Some("a".repeat(40));
     let controller = controller_with_assign(job_id.clone(), EPOCH, spec);
     controller.push_base(Err(ApiError::NotFound));
 
@@ -2661,6 +2765,7 @@ async fn clone_base_source_never_asks_the_controller() {
     let job_id = JobId::new();
     let mut spec = test_spec(&repo_dir.to_string_lossy());
     spec.base_commit = Some("a".repeat(40));
+    spec.source.base = Some("a".repeat(40));
     let controller = controller_with_assign(job_id.clone(), EPOCH, spec);
 
     let mut agent = make_agent(&work_dir, controller.clone(), success_harness);
@@ -2697,6 +2802,7 @@ async fn heartbeats_use_probe_results_without_waiting_for_the_command() {
     let started = Instant::now();
     let request = agent.poll_request(lu_proto::HarnessState::Idle, 0);
     assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(request.version.as_deref(), Some(crate::TING_VERSION));
     assert!(!request.labels.iter().any(|label| label == "slow-probe"));
     assert!(request.label_sources.is_empty());
     for task in tasks {
@@ -2832,6 +2938,7 @@ async fn run_stuck_case(
     std::fs::create_dir(&repo_dir).unwrap();
     create_git_repo(&repo_dir);
     spec.repo = repo_dir.to_string_lossy().into_owned();
+    spec.source.repo = repo_dir.to_string_lossy().into_owned();
 
     let controller = controller_with_assign(JobId::new(), EPOCH, spec);
     let mut agent = make_agent(&work_dir, controller.clone(), harness);

@@ -7,7 +7,7 @@ submit jobs and read results through the same HTTP API the CLI uses.
 ```mermaid
 flowchart LR
     operator["operator<br/>lu CLI / MCP / API"] -->|"submit, query, cancel"| controller
-    agent["agent<br/>lu agent"] -->|"poll, heartbeat, results"| controller
+    agent["agent<br/>ting"] -->|"poll, heartbeat, results"| controller
     controller --- store[("SQLite<br/>jobs, leases")]
     controller --- files[("artifacts_dir<br/>diff, log, report")]
     agent -->|"fresh checkout"| staging
@@ -24,9 +24,10 @@ by the controller; see [Tokens and TLS](tokens-and-tls.md).
 | Term | Meaning |
 | --- | --- |
 | **Job** | A persisted record with a 26-character id, a state, an `attempt` and an `epoch`. It is created from a spec and finishes `done`, `failed` or `cancelled`. |
+| **Batch** | A set of task files or checklist items turned into one job each by `lu submit --batch` or `lu_submit_batch`. Each job gets a key derived from `--key-prefix` and the task slug. See [Batch submissions](batch.md). |
 | **Spec** | The stored request: repository, git ref, task text, harness, optional provider/model, timeouts, `after` dependencies, required labels, idempotency key and `collect`. While the job is `queued` or `blocked`, `lu edit` can change its provider, model, fallbacks, requirements, tolerations and dependencies in place. |
 | **Controller** | The HTTP(S) service that owns state, leases, retries, node cordons, mirrors and artifacts. Job records live in SQLite; artifact files live under `artifacts_dir`. |
-| **Agent / node** | A named `lu agent` process. It has one job slot in this version, advertises labels, renews leases and stages each job in its own work directory. The agent token is bound to that node name. |
+| **Agent / node** | A named `ting` process. It has one job slot in this version, advertises labels, renews leases and stages each job in its own work directory. The agent token is bound to that node name. |
 | **Operator** | Any caller using the operator API: `lu` commands, `lu mcp` tools or a direct HTTP client. Operator tokens are a separate scope. |
 | **Harness** | The process that does the coding. This tree builds `opencode run [--server URL] --auto [-m MODEL] -f TASKFILE MESSAGE`; an optional `harness_wrapper` can prefix that command. |
 | **Artifacts** | Exactly three controller-named files per job: `diff.patch`, `run.log` and `report.json`. Paths are `<job id>/<file name>`, so an agent cannot choose them. |
@@ -43,6 +44,7 @@ by the controller; see [Tokens and TLS](tokens-and-tls.md).
 | Concern | Owner | Where to read more |
 | --- | --- | --- |
 | State and legal transitions | Controller's store | [Job Lifecycle](lifecycle.md) |
+| Batch input to job specs | CLI or MCP planner, before any request | [Batch submissions](batch.md) |
 | Which queued job goes to which agent | Controller dispatch, using labels, provider cordons, drain state and one-job-per-agent | [Job Lifecycle](lifecycle.md) |
 | Retry versus terminal failure | Controller, from the reported failure class and attempt count | [Job Lifecycle](lifecycle.md) |
 | Checkout, dependency patch stacking and harness supervision | Agent | [Dependencies](dependencies.md) |

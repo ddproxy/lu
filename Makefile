@@ -19,25 +19,27 @@ endif
 help:  ## list targets
 	@grep -E '^[a-z-]+:.*##' Makefile | sed 's/:.*##/ -/'
 
-build:  ## release build of lu with the tui feature
+build:  ## release build of lu (with the tui feature) and ting
 	cargo build --release --locked -p lu --features tui
+	cargo build --release --locked -p tuishou-ting
 
-install: build $(INSTALL_UNITS)  ## build and install lu into PREFIX/bin (~/.local, or /usr/local as root; PREFIX= and DESTDIR= override)
+install: build $(INSTALL_UNITS)  ## build and install lu and ting into PREFIX/bin (~/.local, or /usr/local as root; PREFIX= and DESTDIR= override)
 	install -d '$(DESTDIR)$(BINDIR)'
 	install -m 0755 '$(TARGET_DIR)/release/lu' '$(DESTDIR)$(BINDIR)/lu'
-	@echo "installed $(DESTDIR)$(BINDIR)/lu"
+	install -m 0755 '$(TARGET_DIR)/release/ting' '$(DESTDIR)$(BINDIR)/ting'
+	@echo "installed $(DESTDIR)$(BINDIR)/lu and $(DESTDIR)$(BINDIR)/ting"
 
 install-units:  ## install systemd units into PREFIX/lib/systemd/system (root only)
 	install -d '$(DESTDIR)$(SYSTEMD_UNIT_DIR)'
-	install -m 0644 contrib/lu-controller.service contrib/lu-agent.service '$(DESTDIR)$(SYSTEMD_UNIT_DIR)/'
+	install -m 0644 contrib/lu-controller.service contrib/ting.service '$(DESTDIR)$(SYSTEMD_UNIT_DIR)/'
 	@echo "installed units in $(DESTDIR)$(SYSTEMD_UNIT_DIR)"
 
-uninstall: $(UNINSTALL_UNITS)  ## remove the installed binary and, as root, the units
-	rm -f '$(DESTDIR)$(BINDIR)/lu'
+uninstall: $(UNINSTALL_UNITS)  ## remove the installed binaries and, as root, the units
+	rm -f '$(DESTDIR)$(BINDIR)/lu' '$(DESTDIR)$(BINDIR)/ting'
 
 uninstall-units:  ## remove the systemd units from PREFIX/lib/systemd/system (root only)
 	rm -f '$(DESTDIR)$(SYSTEMD_UNIT_DIR)/lu-controller.service' \
-	      '$(DESTDIR)$(SYSTEMD_UNIT_DIR)/lu-agent.service'
+	      '$(DESTDIR)$(SYSTEMD_UNIT_DIR)/ting.service'
 	@echo "removed units from $(DESTDIR)$(SYSTEMD_UNIT_DIR)"
 
 du:  ## show target/ size breakdown (debug/release/musl), biggest first

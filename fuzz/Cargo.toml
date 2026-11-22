@@ -87,5 +87,33 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "scope_controller"
+path = "fuzz_targets/scope_controller.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scope_socket"
+path = "fuzz_targets/scope_socket.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "intake_decoder"
+path = "fuzz_targets/intake_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "intake_rules"
+path = "fuzz_targets/intake_rules.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

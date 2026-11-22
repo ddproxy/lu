@@ -2,9 +2,9 @@
 //! names its table, and secret files other users can read are refused.
 
 mod error;
-mod secret;
+pub mod secret;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
@@ -30,8 +30,16 @@ pub struct ParsedUrl {
 /// A config is a few KiB. The cap stops a runaway or hostile file from being read whole.
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
+/// Largest push token file the controller will read.
+pub const MAX_PUBLISH_TOKEN_BYTES: u64 = 8 * 1024;
+
 /// Limits for operator-declared label probes; lu ships no built-in toolchain knowledge.
-pub const MAX_DETECT_ENTRIES: usize = 16;
+const MAX_PUBLISH_GATES: usize = 16;
+const MAX_PUBLISH_NAME_BYTES: usize = 128;
+const MAX_PUBLISH_COMMAND_BYTES: usize = 4096;
+const MAX_PUBLISH_PREFIX_BYTES: usize = 128;
+
+const MAX_DETECT_ENTRIES: usize = 16;
 pub const MAX_DETECT_ARGV: usize = 8;
 pub const MAX_DETECT_TIMEOUT_SECS: u64 = 30;
 pub const MIN_DETECT_EVERY_SECS: u64 = 30;
@@ -48,6 +56,19 @@ const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
 const MIN_STUCK_AFTER_SECS: u64 = 60;
 const MAX_STUCK_AFTER_SECS: u64 = 86_400;
 const DEFAULT_STUCK_AFTER_SECS: u64 = 1_800;
+
+/// Artifact scrubbing. Built-in rule names are reserved for the tags written into stored
+/// artifacts, so operator rules must pick another name.
+pub const BUILTIN_SCRUB_RULES: [&str; 5] = [
+    "private_key",
+    "bearer_token",
+    "token_prefix",
+    "jwt",
+    "assignment",
+];
+pub const MAX_SCRUB_RULES: usize = 16;
+const MAX_SCRUB_RULE_NAME_BYTES: usize = 32;
+const MAX_SCRUB_PATTERN_BYTES: usize = 512;
 
 /// The agent's default response to a job that stops producing output and using CPU. A job may
 /// override this in its spec.
@@ -96,6 +117,515 @@ pub struct Config {
     pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub log: LogConfig,
+    /// Controller-side scrubbing of stored artifacts. Absent means enabled with no extra rules.
+    #[serde(default)]
+    pub artifacts: Option<ArtifactsConfig>,
+    /// Append-only audit record. Omitted or empty disables auditing entirely.
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
+    /// Job-scoped follow-up submissions. Disabled by default.
+    #[serde(default)]
+    pub scope: Option<ScopeConfig>,
+    /// Node-agent workspace lifecycle. Absent means the documented defaults.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceConfig>,
+    /// Controller-side publishing to review branches. Absent disables publishing.
+    #[serde(default)]
+    pub publish: Option<PublishConfig>,
+    /// Draft retention and inventory limits. Absent means the documented defaults.
+    #[serde(default)]
+    pub drafts: Option<DraftsConfig>,
+    /// Signed webhook intake. Absent disables every intake route.
+    #[serde(default)]
+    pub intake: Option<IntakeConfig>,
+    /// Controller-only credentials for private git mirrors.
+    #[serde(default)]
+    pub mirror: Option<MirrorConfig>,
+}
+
+/// `[drafts]` — how long drafts live and how many may be kept.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DraftsConfig {
+    /// Retention window; a bare number means seconds. Defaults to `7d`.
+    pub ttl: String,
+    /// Maximum number of drafts across all origins.
+    pub max_drafts: u64,
+    /// Maximum number of drafts per origin label.
+    pub max_drafts_per_source: u64,
+}
+
+impl Default for DraftsConfig {
+    fn default() -> Self {
+        Self {
+            ttl: "7d".to_owned(),
+            max_drafts: 10_000,
+            max_drafts_per_source: 1_000,
+        }
+    }
+}
+
+/// `[intake]` — signed, generic webhook intake. Off unless present.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeConfig {
+    #[serde(default)]
+    pub sources: Vec<IntakeSource>,
+}
+
+/// `[[intake.sources]]` — one independently signed webhook endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeSource {
+    /// Route suffix and provenance label. Must be a safe name.
+    pub name: String,
+    /// File containing the HMAC-SHA256 key. Checked to be mode 0600 at start.
+    pub secret_file: String,
+    /// Signature header. Defaults to `X-Hub-Signature-256`.
+    #[serde(default = "default_intake_signature_header")]
+    pub header: String,
+    #[serde(default = "default_intake_max_body_bytes")]
+    pub max_body_bytes: usize,
+    #[serde(default = "default_intake_rate_per_minute")]
+    pub rate_per_minute: u64,
+    /// Delivery id header used for de-duplication.
+    #[serde(default)]
+    pub dedupe_header: Option<String>,
+    /// How long a delivery id is remembered.
+    #[serde(default = "default_intake_dedupe_ttl_secs")]
+    pub dedupe_ttl_secs: u64,
+    /// Explicit opt-in for unencrypted non-loopback listeners.
+    #[serde(default)]
+    pub allow_plain_http: bool,
+    #[serde(default)]
+    pub rules: Vec<IntakeRule>,
+}
+
+fn default_intake_signature_header() -> String {
+    "X-Hub-Signature-256".to_owned()
+}
+fn default_intake_max_body_bytes() -> usize {
+    1024 * 1024
+}
+fn default_intake_rate_per_minute() -> u64 {
+    60
+}
+fn default_intake_dedupe_ttl_secs() -> u64 {
+    24 * 60 * 60
+}
+
+/// A JSON-pointer condition. Exactly one operator must be set.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeCondition {
+    /// RFC 6901 pointer into the webhook body, e.g. `/actor/login`.
+    pub pointer: String,
+    #[serde(default)]
+    pub equals: Option<String>,
+    #[serde(default, rename = "in")]
+    pub in_values: Vec<String>,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub regex: Option<String>,
+    #[serde(default)]
+    pub exists: Option<bool>,
+}
+
+/// A literal string or a JSON pointer into the webhook body.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum IntakeValue {
+    Literal(String),
+    Pointer { pointer: String },
+}
+
+/// `[[intake.sources.rules]]` — maps a signed body to one job.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeRule {
+    /// Every condition must match for the rule to apply.
+    #[serde(default, rename = "match")]
+    pub matches: Vec<IntakeCondition>,
+    /// When set, every condition must match or the delivery is dropped and counted.
+    #[serde(default)]
+    pub allow: Vec<IntakeCondition>,
+    pub repo: IntakeValue,
+    #[serde(rename = "ref")]
+    pub git_ref: IntakeValue,
+    #[serde(default)]
+    pub base: Option<IntakeValue>,
+    /// Operator-authored text. Only pointers listed in `task_vars` may be substituted.
+    #[serde(default)]
+    pub task_template: String,
+    /// Allow-listed pointers for `{{pointer}}` substitution into `task_template`.
+    #[serde(default)]
+    pub task_vars: Vec<String>,
+    /// Pointers copied into the untrusted `context` text.
+    #[serde(default)]
+    pub context_from: Vec<String>,
+    /// Dangerous opt-in: insert payload fields into operator-authored `task`.
+    #[serde(default)]
+    pub unsafe_inline: bool,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub priority: Option<u8>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    #[serde(default)]
+    pub publish: Option<lu_proto::PublishSpec>,
+    /// Template for the job's idempotency key, e.g. `intake-{{/delivery/id}}`.
+    #[serde(default)]
+    pub key_template: Option<String>,
+    #[serde(default)]
+    pub auto_approve: bool,
+    /// Allow refs whose head repository differs from the target repository.
+    #[serde(default)]
+    pub allow_forks: bool,
+}
+
+/// `[mirror.credentials]` — controller-only token files, never placed in jobs or artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorConfig {
+    #[serde(default)]
+    pub credentials: Option<MirrorCredentialsConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorCredentialsConfig {
+    #[serde(default)]
+    pub repos: Vec<MirrorCredential>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorCredential {
+    pub name: String,
+    pub token_file: String,
+}
+
+/// `[scope]` — safe defaults for harness-initiated follow-up jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeConfig {
+    /// Master switch. Off by default; no scoped route is reachable until an operator enables it.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_max_children_per_job")]
+    pub max_children_per_job: u64,
+    #[serde(default = "default_max_descendants_per_root")]
+    pub max_descendants_per_root: u64,
+    #[serde(default = "default_max_depth")]
+    pub max_depth: u32,
+    #[serde(default = "default_max_task_bytes")]
+    pub max_task_bytes: usize,
+    #[serde(default = "default_max_spawn_per_minute")]
+    pub max_spawn_per_minute: u64,
+    #[serde(default = "default_max_artifact_read_bytes")]
+    pub max_artifact_read_bytes: usize,
+    /// Maximum length of a child's summary shown through scope tools. Defaults to 4 KiB.
+    #[serde(default = "default_max_summary_bytes")]
+    pub max_summary_bytes: usize,
+}
+
+impl Default for ScopeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_scope_enabled(),
+            max_children_per_job: default_max_children_per_job(),
+            max_descendants_per_root: default_max_descendants_per_root(),
+            max_depth: default_max_depth(),
+            max_task_bytes: default_max_task_bytes(),
+            max_spawn_per_minute: default_max_spawn_per_minute(),
+            max_artifact_read_bytes: default_max_artifact_read_bytes(),
+            max_summary_bytes: default_max_summary_bytes(),
+        }
+    }
+}
+
+fn default_scope_enabled() -> bool {
+    false
+}
+fn default_max_children_per_job() -> u64 {
+    8
+}
+fn default_max_descendants_per_root() -> u64 {
+    32
+}
+fn default_max_depth() -> u32 {
+    2
+}
+fn default_max_task_bytes() -> usize {
+    64 * 1024
+}
+fn default_max_spawn_per_minute() -> u64 {
+    6
+}
+fn default_max_artifact_read_bytes() -> usize {
+    1024 * 1024
+}
+fn default_max_summary_bytes() -> usize {
+    4096
+}
+
+/// `[workspace]` — node-agent workspace retention and disk pressure settings. Durations accept a
+/// trailing `s`, `m`, `h` or `d`; a bare number means seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct WorkspaceConfig {
+    /// Policy for jobs that do not set `workspace` themselves.
+    pub default: String,
+    /// How long a failed `keep_on_failure` workspace is kept.
+    pub failed_ttl: String,
+    /// How long a `keep` workspace is kept.
+    pub keep_ttl: String,
+    /// Optional cap on total workspace bytes; eviction starts above it.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    /// Stop evicting once disk use is at or below this percent.
+    pub low_water_percent: u8,
+    /// Start evicting once disk use is above this percent.
+    pub high_water_percent: u8,
+    /// How often the agent sweeps TTLs, retries deletions and checks disk pressure.
+    pub sweep_interval: String,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            default: "ephemeral".to_owned(),
+            failed_ttl: "6h".to_owned(),
+            keep_ttl: "48h".to_owned(),
+            max_bytes: None,
+            low_water_percent: 65,
+            high_water_percent: 80,
+            sweep_interval: "60s".to_owned(),
+        }
+    }
+}
+
+impl WorkspaceConfig {
+    /// The configured default policy spelling, already validated by [`Config::validate`].
+    pub fn default_policy(&self) -> &str {
+        self.default.trim()
+    }
+
+    /// `failed_ttl` in seconds.
+    pub fn failed_ttl_secs(&self) -> u64 {
+        parse_duration_secs(&self.failed_ttl).unwrap_or(0)
+    }
+
+    /// `keep_ttl` in seconds.
+    pub fn keep_ttl_secs(&self) -> u64 {
+        parse_duration_secs(&self.keep_ttl).unwrap_or(0)
+    }
+
+    /// `sweep_interval` in seconds.
+    pub fn sweep_interval_secs(&self) -> u64 {
+        parse_duration_secs(&self.sweep_interval).unwrap_or(0)
+    }
+
+    /// Validates spellings and the watermark ordering.
+    pub fn validate(&self) -> Result<(), String> {
+        let valid_policy = matches!(
+            self.default_policy(),
+            "ephemeral" | "keep_on_failure" | "keep"
+        );
+        if !valid_policy {
+            return Err(format!(
+                "[workspace] default must be ephemeral, keep_on_failure or keep (got {:?})",
+                self.default
+            ));
+        }
+        for (field, value) in [
+            ("failed_ttl", self.failed_ttl.as_str()),
+            ("keep_ttl", self.keep_ttl.as_str()),
+            ("sweep_interval", self.sweep_interval.as_str()),
+        ] {
+            let secs = parse_duration_secs(value).ok_or_else(|| {
+                format!("[workspace] {field} must be a duration such as 6h, 30m or 60s")
+            })?;
+            if secs == 0 {
+                return Err(format!("[workspace] {field} must be at least 1s"));
+            }
+        }
+        if self.max_bytes == Some(0) {
+            return Err("[workspace] max_bytes must be positive when set".to_owned());
+        }
+        if self.low_water_percent > 100 || self.high_water_percent > 100 {
+            return Err("[workspace] water marks must be 0 to 100 percent".to_owned());
+        }
+        if self.low_water_percent >= self.high_water_percent {
+            return Err(
+                "[workspace] low_water_percent must be below high_water_percent".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Parses `6h`, `30m`, `90s`, `1d` or a plain number of seconds.
+/// Parses a config duration (`s`, `m`, `h`, `d` suffixes; bare numbers are seconds).
+pub fn parse_duration_secs_public(value: &str) -> Option<u64> {
+    parse_duration_secs(value)
+}
+
+fn parse_duration_secs(value: &str) -> Option<u64> {
+    let text = value.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (digits, multiplier) = match text.as_bytes().last()? {
+        b's' | b'S' => (&text[..text.len() - 1], 1),
+        b'm' | b'M' => (&text[..text.len() - 1], 60),
+        b'h' | b'H' => (&text[..text.len() - 1], 3600),
+        b'd' | b'D' => (&text[..text.len() - 1], 86_400),
+        _ if text.bytes().all(|b| b.is_ascii_digit()) => (text, 1),
+        _ => return None,
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
+/// `[artifacts]` — optional controller-side redaction applied before an artifact is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactsConfig {
+    /// Turn scrubbing on (the default) or off.
+    #[serde(default = "default_scrub")]
+    pub scrub: bool,
+    /// Operator patterns, tried after the built-in rules.
+    #[serde(default)]
+    pub extra_rules: Vec<ScrubRuleConfig>,
+}
+
+fn default_scrub() -> bool {
+    true
+}
+
+/// One `[[artifacts.extra_rules]]` entry. `name` becomes the `[scrubbed:<name>]` tag.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScrubRuleConfig {
+    pub name: String,
+    pub pattern: String,
+}
+
+impl Default for ArtifactsConfig {
+    fn default() -> Self {
+        Self {
+            scrub: default_scrub(),
+            extra_rules: Vec::new(),
+        }
+    }
+}
+
+/// Configuration for the hash-chained job event record. Off by default.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Absolute path of the JSON Lines file the controller appends to.
+    pub path: String,
+}
+
+/// `[publish]` — controller-only settings for turning finished jobs into review branches.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishConfig {
+    /// Forges a job may push to. The name is referenced by `JobSpec.publish.remote`.
+    #[serde(default)]
+    pub remotes: BTreeMap<String, PublishRemote>,
+    /// Named gate commands. `JobSpec.publish.gates` selects from these.
+    #[serde(default)]
+    pub gates: BTreeMap<String, PublishGate>,
+    /// Committer identity written to the generated commit.
+    #[serde(default = "default_publish_committer_name")]
+    pub committer_name: String,
+    #[serde(default = "default_publish_committer_email")]
+    pub committer_email: String,
+    /// Allow publishing a patch that artifact scrubbing changed. Off by default.
+    #[serde(default)]
+    pub allow_scrubbed: bool,
+    /// Maps `host/owner/name` source patterns to a remote name in `remotes`. An unmatched source
+    /// remote has no publish target unless the job's source is itself a configured remote.
+    #[serde(default)]
+    pub redirects: BTreeMap<String, String>,
+    /// Branch names that no source-branch push may update, in addition to the built-in list.
+    #[serde(default)]
+    pub protected_patterns: Vec<String>,
+}
+
+/// One `[publish.remotes.<name>]` entry. The push token is read only from `token_file`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishRemote {
+    /// HTTPS forge URL. Credentials in the URL are always refused.
+    pub url: String,
+    /// Absolute path of an owner-only file containing the push token.
+    pub token_file: String,
+    /// Branch namespaces this remote may receive. Defaults to `["snapshot/"]`.
+    #[serde(default = "default_branch_prefixes")]
+    pub branch_prefixes: Vec<String>,
+    /// Dangerous opt-in: allow a fully approved job to fast-forward its own source branch on this
+    /// remote. Never enabled by default.
+    #[serde(default)]
+    pub allow_source_branch_push: bool,
+    /// Maximum successful pushes per hour for this remote.
+    pub max_pushes_per_hour: u32,
+    /// Test-only loopback `file://` transport for a local bare remote. Requires a `shim.invalid`
+    /// HTTPS URL so it can never be confused with a production forge.
+    #[serde(default)]
+    pub test_file_url: Option<String>,
+}
+
+/// One `[publish.gates.<name>]` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishGate {
+    /// Direct command and arguments, split on whitespace. No shell is involved.
+    pub command: String,
+    /// Wall-clock limit for the gate job, in seconds.
+    pub timeout_secs: u64,
+    /// Exit status the gate must report to count as passing.
+    pub expected_exit_code: i32,
+}
+
+fn default_publish_committer_name() -> String {
+    "Lu Publish".to_owned()
+}
+
+fn default_publish_committer_email() -> String {
+    "lu-publish@localhost".to_owned()
+}
+
+fn default_branch_prefixes() -> Vec<String> {
+    vec!["snapshot/".to_owned()]
+}
+
+/// Redirect patterns and protected branch patterns share one conservative grammar: bounded
+/// printable `host/owner/name` text with `*` wildcards and no URL or ref tricks.
+fn valid_redirect_pattern(value: &str) -> bool {
+    valid_glob(value) && value.contains('/')
+}
+
+fn valid_glob(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '*' | '.' | '_' | '-' | '/' | ':'))
+        && !value.contains("..")
+        && !value.starts_with('/')
+        && !value.ends_with('/')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -233,6 +763,15 @@ pub struct AgentConfig {
     /// A group (name or number) given write access to each job's working tree, for a harness
     /// that runs as another account, such as a container. Never covers `.git`.
     pub workspace_group: Option<String>,
+    /// Numeric uid of the account the harness runs as. The agent chowns each per-job socket and
+    /// its private directory to this uid and checks `SO_PEERCRED` against it. Unset means the
+    /// harness shares the agent's uid.
+    #[serde(default)]
+    pub harness_uid: Option<u32>,
+    /// Numeric gid for the per-job socket. Defaults to `workspace_group` when set, otherwise to
+    /// `harness_uid`. Requires `harness_uid`.
+    #[serde(default)]
+    pub harness_gid: Option<u32>,
     /// A private file holding the opencode server's password, passed to the harness as
     /// `OPENCODE_SERVER_PASSWORD`. The same rules as `token_file`: a regular file owned by the
     /// agent's account with no group or other access.
@@ -270,6 +809,10 @@ pub struct AgentConfig {
     /// Opt-in removal of leftover build directories between jobs.
     #[serde(default)]
     pub housekeeping: Option<HousekeepingConfig>,
+    /// Copied from the top-level `[workspace]` table by the agent binary. Kept out of TOML so a
+    /// `[agent] workspace` key stays an unknown-key error.
+    #[serde(default, skip)]
+    pub workspace: Option<WorkspaceConfig>,
 }
 
 fn default_heartbeat_secs() -> u64 {
@@ -382,7 +925,15 @@ impl Config {
             );
         }
         self.validate_log()?;
+        self.validate_audit()?;
         self.validate_tls()?;
+        self.validate_artifacts()?;
+        self.validate_scope()?;
+        self.validate_workspace()?;
+        self.validate_publish()?;
+        self.validate_drafts()?;
+        self.validate_intake()?;
+        self.validate_mirror()?;
         if let Some(c) = &self.controller {
             c.validate(self.tls.is_some())?;
         }
@@ -413,6 +964,13 @@ impl Config {
         Ok(())
     }
 
+    fn validate_audit(&self) -> Result<(), ConfigError> {
+        if let Some(audit) = &self.audit {
+            validate_abs_no_dotdot("[audit]", "path", &audit.path)?;
+        }
+        Ok(())
+    }
+
     fn validate_tls(&self) -> Result<(), ConfigError> {
         match &self.tls {
             Some(tls) if tls.cert.is_empty() || tls.key.is_empty() => {
@@ -420,6 +978,512 @@ impl Config {
             }
             _ => Ok(()),
         }
+    }
+
+    fn validate_artifacts(&self) -> Result<(), ConfigError> {
+        let Some(artifacts) = &self.artifacts else {
+            return Ok(());
+        };
+        if artifacts.extra_rules.len() > MAX_SCRUB_RULES {
+            return invalid(
+                "[artifacts]",
+                format!(
+                    "extra_rules must name at most {MAX_SCRUB_RULES} patterns (got {})",
+                    artifacts.extra_rules.len()
+                ),
+            );
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for (index, rule) in artifacts.extra_rules.iter().enumerate() {
+            let table = format!("[[artifacts.extra_rules]] #{index} ({})", rule.name);
+            let name_ok = (1..=MAX_SCRUB_RULE_NAME_BYTES).contains(&rule.name.len())
+                && rule
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+            if !name_ok {
+                return invalid(
+                    &table,
+                    format!(
+                        "name must be 1 to {MAX_SCRUB_RULE_NAME_BYTES} characters from A-Z a-z 0-9 _ -"
+                    ),
+                );
+            }
+            if BUILTIN_SCRUB_RULES
+                .iter()
+                .any(|builtin| builtin.eq_ignore_ascii_case(&rule.name))
+                || seen
+                    .iter()
+                    .any(|other| other.eq_ignore_ascii_case(&rule.name))
+            {
+                return invalid(
+                    &table,
+                    format!("name {:?} is reserved or repeated", rule.name),
+                );
+            }
+            seen.push(rule.name.clone());
+            if rule.pattern.is_empty() || rule.pattern.len() > MAX_SCRUB_PATTERN_BYTES {
+                return invalid(
+                    &table,
+                    format!(
+                        "pattern must be 1 to {MAX_SCRUB_PATTERN_BYTES} bytes (got {})",
+                        rule.pattern.len()
+                    ),
+                );
+            }
+            if rule.pattern.bytes().any(|b| b == b'\n' || b == b'\r') {
+                return invalid(&table, "pattern must be a single line".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_scope(&self) -> Result<(), ConfigError> {
+        let Some(scope) = &self.scope else {
+            return Ok(());
+        };
+        if scope.max_children_per_job == 0 {
+            return invalid(
+                "[scope]",
+                "max_children_per_job must be at least 1".to_owned(),
+            );
+        }
+        if scope.max_descendants_per_root < scope.max_children_per_job {
+            return invalid(
+                "[scope]",
+                "max_descendants_per_root must be at least max_children_per_job".to_owned(),
+            );
+        }
+        if !(1..=16).contains(&scope.max_depth) {
+            return invalid("[scope]", "max_depth must be 1 to 16".to_owned());
+        }
+        if !(1024..=256 * 1024).contains(&scope.max_task_bytes) {
+            return invalid(
+                "[scope]",
+                "max_task_bytes must be 1024 to 262144".to_owned(),
+            );
+        }
+        if scope.max_spawn_per_minute == 0 {
+            return invalid(
+                "[scope]",
+                "max_spawn_per_minute must be at least 1".to_owned(),
+            );
+        }
+        if !(4096..=10 * 1024 * 1024).contains(&scope.max_artifact_read_bytes) {
+            return invalid(
+                "[scope]",
+                "max_artifact_read_bytes must be 4096 to 10485760".to_owned(),
+            );
+        }
+        if !(256..=4096).contains(&scope.max_summary_bytes) {
+            return invalid(
+                "[scope]",
+                "max_summary_bytes must be 256 to 4096".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_workspace(&self) -> Result<(), ConfigError> {
+        if let Some(workspace) = &self.workspace {
+            workspace
+                .validate()
+                .map_err(|reason| ConfigError::Invalid {
+                    table: "[workspace]".to_owned(),
+                    reason,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn validate_publish(&self) -> Result<(), ConfigError> {
+        let Some(publish) = &self.publish else {
+            return Ok(());
+        };
+        if publish.committer_name.is_empty()
+            || publish.committer_name.len() > MAX_PUBLISH_NAME_BYTES
+            || publish
+                .committer_name
+                .chars()
+                .any(|c| c.is_control() || c == '<' || c == '>')
+        {
+            return invalid(
+                "[publish]",
+                "committer_name must be 1 to 128 printable characters without < or >".to_owned(),
+            );
+        }
+        if publish.committer_email.is_empty()
+            || publish.committer_email.len() > MAX_PUBLISH_NAME_BYTES * 2
+            || publish.committer_email.chars().any(char::is_control)
+            || publish.committer_email.contains('<')
+            || publish.committer_email.contains('>')
+            || !publish.committer_email.contains('@')
+        {
+            return invalid(
+                "[publish]",
+                "committer_email must be a printable address containing @".to_owned(),
+            );
+        }
+        if publish.gates.len() > MAX_PUBLISH_GATES {
+            return invalid(
+                "[publish]",
+                format!("at most {MAX_PUBLISH_GATES} gates may be configured"),
+            );
+        }
+        for (name, gate) in &publish.gates {
+            validate_name("[publish.gates]", name)?;
+            if gate.command.is_empty() || gate.command.len() > MAX_PUBLISH_COMMAND_BYTES {
+                return invalid(
+                    "[publish.gates]",
+                    format!("gate {name} command must be 1 to {MAX_PUBLISH_COMMAND_BYTES} bytes"),
+                );
+            }
+            if gate
+                .command
+                .chars()
+                .any(|c| c.is_control() && c != ' ' && c != '\t')
+            {
+                return invalid(
+                    "[publish.gates]",
+                    format!("gate {name} command must not contain control characters"),
+                );
+            }
+            if !(1..=3600).contains(&gate.timeout_secs) {
+                return invalid(
+                    "[publish.gates]",
+                    format!("gate {name} timeout_secs must be 1 to 3600"),
+                );
+            }
+            if !(0..=255).contains(&gate.expected_exit_code) {
+                return invalid(
+                    "[publish.gates]",
+                    format!("gate {name} expected_exit_code must be 0 to 255"),
+                );
+            }
+        }
+        for (name, remote) in &publish.remotes {
+            validate_name("[publish.remotes]", name)?;
+            let parsed = parse_http_url(&remote.url)
+                .map_err(|e| map_url_error("[publish.remotes]", "url", e, &remote.url))?;
+            if !parsed.https {
+                return invalid(
+                    "[publish.remotes]",
+                    format!("remote {name} url must use https"),
+                );
+            }
+            validate_abs_no_dotdot("[publish.remotes]", "token_file", &remote.token_file)?;
+            if remote.branch_prefixes.is_empty() {
+                return invalid(
+                    "[publish.remotes]",
+                    format!("remote {name} branch_prefixes must not be empty"),
+                );
+            }
+            for prefix in &remote.branch_prefixes {
+                if prefix.is_empty()
+                    || prefix.len() > MAX_PUBLISH_PREFIX_BYTES
+                    || !prefix.ends_with('/')
+                    || prefix.starts_with('/')
+                    || prefix.starts_with("refs/")
+                    || prefix.contains("..")
+                    || prefix.contains('@')
+                    || prefix.chars().any(char::is_control)
+                {
+                    return invalid(
+                        "[publish.remotes]",
+                        format!("remote {name} has invalid branch prefix {prefix:?}"),
+                    );
+                }
+            }
+            if !(1..=10_000).contains(&remote.max_pushes_per_hour) {
+                return invalid(
+                    "[publish.remotes]",
+                    format!("remote {name} max_pushes_per_hour must be 1 to 10000"),
+                );
+            }
+            if let Some(file_url) = &remote.test_file_url {
+                let host = match &parsed.host {
+                    Host::Name(host) => host.as_str(),
+                    Host::Ip(_) => "",
+                };
+                if host != "shim.invalid" {
+                    return invalid(
+                        "[publish.remotes]",
+                        format!("remote {name} test_file_url requires a shim.invalid url"),
+                    );
+                }
+                let path = file_url.strip_prefix("file://").unwrap_or_default();
+                if !path.starts_with('/')
+                    || path.contains('@')
+                    || path.chars().any(char::is_control)
+                {
+                    return invalid(
+                        "[publish.remotes]",
+                        format!("remote {name} test_file_url must be an absolute file:// path"),
+                    );
+                }
+            }
+        }
+        for (pattern, remote) in &publish.redirects {
+            if !valid_redirect_pattern(pattern) {
+                return invalid(
+                    "[publish.redirects]",
+                    format!("invalid source pattern {pattern:?}"),
+                );
+            }
+            if !publish.remotes.contains_key(remote) {
+                return invalid(
+                    "[publish.redirects]",
+                    format!("pattern {pattern:?} names unknown remote {remote:?}"),
+                );
+            }
+        }
+        for pattern in &publish.protected_patterns {
+            if !valid_glob(pattern) || !pattern.bytes().all(|b| b != b'/') {
+                return invalid(
+                    "[publish]",
+                    format!("invalid protected_patterns entry {pattern:?}"),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_drafts(&self) -> Result<(), ConfigError> {
+        let Some(drafts) = &self.drafts else {
+            return Ok(());
+        };
+        let secs = parse_duration_secs(&drafts.ttl).ok_or_else(|| ConfigError::Invalid {
+            table: "[drafts]".to_owned(),
+            reason: format!("ttl {:?} is not a duration", drafts.ttl),
+        })?;
+        if secs == 0 || secs > 365 * 24 * 60 * 60 {
+            return invalid("[drafts]", "ttl must be between 1s and 365d".to_owned());
+        }
+        if drafts.max_drafts == 0 || drafts.max_drafts_per_source == 0 {
+            return invalid(
+                "[drafts]",
+                "max_drafts and max_drafts_per_source must be positive".to_owned(),
+            );
+        }
+        if drafts.max_drafts_per_source > drafts.max_drafts {
+            return invalid(
+                "[drafts]",
+                "max_drafts_per_source must not exceed max_drafts".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_intake(&self) -> Result<(), ConfigError> {
+        let Some(intake) = &self.intake else {
+            return Ok(());
+        };
+        if intake.sources.is_empty() {
+            return invalid(
+                "[intake]",
+                "at least one [[intake.sources]] is required".to_owned(),
+            );
+        }
+        let controller = self
+            .controller
+            .as_ref()
+            .ok_or_else(|| ConfigError::Invalid {
+                table: "[intake]".to_owned(),
+                reason: "intake requires a [controller] section".to_owned(),
+            })?;
+        let has_tls = self.tls.is_some();
+        let loopback = is_loopback_listen(&controller.listen);
+        let mut names = Vec::new();
+        for source in &intake.sources {
+            let table = format!("[[intake.sources]] ({})", source.name);
+            validate_name(&table, &source.name)?;
+            if names.contains(&source.name) {
+                return invalid(&table, format!("source name {:?} is repeated", source.name));
+            }
+            names.push(source.name.clone());
+            if source.secret_file.is_empty() {
+                return invalid(&table, "secret_file must not be empty".to_owned());
+            }
+            if source.header.is_empty()
+                || source.header.len() > 128
+                || source
+                    .header
+                    .bytes()
+                    .any(|b| b <= b' ' || b == b':' || b == 0x7f)
+            {
+                return invalid(&table, "header must be a valid HTTP header name".to_owned());
+            }
+            if source.max_body_bytes == 0 || source.max_body_bytes > 16 * 1024 * 1024 {
+                return invalid(
+                    &table,
+                    "max_body_bytes must be between 1 and 16777216".to_owned(),
+                );
+            }
+            if source.rate_per_minute == 0 || source.rate_per_minute > 100_000 {
+                return invalid(
+                    &table,
+                    "rate_per_minute must be between 1 and 100000".to_owned(),
+                );
+            }
+            if source.dedupe_ttl_secs == 0 || source.dedupe_ttl_secs > 7 * 24 * 60 * 60 {
+                return invalid(
+                    &table,
+                    "dedupe_ttl_secs must be between 1 and 604800".to_owned(),
+                );
+            }
+            if let Some(header) = &source.dedupe_header {
+                if header.is_empty()
+                    || header.len() > 128
+                    || header.bytes().any(|b| b <= b' ' || b == b':' || b == 0x7f)
+                {
+                    return invalid(
+                        &table,
+                        "dedupe_header must be a valid HTTP header name".to_owned(),
+                    );
+                }
+            }
+            if !has_tls && !loopback && !source.allow_plain_http {
+                return invalid(
+                    &table,
+                    "intake requires TLS or a loopback bind; set allow_plain_http = true only behind a TLS-terminating proxy".to_owned(),
+                );
+            }
+            if source.rules.is_empty() {
+                return invalid(
+                    &table,
+                    "at least one [[intake.sources.rules]] is required".to_owned(),
+                );
+            }
+            for (i, rule) in source.rules.iter().enumerate() {
+                let rule_table = format!("{table} rule #{i}");
+                for (kind, conditions) in [("match", &rule.matches), ("allow", &rule.allow)] {
+                    for (j, condition) in conditions.iter().enumerate() {
+                        let where_ = format!("{rule_table} {kind}[{j}]");
+                        validate_pointer(&where_, &condition.pointer)?;
+                        let ops = condition.equals.is_some() as usize
+                            + !condition.in_values.is_empty() as usize
+                            + condition.prefix.is_some() as usize
+                            + condition.regex.is_some() as usize
+                            + condition.exists.is_some() as usize;
+                        if ops != 1 {
+                            return invalid(
+                                &where_,
+                                "set exactly one of equals, in, prefix, regex or exists".to_owned(),
+                            );
+                        }
+                        if let Some(regex) = &condition.regex {
+                            if regex.is_empty()
+                                || regex.len() > 512
+                                || regex.chars().any(char::is_control)
+                            {
+                                return invalid(
+                                    &where_,
+                                    "regex must be 1 to 512 bytes with no control characters"
+                                        .to_owned(),
+                                );
+                            }
+                        }
+                    }
+                }
+                validate_intake_value(&rule_table, "repo", &rule.repo)?;
+                validate_intake_value(&rule_table, "ref", &rule.git_ref)?;
+                if let Some(base) = &rule.base {
+                    validate_intake_value(&rule_table, "base", base)?;
+                }
+                for pointer in rule.task_vars.iter().chain(rule.context_from.iter()) {
+                    validate_pointer(&rule_table, pointer)?;
+                }
+                let vars: Vec<&str> = rule.task_vars.iter().map(String::as_str).collect();
+                for (field, template) in [
+                    ("task_template", Some(&rule.task_template)),
+                    ("key_template", rule.key_template.as_ref()),
+                ] {
+                    let Some(template) = template else { continue };
+                    if template.len() > 4096 {
+                        return invalid(&rule_table, format!("{field} must be at most 4096 bytes"));
+                    }
+                    for pointer in template_placeholders(template) {
+                        validate_pointer(&rule_table, &pointer)?;
+                        if pointer.len() > MAX_INTAKE_VAR_BYTES {
+                            return invalid(
+                                &rule_table,
+                                format!(
+                                    "{field} pointer is longer than {MAX_INTAKE_VAR_BYTES} bytes"
+                                ),
+                            );
+                        }
+                        if !vars.contains(&pointer.as_str()) {
+                            return invalid(
+                                &rule_table,
+                                format!("{field} uses {pointer:?}, which is not in task_vars"),
+                            );
+                        }
+                    }
+                }
+                if !rule.task_template.is_empty()
+                    && !template_placeholders(&rule.task_template).is_empty()
+                    && !rule.unsafe_inline
+                {
+                    return invalid(
+                        &rule_table,
+                        "task_template substitutions require unsafe_inline = true; use context_from instead".to_owned(),
+                    );
+                }
+                if let Some(priority) = rule.priority {
+                    if !(1..=9).contains(&priority) {
+                        return invalid(&rule_table, "priority must be between 1 and 9".to_owned());
+                    }
+                }
+                if let Some(timeout) = rule.timeout {
+                    if timeout == 0 || timeout > 30 * 24 * 60 * 60 {
+                        return invalid(
+                            &rule_table,
+                            "timeout must be between 1 and 2592000 seconds".to_owned(),
+                        );
+                    }
+                }
+                if let Some(provider) = &rule.provider {
+                    if !valid_name(provider) {
+                        return invalid(&rule_table, "provider is not a valid name".to_owned());
+                    }
+                }
+                if let Some(group) = &rule.group {
+                    if !valid_group_name(group) {
+                        return invalid(&rule_table, "group is not a valid name".to_owned());
+                    }
+                }
+                if rule.publish.is_some() && !rule.unsafe_inline {
+                    // Publishing is operator-authored configuration, not payload text, so it is
+                    // allowed; this branch documents the deliberate distinction.
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_mirror(&self) -> Result<(), ConfigError> {
+        let Some(mirror) = &self.mirror else {
+            return Ok(());
+        };
+        let Some(creds) = &mirror.credentials else {
+            return Ok(());
+        };
+        let mut names = Vec::new();
+        for (i, cred) in creds.repos.iter().enumerate() {
+            let table = format!("[mirror.credentials.repos] #{i} ({})", cred.name);
+            validate_name(&table, &cred.name)?;
+            if names.contains(&cred.name) {
+                return invalid(
+                    &table,
+                    format!("credential name {:?} is repeated", cred.name),
+                );
+            }
+            names.push(cred.name.clone());
+            if cred.token_file.is_empty() {
+                return invalid(&table, "token_file must not be empty".to_owned());
+            }
+        }
+        Ok(())
     }
 
     fn validate_cross_scope(&self) -> Result<(), ConfigError> {
@@ -682,6 +1746,9 @@ impl AgentConfig {
                     "workspace_group must be 1 to 32 letters, digits, '_', '-' or '.'".to_owned(),
                 );
             }
+        }
+        if self.harness_gid.is_some() && self.harness_uid.is_none() {
+            return invalid("[agent]", "harness_gid requires harness_uid".to_owned());
         }
         if !(2..=300).contains(&self.heartbeat_secs) {
             return invalid(
@@ -977,6 +2044,68 @@ fn validate_name(table: &str, name: &str) -> Result<(), ConfigError> {
             "name must be 1 to 64 characters from A-Z a-z 0-9 . _ -".to_owned(),
         )
     }
+}
+
+const MAX_INTAKE_VAR_BYTES: usize = 256;
+
+fn valid_name(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn validate_pointer(table: &str, pointer: &str) -> Result<(), ConfigError> {
+    let ok =
+        pointer.starts_with('/') && pointer.len() <= 512 && !pointer.chars().any(char::is_control);
+    if ok {
+        Ok(())
+    } else {
+        invalid(
+            table,
+            format!("JSON pointer {pointer:?} must start with /, be at most 512 bytes and have no control characters"),
+        )
+    }
+}
+
+fn validate_intake_value(table: &str, field: &str, value: &IntakeValue) -> Result<(), ConfigError> {
+    match value {
+        IntakeValue::Literal(text) => {
+            if text.is_empty()
+                || text.len() > MAX_INTAKE_VAR_BYTES
+                || text.chars().any(char::is_control)
+            {
+                invalid(
+                    table,
+                    format!("{field} literal must be 1 to {MAX_INTAKE_VAR_BYTES} bytes with no control characters"),
+                )
+            } else {
+                Ok(())
+            }
+        }
+        IntakeValue::Pointer { pointer } => validate_pointer(table, pointer),
+    }
+}
+
+/// Returns every `{{pointer}}` placeholder in an operator template.
+fn template_placeholders(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        out.push(after[..end].trim().to_owned());
+        rest = &after[end + 2..];
+    }
+    out
+}
+
+fn is_loopback_listen(listen: &str) -> bool {
+    let host = listen
+        .rsplit_once(':')
+        .map(|(host, _)| host.trim_matches(['[', ']']))
+        .unwrap_or(listen);
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
 }
 
 fn valid_label(value: &str) -> bool {
@@ -1294,6 +2423,14 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
             secret::read_private_file("[agent] reiki_token_file", Path::new(rt), MAX_CONFIG_BYTES)?;
         }
     }
+    if let Some(publish) = &config.publish {
+        for (name, remote) in &publish.remotes {
+            secret::check_private_file(
+                &format!("[publish.remotes.{name}] token_file"),
+                Path::new(&remote.token_file),
+            )?;
+        }
+    }
     if let Some(controller) = &config.controller {
         for repo in &controller.repos {
             if let Some(file) = &repo.credential_file {
@@ -1301,6 +2438,25 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
                     &format!("[[controller.repos]] ({}) credential_file", repo.name),
                     Path::new(file),
                     MAX_CONFIG_BYTES,
+                )?;
+            }
+        }
+    }
+    if let Some(intake) = &config.intake {
+        for source in &intake.sources {
+            secret::read_private_file(
+                &format!("[[intake.sources]] ({}) secret_file", source.name),
+                Path::new(&source.secret_file),
+                MAX_CONFIG_BYTES,
+            )?;
+        }
+    }
+    if let Some(mirror) = &config.mirror {
+        if let Some(creds) = &mirror.credentials {
+            for cred in &creds.repos {
+                secret::check_private_file(
+                    &format!("[mirror.credentials.repos] ({}) token_file", cred.name),
+                    Path::new(&cred.token_file),
                 )?;
             }
         }
@@ -1352,6 +2508,19 @@ mod tests {
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+    #[test]
+    fn scope_defaults_disable_everything_by_default() {
+        let scope = ScopeConfig::default();
+        assert!(!scope.enabled);
+        assert_eq!(scope.max_children_per_job, 8);
+        assert_eq!(scope.max_descendants_per_root, 32);
+        assert_eq!(scope.max_depth, 2);
+        assert_eq!(scope.max_task_bytes, 64 * 1024);
+        assert_eq!(scope.max_spawn_per_minute, 6);
+        assert_eq!(scope.max_artifact_read_bytes, 1024 * 1024);
+        assert_eq!(scope.max_summary_bytes, 4096);
+    }
+
     fn invalid(err: ConfigError) -> (String, String) {
         match err {
             ConfigError::Invalid { table, reason } => (table, reason),
@@ -1381,8 +2550,8 @@ token_sha256 = "{HASH_B}"
 [agent]
 name = "peer-a"
 controller_url = "https://lu.example.net:7600"
-token_file = "/etc/lu/agent.token"
-work_dir = "/srv/work/lu"
+token_file = "/etc/ting/ting.token"
+work_dir = "/var/lib/ting/work"
 harness = "opencode"
 "#
         .to_owned()
@@ -1406,8 +2575,8 @@ token_sha256 = "{HASH_B}"
 [agent]
 name = "peer-a"
 controller_url = "https://lu.example.net:7600"
-token_file = "/etc/lu/agent.token"
-work_dir = "/srv/work/lu"
+token_file = "/etc/ting/ting.token"
+work_dir = "/var/lib/ting/work"
 harness = "opencode"
 heartbeat_secs = 15
 "#
@@ -1440,6 +2609,43 @@ heartbeat_secs = 15
     }
 
     #[test]
+    fn harness_socket_owner_is_configured_by_uid_and_optional_gid() {
+        let agent = Config::parse(&agent_only()).unwrap().agent.unwrap();
+        assert_eq!(agent.harness_uid, None);
+        assert_eq!(agent.harness_gid, None);
+
+        let configured = Config::parse(&format!(
+            "{}harness_uid = 1234\nharness_gid = 2345\n",
+            agent_only()
+        ))
+        .unwrap()
+        .agent
+        .unwrap();
+        assert_eq!(configured.harness_uid, Some(1234));
+        assert_eq!(configured.harness_gid, Some(2345));
+
+        let (table, reason) =
+            invalid(Config::parse(&format!("{}harness_gid = 2345\n", agent_only())).unwrap_err());
+        assert_eq!(table, "[agent]");
+        assert_eq!(reason, "harness_gid requires harness_uid");
+    }
+
+    #[test]
+    fn audit_record_is_off_by_default_and_requires_an_absolute_path() {
+        assert!(Config::parse(&controller_only()).unwrap().audit.is_none());
+        let base = controller_only();
+        let enabled = format!("{base}\n[audit]\npath = \"/var/log/lu/audit.jsonl\"\n");
+        let cfg = Config::parse(&enabled).unwrap();
+        assert_eq!(cfg.audit.unwrap().path, "/var/log/lu/audit.jsonl");
+        for path in ["audit.jsonl", "/var/log/lu/../lu/audit.jsonl"] {
+            let text = format!("{base}\n[audit]\npath = \"{path}\"\n");
+            expect_table(&text, "[audit]");
+        }
+        let unknown = format!("{base}\n[audit]\npath = \"/tmp/a\"\nother = 1\n");
+        assert!(Config::parse(&unknown).is_err());
+    }
+
+    #[test]
     fn agent_stuck_defaults_can_be_overridden_and_are_checked() {
         let base = agent_only();
         let configured = format!("{base}on_stuck = \"cancel\"\nstuck_after_secs = 120\n");
@@ -1453,6 +2659,78 @@ heartbeat_secs = 15
         }
         let invalid_policy = format!("{base}on_stuck = \"later\"\n");
         assert!(Config::parse(&invalid_policy).is_err());
+    }
+
+    #[test]
+    fn artifacts_scrub_defaults_to_on_with_no_extra_rules() {
+        let c = Config::parse(&controller_only()).unwrap();
+        assert!(c.artifacts.is_none());
+        let cfg = Config::parse(&format!("{}\n[artifacts]\n", controller_only())).unwrap();
+        let artifacts = cfg.artifacts.unwrap();
+        assert!(artifacts.scrub);
+        assert!(artifacts.extra_rules.is_empty());
+        assert_eq!(artifacts, ArtifactsConfig::default());
+    }
+
+    #[test]
+    fn artifacts_scrub_can_be_disabled_and_extended() {
+        let text = format!(
+            "{}\n[artifacts]\nscrub = false\n[[artifacts.extra_rules]]\nname = \"internal_id\"\npattern = \"ACME-[A-Z0-9]{{16}}\"\n",
+            controller_only()
+        );
+        let artifacts = Config::parse(&text).unwrap().artifacts.unwrap();
+        assert!(!artifacts.scrub);
+        assert_eq!(artifacts.extra_rules.len(), 1);
+        assert_eq!(artifacts.extra_rules[0].name, "internal_id");
+        assert_eq!(artifacts.extra_rules[0].pattern, "ACME-[A-Z0-9]{16}");
+    }
+
+    #[test]
+    fn artifact_extra_rules_are_bounded_and_named() {
+        let base = format!("{}\n[artifacts]\n", controller_only());
+        let rule = |name: &str, pattern: &str| {
+            format!("[[artifacts.extra_rules]]\nname = \"{name}\"\npattern = \"{pattern}\"\n")
+        };
+        for bad in [
+            "",
+            "has space",
+            "a/b",
+            "too-long-name-aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            expect_table(
+                &format!("{base}{}", rule(bad, "x{12}")),
+                &format!("[[artifacts.extra_rules]] #0 ({bad})"),
+            );
+        }
+        expect_table(
+            &format!("{}{}", base, rule("private_key", "x{12}")),
+            "[[artifacts.extra_rules]] #0 (private_key)",
+        );
+        expect_table(
+            &format!("{}{}{}", base, rule("dup", "x{12}"), rule("DUP", "y{12}")),
+            "[[artifacts.extra_rules]] #1 (DUP)",
+        );
+        expect_table(
+            &format!("{}{}", base, rule("empty", "")),
+            "[[artifacts.extra_rules]] #0 (empty)",
+        );
+        expect_table(
+            &format!("{}{}", base, rule("newline", "a\\nb")),
+            "[[artifacts.extra_rules]] #0 (newline)",
+        );
+        expect_table(
+            &format!(
+                "{}{}",
+                base,
+                rule("huge", &"x".repeat(MAX_SCRUB_PATTERN_BYTES + 1))
+            ),
+            "[[artifacts.extra_rules]] #0 (huge)",
+        );
+        let too_many = (0..MAX_SCRUB_RULES + 1)
+            .map(|i| rule(&format!("r{i}"), "x{12}"))
+            .collect::<String>();
+        expect_table(&format!("{base}{too_many}"), "[artifacts]");
+        assert!(Config::parse(&format!("{}{}", base, rule("ok_rule", "x{12}"))).is_ok());
     }
 
     #[test]
@@ -1525,9 +2803,65 @@ heartbeat_secs = 15
         assert!(e.to_string().contains("extra"), "{e}");
     }
 
+    fn publish_block() -> String {
+        format!(
+            "{}\n[publish.remotes.forge]\nurl = \"https://forge.invalid/lu.git\"\ntoken_file = \"/tmp/lu-token\"\nmax_pushes_per_hour = 5\n",
+            controller_only()
+        )
+    }
+
+    #[test]
+    fn publish_requires_https_and_no_embedded_credentials() {
+        assert!(Config::parse(&publish_block()).is_ok());
+        let bad = publish_block().replace("https://forge.invalid", "http://forge.invalid");
+        expect_table(&bad, "[publish.remotes]");
+        let bad = publish_block().replace("forge.invalid", "user:pw@forge.invalid");
+        expect_table(&bad, "[publish.remotes]");
+        let bad = publish_block() + "branch_prefixes = [\"refs/heads/\"]\n";
+        expect_table(&bad, "[publish.remotes]");
+    }
+
+    #[test]
+    fn publish_gate_values_are_checked() {
+        let base = publish_block() + "[publish.gates.secrets]\ncommand = \"rg secret\"\n";
+        assert!(Config::parse(&format!(
+            "{base}timeout_secs = 60\nexpected_exit_code = 1\n"
+        ))
+        .is_ok());
+        expect_table(
+            &format!("{base}timeout_secs = 0\nexpected_exit_code = 0\n"),
+            "[publish.gates]",
+        );
+        expect_table(
+            &format!("{base}timeout_secs = 60\nexpected_exit_code = 256\n"),
+            "[publish.gates]",
+        );
+        expect_table(
+            &format!("{base}timeout_secs = 60\nexpected_exit_code = 0\nextra = 1\n"),
+            "[publish.gates]",
+        );
+    }
+
+    #[test]
+    fn publish_test_transport_requires_shim_url() {
+        let base = publish_block() + "test_file_url = \"file:///tmp/remote.git\"\n";
+        expect_table(&base, "[publish.remotes]");
+        let ok = publish_block().replace("forge.invalid", "shim.invalid")
+            + "test_file_url = \"file:///tmp/remote.git\"\n";
+        assert!(Config::parse(&ok).is_ok());
+    }
+
     fn expect_table(text: &str, table: &str) {
-        let (t, r) = invalid(Config::parse(text).unwrap_err());
-        assert_eq!(t, table, "reason: {r}");
+        match Config::parse(text).unwrap_err() {
+            ConfigError::Invalid { table: t, reason } => assert_eq!(t, table, "reason: {reason}"),
+            ConfigError::Parse(message) => {
+                assert!(
+                    message.contains("unknown field") || message.contains("extra"),
+                    "unexpected parse error: {message}"
+                );
+            }
+            other => panic!("expected invalid, got {other}"),
+        }
     }
 
     #[test]

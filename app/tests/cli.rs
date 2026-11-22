@@ -6,6 +6,7 @@ use common::*;
 use lu_proto::ArtifactName;
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -52,6 +53,8 @@ async fn top_once_prints_tables_and_top_json_prints_one_object() {
     let server = start(move |record| {
         if record.path.contains("nodes") {
             Reply::json(&node_body)
+        } else if record.path.contains("status") {
+            Reply::json(&json!({}))
         } else {
             Reply::json(&jobs_body)
         }
@@ -84,6 +87,104 @@ async fn top_once_prints_tables_and_top_json_prints_one_object() {
         stderr(&output)
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ls_tree_shows_scope_lineage() {
+    let parent_id = job_id();
+    let child_id = job_id();
+    let mut parent = job_json(&parent_id, "running");
+    parent["spec"]["task"] = json!("parent task");
+    parent["root_job_id"] = json!(parent_id);
+    parent["depth"] = json!(0);
+    let mut child = job_json(&child_id, "queued");
+    child["spec"]["task"] = json!("child task");
+    child["parent_job_id"] = json!(parent_id);
+    child["root_job_id"] = json!(parent_id);
+    child["depth"] = json!(1);
+    let body = json!({"jobs": [parent, child]});
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("ls-tree");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(&["ls", "--tree"], &env_for(&server, &token), None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains(&format!("{parent_id}  running   parent task")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("└─ {child_id}")), "{text}");
+    assert!(text.contains("child task"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_reports_scope_lineage_and_spawn_settings() {
+    let parent_id = job_id();
+    let child_id = job_id();
+    let mut job = job_json(&child_id, "running");
+    job["parent_job_id"] = json!(parent_id);
+    job["root_job_id"] = json!(parent_id);
+    job["depth"] = json!(1);
+    job["spec"]["allow_spawn"] = json!(true);
+    job["spec"]["spawn_inherit"] = json!(false);
+    job["spec"]["spawn_repos"] = json!(["https://example.net/allowed.git"]);
+    let server = start(move |_| Reply::json(&job)).await;
+    let dir = scratch("show-scope");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(&["show", &child_id], &env_for(&server, &token), None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    for expected in [
+        format!("parent              {parent_id}"),
+        format!("root                {parent_id}"),
+        "depth               1".to_owned(),
+        "allow_spawn         true".to_owned(),
+        "spawn_inherit       false".to_owned(),
+        "https://example.net/allowed.git".to_owned(),
+    ] {
+        assert!(text.contains(&expected), "missing {expected:?} in {text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "tui")]
+async fn top_marks_scoped_children() {
+    let parent_id = job_id();
+    let child_id = job_id();
+    let mut parent = job_json(&parent_id, "running");
+    parent["root_job_id"] = json!(parent_id);
+    parent["depth"] = json!(0);
+    let mut child = job_json(&child_id, "running");
+    child["parent_job_id"] = json!(parent_id);
+    child["root_job_id"] = json!(parent_id);
+    child["depth"] = json!(1);
+    let node_body = json!([{
+        "name": "node-a",
+        "harness": "idle",
+        "providers": [],
+        "last_seen": 20,
+        "draining": false
+    }]);
+    let jobs_body = json!({"jobs": [parent, child]});
+    let server = start(move |record| {
+        if record.path.contains("nodes") {
+            Reply::json(&node_body)
+        } else if record.path.contains("status") {
+            Reply::json(&json!({}))
+        } else {
+            Reply::json(&jobs_body)
+        }
+    })
+    .await;
+    let dir = scratch("top-scope");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(&["top", "--once"], &env_for(&server, &token), None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("scope:d1"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -521,6 +622,8 @@ async fn show_prints_the_no_changes_outcome_note() {
     let server = start(move |_| {
         let mut view = job_json(&main_id, "done");
         view["outcome_note"] = json!("no_changes");
+        view["scrubbed_hits"] = json!(4);
+        view["patch_scrubbed"] = json!(true);
         Reply::json(&view)
     })
     .await;
@@ -535,6 +638,16 @@ async fn show_prints_the_no_changes_outcome_note() {
                 && line.trim_end().ends_with("no changes")),
         "{text}"
     );
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| {
+                let mut cells = line.split_whitespace();
+                (cells.next() == Some(name)).then(|| cells.next().unwrap_or(""))
+            })
+            .unwrap_or("")
+    };
+    assert_eq!(field("scrubbed_hits"), "4", "{text}");
+    assert_eq!(field("patch_scrubbed"), "true", "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -687,8 +800,8 @@ async fn submit_reads_stdin_and_sends_every_flag() {
     assert_eq!(records[0].path, "/v1/jobs");
     assert_eq!(records[0].header("idempotency-key"), Some("ticket:42"));
     let spec: Value = serde_json::from_slice(&records[0].body).unwrap();
-    assert_eq!(spec["repo"], "https://example.net/repo.git");
-    assert_eq!(spec["git_ref"], "main");
+    assert_eq!(spec["source"]["repo"], "https://example.net/repo.git");
+    assert_eq!(spec["source"]["ref"], "main");
     assert_eq!(spec["task"], "run the tests\n");
     assert_eq!(spec["provider"], "peer-a");
     assert_eq!(spec["model"], "big-pickle");
@@ -1482,8 +1595,7 @@ async fn usage_errors_exit_two_before_any_request() {
 fn finished_job(id: &str, state: &str) -> Value {
     let mut job = job_json(id, state);
     job["spec"] = json!({
-        "repo": "/srv/repo",
-        "git_ref": "main",
+        "source": {"repo": "/srv/repo", "ref": "main"},
         "task": "go",
         "provider": "peer-a",
         "model": "old-model",
@@ -1680,8 +1792,8 @@ async fn retry_resubmits_the_finished_spec_and_applies_the_overrides() {
     assert_eq!(records[1].path, "/v1/jobs");
     assert_eq!(records[1].header("idempotency-key"), Some("ticket:42"));
     let spec: Value = serde_json::from_slice(&records[1].body).unwrap();
-    assert_eq!(spec["repo"], "/srv/repo");
-    assert_eq!(spec["git_ref"], "main");
+    assert_eq!(spec["source"]["repo"], "/srv/repo");
+    assert_eq!(spec["source"]["ref"], "main");
     assert_eq!(spec["task"], "go");
     assert_eq!(spec["harness"], "opencode");
     assert_eq!(spec["timeout_secs"], 60);
@@ -2129,6 +2241,88 @@ async fn collect_resolves_keys_and_ids_and_sets_the_collection_spec() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collect_refuses_scrubbed_patches_unless_explicitly_allowed() {
+    let dep = job_id();
+    let new_id = job_id();
+    let dep_id = dep.clone();
+    let reply_id = new_id.clone();
+    let server = start(move |record| {
+        if record.method == "GET" {
+            let mut view = collected_view(&dep_id, "done", 10);
+            view["patch_scrubbed"] = json!(true);
+            view["scrubbed_hits"] = json!(2);
+            if record.path.starts_with("/v1/jobs/") {
+                return Reply::json(&view);
+            }
+            return Reply::json(&json!({"jobs": [view], "next": null}));
+        }
+        Reply::json(&job_json(&reply_id, "blocked"))
+    })
+    .await;
+    let dir = scratch("collect-scrubbed");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+
+    let refused = run_with_env(
+        &[
+            "collect",
+            &dep,
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+        ],
+        &envs,
+        None,
+        &dir,
+    );
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("--allow-scrubbed"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("2 scrubbed value(s)"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        !server
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.method == "POST"),
+        "a refused collect must not submit a job"
+    );
+
+    let allowed = run_with_env(
+        &[
+            "collect",
+            &dep,
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--allow-scrubbed",
+        ],
+        &envs,
+        None,
+        &dir,
+    );
+    assert!(allowed.status.success(), "{}", stderr(&allowed));
+    assert_eq!(stdout(&allowed).trim(), new_id);
+    assert!(server
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.method == "POST"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collect_reads_template_override_and_appends_task_file() {
     let dep = job_id();
     let new_id = job_id();
@@ -2279,4 +2473,351 @@ async fn collect_enforces_template_and_task_file_caps() {
 
 async fn server_for_caps() -> TestServer {
     start(|_| Reply::json(&job_json(&job_id(), "done"))).await
+}
+
+#[tokio::test]
+async fn audit_cli_verifies_tails_and_prints_the_head() {
+    use lu_audit::{Data, Event, Field};
+
+    let dir = scratch("audit-cli");
+    let path = dir.join("audit.jsonl");
+    let errors = Arc::new(AtomicU64::new(0));
+    let (writer, task) = lu_audit::Writer::open(&path, Arc::clone(&errors))
+        .await
+        .unwrap();
+    writer.record(
+        Event::Submitted,
+        Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        None,
+        "operator",
+        Data::new().text(Field::Provider, "reiki"),
+    );
+    writer.record(
+        Event::Started,
+        Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        Some("node-a"),
+        "node-a",
+        Data::new(),
+    );
+    drop(writer);
+    task.await.unwrap();
+    let file = path.to_str().unwrap();
+
+    let out = run_with_env(&["audit", "verify", file], &[], None, &dir);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("ok: 2 record(s)"),
+        "{:?}",
+        stdout(&out)
+    );
+
+    let out = run_with_env(&["--json", "audit", "verify", file], &[], None, &dir);
+    let value: Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["records"], 2);
+
+    let out = run_with_env(&["audit", "head", file], &[], None, &dir);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let head = stdout(&out).trim().to_owned();
+    assert_eq!(head.len(), 64);
+    assert!(head.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let out = run_with_env(&["audit", "tail", "--lines", "1", file], &[], None, &dir);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("\"event\":\"started\""), "{text}");
+    assert!(!text.contains("submitted"), "{text}");
+
+    // Anchoring detects removed trailing records even though the remaining chain is valid.
+    let out = run_with_env(
+        &["audit", "verify", file, "--head", &format!("{head}0")],
+        &[],
+        None,
+        &dir,
+    );
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("head hash"), "{}", stderr(&out));
+
+    // A tampered line fails verification.
+    let bytes = std::fs::read(&path).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    std::fs::write(
+        &path,
+        text.replacen("\"event\":\"started\"", "\"event\":\"failed\"", 1),
+    )
+    .unwrap();
+    let out = run_with_env(&["audit", "verify", file], &[], None, &dir);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("hash mismatch"), "{}", stderr(&out));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_batch_dry_run_prints_the_plan_without_connecting() {
+    let server = start(|_| Reply::status(500)).await;
+    let dir = scratch("submit-batch-dry-run");
+    let tasks = dir.join("tasks.md");
+    let defaults = dir.join("defaults.toml");
+    std::fs::write(
+        &tasks,
+        "# Work\n- [ ] First task\n- [ ] Second task\n  - [ ] nested detail\n",
+    )
+    .unwrap();
+    std::fs::write(&defaults, "repo = \"/srv/repo\"\nref = \"main\"\n").unwrap();
+    let missing_token = dir.join("does-not-exist.token");
+    let env = vec![
+        ("LU_URL".to_owned(), server.url.clone()),
+        (
+            "LU_TOKEN_FILE".to_owned(),
+            missing_token.display().to_string(),
+        ),
+    ];
+    let tasks_arg = tasks.display().to_string();
+    let defaults_arg = defaults.display().to_string();
+    let output = run_with_env(
+        &[
+            "--json",
+            "submit",
+            "--batch",
+            &tasks_arg,
+            "--key-prefix",
+            "plan",
+            "--defaults",
+            &defaults_arg,
+            "--chain",
+            "--dry-run",
+        ],
+        &env,
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let plan: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(plan["dry_run"], true);
+    assert_eq!(plan["chain"], true);
+    assert_eq!(plan["max_parallel"], Value::Null);
+    let jobs = plan["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0]["key"], "plan-first-task");
+    assert_eq!(jobs[0]["after"], json!([]));
+    assert_eq!(jobs[1]["key"], "plan-second-task");
+    assert_eq!(jobs[1]["after"], json!(["plan-first-task"]));
+    assert!(server.records.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_batch_is_idempotent_and_caps_the_group() {
+    let ids = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = Arc::clone(&ids);
+    let server = start(
+        move |record| match (record.method.as_str(), record.path.as_str()) {
+            ("PUT", path) if path.ends_with("/limit") => {
+                Reply::json(&json!({"group": "shared", "max_running": 2}))
+            }
+            ("POST", "/v1/jobs") => {
+                let spec: Value = serde_json::from_slice(&record.body).unwrap();
+                let id = job_id();
+                recorded.lock().unwrap().push(id.clone());
+                let mut job = job_json(&id, "queued");
+                job["spec"] = spec;
+                Reply::json(&job)
+            }
+            _ => Reply::status(404),
+        },
+    )
+    .await;
+    let dir = scratch("submit-batch-idempotent");
+    let tasks = dir.join("tasks");
+    std::fs::create_dir(&tasks).unwrap();
+    std::fs::write(tasks.join("build.md"), "Build the thing").unwrap();
+    std::fs::write(tasks.join("test.md"), "Test the thing").unwrap();
+    let defaults = dir.join("defaults.toml");
+    std::fs::write(
+        &defaults,
+        "repo = \"/srv/repo\"\nref = \"main\"\ngroup = \"shared\"\n",
+    )
+    .unwrap();
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let env = env_for(&server, &token);
+    let tasks_arg = tasks.display().to_string();
+    let defaults_arg = defaults.display().to_string();
+    let args = [
+        "--json",
+        "submit",
+        "--batch",
+        &tasks_arg,
+        "--key-prefix",
+        "sprint",
+        "--defaults",
+        &defaults_arg,
+        "--chain",
+        "--max-parallel",
+        "2",
+    ];
+    for _ in 0..2 {
+        let output = run_with_env(&args, &env, None, &dir);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(!stdout(&output).contains(TOKEN));
+        assert!(!stderr(&output).contains(TOKEN));
+        let result: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+        assert_eq!(result["submitted_count"], 2);
+        assert_eq!(result["jobs"][0]["key"], "sprint-build");
+        assert_eq!(result["jobs"][1]["key"], "sprint-test");
+    }
+    let bodies = server
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|record| record.method == "POST" && record.path == "/v1/jobs")
+        .map(|record| serde_json::from_slice::<Value>(&record.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies.len(), 4);
+    let keys = bodies
+        .iter()
+        .map(|body| body["idempotency_key"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        vec!["sprint-build", "sprint-test", "sprint-build", "sprint-test"]
+    );
+    let ids = ids.lock().unwrap();
+    assert_eq!(bodies[1]["after"], json!([ids[0]]));
+    assert_eq!(bodies[3]["after"], json!([ids[2]]));
+    for body in &bodies {
+        assert_eq!(body["group"], "shared");
+    }
+    let puts = server
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|record| record.method == "PUT")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(puts.len(), 2);
+    assert_eq!(puts[0].path, "/v1/groups/shared/limit");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&puts[0].body).unwrap(),
+        json!({"max_running": 2})
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_batch_lists_every_validation_error_before_submitting() {
+    let server = start(|_| Reply::status(500)).await;
+    let dir = scratch("submit-batch-errors");
+    let checklist = dir.join("tasks.md");
+    std::fs::write(&checklist, "- [ ] Duplicate\n- [ ] Duplicate\n- [ ]    \n").unwrap();
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let checklist_arg = checklist.display().to_string();
+    let output = run_with_env(
+        &[
+            "submit",
+            "--batch",
+            &checklist_arg,
+            "--key-prefix",
+            "bad",
+            "--repo",
+            "/srv/repo",
+            "--ref",
+            "main",
+        ],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout(&output).is_empty());
+    let errors = stderr(&output);
+    assert!(errors.contains("duplicate job key"), "{errors}");
+    assert!(errors.contains("task is empty"), "{errors}");
+    assert!(errors.contains("cannot derive a job slug"), "{errors}");
+    assert!(server.records.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_batch_maps_sidecars_external_keys_and_nested_after_hints() {
+    let dependency = job_id();
+    let dep_id = dependency.clone();
+    let ids = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = Arc::clone(&ids);
+    let server = start(
+        move |record| match (record.method.as_str(), record.path.as_str()) {
+            ("GET", "/v1/jobs") => {
+                let mut job = job_json(&dep_id, "done");
+                job["spec"]["idempotency_key"] = json!("external-key");
+                Reply::json(&json!({"jobs": [job], "next": null}))
+            }
+            ("POST", "/v1/jobs") => {
+                let spec: Value = serde_json::from_slice(&record.body).unwrap();
+                let id = job_id();
+                recorded.lock().unwrap().push(id.clone());
+                let mut job = job_json(&id, "queued");
+                job["spec"] = spec;
+                Reply::json(&job)
+            }
+            _ => Reply::status(404),
+        },
+    )
+    .await;
+    let dir = scratch("submit-batch-sidecar");
+    let checklist = dir.join("review.md");
+    std::fs::write(
+        &checklist,
+        "- [ ] Build\n  after: external-key\n- [ ] Test\n  after: build\n- [x] Already done\n```\n- [ ] Inside a fence\n```\n",
+    )
+    .unwrap();
+    let sidecar = dir.join("review.toml");
+    std::fs::write(
+        &sidecar,
+        "provider = \"codex\"\nmodel = \"gpt\"\npriority = 3\ngroup = \"batch\"\ntimeout = 120\nworkspace = \"keep\"\nrequire = [\"linux\"]\nexpect = { files = [\"REVIEW.md\"], mode = \"fail\" }\n",
+    )
+    .unwrap();
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let checklist_arg = checklist.display().to_string();
+    let output = run_with_env(
+        &[
+            "submit",
+            "--batch",
+            &checklist_arg,
+            "--key-prefix",
+            "review",
+            "--repo",
+            "/srv/repo",
+            "--ref",
+            "main",
+        ],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let bodies = server
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|record| record.method == "POST" && record.path == "/v1/jobs")
+        .map(|record| serde_json::from_slice::<Value>(&record.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies.len(), 2);
+    let ids = ids.lock().unwrap();
+    assert_eq!(bodies[0]["after"], json!([dependency]));
+    assert_eq!(bodies[1]["after"], json!([ids[0]]));
+    for body in &bodies {
+        assert_eq!(body["provider"], "codex");
+        assert_eq!(body["model"], "gpt");
+        assert_eq!(body["priority"], 3);
+        assert_eq!(body["group"], "batch");
+        assert_eq!(body["timeout_secs"], 120);
+        assert_eq!(body["workspace"], "keep");
+        assert_eq!(body["requires"], json!(["linux"]));
+        assert_eq!(body["expect"]["files"], json!(["REVIEW.md"]));
+        assert_eq!(body["expect"]["mode"], "fail");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

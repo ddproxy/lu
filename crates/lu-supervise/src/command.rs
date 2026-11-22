@@ -89,3 +89,51 @@ pub(crate) fn build(spec: &CommandSpec) -> Command {
     cmd.kill_on_drop(true);
     cmd
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn harness_environment_exposes_no_controller_credentials() {
+        assert!(BASE_ENV.iter().all(|name| !name.starts_with("LU_")));
+        let spec = CommandSpec::new("/bin/true").env("LU_JOB_SOCKET", "/tmp/job.sock");
+        let command = build(&spec);
+        for (key, _) in command.as_std().get_envs() {
+            let key = key.to_string_lossy();
+            assert!(
+                key == "LU_JOB_SOCKET" || !key.starts_with("LU_"),
+                "credential-like variable reached harness: {key}"
+            );
+        }
+        let values: Vec<_> = command
+            .as_std()
+            .get_envs()
+            .filter(|(key, _)| key.to_string_lossy() == "LU_JOB_SOCKET")
+            .collect();
+        assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn harness_environment_is_a_whitelist() {
+        let spec = CommandSpec::new("/bin/true")
+            .env("LU_JOB_SOCKET", "/tmp/job.sock")
+            .env("LU_TOKEN", "explicit-value");
+        let command = build(&spec);
+        let allowed: Vec<&OsStr> = BASE_ENV
+            .iter()
+            .map(OsStr::new)
+            .chain([OsStr::new("LU_JOB_SOCKET"), OsStr::new("LU_TOKEN")])
+            .collect();
+        let envs: Vec<_> = command.as_std().get_envs().collect();
+        assert!(!envs.is_empty());
+        for (key, _) in envs {
+            assert!(
+                allowed.contains(&key),
+                "unexpected inherited variable: {}",
+                key.to_string_lossy()
+            );
+        }
+    }
+}

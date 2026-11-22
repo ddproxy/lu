@@ -39,6 +39,20 @@ pub async fn status(
         .oldest_pending_at
         .map(|created| n.wall_unix.saturating_sub(created).max(0) as u64)
         .unwrap_or(0);
+    let draft_counts = match tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        move || store.draft_counts()
+    })
+    .await
+    {
+        Ok(Ok(counts)) => counts,
+        Ok(Err(error)) => return with_version(store_err(error).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    };
+    let oldest_draft_secs = draft_counts
+        .oldest_created_at
+        .map(|created| n.wall_unix.saturating_sub(created).max(0) as u64)
+        .unwrap_or(0);
     let db_bytes = std::fs::metadata(&state.db_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -50,9 +64,16 @@ pub async fn status(
         "recovered_on_boot": state.recovered_on_boot(),
         "jobs": jobs,
         "oldest_queued_secs": oldest_queued_secs,
+        "drafts": draft_counts.total,
+        "oldest_draft_secs": oldest_draft_secs,
         "nodes": counts.nodes,
         "nodes_online": counts.nodes_online,
         "lease_secs": state.lease_secs,
+        "audit_write_errors": state.audit_write_errors(),
+        "scope_enabled": state.scope.enabled,
+        "scope_max_depth": state.scope.max_depth,
+        "scope_max_children_per_job": state.scope.max_children_per_job,
+        "scope_max_descendants_per_root": state.scope.max_descendants_per_root,
     });
     with_version(json_value_ok(StatusCode::OK, body))
 }

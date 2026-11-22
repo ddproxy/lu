@@ -1,4 +1,4 @@
-use crate::routes::{agent, health, metrics, operator, status};
+use crate::routes::{agent, health, metrics, operator, scope, status};
 use crate::state::AppState;
 use crate::time::{background_interval_secs, now};
 use axum::extract::DefaultBodyLimit;
@@ -45,6 +45,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let log_body = DefaultBodyLimit::max(crate::routes::MAX_LOG_CHUNK_BODY);
     let diff_body = DefaultBodyLimit::max(crate::routes::MAX_DIFF_BODY);
     let report_body = DefaultBodyLimit::max(crate::routes::MAX_REPORT_BODY);
+    let intake_body = DefaultBodyLimit::max(16 * 1024 * 1024);
 
     let operator = Router::new()
         .route(
@@ -54,6 +55,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 .get(operator::list_jobs),
         )
         .route("/v1/jobs/{id}", get(operator::get_job))
+        .route(
+            "/v1/jobs/{id}/publish",
+            post(operator::publish_job).layer(op_json),
+        )
+        .route(
+            "/v1/groups/{name}/limit",
+            put(operator::set_group_limit).layer(op_json),
+        )
         .route(
             "/v1/jobs/{id}/cancel",
             post(operator::cancel_job).layer(op_json),
@@ -67,6 +76,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/jobs/{id}/artifacts/{name}",
             get(operator::get_artifact),
         )
+        .route("/v1/drafts", get(operator::list_drafts))
+        .route("/v1/drafts/{id}", put(operator::edit_job).layer(op_json))
+        .route(
+            "/v1/drafts/{id}/approve",
+            post(operator::approve_draft).layer(op_json),
+        )
+        .route(
+            "/v1/drafts/{id}/reject",
+            post(operator::reject_draft).layer(op_json),
+        )
         .route("/v1/status", get(status::status))
         .route("/v1/repos", get(operator::list_repos))
         .route(
@@ -75,6 +94,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/nodes", get(operator::list_nodes))
         .route("/v1/nodes/{name}/stats", get(operator::get_node_stats))
+        .route(
+            "/v1/nodes/{name}/workspaces/clean",
+            post(operator::clean_workspaces),
+        )
         .route(
             "/v1/nodes/{name}/drain",
             post(operator::drain_node).layer(op_json),
@@ -113,6 +136,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/agent/jobs/{id}/artifacts/report.json",
             put(agent::put_report_artifact).layer(report_body),
         )
+        .route("/v1/scope/{route}", post(scope::handle))
+        .route(
+            "/v1/agent/jobs/{id}/workspace/release",
+            get(agent::workspace_release),
+        )
         .route("/v1/agent/jobs/{id}/deps", get(agent::list_deps))
         .route(
             "/v1/agent/jobs/{id}/deps/{dep}/diff",
@@ -128,13 +156,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         );
 
     use axum::response::IntoResponse;
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/v1/health", get(health::health))
         .merge(operator)
         .merge(agent)
-        .fallback(|| async { crate::error::ApiError::not_found("not found").into_response() })
-        .with_state(state)
-        .layer(middleware::from_fn(version_mw));
+        .fallback(|| async { crate::error::ApiError::not_found("not found").into_response() });
+
+    // Intake routes exist only when `[intake]` is configured. They authenticate with a per-source
+    // HMAC key, never with an operator token.
+    if state.intake.is_some() {
+        app = app.merge(Router::new().route(
+            "/v1/intake/{source}",
+            post(crate::routes::intake::intake).layer(intake_body),
+        ));
+    }
+    let app = app.with_state(state).layer(middleware::from_fn(version_mw));
 
     with_request_ids(app)
 }
@@ -167,6 +203,26 @@ pub async fn recover_on_boot(state: &Arc<AppState>) -> Result<u64, String> {
 
 pub async fn maintenance_tick(state: &Arc<AppState>) {
     let n = now();
+    let cutoff = n.wall_unix.saturating_sub(state.drafts.ttl_secs as i64);
+    let expired_drafts = tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        move || store.expire_drafts(cutoff, n)
+    })
+    .await;
+    match expired_drafts {
+        Ok(Ok(count)) if count > 0 => {
+            state.record_audit(
+                lu_audit::Event::DraftExpired,
+                None,
+                None,
+                "drafts",
+                lu_audit::Data::new().unsigned(lu_audit::Field::Count, count),
+            );
+        }
+        Ok(Err(e)) => tracing::warn!(?e, "expire_drafts failed"),
+        Err(e) => tracing::warn!(%e, "expire_drafts task failed"),
+        _ => {}
+    }
     let expired = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         move || store.expire_leases(n)
@@ -295,6 +351,17 @@ mod tests {
             _: ArtifactName,
             _: u64,
         ) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn record_scrub(&self, _: &JobId, _: u64, _: u64, _: bool) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn record_publish(
+            &self,
+            _: &JobId,
+            _: &lu_proto::PublishRecord,
+            _: Now,
+        ) -> Result<JobRecord, StoreError> {
             unimplemented!()
         }
         fn complete(

@@ -9,13 +9,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use git2::{Repository, Signature};
-use lu_agent::Agent;
 use lu_client::{ApiError, Controller, DependencyView, PollRequest};
 use lu_config::{AgentConfig, BaseSource};
 use lu_proto::{AgentEvent, ArtifactName, Completion, JobId, LogChunk};
 use lu_staging::pack_commit;
 use lu_supervise::CommandSpec;
 use tokio::sync::oneshot;
+use tuishou_ting::Agent;
 
 struct PathGuard(Option<OsString>);
 
@@ -194,6 +194,8 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         base_source: BaseSource::Controller,
         opencode_server: None,
         workspace_group: None,
+        harness_uid: None,
+        harness_gid: None,
         opencode_password_file: None,
         harness_wrapper: Vec::new(),
         heartbeat_secs: 3,
@@ -207,9 +209,15 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         label_files: Vec::new(),
         detect: Vec::new(),
         housekeeping: None,
+        workspace: None,
     };
     let done = Arc::new(AtomicBool::new(false));
     let spec = lu_proto::JobSpec {
+        source: lu_proto::SourceSpec {
+            repo: "https://example.invalid/source.git".to_owned(),
+            git_ref: "main".to_owned(),
+            base: Some(commit.clone()),
+        },
         repo: "https://example.invalid/source.git".to_owned(),
         git_ref: "main".to_owned(),
         base_commit: Some(commit.clone()),
@@ -233,6 +241,17 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         fallbacks: Vec::new(),
         priority: lu_proto::DEFAULT_PRIORITY,
         group: None,
+        allow_spawn: false,
+        spawn_inherit: false,
+        spawn_repos: Vec::new(),
+        workspace: None,
+        cache_dirs: Vec::new(),
+        context: None,
+        origin: None,
+        origin_ref: None,
+        untrusted_context: false,
+        draft: false,
+        publish: None,
     };
     let controller = Arc::new(PackController {
         spec,

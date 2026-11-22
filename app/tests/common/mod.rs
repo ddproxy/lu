@@ -166,7 +166,7 @@ pub fn job_json(id: &str, state: &str) -> Value {
     json!({
         "id": id,
         "state": state,
-        "spec": {"repo": "/srv/repo", "git_ref": "main", "task": "go"},
+        "spec": {"source": {"repo": "/srv/repo", "ref": "main"}, "task": "go"},
         "attempt": 1,
         "created_at": 10,
         "started_at": 11,
@@ -176,8 +176,18 @@ pub fn job_json(id: &str, state: &str) -> Value {
 }
 
 pub fn run(args: &[&str], envs: &[(&str, &str)], stdin: Option<&str>, cwd: &Path) -> Output {
-    let exe = std::env::var("CARGO_BIN_EXE_lu")
-        .expect("cargo sets the binary path for integration tests");
+    run_bin("lu", args, envs, stdin, cwd)
+}
+
+pub fn run_bin(
+    bin: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin: Option<&str>,
+    cwd: &Path,
+) -> Output {
+    let key = format!("CARGO_BIN_EXE_{bin}");
+    let exe = std::env::var(&key).unwrap_or_else(|_| panic!("cargo did not set {key}"));
     let mut command = Command::new(exe);
     command
         .args(args)
@@ -185,6 +195,8 @@ pub fn run(args: &[&str], envs: &[(&str, &str)], stdin: Option<&str>, cwd: &Path
         .env_remove("LU_URL")
         .env_remove("LU_TOKEN_FILE")
         .env_remove("LU_CA_FILE")
+        .env_remove("LU_TOKEN")
+        .env_remove("LU_OPERATOR_TOKEN")
         .env_remove("XDG_CONFIG_HOME")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

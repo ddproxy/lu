@@ -21,7 +21,32 @@ pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
     let store = lu_store::sqlite::SqliteStore::open(&controller.db)
         .map_err(|e| format!("cannot open {}: {e:?}", controller.db))?;
     let store: Arc<dyn lu_store::Store> = Arc::new(store);
-    let state = Arc::new(ControllerState::from_config(controller, store)?);
+    let state = Arc::new(ControllerState::from_config_with_all(
+        controller,
+        store,
+        config.artifacts.as_ref(),
+        config.scope.as_ref(),
+        config.drafts.as_ref(),
+        config.intake.clone(),
+        config.mirror.as_ref(),
+    )?);
+    if let Some(publish) = config.publish.clone() {
+        state.set_publish(publish);
+    }
+    let audit_task = match &config.audit {
+        Some(audit) => {
+            let (writer, task) = lu_audit::Writer::open(
+                Path::new(&audit.path),
+                Arc::clone(&state.audit_write_errors),
+            )
+            .await
+            .map_err(|e| format!("cannot open audit file {}: {e}", audit.path))?;
+            state.set_audit(writer);
+            tracing::info!(path = %audit.path, "audit record enabled");
+            Some(task)
+        }
+        None => None,
+    };
     // A recovery failure must stop startup: otherwise the process would serve stale
     // leases that appeared unexpired against a fresh monotonic clock.
     recover_on_boot(&state).await?;
@@ -56,11 +81,21 @@ pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
         let bg = tokio::spawn(run_background(Arc::clone(&state), async move {
             let _ = rx_bg.recv().await;
         }));
-        serve(listener, build_router(state), options, tls, async move {
-            let _ = rx_serve.recv().await;
-        })
+        serve(
+            listener,
+            build_router(Arc::clone(&state)),
+            options,
+            tls,
+            async move {
+                let _ = rx_serve.recv().await;
+            },
+        )
         .await;
         let _ = bg.await;
+        drop(state);
+        if let Some(task) = audit_task {
+            let _ = task.await;
+        }
         tracing::info!("stopped");
         Ok(())
     }

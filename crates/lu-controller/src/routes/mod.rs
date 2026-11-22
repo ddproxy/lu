@@ -1,8 +1,10 @@
 pub mod agent;
 pub mod file_body;
 pub mod health;
+pub mod intake;
 pub mod metrics;
 pub mod operator;
+pub mod scope;
 pub mod status;
 
 use crate::error::{ApiError, ApiResult};
@@ -13,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub const MAX_JSON_BODY: usize = 1024 * 1024;
 pub const MAX_LOG_CHUNK_BODY: usize = lu_proto::MAX_LOG_CHUNK_BYTES + 1024; // small slack
@@ -44,6 +47,73 @@ pub async fn read_raw_limited(req: Request, limit: usize) -> ApiResult<axum::bod
         .map_err(|_| ApiError::too_large("request body too large"))
 }
 
+/// Applies `[drafts]` capacity to a new draft, expiring the oldest drafts first. The caller must
+/// call this before writing; a full store returns a typed `limit_exceeded` error.
+pub async fn enforce_draft_capacity(
+    state: &std::sync::Arc<crate::state::AppState>,
+    spec: &lu_proto::JobSpec,
+) -> Result<(), ApiError> {
+    if !spec.draft {
+        return Ok(());
+    }
+    let policy = state.drafts;
+    let origin = spec.origin.clone().unwrap_or_default();
+    let counts = tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        move || store.draft_counts()
+    })
+    .await;
+    let counts = match counts {
+        Ok(Ok(counts)) => counts,
+        _ => return Err(ApiError::internal()),
+    };
+    let per_source = counts
+        .by_origin
+        .iter()
+        .find(|(label, _)| label == &origin)
+        .map(|(_, count)| *count)
+        .unwrap_or(0);
+    let overflow = counts
+        .total
+        .saturating_add(1)
+        .saturating_sub(policy.max_total)
+        .max(
+            per_source
+                .saturating_add(1)
+                .saturating_sub(policy.max_per_source),
+        );
+    if overflow > 0 {
+        let expired = tokio::task::spawn_blocking({
+            let store = Arc::clone(&state.store);
+            let now = crate::time::now();
+            move || store.expire_oldest_drafts(overflow, now)
+        })
+        .await;
+        if !matches!(expired, Ok(Ok(_))) {
+            return Err(ApiError::internal());
+        }
+        let counts = tokio::task::spawn_blocking({
+            let store = Arc::clone(&state.store);
+            move || store.draft_counts()
+        })
+        .await;
+        let counts = match counts {
+            Ok(Ok(counts)) => counts,
+            _ => return Err(ApiError::internal()),
+        };
+        let per_source = counts
+            .by_origin
+            .iter()
+            .find(|(label, _)| label == &origin)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        if counts.total >= policy.max_total || per_source >= policy.max_per_source {
+            return Err(ApiError::limit_exceeded("max_drafts"));
+        }
+    }
+    Ok(())
+}
+
 pub fn store_err(e: lu_store::StoreError) -> ApiError {
     use lu_store::StoreError;
     match e {
@@ -64,7 +134,62 @@ pub fn store_err(e: lu_store::StoreError) -> ApiError {
         }
         StoreError::DependencyCycle => ApiError::bad_request("dependencies would form a cycle"),
         StoreError::InvalidSpec(message) => ApiError::unprocessable(message),
+        StoreError::LimitExceeded(limit) => ApiError::limit_exceeded(limit),
         StoreError::Internal(_) => ApiError::internal(),
+    }
+}
+
+/// Cancels one job and, by default, every descendant. A terminal descendant is left as it is;
+/// a running descendant receives the same cancel request as its parent.
+pub async fn cancel_job_with_descendants(
+    state: &std::sync::Arc<crate::state::AppState>,
+    id: &lu_proto::JobId,
+    keep_children: bool,
+) -> Result<Vec<lu_proto::JobId>, ApiError> {
+    let mut targets = vec![id.clone()];
+    if !keep_children {
+        let store = std::sync::Arc::clone(&state.store);
+        let id_for_scan = id.clone();
+        let descendants = tokio::task::spawn_blocking(move || {
+            fn collect(
+                store: &dyn lu_store::Store,
+                parent: &lu_proto::JobId,
+                out: &mut Vec<lu_proto::JobId>,
+            ) -> Result<(), lu_store::StoreError> {
+                for child in store.children(parent)? {
+                    out.push(child.id.clone());
+                    collect(store, &child.id, out)?;
+                }
+                Ok(())
+            }
+            let mut out = Vec::new();
+            collect(store.as_ref(), &id_for_scan, &mut out)?;
+            Ok::<_, lu_store::StoreError>(out)
+        })
+        .await;
+        match descendants {
+            Ok(Ok(mut children)) => targets.append(&mut children),
+            Ok(Err(error)) => return Err(store_err(error)),
+            Err(_) => return Err(ApiError::internal()),
+        }
+    }
+    let store = std::sync::Arc::clone(&state.store);
+    let result = tokio::task::spawn_blocking(move || {
+        let mut changed = Vec::new();
+        for target in targets {
+            match store.cancel_job(&target, crate::time::now()) {
+                Ok(_) => changed.push(target),
+                Err(lu_store::StoreError::Conflict { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok::<_, lu_store::StoreError>(changed)
+    })
+    .await;
+    match result {
+        Ok(Ok(changed)) => Ok(changed),
+        Ok(Err(error)) => Err(store_err(error)),
+        Err(_) => Err(ApiError::internal()),
     }
 }
 

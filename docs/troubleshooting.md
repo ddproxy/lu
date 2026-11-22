@@ -35,10 +35,25 @@ Worked example — isolate a startup failure:
 ```sh
 lu check --config /etc/lu/lu.toml
 curl -fsS http://127.0.0.1:7600/v1/health
-lu status --config /etc/lu/lu.toml
+export LU_URL=http://127.0.0.1:7600 LU_TOKEN_FILE=/etc/lu/operator.token
+lu status
 ```
 
-`/v1/health` needs no token. A non-loopback listener uses `https://`.
+`/v1/health` needs no token. A non-loopback listener uses `https://`. Operator commands take
+credentials from `LU_URL`/`LU_TOKEN_FILE` (or an operator file), not from `--config`.
+
+## Batch submission
+
+| Symptom | Check | Action |
+| --- | --- | --- |
+| `lu: batch validation failed:` | The listed errors cover duplicate keys, empty or oversized tasks, bad TOML, unknown keys, missing `repo`/`ref` and invalid `after` hints. | Fix every listed issue and retry. Nothing was submitted. See [Batch submissions](batch.md#validation-and-failures). |
+| `duplicate key` | Two task files or checklist items share a slug. | Rename one source, or use another `--key-prefix`. A repeated slug is an error even with different task text. |
+| `unknown key` in `after` | The key is not an earlier job in this batch and was not found on the controller. | Put the prerequisite earlier in the input, or submit it first with that key. |
+| `group cap conflict` | `--max-parallel` was used with jobs in different groups. | Give all jobs the same `group`, or omit `--max-parallel`. |
+| Rerun reports the same ids | The same `--key-prefix` and task slugs produced the same idempotency keys. | Expected. The controller returns the existing jobs instead of creating duplicates. |
+| Partial run exits `1` | Some jobs were submitted before the controller failed. | Read the printed rows, note the remaining keys, then rerun the batch. Submitted jobs keep their keys. |
+
+A dry run performs the same local validation but sends no request and reads no operator token.
 
 ## Job state
 
@@ -53,7 +68,7 @@ State definitions, legal transitions and the full state table are in
 | `recovering` | Agent heartbeat and `recovery_grace_secs`; a late write with an old epoch is discarded. |
 | `done`, `failed`, `cancelled` | `lu logs <id>` and `lu fetch <id>`; `lu retry <id>` resubmits the spec. |
 
-A queued job that cannot be placed shows the first missing label in `lu show` and `lu top`. For what a drain or provider cordon does, see [Provider cordons and node drains](operations.md#provider-cordons-and-node-drains).
+A queued job that cannot be placed shows the first blocking reason in `lu show` and `lu top`: a full group cap, then a missing label, an untolerated taint or no healthy provider pair. For what a drain or provider cordon does, see [Provider cordons and node drains](operations.md#provider-cordons-and-node-drains).
 
 Worked example — diagnose a queued job:
 
@@ -94,6 +109,18 @@ lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --provider openai
 
 Artifact names are fixed: `diff.patch`, `run.log` and `report.json`. Files are `0600` in a `0700` job directory.
 
+## Disk fills with job workspaces
+
+| Symptom | Cause | Action |
+| --- | --- | --- |
+| Node's `work_dir` keeps growing | Kept workspaces have not reached their TTL, or a failure left a tree waiting for release. | Check `lu node <name> --workspaces` and the five `workspace_*` rows in `lu node <name>`; see [workspaces.md](workspaces.md). |
+| Workspaces stay `waiting` | The controller has not stored `report.json`/`diff.patch`, or an active job still names the tree in `spec.after`. | Wait for artifact upload and dependants; the agent retries the release check. The stored patch is what dependants use, so the tree is not kept for stacking. |
+| `workspace_delete_errors_total` keeps rising | A deletion is failing and being retried with backoff. | Read the agent log for the job id and fix permissions or the filesystem problem; the log never prints paths outside the workspace root. |
+| Clean request did nothing | The request is queued for the next poll, or the trees were running or already gone. | Check `queued`, `refused_running` and `missing`, then `lu node <name> --workspaces` again. |
+| Disk pressure does not reclaim enough | High/low water marks or `max_bytes` are set too high, or the remaining trees are running. | Review `[workspace]` with `lu check`; see [config.md](config.md#workspace). |
+
+Operator clean commands and safety rules are in [operations.md](operations.md#workspace-lifecycle); metric alerts are in [monitoring.md](monitoring.md#series).
+
 ## MCP
 
 | Symptom | Cause | Action |
@@ -101,7 +128,7 @@ Artifact names are fixed: `diff.patch`, `run.log` and `report.json`. Files are `
 | `-32602` | Unknown argument, missing argument or bad bound. | Compare the call with the tool table in [mcp.md](mcp.md). |
 | `isError: true` with job text | Job or controller failure. | Read `structuredContent.error`. |
 | `isError: true` on every call | Controller unreachable when the server started. | Fix connection settings and restart `lu mcp`. |
-| `submission limit reached` | More than 30 submissions in a rolling minute. | Wait the reported number of seconds. `lu_submit`, `lu_submit_many` and `lu_retry` share the budget. |
+| `submission limit reached` | More than 30 submissions in a rolling minute. | Wait the reported number of seconds. `lu_submit`, `lu_submit_many`, `lu_submit_batch` and `lu_retry` share the budget. |
 | `-32002` | Tool call before `initialize`. | Send `initialize` first. |
 
 Worked example — read an argument error and a tool failure:
@@ -115,7 +142,7 @@ The first call is `-32602` because `limit` is at most 100. The second returns a 
 
 ## Recovery and backups
 
-The store expects schema version `1`. A database with any other schema version is refused at startup; create a new database for this binary. Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
+The store expects schema version `2`. A database with any other schema version is refused at startup; create a new database for this binary. Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
 
 `lu backup` and `lu restore` procedures, including interrupted restores and artifact snapshots, are in [operations.md](operations.md#backup-and-restore).
 

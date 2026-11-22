@@ -1,23 +1,26 @@
 [Unit]
-Description=Lu agent (template; the 0.1.0 tree has no `lu agent` subcommand)
+Description=Ting node agent
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=lu
-Group=lu
-# The agent needs the shared staging group; the harness itself must run as
-# lu-harness, not as lu, so it cannot read /etc/lu/agent.token.
+User=ting
+Group=ting
+# The agent needs the shared staging group. This unit still runs the harness as ting
+# unless harness_wrapper starts a separate-account runner; workspace_group only
+# shares the working tree, not the agent's token.
 SupplementaryGroups=lu-harness
-WorkingDirectory=/var/lib/lu/work
-# Adjust the binary path if PREFIX was not /usr/local.
-ExecStart=/usr/local/bin/lu agent --config /etc/lu/agent.toml
+WorkingDirectory=/var/lib/ting/work
+# Adjust the binary path if PREFIX was not /usr/local. The [agent] table is kept in
+# the renamed config; see contrib/ting.toml.
+ExecStart=/usr/local/bin/ting --config /etc/ting/ting.toml
+SyslogIdentifier=ting
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=40s
 KillMode=mixed
-StateDirectory=lu
+StateDirectory=ting
 StateDirectoryMode=0750
 UMask=0077
 
@@ -44,9 +47,9 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 AmbientCapabilities=
-# Staging, checkouts and artifacts under /var/lib/lu; the harness home is writable
-# by the child process in the same sandbox.
-ReadWritePaths=/var/lib/lu /var/lib/lu-harness
+# Staging, checkouts and optional [log] file under /var/lib/ting; the harness home
+# is writable by the child process in the same sandbox.
+ReadWritePaths=/var/lib/ting /var/lib/lu-harness
 LimitNOFILE=65536
 
 [Install]

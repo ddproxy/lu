@@ -445,6 +445,8 @@ mod tests {
         let mut dashboard = Dashboard::new();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: vec![NodeRow {
                     name: "peer-a".to_owned(),
@@ -458,6 +460,11 @@ mod tests {
                     mem_available_kb: None,
                     mem_total_kb: None,
                     stuck: 0,
+                    workspace_bytes: 0,
+                    workspace_count: 0,
+                    workspace_reclaimed_bytes_total: 0,
+                    workspace_evictions_total: 0,
+                    workspace_delete_errors_total: 0,
                     labels: Vec::new(),
                 }],
                 jobs: vec![JobRow {
@@ -499,6 +506,8 @@ mod tests {
         let mut dashboard = Dashboard::new();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: vec![NodeRow {
                     name: "peer-a".to_owned(),
@@ -538,6 +547,11 @@ mod tests {
                     mem_available_kb: None,
                     mem_total_kb: None,
                     stuck: 0,
+                    workspace_bytes: 0,
+                    workspace_count: 0,
+                    workspace_reclaimed_bytes_total: 0,
+                    workspace_evictions_total: 0,
+                    workspace_delete_errors_total: 0,
                     labels: Vec::new(),
                 }],
                 jobs: Vec::new(),
@@ -545,14 +559,14 @@ mod tests {
             Instant::now(),
         );
         let view = dashboard.view(Instant::now());
-        let text = screen(&view, 90, 20);
+        let text = screen(&view, 120, 20);
         assert!(text.contains("!zen"), "{text}");
         assert!(text.contains("!openrouter~"), "{text}");
         assert!(text.contains("cordons peer-a"), "{text}");
         assert!(text.contains("! zen 2m left"), "{text}");
         assert!(text.contains("~ openrouter lifts on 2 healthy"), "{text}");
 
-        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
         terminal
             .draw(|frame| {
                 draw(frame, &view);
@@ -595,6 +609,8 @@ mod tests {
         };
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: Vec::new(),
                 jobs: vec![
@@ -637,6 +653,8 @@ mod tests {
         let mut dashboard = Dashboard::new();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: Vec::new(),
                 jobs: vec![JobRow {
@@ -687,6 +705,8 @@ mod tests {
         let t0 = Instant::now();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: Some("0.1.10".to_owned()),
                 nodes: vec![NodeRow {
                     name: "peer-a".to_owned(),
@@ -700,6 +720,11 @@ mod tests {
                     mem_available_kb: Some(200),
                     mem_total_kb: Some(1000),
                     stuck: 0,
+                    workspace_bytes: 0,
+                    workspace_count: 0,
+                    workspace_reclaimed_bytes_total: 0,
+                    workspace_evictions_total: 0,
+                    workspace_delete_errors_total: 0,
                     labels: Vec::new(),
                 }],
                 jobs: vec![JobRow {
@@ -770,6 +795,8 @@ mod tests {
             .collect();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: Vec::new(),
                 jobs,
@@ -795,6 +822,8 @@ mod tests {
         }
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: Vec::new(),
                 jobs,
@@ -837,6 +866,8 @@ mod tests {
         let mut dashboard = Dashboard::new();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: Vec::new(),
                 jobs,
@@ -907,6 +938,8 @@ mod tests {
         let mut dashboard = Dashboard::new();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: Vec::new(),
                 jobs,

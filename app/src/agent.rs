@@ -1,18 +1,19 @@
-//! The `lu agent` subcommand: load the agent configuration, build the controller client, and run
+//! The `ting` binary: load the agent configuration, build the controller client, and run
 //! until SIGINT or SIGTERM.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use lu_agent::Agent;
 use lu_client::{Client, Controller};
+use tuishou_ting::Agent;
 
 pub async fn run(config_path: &Path) -> Result<(), String> {
     let config = lu_config::load(config_path).map_err(|error| error.to_string())?;
-    let agent_config = config
+    let mut agent_config = config
         .agent
         .clone()
-        .ok_or_else(|| "agent requires an [agent] config".to_owned())?;
+        .ok_or_else(|| "ting requires an [agent] config".to_owned())?;
+    agent_config.workspace = config.workspace.clone();
     crate::logging::init(&config.log)?;
 
     let token = lu_config::read_private_file(

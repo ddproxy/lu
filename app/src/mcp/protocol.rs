@@ -127,7 +127,7 @@ impl Server {
                     "protocolVersion": version,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "lu", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Read, submit and control Lu jobs through the lu_* tools. Read tools do not change state; lu_submit, lu_submit_many, lu_retry, lu_cancel, lu_drain and lu_undrain do. Submissions are limited to 30 per rolling minute."
+                    "instructions": "Read, submit and control Lu jobs through the lu_* tools. Read tools do not change state; lu_submit, lu_submit_many, lu_submit_batch, lu_retry, lu_cancel, lu_drain and lu_undrain do. Submissions are limited to 30 per rolling minute."
                 }))
             }
             _ if !initialized => Err((-32002, format!("{method} before initialize"))),

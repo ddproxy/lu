@@ -169,7 +169,7 @@ fn job_json(id: &JobId, state: JobState) -> Value {
     json!({
         "id": id,
         "state": state,
-        "spec": {"repo": "/srv/repo", "git_ref": "main", "task": "go"},
+        "spec": {"source": {"repo": "/srv/repo", "ref": "main"}, "task": "go"},
         "attempt": 1,
         "created_at": 10,
         "started_at": 11,
@@ -180,6 +180,11 @@ fn job_json(id: &JobId, state: JobState) -> Value {
 
 fn spec() -> JobSpec {
     JobSpec {
+        source: lu_proto::SourceSpec {
+            repo: "https://example.net/repo.git".to_owned(),
+            git_ref: "main".to_owned(),
+            base: None,
+        },
         repo: "https://example.net/repo.git".to_owned(),
         git_ref: "main".to_owned(),
         base_commit: None,
@@ -201,6 +206,17 @@ fn spec() -> JobSpec {
         stuck_after_secs: None,
         priority: lu_proto::DEFAULT_PRIORITY,
         group: None,
+        allow_spawn: false,
+        spawn_inherit: false,
+        spawn_repos: Vec::new(),
+        workspace: None,
+        cache_dirs: Vec::new(),
+        context: None,
+        origin: None,
+        origin_ref: None,
+        untrusted_context: false,
+        draft: false,
+        publish: None,
         fallbacks: Vec::new(),
         expect: None,
     }

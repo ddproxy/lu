@@ -1,7 +1,8 @@
 //! lu: a job queue and dispatcher for dev peers.
 
 mod admin;
-mod agent;
+mod audit;
+mod batch;
 mod logging;
 mod mcp;
 mod operator;
@@ -40,6 +41,8 @@ enum Command {
     Backup(admin::BackupArgs),
     /// Install a backup as the controller database after stopping the controller.
     Restore(admin::RestoreArgs),
+    /// Verify, tail or anchor the hash-chained audit record.
+    Audit(audit::AuditArgs),
     /// Show controller uptime, database size, queue and node counts.
     Status(operator::StatusArgs),
     /// Serve the Model Context Protocol over stdio (read and write tools).
@@ -53,10 +56,8 @@ enum Command {
     /// Live terminal view of the nodes and recent jobs. Needs a build with the `tui` feature.
     #[cfg(feature = "tui")]
     Top(top::TopArgs),
-    /// Run the node agent loop. Needs an `[agent]` config.
-    Agent,
     /// Submit a job.
-    Submit(operator::SubmitArgs),
+    Submit(Box<operator::SubmitArgs>),
     /// Create one collection job from earlier inputs (keys or ids).
     Collect(operator::CollectArgs),
     /// Resubmit a finished job's spec as a new job.
@@ -65,8 +66,16 @@ enum Command {
     Edit(operator::EditArgs),
     /// List jobs.
     Ls(operator::LsArgs),
+    /// List stored drafts, oldest first.
+    Drafts(operator::DraftsArgs),
+    /// Approve a draft, optionally editing it first.
+    Approve(operator::ApproveArgs),
+    /// Reject and cancel a draft.
+    Reject(operator::RejectArgs),
     /// Show one job.
     Show(operator::ShowArgs),
+    /// Publish a finished job's diff to its configured target.
+    Publish(operator::PublishArgs),
     /// Draw job dependency graphs.
     Graph(operator::GraphArgs),
     /// Print a job's log.
@@ -80,9 +89,9 @@ enum Command {
     /// Show the host and job stats a node last reported.
     Node(operator::NodeArgs),
     /// Stop assigning new jobs to a node. The node must have heartbeated at least once.
-    Drain(operator::NodeArgs),
+    Drain(operator::NodeTargetArgs),
     /// Allow a drained node to take jobs again. The node must have heartbeated at least once.
-    Undrain(operator::NodeArgs),
+    Undrain(operator::NodeTargetArgs),
     /// Clear provider cordons on a node, or just one provider's cordon.
     Uncordon(operator::UncordonArgs),
 }
@@ -101,6 +110,10 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(&error),
         },
+        Command::Audit(args) => match audit::run(args, json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(&error),
+        },
         Command::Status(args) => operator::status(args, &cli.config, json).await,
         Command::Mcp => mcp::run(&cli.config).await,
         Command::Repos(args) => operator::repos(args, &cli.config, json).await,
@@ -111,16 +124,16 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(&error),
         },
-        Command::Agent => match agent::run(&cli.config).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => fail(&error),
-        },
-        Command::Submit(args) => operator::submit(args, &cli.config, json).await,
+        Command::Submit(args) => operator::submit(*args, &cli.config, json).await,
         Command::Collect(args) => operator::collect(args, &cli.config, json).await,
         Command::Retry(args) => operator::retry(args, &cli.config, json).await,
         Command::Edit(args) => operator::edit(args, &cli.config, json).await,
         Command::Ls(args) => operator::ls(args, &cli.config, json).await,
+        Command::Drafts(args) => operator::drafts(args, &cli.config, json).await,
+        Command::Approve(args) => operator::approve(args, &cli.config, json).await,
+        Command::Reject(args) => operator::reject(args, &cli.config, json).await,
         Command::Show(args) => operator::show(args, &cli.config, json).await,
+        Command::Publish(args) => operator::publish(args, &cli.config, json).await,
         Command::Graph(args) => operator::graph(args, &cli.config, json).await,
         Command::Logs(args) => operator::logs(args, &cli.config, json).await,
         Command::Fetch(args) => operator::fetch(args, &cli.config, json).await,
@@ -138,6 +151,9 @@ fn check(path: &std::path::Path) -> ExitCode {
         Ok(config) => config,
         Err(error) => return fail(&error.to_string()),
     };
+    if let Err(error) = lu_controller::Scrubber::validate_config(config.artifacts.as_ref()) {
+        return fail(&format!("invalid [artifacts] config: {error}"));
+    }
     let mut checks = vec!["config values".to_owned()];
     let tls_on = config.tls.is_some();
     if let Some(c) = &config.controller {
@@ -169,6 +185,13 @@ fn check(path: &std::path::Path) -> ExitCode {
             }
             Err(error) => return fail(&error),
         }
+    }
+    if let Some(a) = &config.artifacts {
+        println!(
+            "artifacts: scrubbing {}, {} extra rule(s)",
+            if a.scrub { "on" } else { "off" },
+            a.extra_rules.len()
+        );
     }
     if let Some(a) = &config.agent {
         println!(

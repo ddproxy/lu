@@ -11,17 +11,18 @@ credentials, and the controller cannot recreate them from the hashes.
 ```sh
 umask 077
 install -d -m 0750 /etc/lu
+install -d -m 0750 /etc/ting
 
-printf '%s' "$(head -c 32 /dev/urandom | base64)" > /etc/lu/agent.token
+printf '%s' "$(head -c 32 /dev/urandom | base64)" > /etc/ting/ting.token
 printf '%s' "$(head -c 32 /dev/urandom | base64)" > /etc/lu/operator.token
 
-# Each file must be owned by the account that reads it: the agent token by lu agent,
+# Each file must be owned by the account that reads it: the agent token by ting,
 # the operator token by whoever runs the operator CLI (root in the systemd example).
-chown lu:lu /etc/lu/agent.token
+chown ting:ting /etc/ting/ting.token
 chown root:root /etc/lu/operator.token
-chmod 600 /etc/lu/agent.token /etc/lu/operator.token
+chmod 600 /etc/ting/ting.token /etc/lu/operator.token
 
-sha256sum /etc/lu/agent.token /etc/lu/operator.token
+sha256sum /etc/ting/ting.token /etc/lu/operator.token
 ```
 
 Use `printf '%s'`, as above, so the file has no trailing newline. Clients trim trailing CR/LF from
@@ -31,7 +32,7 @@ bearer token disagree. Each hash must be 64 lowercase hex characters.
 ```toml
 [[controller.agents]]
 name = "node-a"
-token_sha256 = "<sha256 of agent.token>"
+token_sha256 = "<sha256 of ting.token>"
 
 [[controller.operators]]
 name = "ops"
@@ -80,7 +81,7 @@ A `ca_file` adds up to 1 MiB of PEM certificates to the system trust roots. It d
 them and is not a pinning mechanism. Use a certificate whose subject matches the host name in
 `controller_url` or `LU_URL`. There is no option to disable verification.
 
-`lu check` validates config values, reports `tls on` or `tls off`, names the checks it ran, and opens no token or key files or port. `lu backup` and `lu restore` read only `[controller] db`, and `lu check` uses that key for its database checks without opening secrets, so all three commands work as root against a service account's secrets. `lu serve` loads the key and certificate; `lu agent` loads the agent token; operator commands load the operator token from `LU_TOKEN_FILE` or an operator file. An agent token on an operator route gets `401`, so operator commands never fall back to `[agent].token_file`.
+`lu check` validates config values, reports `tls on` or `tls off`, names the checks it ran, and opens no token or key files or port. `lu backup` and `lu restore` read only `[controller] db`, and `lu check` uses that key for its database checks without opening secrets, so all three commands work as root against a service account's secrets. `lu serve` loads the key and certificate; `ting` loads the agent token; operator commands load the operator token from `LU_TOKEN_FILE` or an operator file. An agent token on an operator route gets `401`, so operator commands never fall back to `[agent].token_file`.
 
 ## Rotation
 
@@ -90,7 +91,7 @@ For a token:
 2. Add or replace its `token_sha256` in the controller config. Hashes must remain unique. To
    overlap old and new clients, keep both hashes for a while; remove the old hash to revoke it.
 3. Restart the controller; config is not reloaded in place.
-4. Replace the token file on the agent or operator host. Restart `lu agent` so it re-reads its
+4. Replace the token file on the agent or operator host. Restart `ting` so it re-reads its
    file; operator commands read the file at each invocation.
 5. Verify with `lu status` (operator scope) and `lu nodes` (agent heartbeats).
 

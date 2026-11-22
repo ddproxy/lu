@@ -7,7 +7,8 @@ use std::str::FromStr;
 use lu_proto::{
     printable, truncate_chars, AgentEvent, ArtifactName, Choice, Completion, CordonView,
     FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobState, JobView, LogChunk, NodeName,
-    NodeView, Outcome, ProviderModel, ProviderState, ProviderStatus,
+    NodeView, Outcome, ProviderModel, ProviderState, ProviderStatus, WorkspacePolicy,
+    WorkspaceState, WorkspaceView,
 };
 
 fn job_id() -> JobId {
@@ -16,6 +17,11 @@ fn job_id() -> JobId {
 
 fn spec() -> JobSpec {
     JobSpec {
+        source: lu_proto::SourceSpec {
+            repo: "https://example.net/team/repo.git".to_owned(),
+            git_ref: "main".to_owned(),
+            base: None,
+        },
         repo: "https://example.net/team/repo.git".to_owned(),
         git_ref: "main".to_owned(),
         base_commit: None,
@@ -25,6 +31,17 @@ fn spec() -> JobSpec {
         model: None,
         priority: lu_proto::DEFAULT_PRIORITY,
         group: None,
+        allow_spawn: false,
+        spawn_inherit: false,
+        spawn_repos: Vec::new(),
+        workspace: None,
+        cache_dirs: Vec::new(),
+        context: None,
+        origin: None,
+        origin_ref: None,
+        untrusted_context: false,
+        draft: false,
+        publish: None,
         timeout_secs: 600,
         idle_timeout_secs: Some(60),
         on_stuck: None,
@@ -109,6 +126,12 @@ fn a_heartbeat_carries_a_capped_forwarded_document() {
         labels: vec!["gpu".to_owned()],
         label_sources: std::collections::BTreeMap::new(),
         taints: Vec::new(),
+        workspace_bytes: 0,
+        workspace_count: 0,
+        workspace_reclaimed_bytes_total: 0,
+        workspace_evictions_total: 0,
+        workspace_delete_errors_total: 0,
+        workspaces: Vec::new(),
     };
     beat.validate().unwrap();
     let wire = serde_json::to_string(&beat).unwrap();
@@ -153,11 +176,27 @@ fn job_and_node_views_match_the_documented_json() {
         id: job_id(),
         state: JobState::Running,
         spec: JobSpec {
+            source: lu_proto::SourceSpec {
+                repo: "https://example.net/team/repo.git".to_owned(),
+                git_ref: "main".to_owned(),
+                base: None,
+            },
             repo: "https://example.net/team/repo.git".to_owned(),
             git_ref: "main".to_owned(),
             task: "add the missing test".to_owned(),
             provider: Some("peer-a".to_owned()),
             group: Some("nightly".to_owned()),
+            allow_spawn: false,
+            spawn_inherit: false,
+            spawn_repos: Vec::new(),
+            workspace: None,
+            cache_dirs: Vec::new(),
+            context: None,
+            origin: None,
+            origin_ref: None,
+            untrusted_context: false,
+            draft: false,
+            publish: None,
             timeout_secs: 600,
             idle_timeout_secs: Some(60),
             idempotency_key: Some("ticket:42".to_owned()),
@@ -186,18 +225,25 @@ fn job_and_node_views_match_the_documented_json() {
         artifacts: vec!["diff.patch".to_owned(), "run.log".to_owned()],
         cancel_requested: false,
         after: vec![dep.clone()],
-        waiting_on: vec![dep],
+        waiting_on: vec![dep.clone()],
+        parent_job_id: None,
+        root_job_id: None,
+        depth: 0,
         waiting_reason: None,
         outcome_note: None,
         diff_bytes: None,
+        scrubbed_hits: 3,
+        patch_scrubbed: true,
         warnings: Some(Vec::new()),
+        audit_write_errors: None,
+        publish: None,
+        publish_target: None,
     };
     let expected_job = serde_json::json!({
         "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
         "state": "running",
         "spec": {
-            "repo": "https://example.net/team/repo.git",
-            "git_ref": "main",
+            "source": {"repo": "https://example.net/team/repo.git", "ref": "main"},
             "task": "add the missing test",
             "harness": "opencode",
             "provider": "peer-a",
@@ -226,7 +272,10 @@ fn job_and_node_views_match_the_documented_json() {
         "cancel_requested": false,
         "after": ["01ARZ3NDEKTSV4RRFFQ69G5FAA"],
         "waiting_on": ["01ARZ3NDEKTSV4RRFFQ69G5FAA"],
+        "depth": 0,
         "waiting_reason": null,
+        "scrubbed_hits": 3u64,
+        "patch_scrubbed": true,
         "warnings": []
     });
     assert_eq!(serde_json::to_value(&job).unwrap(), expected_job);
@@ -274,6 +323,18 @@ fn job_and_node_views_match_the_documented_json() {
         mem_available_kb: Some(8192),
         mem_total_kb: Some(16_384),
         stuck: 1,
+        workspace_bytes: 4_096,
+        workspace_count: 1,
+        workspace_reclaimed_bytes_total: 8_192,
+        workspace_evictions_total: 2,
+        workspace_delete_errors_total: 1,
+        workspaces: vec![WorkspaceView {
+            job_key: "ticket:42".to_owned(),
+            state: WorkspaceState::Kept,
+            bytes: 4_096,
+            age_secs: 90,
+            policy: WorkspacePolicy::Keep,
+        }],
     };
     let expected_node = serde_json::json!({
         "name": "peer-a",
@@ -310,7 +371,19 @@ fn job_and_node_views_match_the_documented_json() {
         "load1": 1.5,
         "mem_available_kb": 8192,
         "mem_total_kb": 16_384,
-        "stuck": 1
+        "stuck": 1,
+        "workspace_bytes": 4_096,
+        "workspace_count": 1,
+        "workspace_reclaimed_bytes_total": 8_192,
+        "workspace_evictions_total": 2,
+        "workspace_delete_errors_total": 1,
+        "workspaces": [{
+            "job_key": "ticket:42",
+            "state": "kept",
+            "bytes": 4_096,
+            "age_secs": 90,
+            "policy": "keep"
+        }]
     });
     assert_eq!(serde_json::to_value(&node).unwrap(), expected_node);
 
@@ -329,8 +402,7 @@ fn job_view_echoes_the_expect_block() {
         "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
         "state": "done",
         "spec": {
-            "repo": "https://example.net/team/repo.git",
-            "git_ref": "main",
+            "source": {"repo": "https://example.net/team/repo.git", "ref": "main"},
             "task": "add the missing test",
             "expect": {
                 "files": ["REVIEW.md"],

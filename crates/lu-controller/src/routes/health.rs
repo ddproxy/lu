@@ -106,6 +106,17 @@ mod tests {
         ) -> Result<(), StoreError> {
             unimplemented!()
         }
+        fn record_scrub(&self, _: &JobId, _: u64, _: u64, _: bool) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn record_publish(
+            &self,
+            _: &JobId,
+            _: &lu_proto::PublishRecord,
+            _: Now,
+        ) -> Result<JobRecord, StoreError> {
+            unimplemented!()
+        }
         fn complete(
             &self,
             _: &Completion,

@@ -12,7 +12,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use git2::{BranchType, Oid, Repository};
-use lu_config::{read_private_file, ControllerConfig, ControllerRepo};
+use lu_config::{
+    read_private_file, ControllerConfig, ControllerRepo, MirrorConfig, MirrorCredential,
+};
+use lu_proto::MAX_GIT_REF_BYTES;
 use serde::Serialize;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -20,6 +23,159 @@ const STALE_AFTER_SECS: u64 = 60;
 const MAX_MIRROR_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: u64 = 8 * 1024;
 const MAX_HEADS: usize = 20;
+
+/// The only PR refs a job may ask for. Both names are kept as written so the fetch refspec is
+/// exactly the one requested; no wildcards are ever derived from job input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullKind {
+    Head,
+    Merge,
+}
+
+impl PullKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Head => "head",
+            Self::Merge => "merge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PullRef {
+    number: String,
+    kind: PullKind,
+}
+
+impl PullRef {
+    fn full_ref(&self) -> String {
+        format!("refs/pull/{}/{}", self.number, self.kind.as_str())
+    }
+
+    /// The sole refspec sent to git for a PR job. Source and destination are both exact.
+    fn fetch_refspec(&self) -> String {
+        format!(
+            "+refs/pull/{}/{}:refs/lu-pr/{}/{}",
+            self.number,
+            self.kind.as_str(),
+            self.number,
+            self.kind.as_str()
+        )
+    }
+
+    fn local_ref(&self) -> String {
+        format!("refs/lu-pr/{}/{}", self.number, self.kind.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedRefKind {
+    Branch,
+    Tag,
+}
+
+impl NamedRefKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Branch => "heads",
+            Self::Tag => "tags",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestedRef {
+    Commit(String),
+    BranchOrTag {
+        lookup: String,
+        allow: String,
+        kind: NamedRefKind,
+    },
+    Pull(PullRef),
+}
+
+/// Strictly parses the small set of ref shapes jobs may name. Git revision expressions, wildcard
+/// refspecs and `refs/*` namespaces other than branches, tags and PR heads are all refused.
+fn parse_requested_ref(value: &str) -> Option<RequestedRef> {
+    if value.is_empty() || value.len() > MAX_GIT_REF_BYTES {
+        return None;
+    }
+    if is_commit_id(value) {
+        return Some(RequestedRef::Commit(value.to_owned()));
+    }
+    if let Some(pull) = parse_pull_ref(value) {
+        return Some(RequestedRef::Pull(pull));
+    }
+    let (lookup, allow, kind) = if let Some(rest) = value.strip_prefix("refs/heads/") {
+        if !valid_ref_name(rest) {
+            return None;
+        }
+        (rest.to_owned(), value.to_owned(), NamedRefKind::Branch)
+    } else if let Some(rest) = value.strip_prefix("refs/tags/") {
+        if !valid_ref_name(rest) {
+            return None;
+        }
+        (rest.to_owned(), value.to_owned(), NamedRefKind::Tag)
+    } else {
+        if value.starts_with("refs/") || !valid_ref_name(value) {
+            return None;
+        }
+        (value.to_owned(), value.to_owned(), NamedRefKind::Branch)
+    };
+    Some(RequestedRef::BranchOrTag {
+        lookup,
+        allow,
+        kind,
+    })
+}
+
+fn parse_pull_ref(value: &str) -> Option<PullRef> {
+    let rest = value.strip_prefix("refs/pull/")?;
+    let (number, kind) = rest.rsplit_once('/')?;
+    if number.is_empty() || number.len() > 18 || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let kind = match kind {
+        "head" => PullKind::Head,
+        "merge" => PullKind::Merge,
+        _ => return None,
+    };
+    Some(PullRef {
+        number: number.to_owned(),
+        kind,
+    })
+}
+
+fn is_commit_id(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A conservative subset of `git check-ref-format`: names are plain branch/tag names or a single
+/// `refs/heads/`/`refs/tags/` prefix, with no revision syntax or path tricks.
+fn valid_ref_name(name: &str) -> bool {
+    if name.is_empty()
+        || name.starts_with('-')
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.ends_with('.')
+        || matches!(name, "HEAD" | "@")
+    {
+        return false;
+    }
+    if name.bytes().any(|b| {
+        b < 0x20
+            || b == 0x7f
+            || b.is_ascii_whitespace()
+            || matches!(b, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\' | b'+')
+    }) {
+        return false;
+    }
+    if name.contains("..") || name.contains("@{") || name.contains("//") {
+        return false;
+    }
+    name.split('/')
+        .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
 
 /// A sync error with any credential material already removed.
 #[derive(Debug)]
@@ -48,6 +204,14 @@ impl MirrorError {
     /// The ref was not a branch, tag or commit the mirror knows, or the allow-list excluded it.
     pub fn is_unknown_ref(&self) -> bool {
         self.message.starts_with("unknown ref ")
+    }
+
+    /// Removes every known credential fragment before the error can leave this module.
+    fn scrub(mut self, credential: Option<&Credential>) -> Self {
+        if let Some(credential) = credential {
+            self.message = credential.scrub(&self.message);
+        }
+        self
     }
 }
 
@@ -107,16 +271,44 @@ struct RepoState {
 pub struct Mirror {
     root: PathBuf,
     repos: Vec<ControllerRepo>,
+    /// `[mirror.credentials.repos]` entries: names or URLs mapped to controller-only token files.
+    /// Only paths live here; the file contents are read afresh for each fetch.
+    credentials: Vec<MirrorCredential>,
     state: Mutex<HashMap<String, RepoState>>,
     sync_lock: Mutex<()>,
 }
 
 impl Mirror {
     pub fn from_config(config: &ControllerConfig) -> Result<Self, String> {
-        Self::new(config.repos.clone(), Path::new(&config.artifacts_dir))
+        Self::from_config_with_credentials(config, None)
+    }
+
+    /// Builds a mirror with the top-level `[mirror.credentials]` token mappings. Callers that only
+    /// hold `ControllerConfig` can attach the mappings later with `with_credentials`.
+    pub fn from_config_with_credentials(
+        config: &ControllerConfig,
+        mirror: Option<&MirrorConfig>,
+    ) -> Result<Self, String> {
+        let credentials = mirror
+            .and_then(|config| config.credentials.as_ref())
+            .map(|config| config.repos.clone())
+            .unwrap_or_default();
+        Self::new_with_credentials(
+            config.repos.clone(),
+            credentials,
+            Path::new(&config.artifacts_dir),
+        )
     }
 
     pub fn new(repos: Vec<ControllerRepo>, artifacts_dir: &Path) -> Result<Self, String> {
+        Self::new_with_credentials(repos, Vec::new(), artifacts_dir)
+    }
+
+    pub fn new_with_credentials(
+        repos: Vec<ControllerRepo>,
+        credentials: Vec<MirrorCredential>,
+        artifacts_dir: &Path,
+    ) -> Result<Self, String> {
         let parent = artifacts_dir
             .parent()
             .ok_or_else(|| "artifacts_dir has no parent for the mirror root".to_owned())?;
@@ -128,9 +320,19 @@ impl Mirror {
         Ok(Self {
             root,
             repos,
+            credentials,
             state: Mutex::new(HashMap::new()),
             sync_lock: Mutex::new(()),
         })
+    }
+
+    /// Attaches `[mirror.credentials]` after construction. Existing callers are unchanged when
+    /// the top-level config is not threaded through to this constructor.
+    pub fn with_credentials(mut self, mirror: &MirrorConfig) -> Self {
+        if let Some(credentials) = &mirror.credentials {
+            self.credentials = credentials.repos.clone();
+        }
+        self
     }
 
     /// Removes askpass helpers left behind when an earlier controller stopped mid-fetch.
@@ -202,31 +404,123 @@ impl Mirror {
     /// Resolves a ref against the mirror without fetching.
     pub fn resolve(&self, name: &str, git_ref: &str) -> Option<String> {
         let repo = self.repo(name)?;
-        if !commit_allowed(repo, git_ref) {
+        let requested = parse_requested_ref(git_ref)?;
+        if !request_allowed(repo, &requested) {
             return None;
         }
-        self.resolve_path(&self.mirror_path(name), repo, git_ref)
+        self.resolve_path(&self.mirror_path(name), &requested)
     }
 
-    /// Resolves a ref for pinning: fetches when the mirror is stale or the ref is unknown.
+    /// Resolves a job's source ref to the head branch it names, using only the mirrored remote.
+    /// Pull-request refs are mapped to the single branch whose tip is the fetched head commit;
+    /// payload text is never consulted. Refusing ambiguous or fork-only heads keeps a source-branch
+    /// push inside the repository the job came from.
+    pub fn source_branch(&self, name: &str, git_ref: &str) -> Result<String, MirrorError> {
+        let repo = self
+            .repo(name)
+            .ok_or_else(|| MirrorError::new(format!("unknown repository {name}")))?;
+        let requested =
+            parse_requested_ref(git_ref).ok_or_else(|| self.unknown_ref(repo, git_ref))?;
+        let commit = self
+            .resolve(name, git_ref)
+            .ok_or_else(|| self.unknown_ref(repo, git_ref))?;
+        let path = self.mirror_path(name);
+        let repository = Repository::open(&path).map_err(|e| MirrorError::new(e.to_string()))?;
+        let target = git2::Oid::from_str(&commit).map_err(|e| MirrorError::new(e.to_string()))?;
+        match requested {
+            RequestedRef::BranchOrTag {
+                lookup,
+                kind: NamedRefKind::Branch,
+                ..
+            } => {
+                let reference = repository
+                    .find_reference(&format!("refs/heads/{lookup}"))
+                    .map_err(|_| self.unknown_ref(repo, git_ref))?;
+                if reference.peel_to_commit().map(|c| c.id()) != Ok(target) {
+                    return Err(self.unknown_ref(repo, git_ref));
+                }
+                Ok(lookup)
+            }
+            RequestedRef::Pull(_) => {
+                let matches: Vec<String> = repository
+                    .branches(Some(git2::BranchType::Local))
+                    .map_err(|e| MirrorError::new(e.to_string()))?
+                    .flatten()
+                    .filter_map(|(branch, _)| {
+                        let name = branch.name().ok().flatten()?.to_owned();
+                        (branch.get().peel_to_commit().map(|c| c.id()).ok()? == target)
+                            .then_some(name)
+                    })
+                    .collect();
+                match matches.as_slice() {
+                    [only] => Ok(only.clone()),
+                    [] => Err(MirrorError::new(
+                        "the pull request head has no branch in the source repository".to_owned(),
+                    )),
+                    _ => Err(MirrorError::new(
+                        "the pull request head matches more than one branch in the source repository"
+                            .to_owned(),
+                    )),
+                }
+            }
+            RequestedRef::Commit(_) | RequestedRef::BranchOrTag { .. } => Err(MirrorError::new(
+                "the source ref must name a branch to push back to its source branch".to_owned(),
+            )),
+        }
+    }
+
+    /// Resolves a ref for pinning. Every fetch triggered by a job uses one exact refspec; the
+    /// wildcard branch/tag sync is reserved for the operator's explicit sync route.
     pub fn ensure_resolved(&self, name: &str, git_ref: &str) -> Result<String, MirrorError> {
         let repo = self
             .repo(name)
             .ok_or_else(|| MirrorError::new(format!("unknown repository {name}")))?
             .clone();
+        let requested =
+            parse_requested_ref(git_ref).ok_or_else(|| self.unknown_ref(&repo, git_ref))?;
+        if !request_allowed(&repo, &requested) {
+            return Err(self.unknown_ref(&repo, git_ref));
+        }
         let _guard = self.lock_sync();
+        let path = self.mirror_path(name);
+        init_mirror_dir(&path, &repo.name)?;
         let stale = self
             .state()
             .get(name)
             .and_then(|state| state.synced_at)
             .map(|at| now_unix().saturating_sub(at) as u64 >= STALE_AFTER_SECS)
             .unwrap_or(true);
-        if stale || self.resolve(name, git_ref).is_none() {
-            self.sync_locked(&repo)?;
+        let known = self.resolve_path(&path, &requested);
+        match &requested {
+            RequestedRef::Pull(pull) => {
+                // PR heads move; always fetch the one ref being pinned, even when it is cached.
+                self.fetch_pull(&repo, &path, pull)?;
+            }
+            RequestedRef::BranchOrTag { lookup, kind, .. } => {
+                if stale || known.is_none() {
+                    let source = format!("refs/{}/{lookup}", kind.as_str());
+                    if let Err(error) = self.fetch_exact(&repo, &path, &source, &source) {
+                        if *kind == NamedRefKind::Branch {
+                            // A name without a prefix may designate a tag; try exactly that tag.
+                            let tag = format!("refs/tags/{lookup}");
+                            self.fetch_exact(&repo, &path, &tag, &tag)?;
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            RequestedRef::Commit(_) => {}
         }
-        self.resolve(name, git_ref).ok_or_else(|| {
-            MirrorError::new(format!("unknown ref {git_ref} in repository {}", repo.name))
-        })
+        self.resolve_path(&path, &requested)
+            .ok_or_else(|| self.unknown_ref(&repo, git_ref))
+    }
+
+    fn unknown_ref(&self, repo: &ControllerRepo, git_ref: &str) -> MirrorError {
+        let shown: String = git_ref.chars().take(128).collect();
+        let credential = self.credential_for(repo).ok().flatten();
+        MirrorError::new(format!("unknown ref {shown} in repository {}", repo.name))
+            .scrub(credential.as_ref())
     }
 
     fn state(&self) -> MutexGuard<'_, HashMap<String, RepoState>> {
@@ -245,21 +539,133 @@ impl Mirror {
         self.root.join(format!("{name}.git"))
     }
 
-    fn sync_locked(&self, repo: &ControllerRepo) -> Result<SyncResult, MirrorError> {
-        let path = self.mirror_path(&repo.name);
-        if !path.exists() {
-            match Repository::init_bare(&path) {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(MirrorError::with_hint(
-                        format!("creating mirror for {} failed: {e}", repo.name),
-                        hint_for(&format!("cannot create mirror: {e}")),
-                    ))
+    /// Fetches all branch heads and tags for a configured mirror. This is used only by the
+    /// operator sync route, which lists heads; job resolution always fetches exact refspecs.
+    fn fetch_all(&self, repo: &ControllerRepo, path: &Path) -> Result<(), MirrorError> {
+        let credential = self.credential_for(repo)?;
+        let refspecs = [
+            "+refs/heads/*:refs/heads/*".to_owned(),
+            "+refs/tags/*:refs/tags/*".to_owned(),
+        ];
+        self.fetch_refspecs(repo, path, &refspecs, credential.as_ref(), true)
+    }
+
+    /// Fetches one exact ref (branch or tag) into its matching local namespace. No wildcard is
+    /// derived from the job's ref, so a job can never trigger a `+refs/*` fetch.
+    fn fetch_exact(
+        &self,
+        repo: &ControllerRepo,
+        path: &Path,
+        source: &str,
+        destination: &str,
+    ) -> Result<(), MirrorError> {
+        let credential = self.credential_for(repo)?;
+        let refspec = format!("+{source}:{destination}");
+        let result = self.fetch_refspecs(repo, path, &[refspec], credential.as_ref(), false);
+        self.fetch_outcome(repo, source, result)
+    }
+
+    /// Fetches one exact PR ref into a private namespace. No other ref is requested or written.
+    fn fetch_pull(
+        &self,
+        repo: &ControllerRepo,
+        path: &Path,
+        pull: &PullRef,
+    ) -> Result<(), MirrorError> {
+        let credential = self.credential_for(repo)?;
+        let full_ref = pull.full_ref();
+        let result = self.fetch_refspecs(
+            repo,
+            path,
+            &[pull.fetch_refspec()],
+            credential.as_ref(),
+            false,
+        );
+        self.fetch_outcome(repo, &full_ref, result)
+    }
+
+    /// A remote that simply lacks the requested ref is an unknown-ref (422) condition; transport
+    /// and configuration failures stay internal. The converted error never echoes git's stderr.
+    fn fetch_outcome(
+        &self,
+        repo: &ControllerRepo,
+        git_ref: &str,
+        result: Result<(), MirrorError>,
+    ) -> Result<(), MirrorError> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let text = error.to_string();
+                if text.contains("couldn't find remote ref")
+                    || (text.contains("remote ref") && text.contains("does not exist"))
+                    || text.contains("no such ref was fetched")
+                {
+                    Err(self.unknown_ref(repo, git_ref))
+                } else {
+                    Err(error)
                 }
             }
-            set_mode(&path, 0o700);
         }
-        fetch(repo, &path, &self.root)?;
+    }
+
+    fn fetch_refspecs(
+        &self,
+        repo: &ControllerRepo,
+        path: &Path,
+        refspecs: &[String],
+        credential: Option<&Credential>,
+        prune: bool,
+    ) -> Result<(), MirrorError> {
+        let askpass = match credential {
+            Some(value) => Some(askpass(value, &self.root).map_err(|e| e.scrub(credential))?),
+            None => None,
+        };
+        let mut cmd = Command::new("git");
+        cmd.arg("--git-dir")
+            .arg(path)
+            .arg("fetch")
+            .arg("--quiet")
+            .arg("--force")
+            .arg("--no-recurse-submodules");
+        if prune {
+            cmd.arg("--prune");
+        }
+        cmd.arg(&repo.url);
+        for refspec in refspecs {
+            cmd.arg(refspec);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        harden(&mut cmd, repo, askpass.as_ref());
+        let output = run_with_timeout(&mut cmd).map_err(|e| e.scrub(credential))?;
+        let stderr = match credential {
+            Some(credential) => credential.scrub(&output.stderr),
+            None => output.stderr,
+        };
+        if output.success {
+            return Ok(());
+        }
+        let detail = trim_error(&stderr);
+        let base = if detail.is_empty() {
+            format!("git fetch for {} failed with {}", repo.name, output.status)
+        } else {
+            format!(
+                "git fetch for {} failed with {}: {}",
+                repo.name, output.status, detail
+            )
+        };
+        Err(MirrorError::with_hint(
+            format!("fetching mirror for {} failed: {base}", repo.name),
+            hint_for(&base),
+        )
+        .scrub(credential))
+    }
+
+    fn sync_locked(&self, repo: &ControllerRepo) -> Result<SyncResult, MirrorError> {
+        let path = self.mirror_path(&repo.name);
+        init_mirror_dir(&path, &repo.name)?;
+        self.fetch_all(repo, &path)?;
         let bytes = tree_bytes(&path)?;
         if bytes > MAX_MIRROR_BYTES {
             return Err(MirrorError::new(format!(
@@ -283,41 +689,59 @@ impl Mirror {
         })
     }
 
-    fn resolve_path(&self, path: &Path, repo: &ControllerRepo, git_ref: &str) -> Option<String> {
+    fn resolve_path(&self, path: &Path, requested: &RequestedRef) -> Option<String> {
         let repository = Repository::open(path).ok()?;
-        if let Ok(oid) = Oid::from_str(git_ref) {
-            if repository.find_commit(oid).is_ok() {
-                return Some(oid.to_string());
+        match requested {
+            RequestedRef::Commit(git_ref) => {
+                let oid = Oid::from_str(git_ref).ok()?;
+                repository.find_commit(oid).ok()?;
+                Some(oid.to_string())
+            }
+            RequestedRef::BranchOrTag { lookup, .. } => {
+                for prefix in ["refs/heads/", "refs/tags/"] {
+                    let name = format!("{prefix}{lookup}");
+                    if let Ok(reference) = repository.find_reference(&name) {
+                        if let Ok(commit) = reference.peel_to_commit() {
+                            return Some(commit.id().to_string());
+                        }
+                    }
+                }
+                None
+            }
+            RequestedRef::Pull(pull) => {
+                let reference = repository.find_reference(&pull.local_ref()).ok()?;
+                reference
+                    .peel_to_commit()
+                    .ok()
+                    .map(|commit| commit.id().to_string())
             }
         }
-        if let Ok(branch) = repository.find_branch(git_ref, BranchType::Local) {
-            if ref_allowed(repo, git_ref) {
-                if let Some(oid) = branch.get().target() {
-                    return Some(oid.to_string());
-                }
-            }
-        }
-        if ref_allowed(repo, git_ref) {
-            if let Ok(object) = repository.revparse_single(&format!("refs/tags/{git_ref}")) {
-                if let Ok(commit) = object.peel_to_commit() {
-                    return Some(commit.id().to_string());
-                }
-            }
-            if let Ok(object) = repository.revparse_single(git_ref) {
-                if let Ok(commit) = object.peel_to_commit() {
-                    return Some(commit.id().to_string());
-                }
-            }
-        }
-        None
     }
 }
 
-fn commit_allowed(repo: &ControllerRepo, git_ref: &str) -> bool {
-    if git_ref.len() == 40 && git_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return true;
+fn init_mirror_dir(path: &Path, name: &str) -> Result<(), MirrorError> {
+    if path.exists() {
+        return Ok(());
     }
-    ref_allowed(repo, git_ref)
+    match Repository::init_bare(path) {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(MirrorError::with_hint(
+                format!("creating mirror for {name} failed: {e}"),
+                hint_for(&format!("cannot create mirror: {e}")),
+            ))
+        }
+    }
+    set_mode(path, 0o700);
+    Ok(())
+}
+
+fn request_allowed(repo: &ControllerRepo, requested: &RequestedRef) -> bool {
+    match requested {
+        RequestedRef::Commit(_) => true,
+        RequestedRef::BranchOrTag { allow, .. } => ref_allowed(repo, allow),
+        RequestedRef::Pull(pull) => ref_allowed(repo, &pull.full_ref()),
+    }
 }
 
 fn ref_allowed(repo: &ControllerRepo, name: &str) -> bool {
@@ -375,6 +799,53 @@ impl Drop for Askpass {
     }
 }
 
+impl Mirror {
+    /// A configured token entry wins over the legacy per-repo `credential_file`. Both are read
+    /// from disk here: neither a token nor its file contents are ever placed in a job, artifact or
+    /// error message.
+    fn credential_for(&self, repo: &ControllerRepo) -> Result<Option<Credential>, MirrorError> {
+        if let Some(entry) = self
+            .credentials
+            .iter()
+            .find(|entry| credential_matches(entry, repo))
+        {
+            return token_credential(entry).map(Some);
+        }
+        credential(repo)
+    }
+}
+
+fn credential_matches(entry: &MirrorCredential, repo: &ControllerRepo) -> bool {
+    entry.name == repo.name
+        || entry.name == repo.url
+        || (!normalize_repo_id(&entry.name).is_empty()
+            && normalize_repo_id(&entry.name) == normalize_repo_id(&repo.url))
+}
+
+fn normalize_repo_id(value: &str) -> String {
+    let value = value.trim().trim_end_matches('/');
+    let value = value.strip_suffix(".git").unwrap_or(value);
+    let value = ["https://", "http://", "ssh://", "git://", "git+ssh://"]
+        .iter()
+        .find_map(|prefix| value.strip_prefix(prefix))
+        .unwrap_or(value);
+    let value = value.rsplit('@').next().unwrap_or(value);
+    value.trim().trim_matches('/').to_ascii_lowercase()
+}
+
+fn token_credential(entry: &MirrorCredential) -> Result<Credential, MirrorError> {
+    let text = read_private_file(
+        &format!("[mirror.credentials] ({}) token_file", entry.name),
+        Path::new(&entry.token_file),
+        MAX_CREDENTIAL_BYTES,
+    )
+    .map_err(|e| MirrorError::new(e.to_string()))?;
+    credential_from_line(
+        &format!("mirror credential {}", entry.name),
+        text.trim_end_matches(['\r', '\n']),
+    )
+}
+
 fn credential(repo: &ControllerRepo) -> Result<Option<Credential>, MirrorError> {
     let Some(file) = &repo.credential_file else {
         return Ok(None);
@@ -385,22 +856,26 @@ fn credential(repo: &ControllerRepo) -> Result<Option<Credential>, MirrorError> 
         MAX_CREDENTIAL_BYTES,
     )
     .map_err(|e| MirrorError::new(e.to_string()))?;
-    let line = text.trim_end_matches(['\r', '\n']);
+    credential_from_line(
+        &format!("repository {}", repo.name),
+        text.trim_end_matches(['\r', '\n']),
+    )
+    .map(Some)
+}
+
+fn credential_from_line(what: &str, line: &str) -> Result<Credential, MirrorError> {
     if line.is_empty() {
-        return Err(MirrorError::new(format!(
-            "repository {} has an empty credential file",
-            repo.name
-        )));
+        return Err(MirrorError::new(format!("{what} is empty")));
     }
     let (username, password) = match line.split_once(':') {
         Some((user, pass)) => (user.to_owned(), pass.to_owned()),
         None => ("x-access-token".to_owned(), line.to_owned()),
     };
-    Ok(Some(Credential {
+    Ok(Credential {
         username,
         password,
         raw: line.to_owned(),
-    }))
+    })
 }
 
 fn askpass(credential: &Credential, root: &Path) -> Result<Askpass, MirrorError> {
@@ -441,50 +916,6 @@ fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), MirrorError> {
         .map_err(|e| MirrorError::new(format!("cannot write askpass helper: {e}")))
 }
 
-fn fetch(repo: &ControllerRepo, path: &Path, root: &Path) -> Result<(), MirrorError> {
-    let credential = credential(repo)?;
-    let askpass = match &credential {
-        Some(value) => Some(askpass(value, root)?),
-        None => None,
-    };
-    let mut cmd = Command::new("git");
-    cmd.arg("--git-dir")
-        .arg(path)
-        .arg("fetch")
-        .arg("--quiet")
-        .arg("--prune")
-        .arg("--force")
-        .arg("--no-recurse-submodules")
-        .arg(&repo.url)
-        .arg("+refs/heads/*:refs/heads/*")
-        .arg("+refs/tags/*:refs/tags/*")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    harden(&mut cmd, repo, askpass.as_ref());
-    let output = run_with_timeout(&mut cmd)?;
-    let stderr = match &credential {
-        Some(credential) => credential.scrub(&output.stderr),
-        None => output.stderr,
-    };
-    if output.success {
-        return Ok(());
-    }
-    let detail = trim_error(&stderr);
-    let base = if detail.is_empty() {
-        format!("git fetch for {} failed with {}", repo.name, output.status)
-    } else {
-        format!(
-            "git fetch for {} failed with {}: {}",
-            repo.name, output.status, detail
-        )
-    };
-    Err(MirrorError::with_hint(
-        format!("fetching mirror for {} failed: {base}", repo.name),
-        hint_for(&base),
-    ))
-}
-
 fn harden(cmd: &mut Command, repo: &ControllerRepo, askpass: Option<&Askpass>) {
     let protocols = if repo.allow_file_urls {
         "file"
@@ -509,6 +940,13 @@ fn harden(cmd: &mut Command, repo: &ControllerRepo, askpass: Option<&Askpass>) {
         .env_remove("GIT_PROXY_COMMAND")
         .env_remove("GIT_ASKPASS")
         .env_remove("SSH_ASKPASS")
+        .env_remove("GIT_SSH_ASKPASS")
+        .env_remove("GIT_USERNAME")
+        .env_remove("GIT_PASSWORD")
+        .env_remove("GIT_TRACE")
+        .env_remove("GIT_TRACE_CURL")
+        .env_remove("GIT_TRACE_CURL_NO_DATA")
+        .env_remove("GIT_CURL_VERBOSE")
         .env_remove("GIT_CONFIG")
         .env_remove("GIT_CONFIG_PARAMETERS")
         .env_remove("GIT_DIR")
@@ -737,6 +1175,26 @@ mod tests {
         )
     }
 
+    fn local_repo_with_pull(path: &Path) -> (String, String, String) {
+        let (url, first, second) = local_repo(path);
+        let repo = Repository::open(path).unwrap();
+        repo.reference(
+            "refs/pull/42/head",
+            Oid::from_str(&first).unwrap(),
+            false,
+            "pr head",
+        )
+        .unwrap();
+        repo.reference(
+            "refs/pull/42/merge",
+            Oid::from_str(&second).unwrap(),
+            false,
+            "pr merge",
+        )
+        .unwrap();
+        (url, first, second)
+    }
+
     fn mirror(repos: Vec<ControllerRepo>) -> (tempfile::TempDir, Mirror) {
         let tmp = tempfile::tempdir().unwrap();
         let artifacts = tmp.path().join("artifacts");
@@ -887,5 +1345,156 @@ mod tests {
         let mut file = std::fs::File::create(mirror.root.join("probe")).unwrap();
         file.write_all(b"x").unwrap();
         assert!(mirror.root.exists());
+    }
+
+    #[test]
+    fn pull_refs_build_one_exact_fetch_refspec() {
+        let head = PullRef {
+            number: "42".to_owned(),
+            kind: PullKind::Head,
+        };
+        assert_eq!(head.full_ref(), "refs/pull/42/head");
+        assert_eq!(
+            head.fetch_refspec(),
+            "+refs/pull/42/head:refs/lu-pr/42/head"
+        );
+        let merge = PullRef {
+            number: "7".to_owned(),
+            kind: PullKind::Merge,
+        };
+        assert_eq!(
+            merge.fetch_refspec(),
+            "+refs/pull/7/merge:refs/lu-pr/7/merge"
+        );
+        assert!(parse_pull_ref("refs/pull/42/head").is_some());
+        assert!(parse_pull_ref("refs/pull/42/merge").is_some());
+    }
+
+    #[test]
+    fn wildcards_revision_expressions_and_malformed_pr_refs_are_rejected() {
+        for bad in [
+            "+refs/pull/42/head",
+            "+refs/heads/*",
+            "refs/pull/*/head",
+            "refs/pull/42/*",
+            "refs/pull/42/HEAD",
+            "refs/pull/42/head/extra",
+            "refs/pull//head",
+            "refs/pull/abc/head",
+            "refs/pull/42/merge?",
+            "refs/remotes/origin/main",
+            "refs/lu-pr/42/head",
+            "main^{tree}",
+            "main~1",
+            "-oProxyCommand=echo",
+            "release/../main",
+            "",
+        ] {
+            assert!(
+                parse_requested_ref(bad).is_none(),
+                "{bad:?} must not be a job ref"
+            );
+        }
+        assert!(parse_requested_ref("main").is_some());
+        assert!(parse_requested_ref("release/1.0").is_some());
+        assert!(parse_requested_ref("refs/tags/v1").is_some());
+        assert!(parse_requested_ref(&"a".repeat(40)).is_some());
+    }
+
+    #[test]
+    fn ensure_resolved_fetches_only_the_exact_pr_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (url, first, second) = local_repo_with_pull(tmp.path());
+        let (_dir, mirror) = mirror(vec![repo_config(&url)]);
+
+        assert_eq!(
+            mirror
+                .ensure_resolved("local", "refs/pull/42/head")
+                .unwrap(),
+            first
+        );
+        let path = mirror.mirror_path("local");
+        let fetched = Repository::open(&path).unwrap();
+        assert_eq!(
+            fetched
+                .find_reference("refs/lu-pr/42/head")
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id()
+                .to_string(),
+            first
+        );
+        assert!(
+            fetched.find_reference("refs/heads/main").is_err(),
+            "a PR fetch must not also fetch wildcard branch heads"
+        );
+        assert_eq!(
+            mirror.resolve("local", "refs/pull/42/head"),
+            Some(first.clone())
+        );
+        assert_eq!(
+            mirror
+                .ensure_resolved("local", "refs/pull/42/merge")
+                .unwrap(),
+            second
+        );
+        assert!(Repository::open(&path)
+            .unwrap()
+            .find_reference("refs/lu-pr/42/merge")
+            .is_ok());
+    }
+
+    #[test]
+    fn invalid_pr_refs_are_rejected_before_any_fetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (url, _, _) = local_repo_with_pull(tmp.path());
+        let (_dir, mirror) = mirror(vec![repo_config(&url)]);
+        for bad in [
+            "refs/pull/*/head",
+            "refs/pull/42/head/merge",
+            "refs/pull/42/merge/../head",
+            "+refs/pull/42/head",
+            "refs/pull/42/foo",
+        ] {
+            let error = mirror.ensure_resolved("local", bad).unwrap_err();
+            assert!(error.is_unknown_ref(), "{bad}: {error}");
+        }
+        assert!(
+            !mirror.mirror_path("local").exists(),
+            "an invalid ref must never start a mirror fetch"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn configured_mirror_token_file_is_private_and_never_leaks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_file = tmp.path().join("token");
+        std::fs::write(&token_file, "super-secret-token\n").unwrap();
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut config = repo_config(&format!("file://{}", tmp.path().join("missing").display()));
+        config.name = "private".to_owned();
+        let artifacts = tmp.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let mirror = Mirror::new_with_credentials(
+            vec![config.clone()],
+            vec![MirrorCredential {
+                name: "private".to_owned(),
+                token_file: token_file.display().to_string(),
+            }],
+            &artifacts,
+        )
+        .unwrap();
+
+        let credential = mirror.credential_for(&config).unwrap().unwrap();
+        assert_eq!(credential.password, "super-secret-token");
+        let error = mirror.sync("private").unwrap_err().to_string();
+        assert!(!error.contains("super-secret-token"), "{error}");
+
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(mirror.credential_for(&config).is_err());
     }
 }
