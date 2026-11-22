@@ -26,7 +26,7 @@ systemd units are in [install.md](install.md); the agent's isolation model is in
 4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store has schema version 9. It creates or verifies the schema at startup and refuses a database whose schema version is newer than the binary supports. Schema 5 adds the nullable `assigned_provider` and `assigned_model` job columns, schema 6 adds `diff_bytes`, which backs the `no changes` note, schema 7 adds `expect_failed`, which backs the `expect failed` note, schema 8 adds `reason` and `set_at_unix` to cordons, which back their API details, and schema 9 adds `dispatch_seq`, the persisted submission order used by queue dispatch; an older database upgrades on open, existing cordons get the reason `Cordoned before upgrade` and the upgrade time as their set time, and existing jobs are numbered by their recorded creation order. Downgrades are not supported; roll back by restoring the matching database backup as well as the older binary.
+The store uses schema version 1. It creates the schema for a new database and refuses a database with any other schema version with a clear message telling the operator to create a new database. Downgrades and in-place upgrades from older schema versions are not supported; create a new database for this binary. Backup and restore follow the same rule.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
 
@@ -116,7 +116,7 @@ systemctl start lu-controller.service
 
 `lu restore` verifies the snapshot, refuses a file that is not a Lu database (an empty or
 foreign SQLite file would replace your data with nothing), checks that every Lu table required by
-its schema version is present, rejects a schema newer than the binary supports, and refuses when
+its schema version is supported, and refuses when
 the database is still in use, so stop the controller first.
 Only one restore runs at a time. It stages the copy beside the database with the old file's
 owner and mode `0600`, moves the current database and every `-wal`, `-shm` and `-journal` file

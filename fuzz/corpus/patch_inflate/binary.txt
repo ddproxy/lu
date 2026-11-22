@@ -1,0 +1,5 @@
+diff --git a/a.bin b/a.bin
+GIT binary patch
+literal 4
+Lc$3x000000000000
+

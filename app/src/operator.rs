@@ -64,9 +64,6 @@ pub struct SubmitArgs {
     /// Only run after the job with this idempotency key (repeatable).
     #[arg(long = "after-key")]
     pub after_key: Vec<String>,
-    /// Do not apply dependency diffs to this job's tree.
-    #[arg(long)]
-    pub no_stack: bool,
     /// Stage dependency artifacts under .lu/inputs: none, files, apply or both.
     #[arg(long, value_name = "MODE")]
     pub collect: Option<CollectMode>,
@@ -512,8 +509,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         stuck_after_secs: args.stuck_after,
         idempotency_key: args.key,
         after,
-        stack_dependencies: !args.no_stack,
-        collect: args.collect,
+        collect: args.collect.unwrap_or_default(),
         include_failed: args.include_failed,
         on_conflict: args.on_conflict,
         allow_empty: args.allow_empty,
@@ -592,8 +588,7 @@ async fn collect_inner(args: CollectArgs, config: &Path, json: bool) -> Result<E
         stuck_after_secs: None,
         idempotency_key: args.key,
         after,
-        stack_dependencies: true,
-        collect: Some(CollectMode::Both),
+        collect: CollectMode::Both,
         include_failed,
         on_conflict: OnConflict::Markers,
         allow_empty: false,
@@ -681,7 +676,7 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
         spec.fallbacks.clear();
     }
     if let Some(collect) = args.collect {
-        spec.collect = Some(collect);
+        spec.collect = collect;
     }
     if args.include_failed {
         spec.include_failed = true;
@@ -1007,9 +1002,9 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
                 }
             }));
             let cordons: Vec<String> = node
-                .cordons
+                .cordon_details
                 .iter()
-                .map(|provider| format!("!{provider}"))
+                .map(|cordon| format!("!{}", cordon.provider))
                 .collect();
             vec![
                 node.name.to_string(),

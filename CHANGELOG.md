@@ -5,6 +5,19 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Updated dependencies: `getrandom` 0.4, `sha2` 0.11, `toml` 1.2, and minor/patch bumps of `clap`, `flate2`, `libc` and `serde_json`.
+### Removed
+
+- Removed `JobSpec.stack_dependencies` and the `--no-stack` flag from the CLI and MCP; dependency handling is controlled by `collect`.
+- Removed the bare `cordons` name list from node views; `cordon_details` is the only cordon field.
+- Collapsed the store migration chain into a single baseline schema version 1. Databases with any other schema version are refused with a message telling the operator to create a new database; backup and restore follow the same rule.
+- Removed `docs/stable-fields.md` and its navigation links.
+### Added
+
+- Cargo-fuzz harnesses for untrusted-input parsers (binary patch preflight and apply, staging and artifact paths, job specs, TOML config, IDs, controller wire requests and secret scrubbing), with hand-written seed corpora and a weekly `fuzz.yml` workflow that runs each target for 120 seconds and uploads crashing inputs.
+
 ### Fixed
 
 - `lu restore` now verifies that a snapshot contains every Lu table for its schema version, not just a matching schema version stamp. A file with a forged or stale version but missing `jobs`, `nodes`, `cordons`, `idempotency` or `job_deps` tables is refused before it can replace the live database.

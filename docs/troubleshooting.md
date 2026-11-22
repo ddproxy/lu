@@ -115,7 +115,7 @@ The first call is `-32602` because `limit` is at most 100. The second returns a 
 
 ## Recovery and backups
 
-The store expects schema version `9`. A newer database is refused at startup; downgrades are not supported. Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
+The store expects schema version `1`. A database with any other schema version is refused at startup; create a new database for this binary. Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
 
 `lu backup` and `lu restore` procedures, including interrupted restores and artifact snapshots, are in [operations.md](operations.md#backup-and-restore).
 

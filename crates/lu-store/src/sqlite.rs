@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use lu_proto::{
-    effective_collect, ArtifactName, CancelEffect, Completion, FailureClass, Heartbeat, JobEdit,
-    JobId, JobSpec, JobState, NodeName, Outcome, MAX_COLLECT_BYTES, MAX_LOG_BYTES,
+    ArtifactName, CancelEffect, Completion, FailureClass, Heartbeat, JobEdit, JobId, JobSpec,
+    JobState, NodeName, Outcome, MAX_COLLECT_BYTES, MAX_LOG_BYTES,
 };
 
 use crate::{
@@ -201,77 +201,32 @@ impl SqliteStore {
             .optional()
             .map_err(internal)?;
         match ver {
-            Some(v) if v > CURRENT_SCHEMA_VERSION => {
-                return Err(internal(format!(
-                    "database schema version {v} is newer than supported {CURRENT_SCHEMA_VERSION}"
-                )));
-            }
             Some(v) if v == CURRENT_SCHEMA_VERSION => {
                 tx.commit().map_err(internal)?;
-                return Ok(());
+                Ok(())
             }
-            Some(v) => {
-                if v < 1 {
-                    apply_v1(&tx)?;
-                }
-                if v < 2 {
-                    apply_v2(&tx)?;
-                }
-                if v < 3 {
-                    apply_v3(&tx)?;
-                }
-                if v < 4 {
-                    apply_v4(&tx)?;
-                }
-                if v < 5 {
-                    apply_v5(&tx)?;
-                }
-                if v < 6 {
-                    apply_v6(&tx)?;
-                }
-                if v < 7 {
-                    apply_v7(&tx)?;
-                }
-                if v < 8 {
-                    apply_v8(&tx)?;
-                }
-                if v < 9 {
-                    apply_v9(&tx)?;
-                }
-                tx.execute("DELETE FROM schema_version", [])
-                    .map_err(internal)?;
-                tx.execute(
-                    "INSERT INTO schema_version(version) VALUES (?1)",
-                    params![CURRENT_SCHEMA_VERSION],
-                )
-                .map_err(internal)?;
-            }
+            Some(v) => Err(internal(format!(
+                "database schema version {v} is not supported; create a new database (this binary supports schema version {CURRENT_SCHEMA_VERSION})"
+            ))),
             None => {
-                apply_v1(&tx)?;
-                apply_v2(&tx)?;
-                apply_v3(&tx)?;
-                apply_v4(&tx)?;
-                apply_v5(&tx)?;
-                apply_v6(&tx)?;
-                apply_v7(&tx)?;
-                apply_v8(&tx)?;
-                apply_v9(&tx)?;
+                apply_baseline(&tx)?;
                 tx.execute(
                     "INSERT INTO schema_version(version) VALUES (?1)",
                     params![CURRENT_SCHEMA_VERSION],
                 )
                 .map_err(internal)?;
+                tx.commit().map_err(internal)?;
+                Ok(())
             }
         }
-        tx.commit().map_err(internal)?;
-        Ok(())
     }
 }
 
-fn apply_v1(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+fn apply_baseline(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS jobs (
+        "CREATE TABLE jobs (
             id TEXT PRIMARY KEY,
+            dispatch_seq INTEGER NOT NULL,
             state TEXT NOT NULL,
             spec_json TEXT NOT NULL,
             attempt INTEGER NOT NULL,
@@ -288,34 +243,35 @@ fn apply_v1(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
             cancel_requested INTEGER NOT NULL,
             log_len INTEGER NOT NULL,
             lease_until_mono_ms INTEGER,
-            recovering_since_mono_ms INTEGER
+            recovering_since_mono_ms INTEGER,
+            assigned_provider TEXT,
+            assigned_model TEXT,
+            diff_bytes INTEGER,
+            expect_failed INTEGER NOT NULL DEFAULT 0
         );
-        CREATE TABLE IF NOT EXISTS nodes (
+        CREATE TABLE nodes (
             name TEXT PRIMARY KEY,
             heartbeat_json TEXT NOT NULL,
             last_seen_wall INTEGER NOT NULL,
             last_seen_mono_ms INTEGER NOT NULL,
             draining INTEGER NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS cordons (
+        CREATE TABLE cordons (
             node TEXT NOT NULL,
             provider TEXT NOT NULL,
             until_mono_ms INTEGER NOT NULL,
+            reiki_derived INTEGER NOT NULL DEFAULT 0,
+            healthy_hb_count INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            set_at_unix INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(node, provider)
         );
-        CREATE TABLE IF NOT EXISTS idempotency (
+        CREATE TABLE idempotency (
             key TEXT PRIMARY KEY,
             spec_hash TEXT NOT NULL,
             job_id TEXT NOT NULL
-        );",
-    )
-    .map_err(internal)?;
-    Ok(())
-}
-
-fn apply_v2(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS job_deps (
+        );
+        CREATE TABLE job_deps (
             job TEXT NOT NULL,
             dep TEXT NOT NULL,
             ord INTEGER NOT NULL,
@@ -323,106 +279,11 @@ fn apply_v2(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
             FOREIGN KEY(job) REFERENCES jobs(id),
             FOREIGN KEY(dep) REFERENCES jobs(id)
         );
-        CREATE INDEX IF NOT EXISTS job_deps_dep ON job_deps(dep);",
+        CREATE INDEX job_deps_dep ON job_deps(dep);
+        CREATE INDEX jobs_idempotency_key
+            ON jobs(json_extract(spec_json, '$.idempotency_key'));",
     )
     .map_err(internal)?;
-    Ok(())
-}
-
-fn apply_v3(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
-    // Reiki-derived cordons yield to live health, so they also need a streak counter. Rows from
-    // older databases keep their time-based behaviour (both columns default to false/zero).
-    tx.execute_batch(
-        "ALTER TABLE cordons ADD COLUMN reiki_derived INTEGER NOT NULL DEFAULT 0;
-         ALTER TABLE cordons ADD COLUMN healthy_hb_count INTEGER NOT NULL DEFAULT 0;",
-    )
-    .map_err(internal)?;
-    Ok(())
-}
-
-fn apply_v4(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
-    // The key lives inside spec_json; this index keeps key lookups off a full table scan.
-    tx.execute_batch(
-        "CREATE INDEX IF NOT EXISTS jobs_idempotency_key
-             ON jobs(json_extract(spec_json, '$.idempotency_key'));",
-    )
-    .map_err(internal)?;
-    Ok(())
-}
-
-fn apply_v5(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
-    // Nullable: a queued job, or one submitted before this schema, has no chosen pair.
-    tx.execute_batch(
-        "ALTER TABLE jobs ADD COLUMN assigned_provider TEXT;
-         ALTER TABLE jobs ADD COLUMN assigned_model TEXT;",
-    )
-    .map_err(internal)?;
-    Ok(())
-}
-
-fn apply_v6(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
-    // Nullable: a job from before this schema has no recorded size, even with a diff file.
-    tx.execute_batch("ALTER TABLE jobs ADD COLUMN diff_bytes INTEGER;")
-        .map_err(internal)?;
-    Ok(())
-}
-
-fn apply_v7(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
-    let exists: bool = tx
-        .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='expect_failed'")
-        .map_err(internal)?
-        .exists([])
-        .map_err(internal)?;
-    if !exists {
-        tx.execute_batch("ALTER TABLE jobs ADD COLUMN expect_failed INTEGER NOT NULL DEFAULT 0;")
-            .map_err(internal)?;
-    }
-    Ok(())
-}
-
-fn apply_v8(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
-    // Existing cordons have no recorded origin: give them a readable reason and the migration
-    // time as their set time. New writes always supply both.
-    tx.execute_batch(
-        "ALTER TABLE cordons ADD COLUMN reason TEXT NOT NULL DEFAULT '';
-         ALTER TABLE cordons ADD COLUMN set_at_unix INTEGER NOT NULL DEFAULT 0;
-         UPDATE cordons SET reason='Cordoned before upgrade',
-             set_at_unix=CAST(strftime('%s','now') AS INTEGER) WHERE set_at_unix=0;",
-    )
-    .map_err(internal)?;
-    Ok(())
-}
-
-/// Persists submission order independently of wall clocks. Ids and `created_at` are still wall
-/// clock based (they are shown to people), but queue order must survive clock steps and submissions
-/// inside the same millisecond. Existing rows are backfilled in their best-known creation order.
-fn apply_v9(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
-    let exists: bool = tx
-        .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name='dispatch_seq'")
-        .map_err(internal)?
-        .exists([])
-        .map_err(internal)?;
-    if exists {
-        return Ok(());
-    }
-    tx.execute_batch("ALTER TABLE jobs ADD COLUMN dispatch_seq INTEGER NOT NULL DEFAULT 0;")
-        .map_err(internal)?;
-    let ids: Vec<String> = {
-        let mut stmt = tx
-            .prepare("SELECT id FROM jobs ORDER BY created_at ASC, id ASC")
-            .map_err(internal)?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(internal)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(internal)?
-    };
-    for (seq, id) in ids.iter().enumerate() {
-        tx.execute(
-            "UPDATE jobs SET dispatch_seq=?1 WHERE id=?2",
-            params![(seq + 1) as i64, id],
-        )
-        .map_err(internal)?;
-    }
     Ok(())
 }
 
@@ -818,11 +679,7 @@ impl Store for SqliteStore {
                 .optional()
                 .map_err(internal)?;
             if let Some((hash, job_id)) = existing {
-                // A spec stored before `priority` existed has a shorter canonical form. Treat an
-                // equal decoded spec as the same submission so an old key still deduplicates.
-                let same = hash == canonical
-                    || serde_json::from_str::<JobSpec>(&hash).is_ok_and(|old| old == *spec);
-                if same {
+                if hash == canonical {
                     let (rec, _, _) = get_job_tx(&tx, &job_id)?;
                     tx.commit().map_err(internal)?;
                     return Ok((rec, false));
@@ -842,8 +699,7 @@ impl Store for SqliteStore {
             )
             .map_err(internal)?;
         let mut blocked = false;
-        let collects_files =
-            effective_collect(spec.collect, spec.stack_dependencies).collects_files();
+        let collects_files = spec.collect.collects_files();
         let mut collected_bytes = 0u64;
         for dep in &spec.after {
             let (dep_state, diff_bytes): (Option<String>, Option<i64>) = tx
@@ -1018,8 +874,6 @@ impl Store for SqliteStore {
 
     fn job_by_key(&self, key: &str) -> Option<JobRecord> {
         let conn = self.conn.lock().ok()?;
-        // Ids sort by creation time, so DESC picks the newest if a legacy database holds more
-        // than one job with the same key.
         let t: JobTuple = conn
             .query_row(
                 "SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model,expect_failed FROM jobs
@@ -2321,7 +2175,6 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
 
     static CTR: AtomicU64 = AtomicU64::new(0);
 
@@ -2370,8 +2223,7 @@ mod tests {
             stuck_after_secs: None,
             idempotency_key: Some("k".to_owned()),
             after: Vec::new(),
-            stack_dependencies: true,
-            collect: None,
+            collect: lu_proto::CollectMode::Apply,
             include_failed: false,
             on_conflict: Default::default(),
             priority: lu_proto::DEFAULT_PRIORITY,
@@ -2406,267 +2258,6 @@ mod tests {
     }
 
     #[test]
-    fn job_by_key_returns_the_newest_of_duplicate_keys() {
-        let p = temp_db("duplicate-key.sqlite");
-        let now = Now {
-            wall_unix: 1,
-            mono_ms: 1,
-        };
-        let (old_id, new_id) = {
-            let s = SqliteStore::open(&p).unwrap();
-            let old = s
-                .create_job(
-                    &crate::conformance::spec("https://x/old.git", Some("dup")),
-                    now,
-                )
-                .unwrap()
-                .0;
-            std::thread::sleep(Duration::from_millis(2));
-            let new = s
-                .create_job(
-                    &crate::conformance::spec("https://x/new.git", Some("other")),
-                    now,
-                )
-                .unwrap()
-                .0;
-            assert!(old.id < new.id);
-            (old.id, new.id)
-        };
-        // A legacy database can hold two jobs whose spec carries the same key.
-        let conn = rusqlite::Connection::open(&p).unwrap();
-        conn.execute(
-            "UPDATE jobs SET spec_json=replace(spec_json, '\"idempotency_key\":\"other\"', '\"idempotency_key\":\"dup\"') WHERE id=?1",
-            params![new_id.as_str()],
-        )
-        .unwrap();
-        drop(conn);
-
-        let s = SqliteStore::open(&p).unwrap();
-        assert_eq!(s.job_by_key("dup").unwrap().id, new_id);
-        assert_ne!(s.job_by_key("dup").unwrap().id, old_id);
-        assert!(s.job_by_key("other").is_none());
-    }
-
-    #[test]
-    fn an_old_database_gains_the_key_index() {
-        let p = temp_db("migrate-key-index.sqlite");
-        let now = Now {
-            wall_unix: 1,
-            mono_ms: 1,
-        };
-        let id = {
-            let s = SqliteStore::open(&p).unwrap();
-            s.create_job(
-                &crate::conformance::spec("https://x/legacy.git", Some("legacy")),
-                now,
-            )
-            .unwrap()
-            .0
-            .id
-        };
-        // Rewind a current database to the previous schema and drop the new index and columns.
-        let conn = rusqlite::Connection::open(&p).unwrap();
-        conn.execute_batch(
-            "ALTER TABLE jobs DROP COLUMN assigned_provider;
-             ALTER TABLE jobs DROP COLUMN assigned_model;
-             ALTER TABLE jobs DROP COLUMN diff_bytes;
-             ALTER TABLE cordons DROP COLUMN reason;
-             ALTER TABLE cordons DROP COLUMN set_at_unix;
-             UPDATE schema_version SET version=3;
-             DROP INDEX jobs_idempotency_key;",
-        )
-        .unwrap();
-        drop(conn);
-
-        let s = SqliteStore::open(&p).unwrap();
-        let conn = s.conn.lock().unwrap();
-        let indexes: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='jobs_idempotency_key'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(indexes, 1);
-        let version: i64 = conn
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, crate::SCHEMA_VERSION);
-        drop(conn);
-        assert_eq!(s.job_by_key("legacy").unwrap().id, id);
-    }
-
-    #[test]
-    fn an_old_database_gains_assigned_choice_columns() {
-        let p = temp_db("migrate-assigned-choice.sqlite");
-        let now = Now {
-            wall_unix: 1,
-            mono_ms: 1,
-        };
-        let id = {
-            let s = SqliteStore::open(&p).unwrap();
-            let mut sp = crate::conformance::spec("https://x/legacy-choice.git", None);
-            sp.provider = Some("p1".to_owned());
-            sp.fallbacks = vec![lu_proto::Choice {
-                provider: "p2".to_owned(),
-                model: Some("m2".to_owned()),
-            }];
-            s.create_job(&sp, now).unwrap().0.id
-        };
-        // Rewind a current database to the previous schema and drop the new columns.
-        let conn = rusqlite::Connection::open(&p).unwrap();
-        conn.execute_batch(
-            "ALTER TABLE jobs DROP COLUMN assigned_provider;
-             ALTER TABLE jobs DROP COLUMN assigned_model;
-             ALTER TABLE jobs DROP COLUMN diff_bytes;
-             ALTER TABLE cordons DROP COLUMN reason;
-             ALTER TABLE cordons DROP COLUMN set_at_unix;
-             UPDATE schema_version SET version=4;",
-        )
-        .unwrap();
-        drop(conn);
-
-        let s = SqliteStore::open(&p).unwrap();
-        let conn = s.conn.lock().unwrap();
-        let columns: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM pragma_table_info('jobs')
-                 WHERE name IN ('assigned_provider','assigned_model')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(columns, 2);
-        let version: i64 = conn
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, crate::SCHEMA_VERSION);
-        drop(conn);
-        let rec = s.get_job(&id).unwrap();
-        assert_eq!(rec.spec.fallbacks.len(), 1);
-        assert_eq!(rec.assigned_provider, None);
-    }
-
-    #[test]
-    fn an_old_database_gains_the_diff_bytes_column() {
-        let p = temp_db("migrate-diff-bytes.sqlite");
-        let now = Now {
-            wall_unix: 1,
-            mono_ms: 1,
-        };
-        let id = {
-            let s = SqliteStore::open(&p).unwrap();
-            s.create_job(
-                &crate::conformance::spec("https://x/legacy-diff.git", None),
-                now,
-            )
-            .unwrap()
-            .0
-            .id
-        };
-        let conn = rusqlite::Connection::open(&p).unwrap();
-        conn.execute_batch(
-            "ALTER TABLE jobs DROP COLUMN diff_bytes;
-             ALTER TABLE cordons DROP COLUMN reason;
-             ALTER TABLE cordons DROP COLUMN set_at_unix;
-             UPDATE schema_version SET version=5;",
-        )
-        .unwrap();
-        drop(conn);
-
-        let s = SqliteStore::open(&p).unwrap();
-        let conn = s.conn.lock().unwrap();
-        let column: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM pragma_table_info('jobs') WHERE name='diff_bytes'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(column, 1);
-        let version: i64 = conn
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, crate::SCHEMA_VERSION);
-        drop(conn);
-        assert_eq!(s.get_job(&id).unwrap().diff_bytes, None);
-    }
-
-    #[test]
-    fn an_old_database_gains_a_monotonic_dispatch_sequence() {
-        let p = temp_db("migrate-dispatch-seq.sqlite");
-        let first = {
-            let s = SqliteStore::open(&p).unwrap();
-            s.create_job(
-                &crate::conformance::spec("https://x/seq-first.git", None),
-                crate::conformance::now(200, 1),
-            )
-            .unwrap()
-            .0
-            .id
-        };
-        let second = {
-            let s = SqliteStore::open(&p).unwrap();
-            s.create_job(
-                &crate::conformance::spec("https://x/seq-second.git", None),
-                crate::conformance::now(100, 2),
-            )
-            .unwrap()
-            .0
-            .id
-        };
-        // Rewind to schema 8, as an operator restoring an older database would have.
-        let conn = rusqlite::Connection::open(&p).unwrap();
-        conn.execute_batch(
-            "DROP INDEX IF EXISTS jobs_dispatch_order;
-             ALTER TABLE jobs DROP COLUMN dispatch_seq;
-             UPDATE schema_version SET version=8;",
-        )
-        .unwrap();
-        drop(conn);
-
-        let s = SqliteStore::open(&p).unwrap();
-        let conn = s.conn.lock().unwrap();
-        let version: i64 = conn
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, crate::SCHEMA_VERSION);
-        let backfilled: i64 = conn
-            .query_row(
-                "SELECT dispatch_seq FROM jobs WHERE id=?1",
-                params![second.as_str()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let later: i64 = conn
-            .query_row(
-                "SELECT dispatch_seq FROM jobs WHERE id=?1",
-                params![first.as_str()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(backfilled < later, "backfill preserves creation order");
-        drop(conn);
-        let third = s
-            .create_job(
-                &crate::conformance::spec("https://x/seq-third.git", None),
-                crate::conformance::now(1, 3),
-            )
-            .unwrap()
-            .0
-            .id;
-        let conn = s.conn.lock().unwrap();
-        let newest: i64 = conn
-            .query_row(
-                "SELECT dispatch_seq FROM jobs WHERE id=?1",
-                params![third.as_str()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(newest > later, "a new job follows every migrated job");
-    }
-
-    #[test]
     fn dependencies_survive_a_reopen() {
         let p = temp_db("deps.sqlite");
         let now = Now {
@@ -2697,69 +2288,25 @@ mod tests {
     }
 
     #[test]
-    fn refuses_newer_schema_version() {
-        let p = temp_db("newer.sqlite");
+    fn refuses_unsupported_schema_version() {
+        let p = temp_db("unsupported.sqlite");
         {
             let _s = SqliteStore::open(&p).unwrap();
         }
-        // bump version
-        let conn = rusqlite::Connection::open(&p).unwrap();
-        conn.execute("UPDATE schema_version SET version = 999", [])
-            .unwrap();
-        drop(conn);
-        let err = SqliteStore::open(&p).unwrap_err();
-        match err {
-            crate::StoreError::Internal(msg) => assert!(msg.contains("newer"), "{msg}"),
-            other => panic!("expected internal newer-version error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn v2_database_upgrades_without_changing_old_cordons() {
-        use lu_proto::{HarnessState, ProviderState};
-
-        let p = temp_db("v2.sqlite");
-        {
-            let mut conn = rusqlite::Connection::open(&p).unwrap();
-            conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL);")
+        for version in [0i64, 2, 9, 999] {
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            conn.execute("UPDATE schema_version SET version = ?1", params![version])
                 .unwrap();
-            let tx = conn.transaction().unwrap();
-            super::apply_v1(&tx).unwrap();
-            super::apply_v2(&tx).unwrap();
-            tx.execute("INSERT INTO schema_version(version) VALUES (2)", [])
-                .unwrap();
-            tx.execute(
-                "INSERT INTO cordons(node,provider,until_mono_ms) VALUES ('node-a','p1',9000)",
-                [],
-            )
-            .unwrap();
-            tx.commit().unwrap();
+            drop(conn);
+            let err = SqliteStore::open(&p).unwrap_err();
+            match err {
+                crate::StoreError::Internal(msg) => {
+                    assert!(msg.contains(&format!("schema version {version}")), "{msg}");
+                    assert!(msg.contains("create a new database"), "{msg}");
+                }
+                other => panic!("expected unsupported schema error, got {other:?}"),
+            }
         }
-        {
-            let s = SqliteStore::open(&p).unwrap();
-            let hb = crate::conformance::hb(
-                "node-a",
-                HarnessState::Idle,
-                vec![("p1", ProviderState::Ok)],
-            );
-            s.heartbeat(&hb, crate::conformance::now(1, 1)).unwrap();
-            s.heartbeat(&hb, crate::conformance::now(2, 2)).unwrap();
-            let nodes = s.nodes(crate::conformance::now(3, 3), 60_000).unwrap();
-            assert_eq!(nodes[0].cordons, vec!["p1"]);
-        }
-        let conn = rusqlite::Connection::open(&p).unwrap();
-        let version: i64 = conn
-            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, crate::SCHEMA_VERSION);
-        let (derived, streak): (i64, i64) = conn
-            .query_row(
-                "SELECT reiki_derived, healthy_hb_count FROM cordons WHERE node='node-a'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!((derived, streak), (0, 0));
     }
 
     #[test]

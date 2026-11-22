@@ -28,8 +28,7 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: key.map(|s| s.to_owned()),
         after: Vec::new(),
-        stack_dependencies: true,
-        collect: None,
+        collect: lu_proto::CollectMode::Apply,
         include_failed: false,
         on_conflict: Default::default(),
         allow_empty: false,
@@ -540,7 +539,7 @@ fn collect_size_is_checked_at_submit<S: Store>(s: &S) {
         spec("https://x/collect-dependent.git", None),
         std::slice::from_ref(&dep.id),
     );
-    dependent.collect = Some(CollectMode::Files);
+    dependent.collect = CollectMode::Files;
     let err = s.create_job(&dependent, now(4, 4)).unwrap_err();
     assert!(
         matches!(&err, StoreError::InvalidSpec(message) if message.contains("collect") && message.contains("over the")),
@@ -548,7 +547,7 @@ fn collect_size_is_checked_at_submit<S: Store>(s: &S) {
     );
 
     // Without file collection the same dependency size is still acceptable.
-    dependent.collect = Some(CollectMode::None);
+    dependent.collect = CollectMode::None;
     let (accepted, _) = s.create_job(&dependent, now(4, 4)).unwrap();
     assert_eq!(accepted.state, JobState::Blocked);
 }

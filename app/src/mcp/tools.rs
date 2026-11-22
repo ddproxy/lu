@@ -246,15 +246,10 @@ const RETRY_TIMEOUT_SECS_FIELD: Field = timeout_field("timeout_secs", false);
 const RETRY_TIMEOUT_FIELD: Field = timeout_field("timeout", false);
 const IDLE_TIMEOUT_SECS_FIELD: Field = idle_timeout_field("idle_timeout_secs");
 const IDLE_TIMEOUT_FIELD: Field = idle_timeout_field("idle_timeout");
-const NO_STACK_FIELD: Field = optional(
-    "no_stack",
-    "boolean",
-    "Do not apply dependency diffs to this job's tree",
-);
 const COLLECT_FIELD: Field = optional(
     "collect",
     "string",
-    "Collect dependency inputs into .lu/inputs: none, files, apply or both; aliases: off, false, diffs, diff, patches, patch; defaults to the no_stack behaviour when absent",
+    "Collect dependency inputs into .lu/inputs: none, files, apply or both; aliases: off, false, diffs, diff, patches, patch; defaults to apply",
 );
 const INCLUDE_FAILED_FIELD: Field = optional(
     "include_failed",
@@ -372,7 +367,6 @@ static JOB_FIELDS: &[Field] = &[
     optional("model", "string", "Model name"),
     REQUIRE_FIELD,
     FALLBACKS_FIELD,
-    NO_STACK_FIELD,
     COLLECT_FIELD,
     INCLUDE_FAILED_FIELD,
     PRIORITY_FIELD,
@@ -497,7 +491,6 @@ const TOOLS: &[ToolDef] = &[
             optional("model", "string", "Model name"),
             REQUIRE_FIELD,
             FALLBACKS_FIELD,
-            NO_STACK_FIELD,
             COLLECT_FIELD,
             EXPECT_FILES_FIELD,
             EXPECT_CHANGED_FIELD,
@@ -581,7 +574,6 @@ const TOOLS: &[ToolDef] = &[
             optional("model", "string", "Replace the model name"),
             REQUIRE_FIELD,
             FALLBACKS_FIELD,
-            NO_STACK_FIELD,
             EXPECT_FILES_FIELD,
             EXPECT_CHANGED_FIELD,
             FORBID_CHANGED_FIELD,
@@ -1060,11 +1052,7 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
         stuck_after_secs: spec_stuck_after(args),
         idempotency_key: optional_string(args, "key"),
         after,
-        stack_dependencies: !args
-            .get("no_stack")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        collect: spec_collect(args)?,
+        collect: spec_collect(args)?.unwrap_or_default(),
         include_failed: args
             .get("include_failed")
             .and_then(Value::as_bool)
@@ -1164,8 +1152,7 @@ fn submit_output(view: &JobView) -> ToolOutput {
                     "provider": clean(&choice.provider),
                     "model": choice.model.as_deref().map(clean)
                 })).collect::<Vec<_>>(),
-                "stack_dependencies": view.spec.stack_dependencies,
-                "collect": view.spec.collect.map(|mode| mode.as_str()),
+                "collect": view.spec.collect.as_str(),
                 "include_failed": view.spec.include_failed,
                 "priority": view.spec.priority,
                 "group": view.spec.group.as_deref().map(clean),
@@ -1544,11 +1531,8 @@ async fn retry(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     if args.get("fallbacks").is_some() {
         spec.fallbacks = spec_fallbacks(args);
     }
-    if let Some(no_stack) = args.get("no_stack").and_then(Value::as_bool) {
-        spec.stack_dependencies = !no_stack;
-    }
     if let Some(collect) = spec_collect(args)? {
-        spec.collect = Some(collect);
+        spec.collect = collect;
     }
     if let Some(include_failed) = args.get("include_failed").and_then(Value::as_bool) {
         spec.include_failed = include_failed;
@@ -1980,17 +1964,11 @@ async fn nodes(host: &Host) -> Result<ToolOutput, ToolError> {
         let item = items
             .iter()
             .find(|item| item["name"].as_str() == Some(node.name.as_str()));
-        let cordons = item
-            .and_then(|item| item["cordons"].as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(clean)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         let cordon_details = cordon_detail_rows(item);
+        let cordons = cordon_details
+            .iter()
+            .filter_map(|c| c["provider"].as_str().map(clean))
+            .collect::<Vec<_>>();
         let stats = client
             .node_stats_raw(&node.name)
             .await
@@ -2021,7 +1999,6 @@ async fn nodes(host: &Host) -> Result<ToolOutput, ToolError> {
             "disk_total_bytes": disk_total,
             "disk_free_percent": disk_percent,
             "stuck": node.stuck,
-            "cordons": cordons,
             "cordon_details": cordon_details
         });
         lines.push(format!(
@@ -2039,7 +2016,7 @@ async fn nodes(host: &Host) -> Result<ToolOutput, ToolError> {
             row["mem_available_kb"],
             row["mem_total_kb"],
             row["stuck"],
-            row["cordons"]
+            json!(cordons)
         ));
         rows.push(row);
     }
@@ -2069,17 +2046,11 @@ async fn node(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     let item = items
         .iter()
         .find(|item| item["name"].as_str() == Some(name.as_str()));
-    let cordons = item
-        .and_then(|item| item["cordons"].as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(clean)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let cordon_details = cordon_detail_rows(item);
+    let cordons = cordon_details
+        .iter()
+        .filter_map(|c| c["provider"].as_str().map(clean))
+        .collect::<Vec<_>>();
 
     let stats_raw = client.node_stats_raw(&name).await.map_err(failure)?;
     let stats = parse_node_stats(&stats_raw)?;
@@ -2111,7 +2082,6 @@ async fn node(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
         "disk_free_percent": disk_percent,
         "running_jobs": stats.jobs.len(),
         "stuck": view.stuck,
-        "cordons": cordons,
         "cordon_details": cordon_details
     });
     let mut structured = row.clone();
@@ -2136,7 +2106,7 @@ async fn node(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
         row["uptime_secs"],
         row["running_jobs"],
         row["stuck"],
-        row["cordons"]
+        json!(cordons)
     );
     Ok(ToolOutput { text, structured })
 }

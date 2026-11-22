@@ -69,17 +69,14 @@ An unreadable or otherwise invalid patch is also a conflict; its detail is appen
 summary instead of a path list. Patches applied before the failing one remain in the exported
 diff and are listed in `applied_dependencies`.
 
-Pass `--no-stack` to set `stack_dependencies: false`. The job still waits for its dependencies,
-but the harness runs on the dependent's own base tree alone and no dependency diffs are applied.
+Set `--collect none` to wait for dependencies without applying their diffs or staging files.
 
 ## Collecting inputs
 
-`--collect <mode>` stages dependency artifacts under `.lu/inputs` before the harness starts. The
-modes are `none` (default), `files`, `apply` and `both`; aliases `off`, `false`, `diffs`, `diff`,
-`patches` and `patch` are accepted. An explicit mode wins over `stack_dependencies`, so
-`--no-stack --collect files` collects files without applying diffs. When `collect` is absent,
-`stack_dependencies` keeps its meaning: `true` behaves like `apply`, `false` like `none`. `apply`
-and `both` apply each input's `diff.patch` in `after` order.
+`--collect <mode>` controls dependency inputs. The modes are `none`, `files`, `apply` and `both`;
+default is `apply`. Aliases `off`, `false`, `diffs`, `diff`, `patches` and `patch` are accepted.
+`files` and `both` stage dependency artifacts under `.lu/inputs` before the harness starts;
+`apply` and `both` apply each input's `diff.patch` in `after` order.
 
 Inputs are the job's `after` dependencies. A `done` dependency is always an input. A `failed` or
 `cancelled` dependency becomes an input only when `--include-failed` is set and that job stored a

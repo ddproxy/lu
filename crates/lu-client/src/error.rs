@@ -82,6 +82,12 @@ impl ApiError {
         }
     }
 
+    /// Fuzz-only entry point for the redaction that `Client::scrub` applies to every error.
+    #[cfg(feature = "fuzzing")]
+    pub fn redact_for_fuzzing(&mut self, secret: &str) {
+        self.redact(secret);
+    }
+
     /// A short, display-safe explanation. Never includes the bearer token.
     pub fn message(&self) -> String {
         match self {

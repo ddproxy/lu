@@ -1,0 +1,91 @@
+[package]
+name = "lu-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+git2 = { version = "0.21", default-features = false }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "rt"] }
+
+lu-auth = { path = "../crates/lu-auth" }
+lu-client = { path = "../crates/lu-client", features = ["fuzzing"] }
+lu-config = { path = "../crates/lu-config" }
+lu-controller = { path = "../crates/lu-controller" }
+lu-proto = { path = "../crates/lu-proto" }
+lu-staging = { path = "../crates/lu-staging" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[[bin]]
+name = "patch_inflate"
+path = "fuzz_targets/patch_inflate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "patch_apply"
+path = "fuzz_targets/patch_apply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "staging_path"
+path = "fuzz_targets/staging_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "artifact_path"
+path = "fuzz_targets/artifact_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "job_spec"
+path = "fuzz_targets/job_spec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ids"
+path = "fuzz_targets/ids.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_request"
+path = "fuzz_targets/wire_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "secret_scrub"
+path = "fuzz_targets/secret_scrub.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -1,7 +1,6 @@
 //! Randomised model-based tests for any [`Store`]. Each seed replays a fixed operation script
 //! against a fresh store and checks the lifecycle invariants after every step.
 
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -30,6 +29,9 @@ struct CordonModel {
     source: CordonSource,
     reason: String,
     set_at_unix: i64,
+    /// Consecutive healthy heartbeats seen since the Reiki cordon was set; the store lifts it at
+    /// two. Failure cordons ignore this counter.
+    healthy_hb_count: u64,
 }
 
 const PROVIDERS: [&str; 2] = ["prov-a", "prov-b"];
@@ -318,7 +320,7 @@ impl Rng {
 
 /// Runs the normal model test against a store created by `make`.
 pub fn run<S: Store>(make: impl Fn() -> S) {
-    for seed in SEEDS {
+    for &seed in &SEEDS {
         run_one(&make, seed, OPS);
     }
 }
@@ -332,27 +334,9 @@ pub fn run_long<S: Store>(make: impl Fn() -> S) {
 
 fn run_one<S: Store>(make: &impl Fn() -> S, seed: u64, ops: usize) {
     let log: SharedLog = Arc::new(Mutex::new(Vec::new()));
-    let model_log = Arc::clone(&log);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let store = make();
-        let mut model = Model::new(seed, ops, store, model_log);
-        model.run();
-    }));
-    if let Err(payload) = result {
-        let message = panic_message(&payload);
-        let lines = log.lock().map(|l| l.join("\n")).unwrap_or_default();
-        panic!("model failed for seed {seed} (0x{seed:016X}):\n{lines}\n\n{message}");
-    }
-}
-
-fn panic_message(payload: &Box<dyn Any + Send>) -> String {
-    if let Some(text) = payload.downcast_ref::<&str>() {
-        (*text).to_owned()
-    } else if let Some(text) = payload.downcast_ref::<String>() {
-        text.clone()
-    } else {
-        "non-string panic payload".to_owned()
-    }
+    let store = make();
+    let mut model = Model::new(seed, ops, store, log);
+    model.run();
 }
 
 struct Model<S: Store> {
@@ -497,8 +481,7 @@ impl<S: Store> Model<S> {
             idempotency_key: None,
             after: Vec::new(),
             base_commit: None,
-            stack_dependencies: true,
-            collect: None,
+            collect: lu_proto::CollectMode::Apply,
             include_failed: false,
             on_conflict: Default::default(),
             allow_empty: false,
@@ -513,11 +496,29 @@ impl<S: Store> Model<S> {
         }
     }
 
+    /// Operation targets are chosen in submission order, not `JobId` order: ids contain wall time
+    /// and randomness, so an id-ordered walk would make one seed replay different scripts on
+    /// different machines. The store's own dispatch order is already submission order.
+    fn records_in_submit_order(&self) -> Vec<JobRecord> {
+        let mut records: Vec<JobRecord> = self.records.values().cloned().collect();
+        records.sort_by_key(|record| {
+            self.submit_order
+                .get(&record.id)
+                .copied()
+                .expect("every model job has a submission sequence")
+        });
+        records
+    }
+
     fn random_deps(&mut self) -> Vec<JobId> {
         if self.records.is_empty() || !self.rng.chance(1, 2) {
             return Vec::new();
         }
-        let ids: Vec<JobId> = self.records.keys().cloned().collect();
+        let ids: Vec<JobId> = self
+            .records_in_submit_order()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
         let start = self.rng.index(ids.len());
         let mut out = vec![ids[start].clone()];
         if ids.len() > 1 && self.rng.chance(1, 3) {
@@ -660,9 +661,39 @@ impl<S: Store> Model<S> {
             .heartbeat(&heartbeat, self.now)
             .expect("heartbeat");
         let name = node(name);
-        self.nodes.insert(name.clone(), heartbeat);
+        self.nodes.insert(name.clone(), heartbeat.clone());
         let generation = self.node_generation.entry(name).or_insert(0);
         *generation = generation.saturating_add(1);
+        self.refresh_reiki_cordons(&heartbeat);
+    }
+
+    /// Mirror `SqliteStore::refresh_reiki_cordons`: a Reiki cordon lifts after two consecutive
+    /// healthy readings for its provider, and any unhealthy reading restarts the streak. Without
+    /// this the model can keep excluding a provider the store has already uncordoned.
+    fn refresh_reiki_cordons(&mut self, heartbeat: &Heartbeat) {
+        let healthy: BTreeSet<&str> = heartbeat
+            .providers
+            .iter()
+            .filter(|p| p.state == ProviderState::Ok)
+            .map(|p| p.name.as_str())
+            .collect();
+        let mut lift = Vec::new();
+        for ((node, provider), cordon) in &mut self.cordons {
+            if node != &heartbeat.node || cordon.source != CordonSource::Reiki {
+                continue;
+            }
+            if healthy.contains(provider.as_str()) {
+                cordon.healthy_hb_count = cordon.healthy_hb_count.saturating_add(1);
+                if cordon.healthy_hb_count >= 2 {
+                    lift.push((node.clone(), provider.clone()));
+                }
+            } else {
+                cordon.healthy_hb_count = 0;
+            }
+        }
+        for key in lift {
+            self.cordons.remove(&key);
+        }
     }
 
     fn provider_ok(&self, name: &NodeName, provider: &str) -> bool {
@@ -775,8 +806,8 @@ impl<S: Store> Model<S> {
 
     fn op_start(&mut self) {
         let candidates: Vec<JobId> = self
-            .records
-            .values()
+            .records_in_submit_order()
+            .into_iter()
             .filter(|record| matches!(record.state, JobState::Leased | JobState::Recovering))
             .map(|record| record.id.clone())
             .collect();
@@ -817,8 +848,8 @@ impl<S: Store> Model<S> {
 
     fn op_renew(&mut self) {
         let candidates: Vec<JobId> = self
-            .records
-            .values()
+            .records_in_submit_order()
+            .into_iter()
             .filter(|record| active(record.state))
             .map(|record| record.id.clone())
             .collect();
@@ -860,7 +891,11 @@ impl<S: Store> Model<S> {
             self.note("reserve_log: no job");
             return;
         }
-        let ids: Vec<JobId> = self.records.keys().cloned().collect();
+        let ids: Vec<JobId> = self
+            .records_in_submit_order()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
         let id = ids[self.rng.index(ids.len())].clone();
         let record = self.records.get(&id).expect("target").clone();
         let wrong_epoch = self.rng.chance(1, 8);
@@ -918,8 +953,8 @@ impl<S: Store> Model<S> {
 
     fn op_record_artifact(&mut self) {
         let candidates: Vec<JobId> = self
-            .records
-            .values()
+            .records_in_submit_order()
+            .into_iter()
             .filter(|record| active(record.state))
             .map(|record| record.id.clone())
             .collect();
@@ -958,8 +993,8 @@ impl<S: Store> Model<S> {
 
     fn op_complete(&mut self) {
         let candidates: Vec<JobId> = self
-            .records
-            .values()
+            .records_in_submit_order()
+            .into_iter()
             .filter(|record| active(record.state))
             .map(|record| record.id.clone())
             .collect();
@@ -1011,10 +1046,13 @@ impl<S: Store> Model<S> {
         // `leased -> done` is not an edge: an agent reports done only after starting, so use a
         // job that has started (or downgrade to a failure the lease may legally report).
         if outcome == Outcome::Done && record.state == JobState::Leased {
-            let started = self.records.iter().find_map(|(other_id, other)| {
-                matches!(other.state, JobState::Running | JobState::Recovering)
-                    .then(|| (other_id.clone(), other.clone()))
-            });
+            let started = self
+                .records_in_submit_order()
+                .into_iter()
+                .find_map(|other| {
+                    matches!(other.state, JobState::Running | JobState::Recovering)
+                        .then(|| (other.id.clone(), other))
+                });
             match started {
                 Some((other_id, other)) => {
                     self.note(format!(
@@ -1122,6 +1160,7 @@ impl<S: Store> Model<S> {
                                     source,
                                     reason,
                                     set_at_unix: self.now.wall_unix,
+                                    healthy_hb_count: 0,
                                 },
                             );
                         }
@@ -1142,7 +1181,11 @@ impl<S: Store> Model<S> {
             self.note("cancel: no job");
             return;
         }
-        let ids: Vec<JobId> = self.records.keys().cloned().collect();
+        let ids: Vec<JobId> = self
+            .records_in_submit_order()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
         let id = ids[self.rng.index(ids.len())].clone();
         let record = self.records.get(&id).expect("target").clone();
         let effect = record.state.cancel_effect();
@@ -1557,5 +1600,77 @@ fn assert_acyclic(current: &BTreeMap<JobId, JobRecord>) {
         if !colour.contains_key(id) {
             visit(id, current, &mut colour);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::sqlite::SqliteStore;
+
+    static DB_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn fresh_store() -> SqliteStore {
+        let dir = std::env::temp_dir().join(format!(
+            "lu-model-cordon-{}-{}",
+            std::process::id(),
+            DB_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        SqliteStore::open(dir.join("db.sqlite")).unwrap()
+    }
+
+    /// Reiki cordons are a store behaviour the model must mirror: two consecutive healthy
+    /// heartbeats lift them. A stale model cordon makes an otherwise eligible job look blocked and
+    /// produces the `store assigned ... model expected none` panic.
+    #[test]
+    fn reiki_cordon_lifts_in_the_model_after_two_healthy_heartbeats() {
+        let log: SharedLog = Arc::new(Mutex::new(Vec::new()));
+        let store = fresh_store();
+        let mut model = Model::new(1, 10, store, log);
+        let name = node("node-a");
+        let key = (name.clone(), "prov-a".to_owned());
+
+        model
+            .store
+            .set_cordon(
+                &name,
+                "prov-a",
+                CordonSource::Reiki,
+                "Reiki cooldown for provider prov-a",
+                model.now.wall_unix,
+                i64::MAX,
+            )
+            .unwrap();
+        model.cordons.insert(
+            key.clone(),
+            CordonModel {
+                until: u64::MAX,
+                source: CordonSource::Reiki,
+                reason: "Reiki cooldown for provider prov-a".to_owned(),
+                set_at_unix: model.now.wall_unix,
+                healthy_hb_count: 0,
+            },
+        );
+
+        // Seed 900 makes the next two operations healthy heartbeats for node-a that still
+        // report prov-a as Ok, matching the store's streak counter.
+        model.rng = Rng(900);
+        model.op_heartbeat();
+        assert!(
+            model.cordons.contains_key(&key),
+            "first healthy beat is not enough"
+        );
+        assert_eq!(model.store.cordons(None).unwrap().len(), 1);
+        model.op_heartbeat();
+
+        assert!(
+            !model.cordons.contains_key(&key),
+            "model kept a Reiki cordon the store lifted"
+        );
+        assert!(model.store.cordons(None).unwrap().is_empty());
     }
 }

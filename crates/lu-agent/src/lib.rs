@@ -23,10 +23,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use lu_client::{ApiError, Controller};
 use lu_config::{AgentConfig, BaseSource, StuckPolicy as ConfigStuckPolicy};
 use lu_proto::{
-    effective_collect, effective_stuck, printable, truncate_chars, AgentEvent, ArtifactName,
-    Completion, ExpectMode, ExpectSpec, FailureClass, HarnessState, Heartbeat, JobId, JobSpec,
-    JobStats, NodeName, OnConflict, Outcome, ProviderModel, ProviderState, ProviderStatus,
-    StuckPolicy, HARNESS_OK_FALSE, MAX_DIFF_BYTES, MAX_NODE_LABELS, MAX_SUMMARY_BYTES, MAX_TAINTS,
+    effective_stuck, printable, truncate_chars, AgentEvent, ArtifactName, Completion, ExpectMode,
+    ExpectSpec, FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobStats, NodeName,
+    OnConflict, Outcome, ProviderModel, ProviderState, ProviderStatus, StuckPolicy,
+    HARNESS_OK_FALSE, MAX_DIFF_BYTES, MAX_NODE_LABELS, MAX_SUMMARY_BYTES, MAX_TAINTS,
 };
 use lu_staging::{
     ApplyError, ConflictPolicy, ExportedDiff, Source, StageRequest, StagedDir, Staging,
@@ -626,7 +626,7 @@ impl Agent {
             }
         };
 
-        let mode = effective_collect(spec.collect, spec.stack_dependencies);
+        let mode = spec.collect;
         let policy = match spec.on_conflict {
             OnConflict::Fail => ConflictPolicy::Fail,
             OnConflict::Markers => ConflictPolicy::Markers,

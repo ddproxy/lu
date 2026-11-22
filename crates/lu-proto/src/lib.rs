@@ -39,10 +39,10 @@ pub use node::{
 };
 pub use sanitize::{printable, truncate_chars};
 pub use spec::{
-    effective_collect, effective_stuck, valid_group, validate_idempotency_key, Choice, CollectMode,
-    CollectModeError, ExpectEdit, ExpectMode, ExpectModeError, ExpectSpec, JobEdit, JobSpec,
-    JobSpecError, OnConflict, OnConflictError, StuckPolicy, StuckPolicyError, ANY_PROVIDER,
-    COLLECT_ALIASES, COLLECT_MODES, EXPECT_MODES, ON_CONFLICT_MODES, STUCK_POLICIES,
+    effective_stuck, valid_group, validate_idempotency_key, Choice, CollectMode, CollectModeError,
+    ExpectEdit, ExpectMode, ExpectModeError, ExpectSpec, JobEdit, JobSpec, JobSpecError,
+    OnConflict, OnConflictError, StuckPolicy, StuckPolicyError, ANY_PROVIDER, COLLECT_ALIASES,
+    COLLECT_MODES, EXPECT_MODES, ON_CONFLICT_MODES, STUCK_POLICIES,
 };
 pub use state::{CancelEffect, JobState, ParseJobStateError};
 pub use view::{CordonView, JobView, NodeView};

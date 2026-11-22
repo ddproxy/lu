@@ -1,0 +1,6 @@
+diff --git a/seed.txt b/seed.txt
+--- a/seed.txt
++++ b/seed.txt
+@@ -1 +1 @@
+-seed
++changed

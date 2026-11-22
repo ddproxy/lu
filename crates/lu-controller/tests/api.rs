@@ -193,8 +193,7 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: key.map(|s| s.to_owned()),
         after: Vec::new(),
-        stack_dependencies: true,
-        collect: None,
+        collect: lu_proto::CollectMode::Apply,
         include_failed: false,
         on_conflict: Default::default(),
         allow_empty: false,
@@ -874,11 +873,11 @@ async fn cordons_for(addr: SocketAddr, node: &str) -> Vec<String> {
         .iter()
         .find(|n| n["name"] == node)
         .unwrap_or_else(|| panic!("node {node} missing: {view}"));
-    n["cordons"]
+    n["cordon_details"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|c| c.as_str().unwrap().to_owned())
+        .filter_map(|c| c["provider"].as_str().map(str::to_owned))
         .collect()
 }
 
@@ -1813,7 +1812,7 @@ async fn an_older_agent_sees_no_new_fields_and_reports_old_classes() {
     let epoch = assign["epoch"].as_u64().unwrap();
     assert!(
         assign["spec"].get("stack_dependencies").is_none(),
-        "the default must not reach an older agent: {assign}"
+        "removed field must not appear on the wire: {assign}"
     );
 
     let b = json!({"epoch": epoch}).to_string();

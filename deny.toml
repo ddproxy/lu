@@ -11,6 +11,8 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Unlicense",
+    "Zlib",
+    "NCSA",
     # webpki-roots (the CA list rustls trusts) is data under this licence.
     "CDLA-Permissive-2.0",
 ]

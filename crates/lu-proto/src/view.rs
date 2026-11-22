@@ -142,9 +142,6 @@ pub struct NodeView {
     #[serde(default)]
     pub current_job: Option<JobId>,
     #[serde(default)]
-    pub cordons: Vec<String>,
-    /// The same cordons with their reason, source and timing. Older controllers omit this.
-    #[serde(default)]
     pub cordon_details: Vec<CordonView>,
     #[serde(default)]
     pub reiki: Option<serde_json::Value>,
@@ -174,7 +171,6 @@ impl NodeView {
             label_sources: BTreeMap::new(),
             taints: Vec::new(),
             current_job: None,
-            cordons: Vec::new(),
             cordon_details: Vec::new(),
             reiki: None,
             load1: None,
@@ -198,8 +194,7 @@ fn empty_job_spec() -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: None,
         after: Vec::new(),
-        stack_dependencies: true,
-        collect: None,
+        collect: crate::CollectMode::Apply,
         include_failed: false,
         on_conflict: Default::default(),
         allow_empty: false,

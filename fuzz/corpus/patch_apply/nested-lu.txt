@@ -1,0 +1,6 @@
+diff --git a/.lu/leak.txt b/.lu/leak.txt
+new file mode 100644
+--- /dev/null
++++ b/.lu/leak.txt
+@@ -0,0 +1 @@
++hidden

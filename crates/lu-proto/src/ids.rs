@@ -61,7 +61,7 @@ impl JobId {
             out.push(CROCKFORD[((millis >> shift) & 0x1F) as usize] as char);
         }
         let mut random = [0u8; RANDOM_BYTES];
-        if getrandom::getrandom(&mut random).is_err() {
+        if getrandom::fill(&mut random).is_err() {
             fallback_random(&mut random, millis);
         }
         let mut value: u128 = 0;

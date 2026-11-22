@@ -1,0 +1,5 @@
+[controller]
+listen = "127.0.0.1:8080"
+db = "/var/lib/lu/lu.db"
+artifacts_dir = "/var/lib/lu/artifacts"
+surprise = 1
