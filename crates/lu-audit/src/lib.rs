@@ -673,7 +673,10 @@ mod tests {
         assert_eq!(record.data.len(), 2);
         let text = String::from_utf8(bytes).expect("utf8");
         for secret in ["fix the bug", "ABCDEFGH", "line two", "prompt"] {
-            assert!(!text.contains(secret), "leaked {secret:?}");
+            assert!(
+                !text.contains(secret),
+                "task text leaked into the audit file"
+            );
         }
         assert!(!text.contains("summary"));
         assert!(!text.contains("token"));
