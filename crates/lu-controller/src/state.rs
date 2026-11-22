@@ -137,6 +137,8 @@ pub struct AppState {
     pub lease_ms: u64,
     pub recovery_grace_ms: u64,
     pub cordon_ms: u64,
+    /// How long a dependent blocked on a failed predecessor waits before it expires.
+    pub blocked_dependent_ttl_secs: u64,
     /// Configured group caps, also installed in the store so dispatch enforces them atomically.
     /// Mutable at runtime so an operator batch can cap its own concurrency group.
     group_limits: Mutex<HashMap<String, usize>>,
@@ -287,6 +289,7 @@ impl AppState {
             lease_ms: lease_secs.saturating_mul(1000),
             recovery_grace_ms: cfg.recovery_grace_secs.saturating_mul(1000),
             cordon_ms: cfg.provider_cooldown_secs.saturating_mul(1000),
+            blocked_dependent_ttl_secs: cfg.blocked_dependent_ttl_secs(),
             group_limits: Mutex::new(group_limits),
             scope: scope.copied().unwrap_or_default(),
             scope_spawns: Mutex::new(HashMap::new()),

@@ -75,6 +75,7 @@ fn controller_cfg(
         }],
         repos: Vec::new(),
         groups: Vec::new(),
+        blocked_dependent_ttl: "24h".to_owned(),
     }
 }
 
@@ -258,6 +259,8 @@ fn sample_spec() -> lu_proto::JobSpec {
         tolerates: Vec::new(),
         fallbacks: Vec::new(),
         expect: None,
+        stack_union_paths: Vec::new(),
+        stack_base_paths: Vec::new(),
     }
 }
 

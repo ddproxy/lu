@@ -68,8 +68,8 @@ keeps the job `done` and adds an `expect_failed` note; `fail` mode ends it `fail
 3. The agent stages a fresh checkout, optionally applies dependency diffs, starts the harness and
    moves the job to `running`. Heartbeats renew the lease.
 4. The harness exits, times out or is cancelled. The agent uploads artifacts and reports an
-   outcome. The controller either finishes the job, requeues it or cascades a failure to
-   dependents.
+   outcome. The controller either finishes the job, requeues it, or leaves dependents blocked when
+   a predecessor fails so it can be retried (they fail at `[controller] blocked_dependent_ttl`).
 
 The job row is the current truth. `lu show` prints that row; `lu logs` reads the stored
 `<job id>/run.log` file, whose accepted length is tracked in the job's `log_len`. `lu top` adds a

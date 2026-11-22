@@ -9,21 +9,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lu_client::{ApiError, Controller, DependencyView, PollRequest};
-use lu_config::BaseSource;
+use lu_config::{BaseSource, StackConfig};
 use lu_proto::{
     AgentEvent, ArtifactName, Completion, ExpectMode, ExpectSpec, FailureClass, HarnessState,
     JobId, JobSpec, JobState, LogChunk, NodeName, OnConflict, Outcome, StuckPolicy,
     WorkspacePolicy, WorkspaceState, HARNESS_OK_FALSE, MAX_LOG_BYTES,
 };
-use lu_staging::{ExportedDiff, Staging};
+use lu_staging::{ExportedDiff, StackPolicy, Staging};
 use lu_supervise::CommandSpec;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
 use super::{
-    evaluate_expect, housekeeping, workspaces::FsDeleter, workspaces::RealClock,
-    workspaces::Registry, workspaces::Settings, Agent, AgentError,
+    dependency_conflict_summary, evaluate_expect, housekeeping, workspaces::FsDeleter,
+    workspaces::RealClock, workspaces::Registry, workspaces::Settings, Agent, AgentError,
+    ConflictContext,
 };
 
 const TEST_HEARTBEAT_SECS: u64 = 5;
@@ -40,6 +41,16 @@ pub(crate) enum Call {
     JobBase {
         job_id: JobId,
         epoch: u64,
+    },
+    StagedCommit {
+        job_id: JobId,
+        epoch: u64,
+        commit: String,
+    },
+    MergeBase {
+        job_id: JobId,
+        epoch: u64,
+        commits: Vec<String>,
     },
     Start {
         job_id: JobId,
@@ -74,6 +85,8 @@ pub(crate) struct FakeController {
     calls: Mutex<Vec<Call>>,
     poll_replies: Mutex<VecDeque<Result<Vec<AgentEvent>, ApiError>>>,
     base_replies: Mutex<VecDeque<BaseReply>>,
+    staged_commit_replies: Mutex<VecDeque<Result<(), ApiError>>>,
+    merge_base_replies: Mutex<VecDeque<Result<String, ApiError>>>,
     start_replies: Mutex<VecDeque<Result<(), ApiError>>>,
     renew_replies: Mutex<VecDeque<Result<bool, ApiError>>>,
     append_log_replies: Mutex<VecDeque<Result<(), ApiError>>>,
@@ -90,6 +103,8 @@ impl FakeController {
             calls: Mutex::new(Vec::new()),
             poll_replies: Mutex::new(VecDeque::new()),
             base_replies: Mutex::new(VecDeque::new()),
+            staged_commit_replies: Mutex::new(VecDeque::new()),
+            merge_base_replies: Mutex::new(VecDeque::new()),
             start_replies: Mutex::new(VecDeque::new()),
             renew_replies: Mutex::new(VecDeque::new()),
             append_log_replies: Mutex::new(VecDeque::new()),
@@ -120,6 +135,14 @@ impl FakeController {
 
     fn push_base(&self, reply: Result<Option<(String, Vec<u8>)>, ApiError>) {
         self.base_replies.lock().unwrap().push_back(reply);
+    }
+
+    fn push_staged_commit(&self, reply: Result<(), ApiError>) {
+        self.staged_commit_replies.lock().unwrap().push_back(reply);
+    }
+
+    fn push_merge_base(&self, reply: Result<String, ApiError>) {
+        self.merge_base_replies.lock().unwrap().push_back(reply);
     }
 
     fn push_start(&self, reply: Result<(), ApiError>) {
@@ -223,6 +246,46 @@ impl Controller for FakeController {
             epoch,
         });
         Box::pin(async move { self.pop_base().unwrap_or(Ok(None)) })
+    }
+
+    fn set_staged_commit<'a>(
+        &'a self,
+        id: &'a JobId,
+        epoch: u64,
+        commit: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>> {
+        self.record(Call::StagedCommit {
+            job_id: id.clone(),
+            epoch,
+            commit: commit.to_owned(),
+        });
+        Box::pin(async move {
+            self.staged_commit_replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(()))
+        })
+    }
+
+    fn merge_base<'a>(
+        &'a self,
+        id: &'a JobId,
+        epoch: u64,
+        commits: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<String, ApiError>> + Send + 'a>> {
+        self.record(Call::MergeBase {
+            job_id: id.clone(),
+            epoch,
+            commits: commits.to_vec(),
+        });
+        Box::pin(async move {
+            self.merge_base_replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(commits[0].clone()))
+        })
     }
 
     fn start<'a>(
@@ -359,6 +422,8 @@ fn test_spec(repo: &str) -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: None,
         after: Vec::new(),
+        stack_union_paths: Vec::new(),
+        stack_base_paths: Vec::new(),
         collect: lu_proto::CollectMode::Apply,
         include_failed: false,
         on_conflict: Default::default(),
@@ -407,6 +472,7 @@ fn make_agent(
         controller,
         staging,
         base_source: BaseSource::Auto,
+        stack: None,
         work_dir: work_dir.to_path_buf(),
         heartbeat_secs: TEST_HEARTBEAT_SECS,
         default_on_stuck: lu_proto::StuckPolicy::None,
@@ -467,6 +533,17 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// Creates a local git repository for testing.
+fn head_commit(repo: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git rev-parse HEAD failed");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 fn create_git_repo(path: &Path) {
     git(path, &["init", "-q", "-b", "main"]);
     git(
@@ -507,7 +584,7 @@ fn make_diff(repo_dir: &Path, path: &str, before: &str, after: &str) -> Vec<u8> 
     output.stdout
 }
 
-fn dependency(id: &JobId, diff: &[u8]) -> DependencyView {
+fn dependency(id: &JobId, diff: &[u8], staged_commit: &str) -> DependencyView {
     DependencyView {
         job_id: id.clone(),
         state: JobState::Done,
@@ -520,6 +597,7 @@ fn dependency(id: &JobId, diff: &[u8]) -> DependencyView {
         finished_at: None,
         failure_class: None,
         summary: None,
+        staged_commit: Some(staged_commit.to_owned()),
     }
 }
 
@@ -1045,6 +1123,8 @@ struct Fixture {
     _tmp: TempDir,
     work_dir: PathBuf,
     repo_dir: PathBuf,
+    /// HEAD at the time the fixture was made; dependencies inherit this base.
+    base_commit: String,
 }
 
 fn fixture() -> Fixture {
@@ -1054,10 +1134,12 @@ fn fixture() -> Fixture {
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir(&repo_dir).unwrap();
     create_git_repo(&repo_dir);
+    let base_commit = head_commit(&repo_dir);
     Fixture {
         _tmp: tmp,
         work_dir,
         repo_dir,
+        base_commit,
     }
 }
 
@@ -1145,6 +1227,8 @@ fn kind(call: &Call) -> &'static str {
     match call {
         Call::Poll(_) => "poll",
         Call::JobBase { .. } => "job_base",
+        Call::StagedCommit { .. } => "staged_commit",
+        Call::MergeBase { .. } => "merge_base",
         Call::Start { .. } => "start",
         Call::Renew { .. } => "renew",
         Call::AppendLog(_) => "append_log",
@@ -1209,20 +1293,20 @@ async fn job_happy_path_calls_in_order() {
 
     let job = job_calls(&calls);
     let kinds: Vec<&str> = job.iter().map(kind).collect();
-    assert_eq!(&kinds[..2], ["deps", "start"], "{kinds:?}");
+    assert_eq!(&kinds[..3], ["staged_commit", "deps", "start"], "{kinds:?}");
     let n = kinds.len();
-    assert!(n > 5, "{kinds:?}");
+    assert!(n > 6, "{kinds:?}");
     assert_eq!(
         &kinds[n - 3..],
         ["put_artifact", "put_artifact", "complete"]
     );
     assert!(
-        kinds[2..n - 3].iter().all(|k| *k == "append_log"),
+        kinds[3..n - 3].iter().all(|k| *k == "append_log"),
         "{kinds:?}"
     );
 
     assert!(matches!(
-        &job[1],
+        &job[2],
         Call::Start { job_id: started, epoch: EPOCH } if *started == job_id
     ));
     let names: Vec<ArtifactName> = job
@@ -1433,8 +1517,8 @@ async fn dependency_diffs_stack_in_after_order() {
     spec.after = vec![dep1.clone(), dep2.clone()];
     let controller = assigned_controller(&job_id, spec);
     controller.push_deps(Ok(vec![
-        dependency(&dep1, &first),
-        dependency(&dep2, &both),
+        dependency(&dep1, &first, &f.base_commit),
+        dependency(&dep2, &both, &f.base_commit),
     ]));
     controller.push_dep_diff(Ok(first));
     controller.push_dep_diff(Ok(both));
@@ -1484,8 +1568,8 @@ async fn compatible_dependency_changes_to_one_file_merge_in_order() {
     spec.after = vec![dep1.clone(), dep2.clone()];
     let controller = assigned_controller(&job_id, spec);
     controller.push_deps(Ok(vec![
-        dependency(&dep1, &first),
-        dependency(&dep2, &second),
+        dependency(&dep1, &first, &f.base_commit),
+        dependency(&dep2, &second, &f.base_commit),
     ]));
     controller.push_dep_diff(Ok(first));
     controller.push_dep_diff(Ok(second));
@@ -1524,8 +1608,8 @@ async fn conflicting_dependency_fails_before_the_harness() {
     spec.after = vec![dep1.clone(), dep2.clone()];
     let controller = assigned_controller(&job_id, spec);
     controller.push_deps(Ok(vec![
-        dependency(&dep1, &first),
-        dependency(&dep2, &second),
+        dependency(&dep1, &first, &f.base_commit),
+        dependency(&dep2, &second, &f.base_commit),
     ]));
     controller.push_dep_diff(Ok(first));
     controller.push_dep_diff(Ok(second));
@@ -1562,7 +1646,7 @@ async fn dependency_without_a_diff_is_skipped() {
     let mut spec = test_spec(&f.repo_dir.to_string_lossy());
     spec.after = vec![dep.clone()];
     let controller = assigned_controller(&job_id, spec);
-    controller.push_deps(Ok(vec![dependency(&dep, b"")]));
+    controller.push_deps(Ok(vec![dependency(&dep, b"", &f.base_commit)]));
 
     let agent = fast_agent(
         &f.work_dir,
@@ -1588,7 +1672,7 @@ async fn dependency_without_a_diff_is_skipped() {
 
 /// Three inputs from one base: the second conflicts with the first, the third is independent.
 fn three_conflicting_inputs(
-    f: &Fixture,
+    f: &mut Fixture,
 ) -> (JobId, JobId, JobId, JobId, Vec<u8>, Vec<u8>, Vec<u8>) {
     let job_id = JobId::new();
     let dep1 = JobId::new();
@@ -1597,6 +1681,7 @@ fn three_conflicting_inputs(
     std::fs::write(f.repo_dir.join("notes.md"), "base\n").unwrap();
     git(&f.repo_dir, &["add", "notes.md"]);
     git(&f.repo_dir, &["commit", "-q", "-m", "notes"]);
+    f.base_commit = head_commit(&f.repo_dir);
     let first = make_diff(&f.repo_dir, "README.md", "test\n", "one\n");
     let second = make_diff(&f.repo_dir, "README.md", "test\n", "two\n");
     let third = make_diff(&f.repo_dir, "notes.md", "base\n", "third\n");
@@ -1623,12 +1708,12 @@ fn conflict_controller(
 
 #[tokio::test]
 async fn fail_policy_names_the_conflicting_input_and_hunk() {
-    let f = fixture();
-    let (job_id, dep1, dep2, dep3, first, second, third) = three_conflicting_inputs(&f);
+    let mut f = fixture();
+    let (job_id, dep1, dep2, dep3, first, second, third) = three_conflicting_inputs(&mut f);
     let deps = vec![
-        dependency(&dep1, &first),
-        dependency(&dep2, &second),
-        dependency(&dep3, &third),
+        dependency(&dep1, &first, &f.base_commit),
+        dependency(&dep2, &second, &f.base_commit),
+        dependency(&dep3, &third, &f.base_commit),
     ];
     let controller = conflict_controller(
         &job_id,
@@ -1666,12 +1751,12 @@ async fn fail_policy_names_the_conflicting_input_and_hunk() {
 
 #[tokio::test]
 async fn skip_policy_omits_the_bad_patch_and_applies_later_inputs() {
-    let f = fixture();
-    let (job_id, dep1, dep2, dep3, first, second, third) = three_conflicting_inputs(&f);
+    let mut f = fixture();
+    let (job_id, dep1, dep2, dep3, first, second, third) = three_conflicting_inputs(&mut f);
     let deps = vec![
-        dependency(&dep1, &first),
-        dependency(&dep2, &second),
-        dependency(&dep3, &third),
+        dependency(&dep1, &first, &f.base_commit),
+        dependency(&dep2, &second, &f.base_commit),
+        dependency(&dep3, &third, &f.base_commit),
     ];
     let controller = conflict_controller(
         &job_id,
@@ -1707,12 +1792,12 @@ async fn skip_policy_omits_the_bad_patch_and_applies_later_inputs() {
 
 #[tokio::test]
 async fn markers_policy_keeps_both_sides_and_exports_them() {
-    let f = fixture();
-    let (job_id, dep1, dep2, dep3, first, second, third) = three_conflicting_inputs(&f);
+    let mut f = fixture();
+    let (job_id, dep1, dep2, dep3, first, second, third) = three_conflicting_inputs(&mut f);
     let deps = vec![
-        dependency(&dep1, &first),
-        dependency(&dep2, &second),
-        dependency(&dep3, &third),
+        dependency(&dep1, &first, &f.base_commit),
+        dependency(&dep2, &second, &f.base_commit),
+        dependency(&dep3, &third, &f.base_commit),
     ];
     let controller = conflict_controller(
         &job_id,
@@ -1760,7 +1845,7 @@ async fn collect_none_leaves_the_base_tree_alone() {
     spec.after = vec![dep.clone()];
     spec.collect = lu_proto::CollectMode::None;
     let controller = assigned_controller(&job_id, spec);
-    controller.push_deps(Ok(vec![dependency(&dep, &diff)]));
+    controller.push_deps(Ok(vec![dependency(&dep, &diff, &f.base_commit)]));
 
     let agent = fast_agent(
         &f.work_dir,
@@ -1774,8 +1859,18 @@ async fn collect_none_leaves_the_base_tree_alone() {
     )
     .await;
 
+    // The dependency view is still needed to resolve the inherited base; only the diff is
+    // skipped when collection is off.
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| matches!(c, Call::Deps { .. }))
+            .count(),
+        1,
+        "{calls:?}"
+    );
     assert!(
-        !calls.iter().any(|c| matches!(c, Call::Deps { .. })),
+        !calls.iter().any(|c| matches!(c, Call::DepDiff { .. })),
         "{calls:?}"
     );
     assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
@@ -3078,4 +3173,398 @@ async fn job_override_wins_over_the_agent_default() {
     assert_eq!(completion.outcome, Outcome::Failed(FailureClass::Node));
     assert_eq!(completion.stuck_mode, Some(StuckPolicy::Retry));
     assert_stuck_summary(&completion, 60);
+}
+
+// --- Stacked chains -------------------------------------------------------------------------
+
+fn commit_file(repo: &Path, path: &str, content: &str, message: &str) -> String {
+    std::fs::write(repo.join(path), content).unwrap();
+    git(repo, &["add", path]);
+    git(repo, &["commit", "-q", "-m", message]);
+    head_commit(repo)
+}
+
+fn reported_staged_commits(calls: &[Call]) -> Vec<String> {
+    calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::StagedCommit { commit, .. } => Some(commit.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn merge_base_calls(calls: &[Call]) -> Vec<Vec<String>> {
+    calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::MergeBase { commits, .. } => Some(commits.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn hex_commit(digit: char) -> String {
+    digit.to_string().repeat(40)
+}
+
+#[tokio::test]
+async fn two_link_chain_inherits_the_dependency_base_after_the_branch_moves() {
+    let f = fixture();
+    let base = f.base_commit.clone();
+    let diff = make_diff(&f.repo_dir, "README.md", "test\n", "test\ndep\n");
+    // The branch moves after the dependency was staged: a fresh checkout would miss `dep`.
+    let moved = commit_file(&f.repo_dir, "README.md", "moved\n", "branch moved");
+    assert_ne!(moved, base);
+
+    let job_id = JobId::new();
+    let dep = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = vec![dep.clone()];
+    let controller = assigned_controller(&job_id, spec);
+    controller.push_deps(Ok(vec![dependency(&dep, &diff, &base)]));
+    controller.push_dep_diff(Ok(diff));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("grep -q '^dep$' README.md && ! grep -q '^moved$' README.md"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+    assert_eq!(reported_staged_commits(&calls), vec![base]);
+    assert!(merge_base_calls(&calls).is_empty());
+}
+
+#[tokio::test]
+async fn three_link_chain_inherits_one_base_for_every_patch() {
+    let f = fixture();
+    let base = f.base_commit.clone();
+    let first = make_diff(&f.repo_dir, "README.md", "test\n", "test\none\n");
+    let second = make_diff(&f.repo_dir, "README.md", "test\n", "test\none\ntwo\n");
+    let third = make_diff(
+        &f.repo_dir,
+        "README.md",
+        "test\n",
+        "test\none\ntwo\nthree\n",
+    );
+
+    let deps: Vec<JobId> = (0..3).map(|_| JobId::new()).collect();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = deps.clone();
+    let controller = assigned_controller(&job_id, spec);
+    controller.push_deps(Ok(vec![
+        dependency(&deps[0], &first, &base),
+        dependency(&deps[1], &second, &base),
+        dependency(&deps[2], &third, &base),
+    ]));
+    controller.push_dep_diff(Ok(first));
+    controller.push_dep_diff(Ok(second));
+    controller.push_dep_diff(Ok(third));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("grep -q '^one$' README.md && grep -q '^two$' README.md && grep -q '^three$' README.md"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+    assert_eq!(reported_staged_commits(&calls), vec![base]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&artifact(&calls, ArtifactName::ReportJson)).unwrap();
+    assert_eq!(
+        report["applied_dependencies"],
+        json!(deps.iter().map(JobId::to_string).collect::<Vec<_>>())
+    );
+}
+
+#[tokio::test]
+async fn diamond_with_agreeing_bases_needs_no_merge_base_call() {
+    let mut f = fixture();
+    std::fs::write(f.repo_dir.join("a.txt"), "a\n").unwrap();
+    std::fs::write(f.repo_dir.join("b.txt"), "b\n").unwrap();
+    git(&f.repo_dir, &["add", "a.txt", "b.txt"]);
+    git(&f.repo_dir, &["commit", "-q", "-m", "files"]);
+    f.base_commit = head_commit(&f.repo_dir);
+    let base = f.base_commit.clone();
+    let first = make_diff(&f.repo_dir, "a.txt", "a\n", "a-one\n");
+    let second = make_diff(&f.repo_dir, "b.txt", "b\n", "b-two\n");
+
+    let dep1 = JobId::new();
+    let dep2 = JobId::new();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = vec![dep1.clone(), dep2.clone()];
+    let controller = assigned_controller(&job_id, spec);
+    controller.push_deps(Ok(vec![
+        dependency(&dep1, &first, &base),
+        dependency(&dep2, &second, &base),
+    ]));
+    controller.push_dep_diff(Ok(first));
+    controller.push_dep_diff(Ok(second));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("grep -q '^a-one$' a.txt && grep -q '^b-two$' b.txt"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+    assert_eq!(reported_staged_commits(&calls), vec![base]);
+    assert!(merge_base_calls(&calls).is_empty());
+}
+
+/// Builds two branch tips over the fixture's base. The branch commits touch `marker.txt` only,
+/// so patches against files from the common base still apply after a merge-base checkout.
+fn diverged_deps(f: &mut Fixture) -> (String, String, Vec<u8>, Vec<u8>) {
+    std::fs::write(f.repo_dir.join("a.txt"), "a\n").unwrap();
+    std::fs::write(f.repo_dir.join("b.txt"), "b\n").unwrap();
+    git(&f.repo_dir, &["add", "a.txt", "b.txt"]);
+    git(&f.repo_dir, &["commit", "-q", "-m", "files"]);
+    f.base_commit = head_commit(&f.repo_dir);
+    let base = f.base_commit.clone();
+    let first = make_diff(&f.repo_dir, "a.txt", "a\n", "a-one\n");
+    let second = make_diff(&f.repo_dir, "b.txt", "b\n", "b-two\n");
+
+    git(&f.repo_dir, &["checkout", "-q", "-b", "left"]);
+    let left = commit_file(&f.repo_dir, "marker.txt", "left\n", "left branch");
+    git(&f.repo_dir, &["checkout", "-q", "-b", "right", &base]);
+    let right = commit_file(&f.repo_dir, "marker.txt", "right\n", "right branch");
+    git(&f.repo_dir, &["checkout", "-q", "main"]);
+    (left, right, first, second)
+}
+
+#[tokio::test]
+async fn diamond_with_disagreeing_bases_uses_the_controllers_merge_base() {
+    let mut f = fixture();
+    let (left, right, first, second) = diverged_deps(&mut f);
+    let base = f.base_commit.clone();
+
+    let dep1 = JobId::new();
+    let dep2 = JobId::new();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = vec![dep1.clone(), dep2.clone()];
+    let controller = assigned_controller(&job_id, spec);
+    controller.push_deps(Ok(vec![
+        dependency(&dep1, &first, &left),
+        dependency(&dep2, &second, &right),
+    ]));
+    controller.push_merge_base(Ok(base.clone()));
+    controller.push_dep_diff(Ok(first));
+    controller.push_dep_diff(Ok(second));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("grep -q '^a-one$' a.txt && grep -q '^b-two$' b.txt && ! test -e marker.txt"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+    assert_eq!(merge_base_calls(&calls), vec![vec![left, right]]);
+    assert_eq!(reported_staged_commits(&calls), vec![base]);
+}
+
+#[tokio::test]
+async fn diamond_merge_base_conflict_names_both_commits_and_every_hunk() {
+    let mut f = fixture();
+    let (left, right, _, _) = diverged_deps(&mut f);
+    let base = f.base_commit.clone();
+    let first = make_diff(&f.repo_dir, "README.md", "test\n", "one\n");
+    let second = make_diff(&f.repo_dir, "README.md", "test\n", "two\n");
+
+    let dep1 = JobId::new();
+    let dep2 = JobId::new();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = vec![dep1.clone(), dep2.clone()];
+    let controller = assigned_controller(&job_id, spec);
+    controller.push_deps(Ok(vec![
+        dependency(&dep1, &first, &left),
+        dependency(&dep2, &second, &right),
+    ]));
+    controller.push_merge_base(Ok(base.clone()));
+    controller.push_dep_diff(Ok(first));
+    controller.push_dep_diff(Ok(second));
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo harness-ran"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Conflict));
+    let summary = done[0].summary.as_deref().unwrap_or("");
+    assert!(summary.contains(&left), "{summary}");
+    assert!(summary.contains(&right), "{summary}");
+    assert!(summary.contains("conflicted files: README.md"), "{summary}");
+    assert!(summary.contains("conflicted hunks:"), "{summary}");
+    assert!(
+        summary.contains("base moved since dependency was staged: yes"),
+        "{summary}"
+    );
+    assert_eq!(reported_staged_commits(&calls), vec![base]);
+}
+
+#[tokio::test]
+async fn a_rejected_staged_commit_stops_before_dependency_patches() {
+    let f = fixture();
+    let base = f.base_commit.clone();
+    let diff = make_diff(&f.repo_dir, "README.md", "test\n", "test\ndep\n");
+    let dep = JobId::new();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = vec![dep.clone()];
+    let controller = assigned_controller(&job_id, spec);
+    controller.push_deps(Ok(vec![dependency(&dep, &diff, &base)]));
+    controller.push_staged_commit(Err(ApiError::Conflict { length: 7 }));
+    controller.push_dep_diff(Ok(diff));
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo harness-ran"));
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(
+        done[0].outcome,
+        Outcome::Failed(FailureClass::Execution),
+        "{done:?}"
+    );
+    let summary = done[0].summary.as_deref().unwrap_or("");
+    assert!(summary.contains(&base), "{summary}");
+    assert!(summary.contains("rejected"), "{summary}");
+    assert_eq!(reported_staged_commits(&calls), vec![base]);
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, Call::DepDiff { .. } | Call::Start { .. })),
+        "no patches or harness may run after a rejected staged commit: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn job_cannot_widen_the_configured_stack_policy() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let dep = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.after = vec![dep.clone()];
+    spec.stack_union_paths = vec!["*.md".to_owned()];
+    let controller = assigned_controller(&job_id, spec);
+    let agent = fast_agent(&f.work_dir, controller.clone(), sh("echo harness-ran"));
+    let mut agent = agent;
+    agent.stack = Some(StackConfig {
+        union_paths: vec!["CHANGELOG.md".to_owned()],
+        base_paths: Vec::new(),
+    });
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Conflict));
+    let summary = done[0].summary.as_deref().unwrap_or("");
+    assert!(summary.contains("widens"), "{summary}");
+    assert!(summary.contains("*.md"), "{summary}");
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            Call::JobBase { .. } | Call::StagedCommit { .. } | Call::Start { .. }
+        )),
+        "a widened policy must fail before staging: {calls:?}"
+    );
+}
+
+#[test]
+fn conflict_summary_reports_files_hunks_movement_and_covering_globs() {
+    let policy = StackPolicy {
+        union_paths: vec!["CHANGELOG.md".to_owned(), "docs/**".to_owned()],
+        base_paths: vec!["Cargo.lock".to_owned()],
+    };
+    let paths = vec!["CHANGELOG.md".to_owned(), "docs/notes.md".to_owned()];
+    let hunks = vec!["CHANGELOG.md@12".to_owned(), "docs/notes.md@3".to_owned()];
+    let summary = dependency_conflict_summary(
+        "input",
+        "dep",
+        &paths,
+        &hunks,
+        Some("hunk at line 12"),
+        &ConflictContext {
+            staged_base: Some(&hex_commit('a')),
+            dependency_base: Some(&hex_commit('b')),
+            stack_policy: Some(&policy),
+            disagreement: Some("dependency staged commits disagreed (left, right)"),
+        },
+    );
+    for expected in [
+        "CHANGELOG.md",
+        "docs/notes.md",
+        "CHANGELOG.md@12",
+        "docs/notes.md@3",
+        "base moved since dependency was staged: yes",
+        "dependency staged commits disagreed (left, right)",
+        "union globs covering conflicts: CHANGELOG.md, docs/**",
+        "base globs covering conflicts: none",
+        "hunk at line 12",
+    ] {
+        assert!(
+            summary.contains(expected),
+            "missing {expected:?}: {summary}"
+        );
+    }
+
+    let no_policy = dependency_conflict_summary(
+        "input",
+        "dep",
+        &paths,
+        &hunks,
+        None,
+        &ConflictContext {
+            staged_base: Some(&hex_commit('a')),
+            dependency_base: Some(&hex_commit('a')),
+            stack_policy: None,
+            disagreement: None,
+        },
+    );
+    assert!(
+        no_policy.contains("base moved since dependency was staged: no"),
+        "{no_policy}"
+    );
+    assert!(
+        no_policy.contains("union globs covering conflicts: none"),
+        "{no_policy}"
+    );
+    assert!(
+        no_policy.contains("base globs covering conflicts: none"),
+        "{no_policy}"
+    );
 }

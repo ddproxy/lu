@@ -14,6 +14,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         .clone()
         .ok_or_else(|| "ting requires an [agent] config".to_owned())?;
     agent_config.workspace = config.workspace.clone();
+    agent_config.stack = config.stack.clone();
     crate::logging::init(&config.log)?;
 
     let token = lu_config::read_private_file(

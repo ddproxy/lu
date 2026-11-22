@@ -485,6 +485,8 @@ impl<S: Store> Model<S> {
             idle_timeout_secs: None,
             idempotency_key: None,
             after: Vec::new(),
+            stack_union_paths: Vec::new(),
+            stack_base_paths: Vec::new(),
             base_commit: None,
             collect: lu_proto::CollectMode::Apply,
             include_failed: false,
@@ -1639,15 +1641,27 @@ impl<S: Store> Model<S> {
                         "blocked job {} has only done dependencies",
                         record.id
                     );
-                    for dep in &not_done {
+                    if record.blocked_reason.as_deref() == Some("predecessor failed") {
+                        // A dead predecessor leaves its still-unfinished dependents blocked with a
+                        // reason and a timestamp until a retry reattaches them or a TTL expires.
                         assert!(
-                            !matches!(
-                                current[dep].state,
-                                JobState::Failed | JobState::Cancelled | JobState::Expired
-                            ),
-                            "blocked job {} waits on terminal dependency {dep}",
+                            record.blocked_since.is_some(),
+                            "blocked job {} has no grace-period start",
                             record.id
                         );
+                        assert_eq!(record.failure_class, None);
+                    } else {
+                        assert_eq!(record.blocked_since, None);
+                        for dep in &not_done {
+                            assert!(
+                                !matches!(
+                                    current[dep].state,
+                                    JobState::Failed | JobState::Cancelled | JobState::Expired
+                                ),
+                                "blocked job {} waits on terminal dependency {dep}",
+                                record.id
+                            );
+                        }
                     }
                     assert_eq!(record.finished_at, None);
                 }

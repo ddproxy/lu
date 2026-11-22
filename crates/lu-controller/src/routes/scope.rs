@@ -485,7 +485,7 @@ async fn process(
                 });
             }
             let changed =
-                crate::routes::cancel_job_with_descendants(state, &child.id, false).await?;
+                crate::routes::cancel_job_with_descendants(state, &child.id, false, true).await?;
             for id in &changed {
                 state.waiters.notify_job(id.as_ref());
             }

@@ -41,13 +41,13 @@ Global flags: `--config <path>` (default `lu.toml`) and `--json` (raw controller
 | `lu status` | `lu status --json` | Uptime, schema, db size, queue and node counts. |
 | `lu submit` | `lu submit --repo /srv/app --ref main --task-file task.txt --wait` | Submits a job and waits for a terminal state. |
 | `lu submit --batch` | `lu submit --batch ./tasks --key-prefix release-1 --defaults ./defaults.toml` | Submits one idempotent job per task in a directory or checklist. |
-| `lu retry` | `lu retry 01AR... --provider anthropic --key retry-2` | Resubmits a finished job's spec as a new job. |
+| `lu retry` | `lu retry 01AR... --provider anthropic --key retry-2` | Resubmits a finished job's spec as a new job; `--chain` also retries dependents and rewrites their references. |
 | `lu ls` | `lu ls --state failed --limit 10` | Newest-first job list. |
 | `lu show` | `lu show 01AR...` | One job plus each dependency and its state. |
 | `lu graph` | `lu graph 01AR...` | Horizontal dependency graph for one component, with task titles. |
 | `lu logs` | `lu logs 01AR... --follow` | Streams until the job reaches a terminal state. |
 | `lu fetch` | `lu fetch 01AR... --out results` | Writes `diff.patch`, `run.log` and `report.json`. |
-| `lu cancel` | `lu cancel 01AR...` | Requests cancellation. |
+| `lu cancel` | `lu cancel 01AR...` | Requests cancellation; `--keep-children` leaves descendants running, `--keep-dependents` leaves blocked dependents waiting. |
 | `lu nodes` | `lu nodes --json` | Full node views, including cordon details and labels. |
 | `lu node` | `lu node node-a --workspaces` | Latest host and job stats, workspace counters and cordon details; `--workspaces` lists job state, bytes, age and policy, and `clean --all`/`clean --job <key>` queues workspace deletion. |
 | `lu uncordon` | `lu uncordon node-a zen` | Clear one provider cordon, or every cordon when the provider is omitted. |
@@ -70,7 +70,12 @@ lu submit --key test --after-key build --repo /srv/app --ref main --task "test"
 lu show 01ARZ3NDEKTSV4RRFFQ69G5FAV
 ```
 
-Each `submit` prints its new job id; use that id with `lu show`.
+Each `submit` prints its new job id; use that id with `lu show`. For a chain blocked by a failed
+predecessor, `lu retry <predecessor>` reattaches the waiting dependents, while
+`lu retry <predecessor> --chain` also retries those dependents and rewrites their references.
+A plain `lu cancel` cancels
+the waiting dependents too; `lu cancel --keep-dependents` leaves them blocked. See
+[Dependencies](dependencies.md#waiting-and-promotion).
 
 ## Client behaviour
 

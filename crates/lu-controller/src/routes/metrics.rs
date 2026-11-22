@@ -131,6 +131,17 @@ pub async fn metrics(
     out.push_str(&gauge("lu_queue_oldest_seconds", &[], oldest));
     out.push('\n');
 
+    out.push_str(
+        "# HELP lu_blocked_dependents_total Blocked jobs waiting for a retry or TTL expiry\n",
+    );
+    out.push_str("# TYPE lu_blocked_dependents_total gauge\n");
+    out.push_str(&gauge(
+        "lu_blocked_dependents_total",
+        &[],
+        counts.waiting_dependents,
+    ));
+    out.push('\n');
+
     // HELP and TYPE comments for gauges
     out.push_str("# HELP lu_jobs Number of jobs per state\n");
     out.push_str("# TYPE lu_jobs gauge\n");

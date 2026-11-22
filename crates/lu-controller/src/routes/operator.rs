@@ -21,7 +21,7 @@ use lu_store::{
     missing_labels, waiting_reason_with_groups, Cordon, CordonSource, JobRecord, NodeRecord, Now,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -49,11 +49,22 @@ fn seconds(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
-pub fn job_view(r: &JobRecord) -> JobView {
-    job_view_with(r, None)
+fn query_flag(query: &HashMap<String, String>, name: &str) -> bool {
+    query
+        .get(name)
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
 }
 
-fn job_view_with(r: &JobRecord, reason: Option<String>) -> JobView {
+pub fn job_view(r: &JobRecord) -> JobView {
+    job_view_with(r, None, lu_config::DEFAULT_BLOCKED_DEPENDENT_TTL_SECS)
+}
+
+/// Maps a store record into a view using the configured blocked-dependent deadline.
+pub fn job_view_with_ttl(r: &JobRecord, ttl_secs: u64) -> JobView {
+    job_view_with(r, None, ttl_secs)
+}
+
+fn job_view_with(r: &JobRecord, reason: Option<String>, ttl_secs: u64) -> JobView {
     JobView {
         id: r.id.clone(),
         state: r.state,
@@ -82,6 +93,11 @@ fn job_view_with(r: &JobRecord, reason: Option<String>) -> JobView {
         root_job_id: r.root_job_id.clone(),
         depth: r.depth,
         waiting_reason: reason,
+        staged_commit: r.staged_commit.clone(),
+        blocked_reason: r.blocked_reason.clone(),
+        blocked_until: r
+            .blocked_since
+            .map(|since| since.saturating_add(i64::try_from(ttl_secs).unwrap_or(i64::MAX))),
         outcome_note: outcome_note(r).map(str::to_owned),
         diff_bytes: r.state.is_terminal().then(|| r.diff_bytes.unwrap_or(0)),
         scrubbed_hits: r.scrubbed_hits,
@@ -116,7 +132,7 @@ async fn job_view_for(state: &Arc<AppState>, rec: &JobRecord) -> Result<JobView,
     let nodes = all_nodes(state, now()).await?;
     let counts = group_counts(state).await?;
     let reason = waiting_reason_with_groups(rec, &nodes, &counts, &state.group_limits());
-    let mut view = job_view_with(rec, reason);
+    let mut view = job_view_with(rec, reason, state.blocked_dependent_ttl_secs);
     view.audit_write_errors = Some(state.audit_write_errors());
     view.publish_target = crate::publish::target_text(state, rec);
     Ok(view)
@@ -127,9 +143,16 @@ fn job_views(
     nodes: &[NodeRecord],
     counts: &HashMap<String, usize>,
     limits: &HashMap<String, usize>,
+    blocked_ttl_secs: u64,
 ) -> Vec<JobView> {
     jobs.iter()
-        .map(|job| job_view_with(job, waiting_reason_with_groups(job, nodes, counts, limits)))
+        .map(|job| {
+            job_view_with(
+                job,
+                waiting_reason_with_groups(job, nodes, counts, limits),
+                blocked_ttl_secs,
+            )
+        })
         .collect()
 }
 
@@ -380,7 +403,13 @@ pub async fn list_jobs(
         };
         let jobs: Vec<JobRecord> = rec.into_iter().collect();
         let body = json!({
-            "jobs": job_views(&jobs, &nodes, &counts, &state.group_limits()),
+            "jobs": job_views(
+                &jobs,
+                &nodes,
+                &counts,
+                &state.group_limits(),
+                state.blocked_dependent_ttl_secs,
+            ),
             "next": null,
         });
         return with_version(json_value_ok(StatusCode::OK, body));
@@ -424,7 +453,13 @@ pub async fn list_jobs(
     };
     let next = jobs.last().map(|j| j.id.to_string());
     let body = json!({
-        "jobs": job_views(&jobs, &nodes, &counts, &state.group_limits()),
+        "jobs": job_views(
+                &jobs,
+                &nodes,
+                &counts,
+                &state.group_limits(),
+                state.blocked_dependent_ttl_secs,
+            ),
         "next": next,
     });
     with_version(json_value_ok(StatusCode::OK, body))
@@ -515,6 +550,94 @@ pub async fn publish_job(
     }
 }
 
+/// Recreates a terminal job from the supplied spec. With `chain=1`, blocked dependents are
+/// recreated too and remapped onto the new dependency ids.
+pub async fn retry_job(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    uri: axum::http::Uri,
+    req: axum::extract::Request,
+) -> Response {
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(o) => o,
+        Err(e) => return with_version(e.into_response()),
+    };
+    let job_id = match JobId::parse(&id) {
+        Ok(i) => i,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
+        Ok(bytes) => bytes,
+        Err(error) => return with_version(error.into_response()),
+    };
+    let spec: JobSpec = match serde_json::from_slice(&bytes) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return with_version(ApiError::unprocessable(error.to_string()).into_response())
+        }
+    };
+    if let Err(error) = spec.validate() {
+        return with_version(ApiError::unprocessable(error.to_string()).into_response());
+    }
+    let chain = query_flag(&parse_query(&uri), "chain");
+    let n = now();
+    let retried = tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        let id = job_id.clone();
+        let spec = spec.clone();
+        move || store.retry_with_dependents(&id, &spec, chain, n)
+    })
+    .await;
+    let (rec, pairs) = match retried {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => return with_version(store_err(error).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    };
+    let waiting_dependents = {
+        let store = Arc::clone(&state.store);
+        let lease_ms = state.lease_ms;
+        match tokio::task::spawn_blocking(move || store.job_counts(n, lease_ms)).await {
+            Ok(Ok(counts)) => counts.waiting_dependents,
+            _ => pairs.len() as u64,
+        }
+    };
+    let retry_pairs: Vec<Value> = pairs
+        .iter()
+        .map(|(old, new)| json!({ "old": old.to_string(), "new": new.to_string() }))
+        .collect();
+    state.record_audit(
+        Event::Retried,
+        Some(rec.id.as_str()),
+        None,
+        &operator,
+        Data::new()
+            .unsigned(Field::Count, pairs.len() as u64)
+            .text(Field::Source, if chain { "chain" } else { "job" }),
+    );
+    state.waiters.notify_job(rec.id.as_ref());
+    for (_, new) in &pairs {
+        state.record_audit(
+            Event::Retried,
+            Some(new.as_str()),
+            None,
+            &operator,
+            Data::new().text(Field::Source, "dependent"),
+        );
+        state.waiters.notify_job(new.as_ref());
+    }
+    state.waiters.notify_work();
+    with_version(json_ok(
+        StatusCode::OK,
+        &json!({
+            "job": job_view_with_ttl(&rec, state.blocked_dependent_ttl_secs),
+            "retried": retry_pairs,
+            "waiting_dependents": waiting_dependents,
+        }),
+    ))
+}
+
 pub async fn cancel_job(
     State(state): State<Arc<AppState>>,
     peer: axum::Extension<PeerAddr>,
@@ -530,16 +653,22 @@ pub async fn cancel_job(
         Ok(i) => i,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
     };
-    // `keep_children=1` is the operator escape hatch; the default cascade protects a tree from
-    // leaving half-finished children behind when its parent is cancelled.
-    let keep_children = crate::routes::parse_query(&uri)
-        .get("keep_children")
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
-    let changed =
-        match crate::routes::cancel_job_with_descendants(&state, &job_id, keep_children).await {
-            Ok(ids) => ids,
-            Err(error) => return with_version(error.into_response()),
-        };
+    // Both flags are operator escape hatches. By default a cancellation clears the spawn tree and
+    // the blocked dependents that can no longer run after their predecessor dies.
+    let query = crate::routes::parse_query(&uri);
+    let keep_children = query_flag(&query, "keep_children");
+    let keep_dependents = query_flag(&query, "keep_dependents");
+    let changed = match crate::routes::cancel_job_with_descendants(
+        &state,
+        &job_id,
+        keep_children,
+        keep_dependents,
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(error) => return with_version(error.into_response()),
+    };
     if !changed.contains(&job_id) {
         let res = tokio::task::spawn_blocking({
             let store = Arc::clone(&state.store);
@@ -664,7 +793,13 @@ pub async fn list_drafts(
     with_version(json_value_ok(
         StatusCode::OK,
         json!({
-            "drafts": job_views(&drafts, &nodes, &counts, &state.group_limits()),
+            "drafts": job_views(
+                &drafts,
+                &nodes,
+                &counts,
+                &state.group_limits(),
+                state.blocked_dependent_ttl_secs,
+            ),
             "next": next,
         }),
     ))
@@ -1328,6 +1463,8 @@ mod tests {
                 publish: None,
                 fallbacks: Vec::new(),
                 expect: None,
+                stack_union_paths: Vec::new(),
+                stack_base_paths: Vec::new(),
             },
             attempt: 1,
             node: None,
@@ -1349,6 +1486,9 @@ mod tests {
             scrubbed_hits: 0,
             patch_scrubbed: false,
             waiting_on: Vec::new(),
+            staged_commit: None,
+            blocked_reason: None,
+            blocked_since: None,
             parent_job_id: None,
             root_job_id: None,
             depth: 0,

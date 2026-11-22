@@ -34,6 +34,39 @@ struct EpochBody {
     epoch: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedCommitBody {
+    /// Full 40-character hex object id of the commit the agent staged from.
+    commit: String,
+    /// Accepted for clients that put the lease epoch in the body instead of the query.
+    epoch: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MergeBaseBody {
+    /// Two or more full 40-character hex object ids.
+    commits: Vec<String>,
+    /// Accepted for clients that put the lease epoch in the body instead of the query.
+    epoch: Option<u64>,
+}
+
+enum MergeBaseError {
+    NoAncestor,
+    Unavailable,
+    Git,
+}
+
+fn valid_commit_id(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Normalises a commit id to the lowercase form the store records.
+fn commit_id(value: &str) -> Option<String> {
+    valid_commit_id(value).then(|| value.to_ascii_lowercase())
+}
+
 enum BasePackError {
     Provider(String),
     Pack(StageError),
@@ -278,7 +311,7 @@ pub async fn start_job(
             state.waiters.notify_work();
             with_version(json_ok(
                 StatusCode::OK,
-                &crate::routes::operator::job_view(&rec),
+                &crate::routes::operator::job_view_with_ttl(&rec, state.blocked_dependent_ttl_secs),
             ))
         }
         Ok(Err(e)) => with_version(store_err(e).into_response()),
@@ -796,7 +829,7 @@ pub async fn complete_job(
             state.waiters.notify_work();
             with_version(json_ok(
                 StatusCode::OK,
-                &crate::routes::operator::job_view(&rec),
+                &crate::routes::operator::job_view_with_ttl(&rec, state.blocked_dependent_ttl_secs),
             ))
         }
         Ok(Err(e)) => with_version(store_err(e).into_response()),
@@ -959,9 +992,158 @@ pub async fn list_deps(
             "finished_at": dep_rec.finished_at,
             "failure_class": dep_rec.failure_class.map(crate::routes::failure_class_str),
             "summary": dep_rec.summary,
+            "staged_commit": dep_rec.staged_commit,
         }));
     }
     with_version(json_ok(StatusCode::OK, &deps))
+}
+
+/// Records the commit an agent staged before dependency patches were applied. The lease epoch
+/// fences the write, so a transferred lease cannot overwrite a newer attempt's base.
+pub async fn set_staged_commit(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    uri: axum::http::Uri,
+    req: axum::extract::Request,
+) -> Response {
+    let node = match authenticate_agent(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(n) => n,
+        Err(e) => return with_version(e.into_response()),
+    };
+    let job_id = match JobId::parse(&id) {
+        Ok(i) => i,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let body: StagedCommitBody = match read_json(req, MAX_JSON_BODY).await {
+        Ok(b) => b,
+        Err(e) => return with_version(e.into_response()),
+    };
+    let Some(commit) = commit_id(&body.commit) else {
+        return with_version(ApiError::bad_request("invalid commit").into_response());
+    };
+    let rec = match owned_job(&state, &node, &job_id).await {
+        Ok(rec) => rec,
+        Err(res) => return *res,
+    };
+    let epoch = match epoch_from_uri(&uri) {
+        Ok(epoch) => epoch,
+        Err(_) => match body.epoch {
+            Some(epoch) => epoch,
+            None => {
+                return with_version(
+                    ApiError::bad_request("missing or invalid epoch").into_response(),
+                )
+            }
+        },
+    };
+    if rec.epoch != epoch {
+        return with_version(ApiError::stale_epoch().into_response());
+    }
+    let jid = job_id.clone();
+    let stored = commit.clone();
+    let store = Arc::clone(&state.store);
+    let result = tokio::task::spawn_blocking(move || {
+        store.record_staged_commit(&jid, epoch, &stored, now())
+    })
+    .await;
+    match result {
+        Ok(Ok(rec)) => with_version(json_ok(
+            StatusCode::OK,
+            &crate::routes::operator::job_view_with_ttl(&rec, state.blocked_dependent_ttl_secs),
+        )),
+        Ok(Err(e)) => with_version(store_err(e).into_response()),
+        Err(_) => with_version(ApiError::internal().into_response()),
+    }
+}
+
+/// Resolves the common ancestor of two or more dependency staged commits. Disagreeing dependency
+/// bases are read-only git work, so the result is computed on the blocking pool and fenced by the
+/// job's lease epoch.
+pub async fn merge_base(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    uri: axum::http::Uri,
+    req: axum::extract::Request,
+) -> Response {
+    let node = match authenticate_agent(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(n) => n,
+        Err(e) => return with_version(e.into_response()),
+    };
+    let job_id = match JobId::parse(&id) {
+        Ok(i) => i,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let body: MergeBaseBody = match read_json(req, MAX_JSON_BODY).await {
+        Ok(b) => b,
+        Err(e) => return with_version(e.into_response()),
+    };
+    if body.commits.len() < 2 || body.commits.len() > lu_proto::MAX_AFTER_JOBS {
+        return with_version(ApiError::bad_request("invalid commit list").into_response());
+    }
+    let Some(commits) = body
+        .commits
+        .iter()
+        .map(|value| commit_id(value))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return with_version(ApiError::bad_request("invalid commit").into_response());
+    };
+    let rec = match owned_job(&state, &node, &job_id).await {
+        Ok(rec) => rec,
+        Err(res) => return *res,
+    };
+    let epoch = match epoch_from_uri(&uri) {
+        Ok(epoch) => epoch,
+        Err(_) => match body.epoch {
+            Some(epoch) => epoch,
+            None => {
+                return with_version(
+                    ApiError::bad_request("missing or invalid epoch").into_response(),
+                )
+            }
+        },
+    };
+    if rec.epoch != epoch {
+        return with_version(ApiError::stale_epoch().into_response());
+    }
+    let repo = rec.spec.repo.clone();
+    let resolved = tokio::task::spawn_blocking(move || -> Result<String, MergeBaseError> {
+        for provider in &state.repo_providers {
+            let repository = match provider.open(&repo) {
+                Ok(Some(repository)) => repository,
+                Ok(None) => continue,
+                Err(_) => return Err(MergeBaseError::Git),
+            };
+            let mut base = git2::Oid::from_str(&commits[0]).map_err(|_| MergeBaseError::Git)?;
+            for value in &commits[1..] {
+                let oid = git2::Oid::from_str(value).map_err(|_| MergeBaseError::Git)?;
+                base = repository
+                    .merge_base(base, oid)
+                    .map_err(|_| MergeBaseError::NoAncestor)?;
+            }
+            return Ok(base.to_string());
+        }
+        Err(MergeBaseError::Unavailable)
+    })
+    .await;
+    match resolved {
+        Ok(Ok(commit)) => with_version(json_ok(
+            StatusCode::OK,
+            &serde_json::json!({ "commit": commit }),
+        )),
+        Ok(Err(MergeBaseError::NoAncestor)) => {
+            with_version(ApiError::conflict("no common merge base").into_response())
+        }
+        Ok(Err(MergeBaseError::Unavailable)) => {
+            with_version(ApiError::not_found("base not available").into_response())
+        }
+        Ok(Err(MergeBaseError::Git)) => with_version(ApiError::internal().into_response()),
+        Err(_) => with_version(ApiError::internal().into_response()),
+    }
 }
 
 pub async fn get_dep_diff(
@@ -1324,6 +1506,8 @@ mod poll_renewal_tests {
                     publish: None,
                     fallbacks: Vec::new(),
                     expect: None,
+                    stack_union_paths: Vec::new(),
+                    stack_base_paths: Vec::new(),
                 },
                 attempt: 1,
                 node: Some(NodeName::parse("node-a").unwrap()),
@@ -1345,6 +1529,9 @@ mod poll_renewal_tests {
                 scrubbed_hits: 0,
                 patch_scrubbed: false,
                 waiting_on: Vec::new(),
+                staged_commit: None,
+                blocked_reason: None,
+                blocked_since: None,
                 parent_job_id: None,
                 root_job_id: None,
                 depth: 0,
@@ -1542,6 +1729,7 @@ mod poll_renewal_tests {
             }],
             repos: Vec::new(),
             groups: Vec::new(),
+            blocked_dependent_ttl: "24h".to_owned(),
         };
         let state = Arc::new(AppState::from_config(&cfg, store.clone()).unwrap());
         let body = json!({"heartbeat": {"node": "node-a", "harness": "idle", "providers": []}, "wait_secs": 0}).to_string();
@@ -1596,6 +1784,7 @@ mod poll_renewal_tests {
             }],
             repos: Vec::new(),
             groups: Vec::new(),
+            blocked_dependent_ttl: "24h".to_owned(),
         };
         let state = Arc::new(AppState::from_config(&cfg, store).unwrap());
         let dir = tmp.path().join("artifacts").join(job_id.to_string());

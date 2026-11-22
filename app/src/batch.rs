@@ -670,6 +670,8 @@ pub fn plan(opts: &BatchOptions<'_>) -> Result<BatchPlan, Vec<String>> {
             tolerates: Vec::new(),
             fallbacks: Vec::new(),
             expect: fields.expect,
+            stack_union_paths: Vec::new(),
+            stack_base_paths: Vec::new(),
         };
         if let Err(error) = spec.validate() {
             push_error(&mut errors, &raw.source, error);

@@ -9,7 +9,7 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 #[cfg(test)]
 pub mod conformance;
@@ -96,8 +96,15 @@ pub struct JobRecord {
     pub scrubbed_hits: u64,
     /// Whether the stored `diff.patch` was scrubbed; such a patch may no longer apply.
     pub patch_scrubbed: bool,
-    /// Dependencies that are not yet `done`; empty once the job may run.
+    /// Dependencies that are not yet `done`; empty once the job may run. A job blocked by a dead
+    /// predecessor keeps the dead id here until it is retried or expires.
     pub waiting_on: Vec<JobId>,
+    /// Commit an agent staged for a stacked-chain predecessor, recorded while the job is leased.
+    pub staged_commit: Option<String>,
+    /// Why a blocked job is waiting, currently `predecessor failed` after a dead dependency.
+    pub blocked_reason: Option<String>,
+    /// Wall-clock time when `blocked_reason` was set, used by the retry/TTL grace period.
+    pub blocked_since: Option<i64>,
     /// Set only for jobs submitted through a harness's scoped socket.
     pub parent_job_id: Option<JobId>,
     /// The root of the spawn tree; equal to this job's id for a top-level job.
@@ -119,6 +126,8 @@ pub struct JobCounts {
     pub completed_cancelled: u64,
     /// Creation time of the oldest `queued` or `blocked` job, if any.
     pub oldest_pending_at: Option<i64>,
+    /// Blocked jobs whose predecessor failed and which are waiting for a retry or TTL expiry.
+    pub waiting_dependents: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -350,6 +359,60 @@ pub trait Store: Send + Sync + 'static {
     /// Queued or blocked becomes cancelled; leased or running sets `cancel_requested`;
     /// terminal conflicts.
     fn cancel_job(&self, id: &JobId, now: Now) -> Result<JobRecord, StoreError>;
+
+    /// Records the 40-character lowercase hex commit an agent staged for a stacked chain. The job
+    /// must be leased or running at `epoch`; a stale epoch or a finished job is rejected.
+    fn record_staged_commit(
+        &self,
+        id: &JobId,
+        epoch: u64,
+        commit: &str,
+        now: Now,
+    ) -> Result<JobRecord, StoreError> {
+        let _ = (id, epoch, commit, now);
+        Err(StoreError::InvalidSpec(
+            "staged commits are not supported by this store".to_owned(),
+        ))
+    }
+
+    /// Direct dependents waiting on `dep` because that predecessor failed or was cancelled.
+    fn blocked_dependents(&self, dep: &JobId) -> Result<Vec<JobRecord>, StoreError> {
+        let _ = dep;
+        Ok(Vec::new())
+    }
+
+    /// Fails blocked dependents whose retry/TTL grace period has elapsed. Returns the ids moved.
+    fn expire_blocked_dependents(&self, now: Now, ttl_secs: u64) -> Result<Vec<JobId>, StoreError> {
+        let _ = (now, ttl_secs);
+        Ok(Vec::new())
+    }
+
+    /// Cancels a job; by default only the named job. Stores that track dependency waits can also
+    /// cancel the blocked dependents that can no longer run.
+    fn cancel_job_with_dependents(
+        &self,
+        id: &JobId,
+        now: Now,
+        keep_dependents: bool,
+    ) -> Result<JobRecord, StoreError> {
+        let _ = keep_dependents;
+        self.cancel_job(id, now)
+    }
+
+    /// Creates a fresh terminal retry of `id` from `spec`. When `chain` is set, blocked dependents
+    /// are cloned too, remapped onto the new ids. Returns each `(old, new)` pair created.
+    fn retry_with_dependents(
+        &self,
+        id: &JobId,
+        spec: &JobSpec,
+        chain: bool,
+        now: Now,
+    ) -> Result<(JobRecord, Vec<(JobId, JobId)>), StoreError> {
+        let _ = (id, spec, chain, now);
+        Err(StoreError::InvalidSpec(
+            "retrying with dependents is not supported by this store".to_owned(),
+        ))
+    }
 
     /// Changes the provider, model, fallbacks, labels, taints or dependencies of a queued or
     /// blocked job, keeping its id. Other states conflict. New dependencies must exist, be alive,

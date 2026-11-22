@@ -27,7 +27,7 @@ systemd units are in [install.md](install.md); the agent's isolation model is in
 4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store uses schema version 3. It creates the schema for a new database and migrates schema 1 and 2 databases in place on startup, adding the scrubbing, lineage and publish columns. Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly schema version 3, so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
+The store uses schema version 4. It creates the schema for a new database and migrates schema 1, 2 and 3 databases in place on startup, adding the scrubbing, lineage, publish and stacked-chain columns (`staged_commit`, `blocked_reason`, `blocked_since`). Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly schema version 4, so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
 
@@ -116,7 +116,7 @@ systemctl start lu-controller.service
 ```
 
 `lu restore` verifies the snapshot, refuses a file that is not a Lu database (an empty or
-foreign SQLite file would replace your data with nothing), requires exactly schema version 3 and
+foreign SQLite file would replace your data with nothing), requires exactly schema version 4 and
 every table that version creates, and refuses when the database is still in use, so stop the
 controller first.
 Only one restore runs at a time. It stages the copy beside the database with the old file's
@@ -156,6 +156,35 @@ Legal state transitions and the recovery state machine are in [lifecycle.md](lif
 The listener stops accepting new connections on `SIGTERM` or Ctrl-C and drains in-flight connections for up to 10 seconds. The contributed unit allows 40 seconds before systemd sends `SIGKILL`.
 
 If the controller is down for longer than a lease, agents cannot renew. When it returns, the same recovery path applies; a job can therefore consume a retry even though the harness itself did nothing wrong.
+
+## Dependency chains and blocked dependents
+
+A failed or cancelled predecessor leaves its blocked dependents `blocked` rather than failing them
+immediately. `lu ls --state blocked` and `lu show <dependent>` show
+`blocked_reason: "predecessor failed"` plus a `blocked_until` deadline;
+`[controller] blocked_dependent_ttl` (default `24h`) sets how long they wait before failing with
+`failure_class: "dependency"`. `lu top` and the `lu_blocked_dependents_total` metric show the waiting
+count. See [dependencies.md](dependencies.md#waiting-and-promotion).
+
+```sh
+lu ls --state blocked
+lu show 01ARZ3NDEKTSV4RRFFQ69G5FAV     # inspect the predecessor and the deadline
+lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV     # reattach waiting dependents to the new job
+lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --chain  # also retry dependents and their references
+lu cancel 01ARZ3NDEKTSV4RRFFQ69G5FAV --keep-dependents
+```
+
+Chains use one base: a dependent without a pinned `source.base` inherits its predecessor's
+recorded `staged_commit`, and its exported patch is relative to that base. If several dependencies
+disagree, the agent stages their newest common ancestor; if any patch then fails to apply, the job
+fails with class `conflict` and the summary names every contested commit. After the chain finishes,
+merge the final patch onto the moved
+branch yourself — Lu does not rebase it onto a later tip. Conflict resolution for known-safe paths
+is opt-in through the agent's `[stack] union_paths` and `base_paths`
+([config.md](config.md#stack)); per-job `stack_union_paths`/`stack_base_paths` can only narrow those
+lists, and uncovered paths fail closed. See
+[dependencies.md](dependencies.md#one-base-per-chain) and
+[dependencies.md](dependencies.md#policy-paths-for-known-safe-conflicts).
 
 ## Provider failure detection
 
@@ -355,6 +384,8 @@ Safety rules:
 `lu top` shows the controller and agent versions in its title (`lu top <version> · controller <version>`). The node table includes `VERSION`, `LOAD` (`load1`, one decimal or `-`), `MEM` (used percent of total, or `-`), `WORKSPACES` (`count/bytes`) and `WS TOTALS` (`reclaimed/evictions/errors`). Memory is green below 80%, orange at 80%, and red at 95%. A node with `stuck > 0` shows a red `stuck` marker after its state, and a node whose version differs from the controller's is coloured orange.
 
 With the job list focused and a running job selected, `x` opens a process pane under the lists. It shows the selected job's three liveness counters (output idle, CPU idle, uploader behind) and its process tree (`PID`, `STATE`, `CPU_S`, `RSS`, `AGE`, `COMMAND`) from `GET /v1/nodes/{name}/stats`, refreshed every two seconds while open. States `D` and `Z` are red; both idle counters above 120 seconds are orange, and a stuck job is red. The pane also draws load and memory-used sparklines for that node from the dashboard's recent samples. `Esc` or `x` closes the pane. `--once` prints the same node columns as plain text.
+
+`lu top` also reports the number of dependents waiting on a failed or cancelled predecessor: when the count is non-zero, the title adds `· waiting <count>` after the controller version, matching the `lu_blocked_dependents_total` metric. See [Dependency chains and blocked dependents](#dependency-chains-and-blocked-dependents).
 
 `lu top` draws the dependency graph in a bordered `Graph` panel below the job list when the terminal is at least 24 rows tall and a component has an unfinished job. Press `g` to hide or show it. A component is a set of jobs linked by `after`, including finished jobs that connect unfinished ones; a component whose jobs are all terminal is left out. The panel gets at most a third of the terminal height and at least three content rows; it clips long graphs instead of pushing the other panes.
 

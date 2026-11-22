@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use lu_client::{ApiError, Controller};
-use lu_config::{AgentConfig, BaseSource, StuckPolicy as ConfigStuckPolicy};
+use lu_client::{ApiError, Controller, DependencyView};
+use lu_config::{AgentConfig, BaseSource, StackConfig, StuckPolicy as ConfigStuckPolicy};
 use lu_proto::{
     effective_stuck, printable, truncate_chars, AgentEvent, ArtifactName, Completion, ExpectMode,
     ExpectSpec, FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobStats, NodeName,
@@ -33,7 +33,7 @@ use lu_proto::{
     MAX_TAINTS,
 };
 use lu_staging::{
-    ApplyError, ConflictPolicy, ExportedDiff, Source, StageRequest, StagedDir, Staging,
+    ApplyError, ConflictPolicy, ExportedDiff, Source, StackPolicy, StageRequest, StagedDir, Staging,
 };
 use lu_supervise::{CommandSpec, Limits, Outcome as SuperviseOutcome, Supervisor};
 use tokio::sync::{mpsc, oneshot};
@@ -86,6 +86,11 @@ const REIKI_UNAVAILABLE_READS: u32 = 2;
 
 /// Output quoted on a completion summary. Kept small and independent of the log cap.
 const SUMMARY_TAIL_BYTES: usize = 16 * 1024;
+
+/// How many files, hunks or policy globs one conflict summary lists before it says "more".
+const CONFLICT_SUMMARY_ITEMS: usize = 12;
+/// Length of one printable item in a conflict summary.
+const CONFLICT_SUMMARY_ITEM_CHARS: usize = 160;
 
 /// The command builder is a seam for tests; production always builds the opencode command.
 type CommandBuilder =
@@ -207,6 +212,8 @@ pub struct Agent {
     controller: Arc<dyn Controller>,
     staging: Staging,
     base_source: BaseSource,
+    /// Agent-wide `[stack]` policy. Job specs may only narrow it.
+    stack: Option<StackConfig>,
     work_dir: PathBuf,
     heartbeat_secs: u64,
     /// Defaults applied to jobs that omit their own stuck fields.
@@ -342,6 +349,7 @@ impl Agent {
             controller,
             staging,
             base_source: config.base_source,
+            stack: config.stack,
             work_dir,
             heartbeat_secs: config.heartbeat_secs,
             default_on_stuck: proto_stuck_policy(config.on_stuck),
@@ -614,12 +622,15 @@ impl Agent {
     }
 
     /// Fetches the base pack when the job names one and the configured source allows it.
-    /// A controller-mode miss is a node failure; `auto` silently falls back to cloning.
+    /// A controller-mode miss is a node failure; `auto` silently falls back to cloning. An
+    /// inherited commit is different: the controller may only hold a pack for the job's original
+    /// base, so a miss there falls back to a clone of the inherited commit in every mode.
     async fn fetch_base(
         &self,
         job_id: &JobId,
         epoch: u64,
         commit: Option<&str>,
+        inherited: bool,
     ) -> Result<Option<(String, Vec<u8>)>, AgentError> {
         let Some(commit) = commit else {
             return Ok(None);
@@ -630,6 +641,13 @@ impl Agent {
         match self.controller.job_base(job_id, epoch).await {
             Ok(Some((got, pack))) => {
                 if got != commit {
+                    if inherited {
+                        info!(
+                            job = %job_id,
+                            "controller base is not the inherited commit; cloning instead"
+                        );
+                        return Ok(None);
+                    }
                     return Err(AgentError::Controller(format!(
                         "controller returned base {got}, expected {commit}"
                     )));
@@ -637,7 +655,7 @@ impl Agent {
                 Ok(Some((got, pack)))
             }
             Ok(None) | Err(ApiError::NotFound) => match self.base_source {
-                BaseSource::Controller => Err(AgentError::Controller(
+                BaseSource::Controller if !inherited => Err(AgentError::Controller(
                     "controller has no base for the job".to_owned(),
                 )),
                 BaseSource::Auto => {
@@ -645,6 +663,10 @@ impl Agent {
                     Ok(None)
                 }
                 BaseSource::Clone => Ok(None),
+                BaseSource::Controller => {
+                    info!(job = %job_id, "controller has no inherited base; cloning instead");
+                    Ok(None)
+                }
             },
             Err(error) => Err(fatal_error(&error).unwrap_or_else(|| {
                 AgentError::Controller(format!("could not fetch the base: {error}"))
@@ -703,6 +725,109 @@ impl Agent {
         )
         .map(|(policy, after_secs)| (policy, self.stuck_after_override.unwrap_or(after_secs)));
 
+        // A job override is only allowed to narrow the agent's configured stack policy. Refuse it
+        // before any staging work, so a widened policy never reaches a harness.
+        let stack_policy = match effective_stack_policy(self.stack.as_ref(), &spec) {
+            Ok(policy) => policy,
+            Err(summary) => {
+                self.complete_failure(&job_id, epoch, &summary, FailureClass::Conflict, &workspace)
+                    .await?;
+                return Ok(JobEnd::Finished);
+            }
+        };
+
+        // A chain starts from the commit its dependencies were staged from, not from whatever the
+        // branch happens to point at now. One controller read serves both the base decision and
+        // the later patch application.
+        let mut stack_base: Option<StackBase> = None;
+        let mut deps_for_apply: Option<Vec<DependencyView>> = None;
+        if !spec.after.is_empty() && spec.base_commit.is_none() {
+            let deps = match self.controller.deps(&job_id, epoch).await {
+                Ok(deps) => deps,
+                Err(ApiError::StaleEpoch) => return Ok(JobEnd::Stale),
+                Err(ApiError::Unauthorized) => return Err(AgentError::Unauthorized),
+                Err(ApiError::Forbidden) => return Err(AgentError::Forbidden),
+                Err(error) => {
+                    return Err(AgentError::Controller(format!(
+                        "could not list dependencies for the stack base: {error}"
+                    )))
+                }
+            };
+            let commits = match inherited_commits(&deps, &spec.after) {
+                Ok(commits) => commits,
+                Err(summary) => {
+                    self.complete_failure(
+                        &job_id,
+                        epoch,
+                        &summary,
+                        FailureClass::Conflict,
+                        &workspace,
+                    )
+                    .await?;
+                    return Ok(JobEnd::Finished);
+                }
+            };
+            let (commit, disagreement) = if commits.iter().all(|commit| commit == &commits[0]) {
+                (commits[0].clone(), None)
+            } else {
+                match self.controller.merge_base(&job_id, epoch, &commits).await {
+                    Ok(commit) if is_commit_id(&commit) => {
+                        let disagreement = format!(
+                            "dependency staged commits disagreed ({}); resolved with merge base {commit}",
+                            commits.join(", ")
+                        );
+                        (commit, Some(disagreement))
+                    }
+                    Ok(commit) => {
+                        let summary = format!(
+                            "controller returned an invalid merge base {commit:?} for disagreeing dependencies {}",
+                            commits.join(", ")
+                        );
+                        self.complete_failure(
+                            &job_id,
+                            epoch,
+                            &summary,
+                            FailureClass::Conflict,
+                            &workspace,
+                        )
+                        .await?;
+                        return Ok(JobEnd::Finished);
+                    }
+                    Err(error) => {
+                        let summary = format!(
+                            "dependencies disagree on the staged commit ({}); no common base: {}",
+                            commits.join(", "),
+                            printable(&error.to_string())
+                        );
+                        match error {
+                            ApiError::StaleEpoch => return Ok(JobEnd::Stale),
+                            ApiError::Unauthorized => return Err(AgentError::Unauthorized),
+                            ApiError::Forbidden => return Err(AgentError::Forbidden),
+                            _ => {}
+                        }
+                        self.complete_failure(
+                            &job_id,
+                            epoch,
+                            &summary,
+                            FailureClass::Conflict,
+                            &workspace,
+                        )
+                        .await?;
+                        return Ok(JobEnd::Finished);
+                    }
+                }
+            };
+            stack_base = Some(StackBase {
+                commit,
+                disagreement,
+            });
+            deps_for_apply = Some(deps);
+        }
+        let effective_base = stack_base
+            .as_ref()
+            .map(|base| base.commit.clone())
+            .or_else(|| spec.base_commit.clone());
+
         let request = StageRequest {
             job_id: job_id.to_string(),
             source: if spec.repo.starts_with('/') {
@@ -710,10 +835,17 @@ impl Agent {
             } else {
                 Source::Url(spec.repo.clone())
             },
-            git_ref: spec.git_ref.clone(),
+            git_ref: effective_base
+                .clone()
+                .unwrap_or_else(|| spec.git_ref.clone()),
         };
         let base = self
-            .fetch_base(&job_id, epoch, spec.base_commit.as_deref())
+            .fetch_base(
+                &job_id,
+                epoch,
+                effective_base.as_deref(),
+                stack_base.is_some(),
+            )
             .await?;
         let staged = match base {
             Some((commit, pack)) => self.staging.stage_from_pack(request, &commit, &pack),
@@ -729,6 +861,43 @@ impl Agent {
                 return Ok(JobEnd::Finished);
             }
         };
+
+        // Record the real HEAD before any dependency patch lands, so future dependants inherit
+        // this job's base rather than its patched result.
+        let staged_commit = match staged_head_commit(&staged) {
+            Ok(commit) => commit,
+            Err(error) => {
+                let summary = format!("could not resolve the staged commit: {error}");
+                self.complete_failure(&job_id, epoch, &summary, FailureClass::Node, &workspace)
+                    .await?;
+                return Ok(JobEnd::Finished);
+            }
+        };
+        match self
+            .controller
+            .set_staged_commit(&job_id, epoch, &staged_commit)
+            .await
+        {
+            Ok(()) => {}
+            Err(ApiError::StaleEpoch) => return Ok(JobEnd::Stale),
+            Err(ApiError::Unauthorized) => return Err(AgentError::Unauthorized),
+            Err(ApiError::Forbidden) => return Err(AgentError::Forbidden),
+            Err(error) => {
+                let summary = format!(
+                    "controller rejected the staged commit {staged_commit}: {}",
+                    printable(&error.to_string())
+                );
+                self.complete_failure(
+                    &job_id,
+                    epoch,
+                    &summary,
+                    FailureClass::Execution,
+                    &workspace,
+                )
+                .await?;
+                return Ok(JobEnd::Finished);
+            }
+        }
 
         if let Err(error) = self.workspaces.create_cache_dirs(&job_id, &spec.cache_dirs) {
             let summary = format!("workspace cache directories failed: {error}");
@@ -751,8 +920,19 @@ impl Agent {
         };
         let mut applied = Vec::new();
         if mode.applies_diffs() {
+            let context = StackContext {
+                deps: deps_for_apply,
+                stack_policy: stack_policy.as_ref(),
+            };
             match self
-                .apply_dependencies(&job_id, epoch, &staged, policy, spec.include_failed)
+                .apply_dependencies(
+                    &job_id,
+                    epoch,
+                    &staged,
+                    policy,
+                    spec.include_failed,
+                    context,
+                )
                 .await?
             {
                 DependencyApply::Applied(deps) => applied = deps,
@@ -761,11 +941,26 @@ impl Agent {
                     input,
                     dependency,
                     paths,
+                    hunks,
+                    dependency_base,
                     applied: done,
                     detail,
                 } => {
-                    let summary =
-                        dependency_conflict_summary(&input, &dependency, &paths, detail.as_deref());
+                    let summary = dependency_conflict_summary(
+                        &input,
+                        &dependency,
+                        &paths,
+                        &hunks,
+                        detail.as_deref(),
+                        &ConflictContext {
+                            staged_base: effective_base.as_deref(),
+                            dependency_base: dependency_base.as_deref(),
+                            stack_policy: stack_policy.as_ref(),
+                            disagreement: stack_base
+                                .as_ref()
+                                .and_then(|base| base.disagreement.as_deref()),
+                        },
+                    );
                     self.finish(&Finish {
                         job_id: &job_id,
                         epoch,
@@ -1386,17 +1581,21 @@ impl Agent {
         staged: &StagedDir,
         policy: ConflictPolicy,
         include_failed: bool,
+        context: StackContext<'_>,
     ) -> Result<DependencyApply, AgentError> {
-        let deps = match self.controller.deps(job_id, epoch).await {
-            Ok(deps) => deps,
-            Err(ApiError::StaleEpoch) => return Ok(DependencyApply::Stale),
-            Err(ApiError::Unauthorized) => return Err(AgentError::Unauthorized),
-            Err(ApiError::Forbidden) => return Err(AgentError::Forbidden),
-            Err(error) => {
-                return Err(AgentError::Controller(format!(
-                    "could not list dependencies: {error}"
-                )))
-            }
+        let deps = match context.deps {
+            Some(deps) => deps,
+            None => match self.controller.deps(job_id, epoch).await {
+                Ok(deps) => deps,
+                Err(ApiError::StaleEpoch) => return Ok(DependencyApply::Stale),
+                Err(ApiError::Unauthorized) => return Err(AgentError::Unauthorized),
+                Err(ApiError::Forbidden) => return Err(AgentError::Forbidden),
+                Err(error) => {
+                    return Err(AgentError::Controller(format!(
+                        "could not list dependencies: {error}"
+                    )))
+                }
+            },
         };
         let names = collect::input_names(&deps, include_failed);
         let mut applied = Vec::new();
@@ -1421,7 +1620,13 @@ impl Agent {
                     )))
                 }
             };
-            match Staging::apply_input_diff(staged, &bytes, &name, policy) {
+            match Staging::apply_input_diff_with_policy(
+                staged,
+                &bytes,
+                &name,
+                policy,
+                context.stack_policy,
+            ) {
                 Ok(result) => applied.push(AppliedInput {
                     job_id: dep.job_id.to_string(),
                     name,
@@ -1429,11 +1634,17 @@ impl Agent {
                     conflicted_paths: result.conflicted_paths,
                     detail: result.detail,
                 }),
-                Err(ApplyError::Conflict { paths, detail }) => {
+                Err(ApplyError::Conflict {
+                    paths,
+                    hunks,
+                    detail,
+                }) => {
                     return Ok(DependencyApply::Conflict {
                         input: name,
                         dependency: dep.job_id.to_string(),
                         paths,
+                        hunks,
+                        dependency_base: dep.staged_commit.clone(),
                         applied,
                         detail,
                     })
@@ -1443,6 +1654,8 @@ impl Agent {
                         input: name,
                         dependency: dep.job_id.to_string(),
                         paths: Vec::new(),
+                        hunks: Vec::new(),
+                        dependency_base: dep.staged_commit.clone(),
                         applied,
                         detail: Some(error.to_string()),
                     })
@@ -1609,26 +1822,216 @@ enum DependencyApply {
         input: String,
         dependency: String,
         paths: Vec<String>,
+        hunks: Vec<String>,
+        dependency_base: Option<String>,
         applied: Vec<AppliedInput>,
         detail: Option<String>,
     },
     Stale,
 }
 
+/// The base decision made before staging. `disagreement` is a printable note naming every
+/// conflicting dependency commit when the controller had to compute a merge base.
+struct StackBase {
+    commit: String,
+    disagreement: Option<String>,
+}
+
+/// Values borrowed from the base decision for the patch-application step.
+struct StackContext<'a> {
+    /// Dependency views already fetched for the base decision, if there was one.
+    deps: Option<Vec<DependencyView>>,
+    stack_policy: Option<&'a StackPolicy>,
+}
+
+/// Values borrowed when a dependency patch conflicts.
+struct ConflictContext<'a> {
+    staged_base: Option<&'a str>,
+    dependency_base: Option<&'a str>,
+    stack_policy: Option<&'a StackPolicy>,
+    disagreement: Option<&'a str>,
+}
+
+fn is_commit_id(text: &str) -> bool {
+    text.len() == 40 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Narrows the agent-wide `[stack]` policy with a job's overrides. The narrow lists carry only
+/// globs the agent already configured, so a job cannot widen what the node permits. An empty
+/// policy on either side stays fail-closed (`None`).
+fn effective_stack_policy(
+    config: Option<&StackConfig>,
+    spec: &JobSpec,
+) -> Result<Option<StackPolicy>, String> {
+    let Some(config) = config else {
+        if !spec.stack_union_paths.is_empty() || !spec.stack_base_paths.is_empty() {
+            return Err(
+                "job override widens the configured [stack] policy: no paths are configured on this agent"
+                    .to_owned(),
+            );
+        }
+        return Ok(None);
+    };
+    for path in &spec.stack_union_paths {
+        if !config.union_paths.contains(path) {
+            return Err(format!(
+                "job override widens the configured [stack] policy: union path {path:?} is not configured"
+            ));
+        }
+    }
+    for path in &spec.stack_base_paths {
+        if !config.base_paths.contains(path) {
+            return Err(format!(
+                "job override widens the configured [stack] policy: base path {path:?} is not configured"
+            ));
+        }
+    }
+    let union_paths = if spec.stack_union_paths.is_empty() {
+        config.union_paths.clone()
+    } else {
+        spec.stack_union_paths.clone()
+    };
+    let base_paths = if spec.stack_base_paths.is_empty() {
+        config.base_paths.clone()
+    } else {
+        spec.stack_base_paths.clone()
+    };
+    if union_paths.is_empty() && base_paths.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(StackPolicy {
+            union_paths,
+            base_paths,
+        }))
+    }
+}
+
+/// Reads the commit each dependency was staged from. Every dependency named in `after` must have
+/// one: without it there is no safe base to inherit and the job fails closed.
+fn inherited_commits(deps: &[DependencyView], after: &[JobId]) -> Result<Vec<String>, String> {
+    let mut commits = Vec::with_capacity(deps.len());
+    for dep in deps {
+        let Some(commit) = dep.staged_commit.as_deref() else {
+            return Err(format!(
+                "dependency {} has no staged commit; cannot inherit a stack base",
+                dep.job_id
+            ));
+        };
+        if !is_commit_id(commit) {
+            return Err(format!(
+                "dependency {} reported an invalid staged commit {commit:?}",
+                dep.job_id
+            ));
+        }
+        commits.push(commit.to_owned());
+    }
+    for id in after {
+        if !deps.iter().any(|dep| &dep.job_id == id) {
+            return Err(format!(
+                "dependency {id} has no staged commit in the dependency view"
+            ));
+        }
+    }
+    Ok(commits)
+}
+
+/// Resolves the actual commit checked out in a staged tree. Dependency patches are applied to
+/// this tree, and it is the commit reported to the controller for later links in the chain.
+fn staged_head_commit(staged: &StagedDir) -> Result<String, String> {
+    let repo = git2::Repository::open(staged.path())
+        .map_err(|error| format!("could not open the staged repository: {error}"))?;
+    let head = repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map_err(|error| format!("could not peel staged HEAD to a commit: {error}"))?;
+    let commit = head.id().to_string();
+    if !is_commit_id(&commit) {
+        return Err(format!("staged HEAD {commit:?} is not a commit id"));
+    }
+    Ok(commit)
+}
+
+fn printable_items(items: &[String]) -> String {
+    if items.is_empty() {
+        return "none".to_owned();
+    }
+    let mut text: Vec<String> = items
+        .iter()
+        .take(CONFLICT_SUMMARY_ITEMS)
+        .map(|item| truncate_chars(&printable(item), CONFLICT_SUMMARY_ITEM_CHARS))
+        .collect();
+    if items.len() > CONFLICT_SUMMARY_ITEMS {
+        text.push(format!("(+{} more)", items.len() - CONFLICT_SUMMARY_ITEMS));
+    }
+    text.join(", ")
+}
+
+fn covering_globs<'a>(globs: &'a [String], paths: &[String]) -> Vec<&'a str> {
+    globs
+        .iter()
+        .map(String::as_str)
+        .filter(|glob| {
+            paths
+                .iter()
+                .any(|path| ExpectSpec::glob_matches(glob, path))
+        })
+        .collect()
+}
+
 fn dependency_conflict_summary(
     input: &str,
     dependency: &str,
     paths: &[String],
+    hunks: &[String],
     detail: Option<&str>,
+    context: &ConflictContext<'_>,
 ) -> String {
-    let mut summary = format!("input {input} ({dependency}) could not be applied");
+    let mut summary = format!(
+        "input {} ({}) could not be applied",
+        printable(input),
+        printable(dependency)
+    );
     if !paths.is_empty() {
-        summary.push_str("; conflicts: ");
-        summary.push_str(&paths.join(", "));
+        summary.push_str("; conflicted files: ");
+        summary.push_str(&printable_items(paths));
+    }
+    if !hunks.is_empty() {
+        summary.push_str("; conflicted hunks: ");
+        let hunks: Vec<String> = hunks.to_vec();
+        summary.push_str(&printable_items(&hunks));
+    }
+    let moved = match (context.staged_base, context.dependency_base) {
+        (Some(staged), Some(dependency)) => !staged.eq_ignore_ascii_case(dependency),
+        // An older controller does not report a dependency base, so it cannot have moved.
+        _ => false,
+    };
+    summary.push_str(&format!(
+        "; base moved since dependency was staged: {}",
+        if moved { "yes" } else { "no" }
+    ));
+    if let Some(disagreement) = context.disagreement {
+        summary.push_str("; ");
+        summary.push_str(&printable(disagreement));
+    }
+    let (union_globs, base_globs) = match context.stack_policy {
+        Some(policy) => (
+            covering_globs(&policy.union_paths, paths),
+            covering_globs(&policy.base_paths, paths),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+    for (label, globs) in [("union", union_globs), ("base", base_globs)] {
+        summary.push_str(&format!("; {label} globs covering conflicts: "));
+        if globs.is_empty() {
+            summary.push_str("none");
+        } else {
+            let globs: Vec<String> = globs.into_iter().map(str::to_owned).collect();
+            summary.push_str(&printable_items(&globs));
+        }
     }
     if let Some(detail) = detail {
         summary.push_str(": ");
-        summary.push_str(detail);
+        summary.push_str(&printable(detail));
     }
     summary
 }

@@ -5,6 +5,16 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- One base per dependency chain. The agent records the commit it staged in `JobView.staged_commit`, also exposed on entries from `GET /v1/agent/jobs/{id}/deps`. A dependent with no pinned `source.base` inherits the `staged_commit` of its dependencies; all must agree, and disagreeing commits stage their newest common ancestor; if a patch then fails to apply, a conflict summary names every contested commit. A dependent's `diff.patch` is relative to the inherited base, and the operator merges the final patch onto the moved branch afterwards. See [docs/dependencies.md](docs/dependencies.md#one-base-per-chain).
+- Opt-in agent `[stack]` conflict policies: `union_paths` keeps both sides' added lines in order and base deletions, while `base_paths` takes the base side for generated lock files. Per-job `stack_union_paths`/`stack_base_paths` can only narrow the configured lists; every other path fails closed with class `conflict`. A resolved conflict's summary names each file and hunk, whether the base moved since staging, and the covered policy paths. See [docs/config.md](docs/config.md#stack) and [docs/dependencies.md](docs/dependencies.md#policy-paths-for-known-safe-conflicts).
+- `[controller] blocked_dependent_ttl` (default `24h`). A failed or cancelled predecessor leaves blocked dependents waiting with `blocked_reason: "predecessor failed"`, shown in job views (`blocked_until` deadline) and `lu ls`. `lu retry` reattaches waiting dependents, `lu retry --chain` also retries dependents and their references, cancel takes waiting dependents unless `--keep-dependents`, and TTL expiry fails them with class `dependency`. `lu_blocked_dependents_total` and `lu top` show the waiting count. See [docs/operations.md](docs/operations.md#dependency-chains-and-blocked-dependents).
+
+### Changed
+
+- The store has a single baseline at schema version 4, adding `staged_commit`, `blocked_reason` and `blocked_since` to jobs. Databases at versions 1, 2 and 3 migrate in place at startup; backups and restores require exactly version 4. The Ting rename still does not change the schema baseline. Schema references were updated across the operator docs.
+
 ## [0.5.0]
 
 Requires: a new controller database (the schema was reset; recreate it before upgrading).

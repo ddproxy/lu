@@ -64,6 +64,16 @@ pub struct JobView {
     pub depth: u32,
     #[serde(default)]
     pub waiting_reason: Option<String>,
+    /// Commit the agent actually staged this job from, recorded before dependency patches are
+    /// applied. Dependents inherit it when they have no pinned base of their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_commit: Option<String>,
+    /// Why a blocked job is waiting; `predecessor failed` after a failed or cancelled dependency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    /// Wall-clock deadline at which a blocked dependent fails with class `dependency`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_until: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_note: Option<String>,
     /// Size of `diff.patch`, present for terminal jobs (zero when none was stored).
@@ -115,6 +125,9 @@ impl JobView {
             root_job_id: None,
             depth: 0,
             waiting_reason: None,
+            staged_commit: None,
+            blocked_reason: None,
+            blocked_until: None,
             outcome_note: None,
             diff_bytes: None,
             scrubbed_hits: 0,
@@ -287,6 +300,8 @@ pub(crate) fn empty_job_spec() -> JobSpec {
         collect: crate::CollectMode::Apply,
         include_failed: false,
         on_conflict: Default::default(),
+        stack_union_paths: Vec::new(),
+        stack_base_paths: Vec::new(),
         allow_empty: false,
         expect: None,
         requires: Vec::new(),

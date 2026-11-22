@@ -78,7 +78,7 @@ fn log_tail(text: &str) -> String {
         .join("\n")
 }
 
-async fn snapshot(client: &Client) -> Result<Snapshot, String> {
+async fn snapshot(client: &Client) -> Result<(Snapshot, u64), String> {
     let now = unix_now();
     let nodes = client.nodes().await.map_err(|e| e.to_string())?;
     let jobs = client
@@ -86,97 +86,112 @@ async fn snapshot(client: &Client) -> Result<Snapshot, String> {
         .await
         .map_err(|e| e.to_string())?;
     let status = client.status().await.map_err(|e| e.to_string())?;
-    Ok(Snapshot {
-        drafts: status.drafts,
-        oldest_draft_secs: status.oldest_draft_secs,
-        controller_version: client.controller_version(),
-        nodes: nodes
-            .nodes
-            .iter()
-            .map(|node| NodeRow {
-                name: node.name.to_string(),
-                harness: operator::harness_name(node.harness),
-                drained: node.draining,
-                seen_secs_ago: (node.last_seen > 0).then(|| now.saturating_sub(node.last_seen)),
-                providers: node
-                    .providers
-                    .iter()
-                    .map(|p| ProviderCell {
-                        name: p.name.clone(),
-                        state: p.state.as_str().to_owned(),
-                        soonest_secs: p.soonest_secs,
-                    })
-                    .collect(),
-                cordons: node
-                    .cordon_details
-                    .iter()
-                    .map(|cordon| CordonCell {
-                        provider: cordon.provider.clone(),
-                        source: cordon.source.clone(),
-                        reason: cordon.reason.clone(),
-                        remaining_secs: cordon
-                            .until
-                            .map(|until| until.saturating_sub(now as i64).max(0) as u64),
-                        lifts_after_healthy_heartbeats: cordon.lifts_after_healthy_heartbeats,
-                    })
-                    .collect(),
-                version: node.version.clone(),
-                load1: node.load1,
-                mem_available_kb: node.mem_available_kb,
-                mem_total_kb: node.mem_total_kb,
-                stuck: node.stuck,
-                workspace_bytes: node.workspace_bytes,
-                workspace_count: node.workspace_count,
-                workspace_reclaimed_bytes_total: node.workspace_reclaimed_bytes_total,
-                workspace_evictions_total: node.workspace_evictions_total,
-                workspace_delete_errors_total: node.workspace_delete_errors_total,
-                labels: node.labels.clone(),
-            })
-            .collect(),
-        jobs: jobs
-            .jobs
-            .iter()
-            .map(|job| JobRow {
-                id: job.id.to_string(),
-                title: operator::job_title(&job.spec.task),
-                state: operator::state_name(job.state).to_owned(),
-                node: job.node.as_ref().map(ToString::to_string),
-                attempt: job.attempt,
-                age_secs: now.saturating_sub(job.created_at),
-                model: job.spec.model.clone(),
-                note: {
-                    let mut note = match job.outcome_note.as_deref() {
-                        Some("no_changes") => "no changes".to_owned(),
-                        Some("expect_failed") => "expect failed".to_owned(),
-                        _ => match (&job.failure_class, &job.summary) {
-                            (Some(_), Some(summary)) => format!(
-                                "{}: {}",
-                                operator::failure_name(job.failure_class),
-                                plain_summary(summary)
-                            ),
-                            (Some(_), None) => operator::failure_name(job.failure_class),
-                            (None, Some(summary)) => plain_summary(summary),
-                            (None, None) => String::new(),
-                        },
-                    };
-                    if job.parent_job_id.is_some() {
-                        if !note.is_empty() {
-                            note.push(' ');
+    let waiting_dependents = status.waiting_dependents;
+    // The shared TUI model has no waiting-dependent field. A suffix on the controller version
+    // keeps the count visible in the live header without changing the crate boundary.
+    let controller_version = match client.controller_version() {
+        Some(version) if waiting_dependents > 0 => {
+            Some(format!("{version} · waiting {waiting_dependents}"))
+        }
+        version => version,
+    };
+    Ok((
+        Snapshot {
+            drafts: status.drafts,
+            oldest_draft_secs: status.oldest_draft_secs,
+            controller_version,
+            nodes: nodes
+                .nodes
+                .iter()
+                .map(|node| NodeRow {
+                    name: node.name.to_string(),
+                    harness: operator::harness_name(node.harness),
+                    drained: node.draining,
+                    seen_secs_ago: (node.last_seen > 0).then(|| now.saturating_sub(node.last_seen)),
+                    providers: node
+                        .providers
+                        .iter()
+                        .map(|p| ProviderCell {
+                            name: p.name.clone(),
+                            state: p.state.as_str().to_owned(),
+                            soonest_secs: p.soonest_secs,
+                        })
+                        .collect(),
+                    cordons: node
+                        .cordon_details
+                        .iter()
+                        .map(|cordon| CordonCell {
+                            provider: cordon.provider.clone(),
+                            source: cordon.source.clone(),
+                            reason: cordon.reason.clone(),
+                            remaining_secs: cordon
+                                .until
+                                .map(|until| until.saturating_sub(now as i64).max(0) as u64),
+                            lifts_after_healthy_heartbeats: cordon.lifts_after_healthy_heartbeats,
+                        })
+                        .collect(),
+                    version: node.version.clone(),
+                    load1: node.load1,
+                    mem_available_kb: node.mem_available_kb,
+                    mem_total_kb: node.mem_total_kb,
+                    stuck: node.stuck,
+                    workspace_bytes: node.workspace_bytes,
+                    workspace_count: node.workspace_count,
+                    workspace_reclaimed_bytes_total: node.workspace_reclaimed_bytes_total,
+                    workspace_evictions_total: node.workspace_evictions_total,
+                    workspace_delete_errors_total: node.workspace_delete_errors_total,
+                    labels: node.labels.clone(),
+                })
+                .collect(),
+            jobs: jobs
+                .jobs
+                .iter()
+                .map(|job| JobRow {
+                    id: job.id.to_string(),
+                    title: operator::job_title(&job.spec.task),
+                    state: operator::state_name(job.state).to_owned(),
+                    node: job.node.as_ref().map(ToString::to_string),
+                    attempt: job.attempt,
+                    age_secs: now.saturating_sub(job.created_at),
+                    model: job.spec.model.clone(),
+                    note: {
+                        let mut note = match job.outcome_note.as_deref() {
+                            Some("no_changes") => "no changes".to_owned(),
+                            Some("expect_failed") => "expect failed".to_owned(),
+                            _ => match (&job.failure_class, &job.summary) {
+                                (Some(_), Some(summary)) => format!(
+                                    "{}: {}",
+                                    operator::failure_name(job.failure_class),
+                                    plain_summary(summary)
+                                ),
+                                (Some(_), None) => operator::failure_name(job.failure_class),
+                                (None, Some(summary)) => plain_summary(summary),
+                                (None, None) => String::new(),
+                            },
+                        };
+                        if job.parent_job_id.is_some() {
+                            if !note.is_empty() {
+                                note.push(' ');
+                            }
+                            note.push_str(&format!("scope:d{}", job.depth));
                         }
-                        note.push_str(&format!("scope:d{}", job.depth));
-                    }
-                    if let Some(publish) = &job.publish {
-                        if !note.is_empty() {
-                            note.push(' ');
+                        if let Some(publish) = &job.publish {
+                            if !note.is_empty() {
+                                note.push(' ');
+                            }
+                            note.push_str(&format!(
+                                "publish:{}:{}",
+                                publish.detail, publish.branch
+                            ));
                         }
-                        note.push_str(&format!("publish:{}:{}", publish.detail, publish.branch));
-                    }
-                    note
-                },
-                after: job.after.iter().map(ToString::to_string).collect(),
-            })
-            .collect(),
-    })
+                        note
+                    },
+                    after: job.after.iter().map(ToString::to_string).collect(),
+                })
+                .collect(),
+        },
+        waiting_dependents,
+    ))
 }
 
 async fn fetch_log(client: &Client, job_id: &str) -> Result<String, String> {
@@ -230,11 +245,14 @@ async fn fetch_process_stats(client: &Client, target: &ProcessPaneTarget) -> Upd
 }
 
 async fn print_once(client: &Client) -> Result<(), String> {
-    let snapshot = snapshot(client).await?;
+    let (snapshot, waiting_dependents) = snapshot(client).await?;
     let mut dashboard = Dashboard::new();
     let now = Instant::now();
     dashboard.apply(Ok(snapshot), now);
     println!("{}", dashboard.view(now).table_text());
+    if waiting_dependents > 0 {
+        println!("waiting_dependents {waiting_dependents}");
+    }
     Ok(())
 }
 
@@ -244,7 +262,12 @@ async fn print_json(client: &Client) -> Result<(), String> {
         .list_jobs(None, Some(JOBS_SHOWN))
         .await
         .map_err(|error| error.to_string())?;
-    let body = serde_json::json!({ "nodes": nodes.nodes, "jobs": jobs.jobs });
+    let status = client.status().await.map_err(|error| error.to_string())?;
+    let body = serde_json::json!({
+        "nodes": nodes.nodes,
+        "jobs": jobs.jobs,
+        "waiting_dependents": status.waiting_dependents,
+    });
     let text = serde_json::to_string(&body).map_err(|error| error.to_string())?;
     println!("{text}");
     Ok(())
@@ -279,7 +302,8 @@ pub async fn run(config: &Path, args: TopArgs, json: bool) -> Result<(), String>
         while !feeder_stop.load(Ordering::Relaxed) {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if tx.send(snapshot(&feeder_client).await).is_err() {
+                    let fetched = snapshot(&feeder_client).await.map(|(snapshot, _)| snapshot);
+                    if tx.send(fetched).is_err() {
                         break;
                     }
                     if let Some(target) = process_target.clone() {

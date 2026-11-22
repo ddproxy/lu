@@ -15,9 +15,9 @@ use crate::limits::{
     MAX_EXPECT_PATH_BYTES, MAX_FALLBACKS, MAX_GIT_REF_BYTES, MAX_GROUP_BYTES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS, MAX_MODEL_BYTES, MAX_NAME_BYTES,
     MAX_ORIGIN_BYTES, MAX_ORIGIN_REF_BYTES, MAX_PRIORITY, MAX_PUBLISH_BRANCH_BYTES,
-    MAX_PUBLISH_GATES, MAX_REPO_BYTES, MAX_REQUIRES_LABELS, MAX_SPAWN_REPOS, MAX_STUCK_AFTER_SECS,
-    MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MAX_TOLERATES, MIN_PRIORITY, MIN_STUCK_AFTER_SECS,
-    MIN_TIMEOUT_SECS,
+    MAX_PUBLISH_GATES, MAX_REPO_BYTES, MAX_REQUIRES_LABELS, MAX_SPAWN_REPOS, MAX_STACK_PATHS,
+    MAX_STACK_PATH_BYTES, MAX_STUCK_AFTER_SECS, MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MAX_TOLERATES,
+    MIN_PRIORITY, MIN_STUCK_AFTER_SECS, MIN_TIMEOUT_SECS,
 };
 
 /// The provider name that asks dispatch to choose a healthy provider from the node's offer.
@@ -798,6 +798,30 @@ fn is_suspect(mode: &ExpectMode) -> bool {
     *mode == ExpectMode::Suspect
 }
 
+/// Checks a stack-policy glob list. The same conservative grammar as `expect` globs keeps the
+/// agent's path matching and the controller's validation in agreement.
+pub fn validate_stack_paths(field: &'static str, values: &[String]) -> Result<(), JobSpecError> {
+    if values.len() > MAX_STACK_PATHS {
+        return Err(invalid(
+            field,
+            format!(
+                "must name at most {MAX_STACK_PATHS} paths (got {})",
+                values.len()
+            ),
+        ));
+    }
+    for value in values {
+        check_expect_value(value, MAX_STACK_PATH_BYTES, true)
+            .map_err(|reason| invalid(field, reason))?;
+    }
+    for (i, value) in values.iter().enumerate() {
+        if values[..i].contains(value) {
+            return Err(invalid(field, format!("duplicate path {value}")));
+        }
+    }
+    Ok(())
+}
+
 /// What the agent does when a job stops producing output and using CPU.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -985,6 +1009,13 @@ pub struct JobSpec {
     /// How to handle an input patch that does not apply cleanly.
     #[serde(default, skip_serializing_if = "is_default_conflict")]
     pub on_conflict: OnConflict,
+    /// Per-job narrowing of the agent's `[stack] union_paths`. Every entry must also appear in
+    /// the agent's configured list; the agent refuses a job that widens the policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stack_union_paths: Vec<String>,
+    /// Per-job narrowing of the agent's `[stack] base_paths`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stack_base_paths: Vec<String>,
     /// Whether an empty `diff.patch` is expected, so no `no_changes` note is added.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_empty: bool,
@@ -1074,6 +1105,10 @@ struct RawJobSpec {
     #[serde(default)]
     on_conflict: Option<String>,
     #[serde(default)]
+    stack_union_paths: Vec<String>,
+    #[serde(default)]
+    stack_base_paths: Vec<String>,
+    #[serde(default)]
     allow_empty: bool,
     #[serde(default)]
     expect: Option<ExpectSpec>,
@@ -1153,6 +1188,8 @@ impl TryFrom<RawJobSpec> for JobSpec {
             collect: collect.unwrap_or_default(),
             include_failed: raw.include_failed,
             on_conflict: on_conflict.unwrap_or_default(),
+            stack_union_paths: raw.stack_union_paths,
+            stack_base_paths: raw.stack_base_paths,
             allow_empty: raw.allow_empty,
             expect: raw.expect,
             requires: raw.requires,
@@ -1265,6 +1302,16 @@ impl JobSpec {
                     self.after.len()
                 ),
             ));
+        }
+        validate_stack_paths("stack_union_paths", &self.stack_union_paths)?;
+        validate_stack_paths("stack_base_paths", &self.stack_base_paths)?;
+        for path in &self.stack_union_paths {
+            if self.stack_base_paths.contains(path) {
+                return Err(invalid(
+                    "stack_base_paths",
+                    format!("{path} is also in stack_union_paths"),
+                ));
+            }
         }
         if let Some(expect) = &self.expect {
             expect.validate()?;
@@ -1887,6 +1934,8 @@ mod tests {
             collect: CollectMode::Apply,
             include_failed: false,
             on_conflict: Default::default(),
+            stack_union_paths: Vec::new(),
+            stack_base_paths: Vec::new(),
             allow_empty: false,
             expect: None,
             requires: Vec::new(),
@@ -1912,6 +1961,23 @@ mod tests {
 
     fn error_field(spec: &JobSpec) -> &'static str {
         spec.validate().unwrap_err().field()
+    }
+
+    #[test]
+    fn stack_policy_overrides_are_validated_and_canonical() {
+        let mut spec = sample();
+        spec.stack_union_paths.push("CHANGELOG.md".to_owned());
+        spec.stack_base_paths.push("Cargo.lock".to_owned());
+        assert!(spec.validate().is_ok());
+        assert!(spec
+            .canonical_json()
+            .contains("\"stack_union_paths\":[\"CHANGELOG.md\"]"));
+
+        spec.stack_union_paths.push("../escape".to_owned());
+        assert_eq!(error_field(&spec), "stack_union_paths");
+        spec.stack_union_paths.pop();
+        spec.stack_union_paths.push("Cargo.lock".to_owned());
+        assert_eq!(error_field(&spec), "stack_base_paths");
     }
 
     #[test]

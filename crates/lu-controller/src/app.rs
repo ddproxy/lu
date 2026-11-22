@@ -60,6 +60,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(operator::publish_job).layer(op_json),
         )
         .route(
+            "/v1/jobs/{id}/retry",
+            post(operator::retry_job).layer(op_json),
+        )
+        .route(
             "/v1/groups/{name}/limit",
             put(operator::set_group_limit).layer(op_json),
         )
@@ -143,6 +147,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/agent/jobs/{id}/deps", get(agent::list_deps))
         .route(
+            "/v1/agent/jobs/{id}/staged-commit",
+            post(agent::set_staged_commit).layer(op_json),
+        )
+        .route(
+            "/v1/agent/jobs/{id}/merge-base",
+            post(agent::merge_base).layer(op_json),
+        )
+        .route(
             "/v1/agent/jobs/{id}/deps/{dep}/diff",
             get(agent::get_dep_diff),
         )
@@ -223,12 +235,30 @@ pub async fn maintenance_tick(state: &Arc<AppState>) {
         Err(e) => tracing::warn!(%e, "expire_drafts task failed"),
         _ => {}
     }
+    let mut changed = false;
+    let expired_dependents = tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        let ttl_secs = state.blocked_dependent_ttl_secs;
+        move || store.expire_blocked_dependents(n, ttl_secs)
+    })
+    .await;
+    match expired_dependents {
+        Ok(Ok(ids)) => {
+            if !ids.is_empty() {
+                changed = true;
+                for id in &ids {
+                    state.waiters.notify_job(id.as_ref());
+                }
+            }
+        }
+        Ok(Err(e)) => tracing::warn!(?e, "expire_blocked_dependents failed"),
+        Err(e) => tracing::warn!(%e, "expire_blocked_dependents task failed"),
+    }
     let expired = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         move || store.expire_leases(n)
     })
     .await;
-    let mut changed = false;
     match expired {
         Ok(Ok(v)) => {
             if !v.is_empty() {
@@ -432,6 +462,7 @@ mod tests {
             operators: Vec::new(),
             repos: Vec::new(),
             groups: Vec::new(),
+            blocked_dependent_ttl: "24h".to_owned(),
         };
         let state = Arc::new(AppState::from_config(&cfg, Arc::new(FailingRecoveryStore)).unwrap());
         let error = recover_on_boot(&state).await.unwrap_err();

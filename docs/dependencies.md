@@ -44,21 +44,62 @@ lu submit --key ship --after-key test --after-key lint \
 ## Waiting and promotion
 
 A new job is `queued` when every dependency is `done`, otherwise `blocked`. `lu ls` shows the
-number of unfinished dependencies in its `AFTER` column (`-` for none); `lu show` prints one
-`after  <id>  <state>` line per dependency, marking those still awaited with `(waiting)`.
+number of unfinished dependencies in its `AFTER` column (`-` for none); for a blocked dependent of
+a failed or cancelled predecessor it also shows `predecessor failed`. `lu show` prints one
+`after  <id>  <state>` line per dependency, marking those still awaited with `(waiting)`, plus the
+job's `blocked_reason` and `blocked_until` deadline when a predecessor failed.
 
 When a job completes `done`, the controller moves each blocked direct dependent whose entire
-dependency set is now `done` to `queued`. When a job finishes `failed` or `cancelled`, the
-controller recursively fails its blocked dependents with `failure_class: "dependency"` and a
-summary of the form `dependency <id> <state>`. Those failures cascade in turn; no agent runs and
-no dependency patch is applied for such a dependent.
+dependency set is now `done` to `queued`. A failed or cancelled predecessor does **not** fail its
+dependents immediately: they stay `blocked` with `blocked_reason: "predecessor failed"` so an
+operator can retry the predecessor instead of rebuilding the chain. `lu retry <predecessor>`
+reattaches its waiting dependents to the new job; `lu retry <predecessor> --chain` also retries the
+dependents and rewrites their `after` references to the retried jobs. Cancelling a predecessor
+cancels its waiting dependents as well unless the operator passes
+`lu cancel <predecessor> --keep-dependents`. If no retry happens within
+`[controller] blocked_dependent_ttl` (default `24h`), a blocked dependent fails with
+`failure_class: "dependency"` and a summary naming the predecessor. `lu top` and the
+`lu_blocked_dependents_total` metric show how many dependents are waiting.
+
+`include_failed: true` is a separate opt-in: a dependency already dead at submission is accepted,
+and the dependent starts `queued` once its other dependencies are `done`. A job still blocked when
+a dependency fails uses the wait-and-retry behaviour above.
+
+```sh
+lu show 01ARZ3NDEKTSV4RRFFQ69G5FAV   # blocked_reason: predecessor failed
+lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV   # reattach waiting dependents to the new job
+lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --chain  # also retry the dependents and their references
+lu cancel 01ARZ3NDEKTSV4RRFFQ69G5FAV --keep-dependents
+```
+
+## One base per chain
+
+Every job records the commit the agent actually staged in `staged_commit`, before dependency
+patches are applied. The field appears in the `JobView` returned by `lu show`, `lu ls --json` and
+the operator API, and in each entry of `GET /v1/agent/jobs/{id}/deps?epoch=N`. A job with a pinned
+`source.base` uses that commit. A dependent with no pinned base inherits the `staged_commit` of
+its dependencies, so the whole chain shares one base tree.
+
+- Every dependency of a dependent must agree on the inherited commit. When the recorded commits
+  differ, the agent resolves their newest common ancestor and stages that tree as the shared base.
+- If any dependency patch does not apply cleanly at that base, the job fails with
+  `failure_class: "conflict"` and no harness runs. The summary names every contested commit, for
+  example `dependency staged commits disagreed (<commit-a>, <commit-b>); resolved with merge base
+  <base>` or `dependencies disagree on the staged commit (<commit-a>, <commit-b>); no common base: ...`.
+
+A dependent's exported `diff.patch` is relative to the inherited base (or the common ancestor used
+in the fallback), not to a branch tip that may have moved since. It includes the applied dependency
+patches. When the chain finishes, the operator merges the final patch onto the moved branch
+afterwards; Lu does not rebase that patch onto a later tip. See
+[collecting inputs](#collecting-inputs) for the modes that stage and apply dependency diffs.
 
 ## Stacking dependency diffs
 
-By default the agent stages the dependent's base tree, then fetches each dependency's
-`diff.patch` in `after` order and applies it to that tree. Empty or missing diffs are skipped.
-The harness then runs on the combined tree, and the dependent's exported diff includes the
-applied dependency changes. The list of applied dependency ids is recorded in `report.json` under
+By default the agent stages the chain's base tree — a pinned `source.base` or the inherited
+`staged_commit` described above — then fetches each dependency's `diff.patch` in `after` order and
+applies it to that tree. Empty or missing diffs are skipped. The harness then runs on the combined
+tree, and the dependent's exported diff includes the applied dependency changes and is relative to
+the base it staged. The list of applied dependency ids is recorded in `report.json` under
 `applied_dependencies`. Stacking uses the controller's stored patch, so a dependency's workspace is
 not kept just because a dependent is running; the agent waits for controller release before an
 ephemeral deletion. See [workspaces.md](workspaces.md).
@@ -67,7 +108,7 @@ If a dependency patch cannot be applied, the job finishes `failed` with
 `failure_class: "conflict"` and a summary such as:
 
 ```text
-input build (01ARZ3NDEKTSV4RRFFQ69G5FAV) could not be applied; conflicts: src/main.rs, tests/main.rs
+input build (01ARZ3NDEKTSV4RRFFQ69G5FAV) could not be applied; conflicted files: src/main.rs, tests/main.rs
 ```
 
 An unreadable or otherwise invalid patch is also a conflict; its detail is appended to the
@@ -75,6 +116,26 @@ summary instead of a path list. Patches applied before the failing one remain in
 diff and are listed in `applied_dependencies`.
 
 Set `--collect none` to wait for dependencies without applying their diffs or staging files.
+
+### Policy paths for known-safe conflicts
+
+An operator can opt into two conflict policies for named paths in the agent's `[stack]` config
+([config.md](config.md#stack)):
+
+- `union_paths`: keep both sides' added lines, in order, and keep base-side deletions.
+- `base_paths`: take the base side, typically for generated lock files.
+
+Both lists are empty by default. Per-job `stack_union_paths` and `stack_base_paths` may only
+**narrow** the configured lists: a job naming a pattern the agent did not configure, or a pattern
+in both lists, is refused instead of widening the policy. Paths use the same bounded,
+repo-relative glob grammar as `expect` (`*`, `**` and `?`; no character classes).
+
+Any conflict outside a covered path fails closed with `failure_class: "conflict"`; `--on-conflict`
+below does not make an uncovered stack path safe. When a policy resolves a conflict, the summary
+names every affected file and hunk, says whether the base moved since the dependency was staged,
+and lists the covered policy paths that were used for the decision. That makes the resolution
+auditable from `lu show`, `report.json` and the stored artifacts. The policies are opt-in and
+fail closed; see [SECURITY.md](../SECURITY.md) for the overall trust model.
 
 ## Collecting inputs
 
@@ -85,7 +146,7 @@ default is `apply`. Aliases `off`, `false`, `diffs`, `diff`, `patches` and `patc
 
 Inputs are the job's `after` dependencies. A `done` dependency is always an input. A `failed` or
 `cancelled` dependency becomes an input only when `--include-failed` is set and that job stored a
-`diff.patch`; without the opt-in, a dead dependency still fails its dependents as described above.
+`diff.patch`; without the opt-in, a dead dependency leaves its dependents blocked as described above.
 `--include-failed` is also accepted by `lu retry` and `lu edit`. At most 16 inputs and 64 MiB of
 stored diffs are allowed; the controller checks the limit at submit time when sizes are known and
 the agent re-checks it before staging. Each `GIT binary patch` side is preflighted before libgit2

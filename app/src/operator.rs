@@ -219,6 +219,9 @@ pub struct RetryArgs {
     /// Job id.
     #[arg(value_parser = parse_job_id)]
     pub id: JobId,
+    /// Recreate blocked dependents too, remapped onto the new job ids.
+    #[arg(long)]
+    pub chain: bool,
     /// Replace the provider name.
     #[arg(long)]
     pub provider: Option<String>,
@@ -505,6 +508,9 @@ pub struct CancelArgs {
     /// Leave this job's descendants running instead of cancelling them too.
     #[arg(long)]
     pub keep_children: bool,
+    /// Leave blocked dependents waiting instead of cancelling them too.
+    #[arg(long)]
+    pub keep_dependents: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -724,6 +730,8 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         tolerates: args.tolerate,
         fallbacks: args.fallbacks,
         expect: expect.spec(),
+        stack_union_paths: Vec::new(),
+        stack_base_paths: Vec::new(),
     };
     spec.validate().map_err(|error| error.to_string())?;
 
@@ -896,6 +904,8 @@ async fn collect_inner(args: CollectArgs, config: &Path, json: bool) -> Result<E
         tolerates: Vec::new(),
         fallbacks: Vec::new(),
         expect: None,
+        stack_union_paths: Vec::new(),
+        stack_base_paths: Vec::new(),
     };
     spec.validate().map_err(|error| error.to_string())?;
     submit_and_report(&client, &spec, json, args.wait).await
@@ -1004,7 +1014,40 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
     spec.idempotency_key = args.key;
     spec.validate().map_err(|error| error.to_string())?;
 
-    submit_and_report(&client, &spec, json, args.wait).await
+    let chain = args.chain;
+    let reply = client
+        .retry_with_dependents(&args.id, &spec, chain)
+        .await
+        .map_err(|error| error.to_string())?;
+    if json {
+        let text = serde_json::to_string(&reply).map_err(|error| error.to_string())?;
+        print_raw(&text);
+    } else {
+        println!("{} {}", reply.job.id, state_name(reply.job.state));
+        if !reply.retried.is_empty() {
+            println!("retried {} dependents", reply.retried.len());
+        }
+        if reply.waiting_dependents > 0 {
+            println!("waiting_dependents {}", reply.waiting_dependents);
+        }
+    }
+    if args.wait {
+        let final_view = wait_for_job(&client, &reply.job.id).await?;
+        eprintln!("state: {}", state_name(final_view.state));
+        if json {
+            let raw = client
+                .get_job_raw(&reply.job.id)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_raw(&raw);
+        }
+        return Ok(if final_view.state == JobState::Done {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(EXIT_UNSUCCESSFUL)
+        });
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn task_from_file(path: &Path) -> Result<String, String> {
@@ -1202,12 +1245,18 @@ async fn ls_inner(args: LsArgs, config: &Path, json: bool) -> Result<ExitCode, S
                     job.waiting_on.len().to_string()
                 },
                 time(job.created_at),
+                job.blocked_reason
+                    .as_deref()
+                    .map(display_field)
+                    .unwrap_or_else(|| "-".to_owned()),
                 outcome_text(job.outcome_note.as_deref()),
             ]
         })
         .collect();
     print_table(
-        &["ID", "STATE", "NODE", "ATTEMPT", "AFTER", "CREATED", "NOTE"],
+        &[
+            "ID", "STATE", "NODE", "ATTEMPT", "AFTER", "CREATED", "BLOCKED", "NOTE",
+        ],
         rows,
     );
     Ok(ExitCode::SUCCESS)
@@ -1446,14 +1495,14 @@ async fn cancel_inner(args: CancelArgs, config: &Path, json: bool) -> Result<Exi
     let client = connect(config)?;
     if json {
         let raw = client
-            .cancel_raw(&args.id)
+            .cancel_raw_with_options(&args.id, args.keep_children, args.keep_dependents)
             .await
             .map_err(|error| error.to_string())?;
         print_raw(&raw);
         return Ok(ExitCode::SUCCESS);
     }
     let view = client
-        .cancel_with_children(&args.id, args.keep_children)
+        .cancel_with_options(&args.id, args.keep_children, args.keep_dependents)
         .await
         .map_err(|error| error.to_string())?;
     print_job(&view);
@@ -2152,6 +2201,27 @@ fn print_job(view: &JobView) {
                 .map(display_field)
                 .unwrap_or_else(|| "-".to_owned()),
         ),
+        (
+            "staged_commit",
+            view.staged_commit
+                .as_deref()
+                .map(display_field)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        (
+            "blocked_reason",
+            view.blocked_reason
+                .as_deref()
+                .map(display_field)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        (
+            "blocked_until",
+            optional_time(
+                view.blocked_until
+                    .and_then(|value| u64::try_from(value).ok()),
+            ),
+        ),
         ("outcome_note", outcome_text(view.outcome_note.as_deref())),
         (
             "diff_bytes",
@@ -2200,6 +2270,7 @@ fn print_status(status: &StatusView) {
         ("schema_version", status.schema_version.to_string()),
         ("db_bytes", status.db_bytes.to_string()),
         ("recovered_on_boot", status.recovered_on_boot.to_string()),
+        ("waiting_dependents", status.waiting_dependents.to_string()),
         ("oldest_queued_secs", status.oldest_queued_secs.to_string()),
         ("nodes", status.nodes.to_string()),
         ("nodes_online", status.nodes_online.to_string()),

@@ -1136,6 +1136,8 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
         tolerates: Vec::new(),
         fallbacks: spec_fallbacks(args),
         expect: spec_expect(args)?,
+        stack_union_paths: Vec::new(),
+        stack_base_paths: Vec::new(),
     };
     validate_spec(&spec)?;
     Ok(spec)

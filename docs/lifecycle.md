@@ -12,9 +12,9 @@ stateDiagram-v2
     draft --> blocked: approve with dependencies unmet
     draft --> cancelled: reject
     draft --> expired: ttl elapsed
-    blocked --> queued: last dependency done
-    blocked --> failed: dependency failed
-    blocked --> cancelled: cancel
+    blocked --> queued: last dependency done or predecessor retried
+    blocked --> failed: blocked-dependent ttl elapsed
+    blocked --> cancelled: cancel (also cancels waiting dependents)
     queued --> leased: dispatch to an idle agent
     queued --> blocked: edit adds an unfinished dependency
     queued --> cancelled: cancel
@@ -48,7 +48,8 @@ stateDiagram-v2
 ```
 
 The state list is exactly `draft`, `blocked`, `queued`, `leased`, `running`, `recovering`,
-`needs_input`, `done`, `failed`, `cancelled`, `expired`. `needs_input` is part of the wire enum and
+`needs_input`, `done`, `failed`, `cancelled`, `expired`. Waiting for a failed predecessor adds no
+state: the dependent remains `blocked` with a `blocked_reason` and a deadline. `needs_input` is part of the wire enum and
 the transition table, but it is reserved and unreachable in this version. The terminal states are
 `done`, `failed`, `cancelled` and `expired`; they have no outgoing edges.
 
@@ -57,7 +58,7 @@ the transition table, but it is reserved and unreachable in this version. The te
 | From | Allowed targets | What causes it |
 | --- | --- | --- |
 | `draft` | `queued`, `blocked`, `cancelled`, `expired` | Operator approval with all dependencies done or with unmet dependencies; rejection; `ttl` elapsed. Never dispatched in this state. |
-| `blocked` | `queued`, `cancelled`, `failed` | All dependencies become `done`; operator cancel; a dependency fails or is cancelled, which cascades. |
+| `blocked` | `queued`, `cancelled`, `failed` | All dependencies become `done` or a failed predecessor is retried; operator cancel (also cancels waiting dependents); `[controller] blocked_dependent_ttl` expires after a predecessor failed. |
 | `queued` | `leased`, `blocked`, `cancelled` | Dispatch to an idle, non-draining agent; edit adds an unfinished dependency; operator cancel. |
 | `leased` | `running`, `queued`, `recovering`, `cancelled`, `failed` | Agent starts; retryable failure or lost lease; lease expiry or controller restart; cancel; non-retryable failure. |
 | `running` | `done`, `failed`, `cancelled`, `queued`, `recovering` | Harness success; terminal failure (including stuck cancel); honoured cancel; provider or stuck retry; lease expiry. |
@@ -94,6 +95,27 @@ takes the first healthy, uncordoned pair from the node's published `provider_mod
 it as the assigned provider and model. With no eligible pair the job stays `queued` with a
 waiting reason.
 
+## Blocked dependents and chain bases
+
+When a dependency finishes `failed` or `cancelled`, its blocked dependents do not fail immediately.
+They stay `blocked` with `blocked_reason: "predecessor failed"` and a `blocked_until` deadline from
+`[controller] blocked_dependent_ttl` (default 24h); `lu ls` prints the same reason. Retrying the
+predecessor reattaches waiting dependents to the new job, while `lu retry --chain` also retries the
+dependents and rewrites their `after` references. `lu cancel --keep-dependents` leaves waiting
+dependents in place; a plain cancel takes them with the predecessor. At the deadline a still-blocked
+dependent fails with `failure_class: "dependency"` and never retries. `lu top` and the
+`lu_blocked_dependents_total` metric expose the waiting count. See
+[Waiting and promotion](dependencies.md#waiting-and-promotion).
+
+A dependent with no pinned `source.base` inherits its dependencies' `staged_commit`, which the agent
+records before applying dependency patches. Multiple dependencies must agree; when they disagree, the agent stages their newest common
+ancestor. If any patch then fails to apply, the job fails with class `conflict` and the summary names
+every contested commit. The dependent's `diff.patch` is
+relative to the inherited base, so the operator merges the final patch onto the moved branch after
+the chain finishes. Opt-in `[stack]` policies resolve conflicts only on covered paths and fail
+closed elsewhere; see [One base per chain](dependencies.md#one-base-per-chain) and
+[config.md](config.md#stack).
+
 ## Editing a queued or blocked job
 
 `lu edit` changes provider, model, fallbacks, requirements, tolerations and dependencies of a
@@ -127,14 +149,15 @@ rules that create drafts are in [intake.md](intake.md).
 | `node` | Agent lost, lease expired, harness spawn failed, harness crashed at launch (a crash banner within 3 seconds and before any harness output), workspace prepare failed, an ordinary staging error, or a stuck job with the retry policy. | Requeue while `attempt <= max_retries` (default 1, allowed 0–3); otherwise fail with `node`. |
 | `provider` | All keys unavailable, a model limit, a 429, or a provider-failure marker followed by harness silence. | Requeue while `attempt <= 100`; `max_retries` is not consulted. At `attempt > 100` the job fails with `provider`. |
 | `execution` | Harness exited non-zero, timed out, produced no output, was stopped by the stuck cancel policy, or the task itself was invalid. Staging errors naming a missing ref, authentication failure or unknown repository are also `execution`. | Never requeue. |
-| `dependency` | A dependency finished `failed` or `cancelled`. | Never requeue. |
+| `dependency` | A dependency finished `failed` or `cancelled` and the dependent's blocked-dependent TTL expired before a retry reattached it. | Never requeue. |
 | `conflict` | A dependency diff could not be applied to the dependent's base tree. | Never requeue. |
 
 A requeue increments `attempt`, clears the node and cancel request, and moves the job back to
 `queued`. A provider requeue also inserts or refreshes a cordon for the `(node, provider)` pair:
 normally for `provider_cooldown_secs` (default 1800), or for the agent's `retry_after_secs` clamped
-to 5 seconds–24 hours. Execution, dependency and conflict failures are terminal on the first
-occurrence and fail any blocked dependents.
+to 5 seconds–24 hours. Execution and conflict failures are terminal on the first occurrence. A
+`dependency` failure is terminal for that job after its blocked-dependent TTL, when dependents that
+are still waiting also fail; see [Blocked dependents and chain bases](#blocked-dependents-and-chain-bases).
 
 Because node and provider requeues increment `attempt`, the effective budgets are: node failures
 at attempts 1 through `max_retries` are retried, and provider failures at attempts 1 through 100
@@ -174,8 +197,8 @@ default) leaves the job running. Both active policies upload the usual artifacts
 
 | State | Effect |
 | --- | --- |
-| `draft`, `blocked`, `queued`, `recovering` | Immediate `cancelled` with a finished time; blocked dependents fail with class `dependency`. A draft is normally cancelled by `lu reject`. |
-| `leased`, `running`, `needs_input` | `cancel_requested` is set. The job stays in its state until the agent stops the harness and reports `Cancelled`; then it becomes `cancelled` and dependents fail. |
+| `draft`, `blocked`, `queued`, `recovering` | Immediate `cancelled` with a finished time. Waiting dependents are cancelled too unless `--keep-dependents` is set; a draft is normally cancelled by `lu reject`. |
+| `leased`, `running`, `needs_input` | `cancel_requested` is set. The job stays in its state until the agent stops the harness and reports `Cancelled`; then it becomes `cancelled` and its waiting dependents stay `blocked` until retried or the TTL expires. |
 | `done`, `failed`, `cancelled`, `expired` | Refused with `409 conflict`. |
 
 ## Empty diffs

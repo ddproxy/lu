@@ -62,7 +62,7 @@ State definitions, legal transitions and the full state table are in
 
 | State | Next check |
 | --- | --- |
-| `blocked` | `lu show <id>` lists each dependency and its state. |
+| `blocked` | `lu show <id>` lists each dependency, its state and, when a predecessor failed, `blocked_reason` and `blocked_until`. |
 | `queued` | `lu nodes --json`: an online, idle, non-draining node with every required label and provider. |
 | `leased` / `running` | `lu node <node>` for the latest heartbeat and process tree. |
 | `recovering` | Agent heartbeat and `recovery_grace_secs`; a late write with an old epoch is discarded. |
@@ -78,11 +78,30 @@ lu nodes --json
 lu undrain node-a
 ```
 
+## Dependency chains
+
+| Symptom | Check | Action |
+| --- | --- | --- |
+| Dependent stays `blocked` with `predecessor failed` | `lu show <dependent>` lists the predecessor and the `blocked_until` deadline; `lu ls --state blocked` shows the backlog. | Retry the predecessor with `lu retry <predecessor>` to reattach waiting dependents, or `lu retry <predecessor> --chain` to retry the dependents as well. Otherwise they fail with class `dependency` at `[controller] blocked_dependent_ttl` (default 24h). `lu top` and `lu_blocked_dependents_total` show the count. |
+| Waiting dependents were cancelled | A plain `lu cancel <predecessor>` cancels them. | Leave them blocked next time with `lu cancel <predecessor> --keep-dependents`. |
+| Conflict summary names two commits | The dependencies recorded different `staged_commit` values. The agent staged their newest common ancestor, but a dependency patch did not apply there (or no common ancestor exists). | Inspect the named commits and the dependencies' `diff.patch` files. When a common ancestor exists and every patch applies, it is used automatically; otherwise resolve the patches and resubmit the chain. |
+| Conflict on a `union_paths` or `base_paths` path | The summary lists every file and hunk, whether the base moved, and the covered policy paths. | Check the agent's `[stack]` lists and the job's narrower `stack_union_paths`/`stack_base_paths`; uncovered paths always fail closed. See [Policy paths](dependencies.md#policy-paths-for-known-safe-conflicts). |
+| Final patch does not apply to the current branch | The chain's `diff.patch` is relative to the inherited base, which may predate the branch tip. | Merge the final patch onto the moved branch yourself; Lu does not rebase it. |
+
+Worked example — recover a chain after a failed predecessor:
+
+```sh
+lu ls --state blocked
+lu show 01ARZ3NDEKTSV4RRFFQ69G5FAV   # blocked_reason: predecessor failed
+lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --chain
+```
+
 ## Failure classes
 
 The full failure-class table, retry rules and agent-side classification are in
 [Job Lifecycle](lifecycle.md#failure-classes-and-retries). Read `failure_class` with `lu show <id>`
-before applying the checks below.
+before applying the checks below. A `dependency` failure now follows a blocked wait of up to
+`[controller] blocked_dependent_ttl`; see [Dependency chains](#dependency-chains).
 
 A `409 stale_epoch` means the agent write came from an old lease; the controller ignores it. A log append at the wrong offset returns `409 conflict` with `{"error":"conflict","message":"conflict","length":L}`; resume from `L`. A `429` carries `Retry-After` seconds.
 
@@ -142,7 +161,7 @@ The first call is `-32602` because `limit` is at most 100. The second returns a 
 
 ## Recovery and backups
 
-The store expects schema version `3`. Schema 1 and 2 databases are migrated in place at startup; any other version is refused with a message telling the operator to create a new database. `lu restore` is stricter and accepts only schema 3 backups. Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
+The store expects schema version `4`. Schema 1, 2 and 3 databases are migrated in place at startup; any other version is refused with a message telling the operator to create a new database. `lu restore` is stricter and accepts only schema 4 backups. Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
 
 `lu backup` and `lu restore` procedures, including interrupted restores and artifact snapshots, are in [operations.md](operations.md#backup-and-restore).
 

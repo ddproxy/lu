@@ -9,7 +9,7 @@ use lu_proto::{
     MAX_COLLECT_BYTES, MAX_LOG_BYTES,
 };
 
-use crate::{CordonSource, Now, ScopeLimits, Store, StoreError};
+use crate::{CordonSource, JobRecord, Now, ScopeLimits, Store, StoreError};
 
 pub fn now(wall_unix: i64, mono_ms: u64) -> Now {
     Now { wall_unix, mono_ms }
@@ -33,6 +33,8 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         idle_timeout_secs: None,
         idempotency_key: key.map(|s| s.to_owned()),
         after: Vec::new(),
+        stack_union_paths: Vec::new(),
+        stack_base_paths: Vec::new(),
         collect: lu_proto::CollectMode::Apply,
         include_failed: false,
         on_conflict: Default::default(),
@@ -155,11 +157,15 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     drain_unknown_node_is_rejected(&make());
     blocked_on_submit_and_unblocked_on_done(&make());
     dependencies_already_done_queue_immediately(&make());
-    failed_dependency_cascades_two_levels(&make());
-    cancelled_dependency_cascades_two_levels(&make());
+    failed_dependency_blocks_two_levels(&make());
+    cancelled_dependency_blocks_two_levels(&make());
     diamond_dependency(&make());
     unknown_and_invalid_dependencies_are_rejected(&make());
     include_failed_releases_dependents(&make());
+    blocked_dependents_are_reported_and_expire(&make());
+    staged_commit_is_recorded_for_active_jobs(&make());
+    cancel_with_dependents_keeps_or_cascades(&make());
+    retry_with_dependents_reattaches_or_clones(&make());
     collect_size_is_checked_at_submit(&make());
     job_counts(&make());
     draft_lifecycle(&make);
@@ -243,6 +249,21 @@ fn with_after(mut sp: JobSpec, after: &[JobId]) -> JobSpec {
 fn with_include_failed(mut sp: JobSpec) -> JobSpec {
     sp.include_failed = true;
     sp
+}
+
+/// A dead predecessor waits for a retry or TTL instead of failing its dependents outright.
+fn assert_blocked_on_predecessor(job: &JobRecord, dep: &JobId, since: i64) {
+    assert_eq!(job.state, JobState::Blocked, "blocked state for {}", job.id);
+    assert_eq!(job.blocked_reason.as_deref(), Some("predecessor failed"));
+    assert_eq!(job.blocked_since, Some(since));
+    assert_eq!(job.failure_class, None);
+    assert_eq!(job.finished_at, None);
+    assert!(
+        job.waiting_on.contains(dep),
+        "{} still waits on {dep}: {:?}",
+        job.id,
+        job.waiting_on
+    );
 }
 
 fn finish_done<S: Store>(s: &S, id: &JobId, node_name: &str, wall: i64, mono: u64) {
@@ -384,7 +405,7 @@ fn dependencies_already_done_queue_immediately<S: Store>(s: &S) {
     assert!(b.waiting_on.is_empty());
 }
 
-fn failed_dependency_cascades_two_levels<S: Store>(s: &S) {
+fn failed_dependency_blocks_two_levels<S: Store>(s: &S) {
     let (a, _) = s
         .create_job(&spec("https://x/a.git", None), now(1, 1))
         .unwrap();
@@ -403,22 +424,21 @@ fn failed_dependency_cascades_two_levels<S: Store>(s: &S) {
     finish_failed(s, &a.id, "fail-node-a", 10, 10);
 
     let b2 = s.get_job(&b.id).unwrap();
-    assert_eq!(b2.state, JobState::Failed);
-    assert_eq!(b2.failure_class, Some(FailureClass::Dependency));
+    assert_blocked_on_predecessor(&b2, &a.id, 10);
     assert_eq!(
         b2.summary.as_deref(),
-        Some(format!("dependency {} failed", a.id).as_str())
+        Some(format!("dependency {} failed; waiting for retry or TTL", a.id).as_str())
     );
+    // The transitive dependent is blocked by the blocked middle job, not failed.
     let c2 = s.get_job(&c.id).unwrap();
-    assert_eq!(c2.state, JobState::Failed);
-    assert_eq!(c2.failure_class, Some(FailureClass::Dependency));
-    assert!(c2
-        .summary
-        .as_deref()
-        .is_some_and(|m| m.starts_with(&format!("dependency {} ", b.id))));
+    assert_blocked_on_predecessor(&c2, &b.id, 10);
+    assert_eq!(
+        c2.summary.as_deref(),
+        Some(format!("dependency {} blocked; waiting for retry or TTL", b.id).as_str())
+    );
 }
 
-fn cancelled_dependency_cascades_two_levels<S: Store>(s: &S) {
+fn cancelled_dependency_blocks_two_levels<S: Store>(s: &S) {
     let (a, _) = s
         .create_job(&spec("https://x/a.git", None), now(1, 1))
         .unwrap();
@@ -436,14 +456,13 @@ fn cancelled_dependency_cascades_two_levels<S: Store>(s: &S) {
         .unwrap();
     s.cancel_job(&a.id, now(4, 4)).unwrap();
     let b2 = s.get_job(&b.id).unwrap();
-    assert_eq!(b2.state, JobState::Failed);
-    assert_eq!(b2.failure_class, Some(FailureClass::Dependency));
+    assert_blocked_on_predecessor(&b2, &a.id, 4);
     assert_eq!(
         b2.summary.as_deref(),
-        Some(format!("dependency {} cancelled", a.id).as_str())
+        Some(format!("dependency {} cancelled; waiting for retry or TTL", a.id).as_str())
     );
     let c2 = s.get_job(&c.id).unwrap();
-    assert_eq!(c2.state, JobState::Failed);
+    assert_blocked_on_predecessor(&c2, &b.id, 4);
 }
 
 fn diamond_dependency<S: Store>(s: &S) {
@@ -495,8 +514,7 @@ fn diamond_dependency<S: Store>(s: &S) {
         .unwrap();
     finish_failed(s, &e.id, "diamond-e", 40, 40);
     let g2 = s.get_job(&g.id).unwrap();
-    assert_eq!(g2.state, JobState::Failed);
-    assert_eq!(g2.failure_class, Some(FailureClass::Dependency));
+    assert_blocked_on_predecessor(&g2, &e.id, 40);
     assert_eq!(
         s.get_job(&f.id).unwrap().state,
         JobState::Queued,
@@ -594,7 +612,7 @@ fn include_failed_releases_dependents<S: Store>(s: &S) {
     // Cancel the released dependent so it cannot interfere with the next case.
     s.cancel_job(&b.id, now(11, 11)).unwrap();
 
-    // A dependent that did not opt in still fails as before.
+    // A dependent that did not opt in waits for a retry or TTL instead of failing at once.
     let (c, _) = s
         .create_job(&spec("https://x/c.git", None), now(6, 6))
         .unwrap();
@@ -606,8 +624,300 @@ fn include_failed_releases_dependents<S: Store>(s: &S) {
         .unwrap();
     finish_failed(s, &c.id, "cascade-node", 20, 20);
     let d2 = s.get_job(&d.id).unwrap();
-    assert_eq!(d2.state, JobState::Failed);
-    assert_eq!(d2.failure_class, Some(FailureClass::Dependency));
+    assert_blocked_on_predecessor(&d2, &c.id, 20);
+}
+
+fn blocked_dependents_are_reported_and_expire<S: Store>(s: &S) {
+    let (a, _) = s
+        .create_job(&spec("https://x/ttl-a.git", None), now(1, 1))
+        .unwrap();
+    let (b, _) = s
+        .create_job(
+            &with_after(
+                spec("https://x/ttl-b.git", None),
+                std::slice::from_ref(&a.id),
+            ),
+            now(2, 2),
+        )
+        .unwrap();
+    let (c, _) = s
+        .create_job(
+            &with_after(
+                spec("https://x/ttl-c.git", None),
+                std::slice::from_ref(&b.id),
+            ),
+            now(3, 3),
+        )
+        .unwrap();
+    finish_failed(s, &a.id, "ttl-node", 10, 10);
+
+    let direct = s.blocked_dependents(&a.id).unwrap();
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].id, b.id);
+    assert_blocked_on_predecessor(&direct[0], &a.id, 10);
+    let transitive = s.blocked_dependents(&b.id).unwrap();
+    assert_eq!(transitive.len(), 1);
+    assert_eq!(transitive[0].id, c.id);
+    assert_blocked_on_predecessor(&transitive[0], &b.id, 10);
+    assert_eq!(
+        s.job_counts(now(11, 11), 1000).unwrap().waiting_dependents,
+        2
+    );
+
+    assert!(s
+        .expire_blocked_dependents(now(19, 19), 10)
+        .unwrap()
+        .is_empty());
+    let mut moved = s.expire_blocked_dependents(now(20, 20), 10).unwrap();
+    moved.sort();
+    let mut expected = vec![b.id.clone(), c.id.clone()];
+    expected.sort();
+    assert_eq!(moved, expected);
+
+    for (job, predecessor) in [
+        (s.get_job(&b.id).unwrap(), a.id.clone()),
+        (s.get_job(&c.id).unwrap(), b.id.clone()),
+    ] {
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.failure_class, Some(FailureClass::Dependency));
+        assert_eq!(job.blocked_reason, None);
+        assert_eq!(job.blocked_since, None);
+        assert_eq!(job.finished_at, Some(20));
+        assert_eq!(
+            job.summary.as_deref(),
+            Some(format!("dependency {predecessor} failed; retry TTL 10s expired").as_str())
+        );
+    }
+    assert!(s.blocked_dependents(&a.id).unwrap().is_empty());
+    assert_eq!(
+        s.job_counts(now(21, 21), 1000).unwrap().waiting_dependents,
+        0
+    );
+}
+
+fn staged_commit_is_recorded_for_active_jobs<S: Store>(s: &S) {
+    let (j, _) = s
+        .create_job(&spec("https://x/staged.git", None), now(1, 1))
+        .unwrap();
+    s.heartbeat(&hb("staged-node", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let a = s
+        .next_assignment(&node("staged-node"), now(2, 2), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.job_id, j.id);
+    s.start_job(&j.id, a.epoch, now(3, 3)).unwrap();
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let got = s
+        .record_staged_commit(&j.id, a.epoch, commit, now(4, 4))
+        .unwrap();
+    assert_eq!(got.staged_commit.as_deref(), Some(commit));
+    assert_eq!(got.updated_at, 4);
+    assert_eq!(
+        s.get_job(&j.id).unwrap().staged_commit.as_deref(),
+        Some(commit)
+    );
+
+    assert_eq!(
+        s.record_staged_commit(&j.id, a.epoch + 1, commit, now(5, 5)),
+        Err(StoreError::StaleEpoch)
+    );
+    let err = s
+        .record_staged_commit(&j.id, a.epoch, "TOO-SHORT", now(5, 5))
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreError::InvalidSpec(msg) if msg.contains("40 lowercase hex")),
+        "{err:?}"
+    );
+    assert!(matches!(
+        s.record_staged_commit(&j.id, a.epoch, &"g".repeat(40), now(5, 5)),
+        Err(StoreError::InvalidSpec(_))
+    ));
+
+    // A leased job can stage too.
+    let (leased, _) = s
+        .create_job(&spec("https://x/staged-leased.git", None), now(1, 1))
+        .unwrap();
+    s.heartbeat(&hb("staged-node-2", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let lease = s
+        .next_assignment(&node("staged-node-2"), now(5, 5), 60_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.job_id, leased.id);
+    let got = s
+        .record_staged_commit(&leased.id, lease.epoch, commit, now(6, 6))
+        .unwrap();
+    assert_eq!(got.state, JobState::Leased);
+    assert_eq!(got.staged_commit.as_deref(), Some(commit));
+
+    // Pending and terminal jobs cannot stage a commit.
+    let (queued, _) = s
+        .create_job(&spec("https://x/staged-queued.git", None), now(1, 1))
+        .unwrap();
+    assert_eq!(
+        s.record_staged_commit(&queued.id, 0, commit, now(7, 7)),
+        Err(StoreError::Conflict { length: None })
+    );
+    let done = Completion {
+        job_id: j.id.clone(),
+        epoch: a.epoch,
+        outcome: Outcome::Done,
+        exit_code: Some(0),
+        summary: None,
+        retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
+    };
+    s.complete(&done, None, now(8, 8), 1, 1000).unwrap();
+    assert_eq!(
+        s.record_staged_commit(&j.id, a.epoch, commit, now(9, 9)),
+        Err(StoreError::Conflict { length: None })
+    );
+}
+
+fn cancel_with_dependents_keeps_or_cascades<S: Store>(s: &S) {
+    let (a, _) = s
+        .create_job(&spec("https://x/cancel-keep.git", None), now(1, 1))
+        .unwrap();
+    let (b, _) = s
+        .create_job(
+            &with_after(
+                spec("https://x/cancel-keep-dep.git", None),
+                std::slice::from_ref(&a.id),
+            ),
+            now(2, 2),
+        )
+        .unwrap();
+    let cancelled = s
+        .cancel_job_with_dependents(&a.id, now(3, 3), true)
+        .unwrap();
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert_blocked_on_predecessor(&s.get_job(&b.id).unwrap(), &a.id, 3);
+
+    let (x, _) = s
+        .create_job(&spec("https://x/cancel-cascade.git", None), now(4, 4))
+        .unwrap();
+    let (y, _) = s
+        .create_job(
+            &with_after(
+                spec("https://x/cancel-cascade-dep.git", None),
+                std::slice::from_ref(&x.id),
+            ),
+            now(5, 5),
+        )
+        .unwrap();
+    let (z, _) = s
+        .create_job(
+            &with_after(
+                spec("https://x/cancel-cascade-dep2.git", None),
+                std::slice::from_ref(&y.id),
+            ),
+            now(6, 6),
+        )
+        .unwrap();
+    let cancelled = s
+        .cancel_job_with_dependents(&x.id, now(7, 7), false)
+        .unwrap();
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert_eq!(cancelled.finished_at, Some(7));
+    for id in [&y.id, &z.id] {
+        let rec = s.get_job(id).unwrap();
+        assert_eq!(rec.state, JobState::Cancelled, "cascade reached {id}");
+        assert_eq!(rec.finished_at, Some(7));
+        assert_eq!(rec.blocked_reason, None);
+        assert_eq!(rec.blocked_since, None);
+    }
+}
+
+fn retry_with_dependents_reattaches_or_clones<S: Store>(s: &S) {
+    let a_spec = spec("https://x/retry-direct.git", Some("retry-direct"));
+    let (a, _) = s.create_job(&a_spec, now(1, 1)).unwrap();
+    let (b, _) = s
+        .create_job(
+            &with_after(
+                spec("https://x/retry-direct-dep.git", None),
+                std::slice::from_ref(&a.id),
+            ),
+            now(2, 2),
+        )
+        .unwrap();
+    let (c, _) = s
+        .create_job(
+            &with_after(
+                spec("https://x/retry-direct-dep2.git", None),
+                std::slice::from_ref(&b.id),
+            ),
+            now(3, 3),
+        )
+        .unwrap();
+    finish_failed(s, &a.id, "retry-direct-node", 10, 10);
+    assert_eq!(
+        s.retry_with_dependents(&b.id, &a_spec, false, now(11, 11)),
+        Err(StoreError::Conflict { length: None }),
+        "a blocked job is not retryable"
+    );
+
+    let (root, pairs) = s
+        .retry_with_dependents(&a.id, &a_spec, false, now(12, 12))
+        .unwrap();
+    assert_eq!(pairs, vec![(a.id.clone(), root.id.clone())]);
+    assert_eq!(root.state, JobState::Queued);
+    assert_eq!(root.attempt, 1);
+    assert_eq!(s.job_by_key("retry-direct").unwrap().id, root.id);
+    let b2 = s.get_job(&b.id).unwrap();
+    assert_eq!(b2.state, JobState::Blocked);
+    assert_eq!(b2.spec.after, vec![root.id.clone()]);
+    assert_eq!(b2.waiting_on, vec![root.id.clone()]);
+    assert_eq!(b2.blocked_reason, None);
+    assert_eq!(b2.blocked_since, None);
+    assert_eq!(b2.summary, None);
+    // Transitive dependents are left alone by a direct-only retry.
+    assert_blocked_on_predecessor(&s.get_job(&c.id).unwrap(), &b.id, 10);
+    s.cancel_job(&root.id, now(20, 20)).unwrap();
+
+    let x_spec = spec("https://x/retry-chain.git", Some("retry-chain"));
+    let (x, _) = s.create_job(&x_spec, now(13, 13)).unwrap();
+    let mut y_spec = spec("https://x/retry-chain-dep.git", Some("retry-chain-y"));
+    y_spec.after = vec![x.id.clone()];
+    let (y, _) = s.create_job(&y_spec, now(14, 14)).unwrap();
+    let mut z_spec = spec("https://x/retry-chain-dep2.git", Some("retry-chain-z"));
+    z_spec.after = vec![y.id.clone()];
+    let (z, _) = s.create_job(&z_spec, now(15, 15)).unwrap();
+    finish_failed(s, &x.id, "retry-chain-node", 20, 20);
+
+    let (new_x, pairs) = s
+        .retry_with_dependents(&x.id, &x_spec, true, now(21, 21))
+        .unwrap();
+    assert_eq!(pairs.len(), 3);
+    assert_eq!(pairs[0], (x.id.clone(), new_x.id.clone()));
+    let new_y_id = pairs
+        .iter()
+        .find(|(old, _)| old == &y.id)
+        .map(|(_, new)| new.clone())
+        .expect("y was cloned");
+    let new_z_id = pairs
+        .iter()
+        .find(|(old, _)| old == &z.id)
+        .map(|(_, new)| new.clone())
+        .expect("z was cloned");
+    assert_eq!(new_x.state, JobState::Queued);
+    for (id, after) in [
+        (new_y_id.clone(), vec![new_x.id.clone()]),
+        (new_z_id.clone(), vec![new_y_id.clone()]),
+    ] {
+        let rec = s.get_job(&id).unwrap();
+        assert_eq!(rec.state, JobState::Blocked);
+        assert_eq!(rec.spec.after, after);
+        assert_eq!(rec.waiting_on, rec.spec.after);
+        assert_eq!(rec.blocked_reason, None);
+        assert_eq!(rec.attempt, 1);
+    }
+    assert_eq!(s.job_by_key("retry-chain").unwrap().id, new_x.id);
+    assert_eq!(s.job_by_key("retry-chain-y").unwrap().id, new_y_id);
+    assert_eq!(s.job_by_key("retry-chain-z").unwrap().id, new_z_id);
+    assert_blocked_on_predecessor(&s.get_job(&y.id).unwrap(), &x.id, 20);
+    assert_blocked_on_predecessor(&s.get_job(&z.id).unwrap(), &y.id, 20);
 }
 
 fn collect_size_is_checked_at_submit<S: Store>(s: &S) {
@@ -771,13 +1081,12 @@ fn cancel_recovering_ends_it_cancelled_immediately<S: Store>(s: &S) {
         .unwrap()
         .is_empty());
     assert!(s.renew_lease(&dep.id, a.epoch, now(6, 6), 60_000).is_err());
-    // its blocked dependent fails the way a cancelled dependency does
-    let failed = s.get_job(&dependent.id).unwrap();
-    assert_eq!(failed.state, JobState::Failed);
-    assert_eq!(failed.failure_class, Some(FailureClass::Dependency));
+    // its blocked dependent waits for a retry or TTL the way a cancelled dependency does
+    let blocked = s.get_job(&dependent.id).unwrap();
+    assert_blocked_on_predecessor(&blocked, &dep.id, 5);
     assert_eq!(
-        failed.summary.as_deref(),
-        Some(format!("dependency {} cancelled", dep.id).as_str())
+        blocked.summary.as_deref(),
+        Some(format!("dependency {} cancelled; waiting for retry or TTL", dep.id).as_str())
     );
     // terminal: a second cancel conflicts
     assert_eq!(
@@ -2224,6 +2533,7 @@ fn job_counts<S: Store>(s: &S) {
     assert_eq!(c.completed_done, 0);
     assert_eq!(c.completed_failed, 0);
     assert_eq!(c.completed_cancelled, 0);
+    assert_eq!(c.waiting_dependents, 0);
 
     // create some jobs
     let (j1, _) = s
@@ -2297,6 +2607,25 @@ fn job_counts<S: Store>(s: &S) {
     assert_eq!(states[&JobState::Running], 0);
     assert_eq!(states[&JobState::Recovering], 0);
     assert_eq!(states[&JobState::NeedsInput], 0);
+
+    let (pred, _) = s
+        .create_job(&spec("https://x/counts-pred.git", None), now(12, 12))
+        .unwrap();
+    s.create_job(
+        &with_after(
+            spec("https://x/counts-dep.git", None),
+            std::slice::from_ref(&pred.id),
+        ),
+        now(13, 13),
+    )
+    .unwrap();
+    finish_failed(s, &pred.id, "counts-node", 14, 14);
+    assert_eq!(
+        s.job_counts(now(20, 1500), 1000)
+            .unwrap()
+            .waiting_dependents,
+        1
+    );
 }
 
 fn higher_priority_dispatches_first<S: Store>(s: &S) {

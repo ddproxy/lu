@@ -57,6 +57,7 @@ fn controller_cfg(db: &str, artifacts_dir: &str) -> ControllerConfig {
         }],
         repos: Vec::new(),
         groups: Vec::new(),
+        blocked_dependent_ttl: "24h".to_owned(),
     }
 }
 
@@ -238,6 +239,8 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         publish: None,
         fallbacks: Vec::new(),
         expect: None,
+        stack_union_paths: Vec::new(),
+        stack_base_paths: Vec::new(),
     }
 }
 
