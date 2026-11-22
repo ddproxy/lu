@@ -43,6 +43,29 @@ pub struct DependencyView {
     pub failure_class: Option<FailureClass>,
     #[serde(default)]
     pub summary: Option<String>,
+    /// Commit the dependency was staged from before its patches were applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_commit: Option<String>,
+}
+
+/// One job recreated by a chained retry. The old id stays terminal for its audit trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPair {
+    #[serde(default)]
+    pub old: JobId,
+    #[serde(default)]
+    pub new: JobId,
+}
+
+/// The result of an operator retry. `retried` is empty for a plain retry; `waiting_dependents`
+/// reports how many dependents are still blocked waiting for a retry or TTL expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryReply {
+    pub job: JobView,
+    #[serde(default)]
+    pub retried: Vec<RetryPair>,
+    #[serde(default)]
+    pub waiting_dependents: u64,
 }
 
 /// A page of jobs. The controller may add fields later; unknown ones are ignored.
@@ -103,6 +126,9 @@ pub struct StatusView {
     pub db_bytes: u64,
     #[serde(default)]
     pub recovered_on_boot: u64,
+    /// Blocked dependents waiting for a retry or TTL expiry.
+    #[serde(default)]
+    pub waiting_dependents: u64,
     #[serde(default)]
     pub jobs: BTreeMap<String, u64>,
     #[serde(default)]

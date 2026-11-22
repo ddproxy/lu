@@ -446,6 +446,7 @@ mod tests {
             finished_at: None,
             failure_class: None,
             summary: None,
+            staged_commit: None,
         }
     }
 

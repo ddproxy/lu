@@ -126,10 +126,12 @@ impl From<io::Error> for ArtifactError {
 pub enum ApplyError {
     /// The patch was malformed or git could not read or write the tree.
     Git(String),
-    /// No apply strategy succeeded. `detail` names the failing hunk and file when known.
+    /// No apply strategy succeeded. `hunks` names every patch hunk involved.
     Conflict {
         /// Paths left in conflict by a three-way merge, or the patch's target file.
         paths: Vec<String>,
+        /// One entry per affected hunk, for example `CHANGELOG.md@12`.
+        hunks: Vec<String>,
         /// Extra context, including the failing hunk and file, when available.
         detail: Option<String>,
     },
@@ -139,8 +141,15 @@ impl fmt::Display for ApplyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ApplyError::Git(message) => write!(f, "apply error: {message}"),
-            ApplyError::Conflict { paths, detail } => {
+            ApplyError::Conflict {
+                paths,
+                hunks,
+                detail,
+            } => {
                 write!(f, "apply conflict in {}", paths.join(", "))?;
+                if !hunks.is_empty() {
+                    write!(f, " (hunks: {})", hunks.join(", "))?;
+                }
                 if let Some(detail) = detail {
                     write!(f, ": {detail}")?;
                 }
@@ -161,6 +170,58 @@ pub enum ConflictPolicy {
     Markers,
     /// Leave this input unapplied and keep applying later inputs.
     Skip,
+}
+
+/// How a conflicted file is handled by an explicit [`StackPolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackPathRule {
+    /// Keep the base lines, then append both sides' added lines (ours first).
+    Union,
+    /// Write the base blob's bytes, discarding both sides' changes.
+    Base,
+    /// The path is not covered by the stack policy.
+    None,
+}
+
+/// Explicit opt-in rules for conflict paths that a stack knows how to resolve.
+///
+/// Globs use [`lu_proto::ExpectSpec::glob_matches`]: `*` and `?` stay within a path segment,
+/// `**` spans segments. When a path matches both sets, `union_paths` takes precedence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StackPolicy {
+    /// Files whose conflicts are resolved by keeping base lines and both sides' additions.
+    pub union_paths: Vec<String>,
+    /// Files whose conflicts are resolved by writing the base blob back.
+    pub base_paths: Vec<String>,
+}
+
+impl StackPolicy {
+    /// Classify one conflict path. A path outside both glob sets is [`StackPathRule::None`].
+    pub fn classify(&self, path: &str) -> StackPathRule {
+        if self
+            .union_paths
+            .iter()
+            .any(|pattern| lu_proto::ExpectSpec::glob_matches(pattern, path))
+        {
+            StackPathRule::Union
+        } else if self
+            .base_paths
+            .iter()
+            .any(|pattern| lu_proto::ExpectSpec::glob_matches(pattern, path))
+        {
+            StackPathRule::Base
+        } else {
+            StackPathRule::None
+        }
+    }
+
+    /// Whether every path in a conflict set has a resolution rule.
+    pub fn covers_all(&self, paths: &[String]) -> bool {
+        !paths.is_empty()
+            && paths
+                .iter()
+                .all(|path| self.classify(path) != StackPathRule::None)
+    }
 }
 
 /// How one collected input was applied to a staged checkout.
@@ -851,14 +912,30 @@ pub fn check_patch_inflate(patch: &[u8], cap: u64) -> Result<(), ApplyError> {
 impl Staging {
     /// Apply one collected input's diff under `policy`. `name` labels conflict markers.
     ///
-    /// Every strategy is tried in order: libgit2 apply, libgit2 three-way, then the git binary's
-    /// fuzzy three-way apply. A clean apply contributes its whole patch; a conflict under
-    /// `markers` contributes both sides in the worktree, so later inputs still apply on top.
+    /// Equivalent to [`Staging::apply_input_diff_with_policy`] with no stack rules.
     pub fn apply_input_diff(
         staged: &StagedDir,
         patch: &[u8],
         name: &str,
         policy: ConflictPolicy,
+    ) -> Result<InputApplyResult, ApplyError> {
+        Self::apply_input_diff_with_policy(staged, patch, name, policy, None)
+    }
+
+    /// Apply one collected input's diff under `policy`, with optional explicit stack rules for
+    /// conflict resolution. `name` labels conflict markers.
+    ///
+    /// Every strategy is tried in order: libgit2 apply, libgit2 three-way, then the git binary's
+    /// fuzzy three-way apply. A clean apply contributes its whole patch; a conflict under
+    /// `markers` contributes both sides in the worktree, so later inputs still apply on top.
+    /// A stack policy covering *every* conflicted path resolves them (see [`StackPolicy`]);
+    /// otherwise the conflict fails closed, whatever the job policy says.
+    pub fn apply_input_diff_with_policy(
+        staged: &StagedDir,
+        patch: &[u8],
+        name: &str,
+        policy: ConflictPolicy,
+        stack: Option<&StackPolicy>,
     ) -> Result<InputApplyResult, ApplyError> {
         let label = conflict_label(name);
         let repo = git2::Repository::open(staged.path())
@@ -935,14 +1012,51 @@ impl Staging {
                     }
                     Err(git_error) => {
                         let paths = index_conflict_paths(&repo)?;
-                        if !paths.is_empty() && policy == ConflictPolicy::Markers {
-                            relabel_git_conflicts(&repo, &paths, &label)?;
-                            reset_index_to_head(&repo)?;
-                            return Ok(InputApplyResult {
-                                applied: true,
-                                conflicted_paths: paths,
-                                detail: Some(hunk),
-                            });
+                        if !paths.is_empty() {
+                            let hunks = conflict_hunks(patch, &paths);
+                            if let Some(stack) = stack {
+                                let mut index = repo.index().map_err(|error| {
+                                    ApplyError::Git(format!("failed to open index: {error}"))
+                                })?;
+                                let planned =
+                                    plan_stack_resolution(&repo, &index, stack, &paths, &hunks);
+                                let plan = match planned {
+                                    Ok(Some(plan)) => plan,
+                                    Ok(None) => {
+                                        drop(index);
+                                        restore_tree(&repo, &ours)?;
+                                        reset_index_to_head(&repo)?;
+                                        return Err(conflict_error(paths, hunks, hunk.clone()));
+                                    }
+                                    Err(error) => {
+                                        drop(index);
+                                        restore_tree(&repo, &ours)?;
+                                        reset_index_to_head(&repo)?;
+                                        return Err(error);
+                                    }
+                                };
+                                let summary = stage_stack_resolution(&repo, &mut index, &plan)?;
+                                index.write().map_err(|error| {
+                                    ApplyError::Git(format!("failed to write index: {error}"))
+                                })?;
+                                // The checkout's index always tracks HEAD; resolved content lives
+                                // in the worktree and in the exported diff.
+                                reset_index_to_head(&repo)?;
+                                return Ok(InputApplyResult {
+                                    applied: true,
+                                    conflicted_paths: paths,
+                                    detail: Some(summary),
+                                });
+                            }
+                            if policy == ConflictPolicy::Markers {
+                                relabel_git_conflicts(&repo, &paths, &label)?;
+                                reset_index_to_head(&repo)?;
+                                return Ok(InputApplyResult {
+                                    applied: true,
+                                    conflicted_paths: paths,
+                                    detail: Some(hunk),
+                                });
+                            }
                         }
                         restore_tree(&repo, &ours)?;
                         reset_index_to_head(&repo)?;
@@ -950,10 +1064,11 @@ impl Staging {
                             "failed to prepare three-way merge: {hunk}: {e}; plain apply: {plain_error}; git apply --3way: {git_error}"
                         );
                         return match policy {
-                            ConflictPolicy::Fail => Err(ApplyError::Conflict {
-                                paths: patch_paths(patch),
-                                detail: Some(detail),
-                            }),
+                            ConflictPolicy::Fail => {
+                                let paths = patch_paths(patch);
+                                let hunks = conflict_hunks(patch, &paths);
+                                Err(conflict_error(paths, hunks, detail))
+                            }
                             _ => Ok(unapplied(policy, Vec::new(), detail)),
                         };
                     }
@@ -970,44 +1085,38 @@ impl Staging {
             .merge_trees(&base, &ours, &theirs, None)
             .map_err(|e| ApplyError::Git(format!("failed to merge trees: {e}")))?;
 
-        if policy == ConflictPolicy::Skip {
-            let paths = merge_conflict_paths(&merged)?;
-            if !paths.is_empty() {
-                return Ok(unapplied(policy, paths, hunk));
-            }
-        } else {
-            let paths = merge_conflict_paths(&merged)?;
-            if !paths.is_empty() {
-                return match policy {
-                    ConflictPolicy::Fail => Err(ApplyError::Conflict {
-                        paths,
-                        detail: Some(hunk),
-                    }),
-                    ConflictPolicy::Markers => {
-                        let paths = write_merge_conflict_markers(&repo, &merged, &label)?;
-                        reset_index_to_head(&repo)?;
-                        Ok(InputApplyResult {
-                            applied: true,
-                            conflicted_paths: paths,
-                            detail: Some(hunk),
-                        })
-                    }
-                    ConflictPolicy::Skip => unreachable!("handled above"),
+        let paths = merge_conflict_paths(&merged)?;
+        if !paths.is_empty() {
+            let hunks = conflict_hunks(patch, &paths);
+            if let Some(stack) = stack {
+                let plan = match plan_stack_resolution(&repo, &merged, stack, &paths, &hunks)? {
+                    Some(plan) => plan,
+                    None => return Err(conflict_error(paths, hunks, hunk)),
                 };
+                let summary = stage_stack_resolution(&repo, &mut merged, &plan)?;
+                checkout_merged_tree(&repo, &mut merged)?;
+                return Ok(InputApplyResult {
+                    applied: true,
+                    conflicted_paths: paths,
+                    detail: Some(summary),
+                });
             }
+            return match policy {
+                ConflictPolicy::Fail => Err(conflict_error(paths, hunks, hunk)),
+                ConflictPolicy::Markers => {
+                    let paths = write_merge_conflict_markers(&repo, &merged, &label)?;
+                    reset_index_to_head(&repo)?;
+                    Ok(InputApplyResult {
+                        applied: true,
+                        conflicted_paths: paths,
+                        detail: Some(hunk),
+                    })
+                }
+                ConflictPolicy::Skip => Ok(unapplied(policy, paths, hunk)),
+            };
         }
 
-        let merged_oid = merged
-            .write_tree_to(&repo)
-            .map_err(|e| ApplyError::Git(format!("failed to write merged tree: {e}")))?;
-        let merged = repo
-            .find_tree(merged_oid)
-            .map_err(|e| ApplyError::Git(format!("failed to read merged tree: {e}")))?;
-        let mut checkout = git2::build::CheckoutBuilder::new();
-        checkout.force().remove_untracked(true);
-        repo.checkout_tree(merged.as_object(), Some(&mut checkout))
-            .map_err(|e| ApplyError::Git(format!("failed to check out merge: {e}")))?;
-        reset_index_to_head(&repo)?;
+        checkout_merged_tree(&repo, &mut merged)?;
         Ok(InputApplyResult {
             applied: true,
             conflicted_paths: Vec::new(),
@@ -1030,6 +1139,346 @@ fn patch_paths(patch: &[u8]) -> Vec<String> {
         Some((file, _)) if file != "unknown file" => vec![file],
         _ => Vec::new(),
     }
+}
+
+fn conflict_error(paths: Vec<String>, hunks: Vec<String>, detail: String) -> ApplyError {
+    ApplyError::Conflict {
+        paths,
+        hunks,
+        detail: Some(detail),
+    }
+}
+
+/// Every `@@ -x,y +a,b @@` header paired with its preceding `+++ b/file`.
+fn patch_locations(patch: &[u8]) -> Vec<(String, usize)> {
+    let text = String::from_utf8_lossy(patch);
+    let mut file = None;
+    let mut locations = Vec::new();
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("+++ ") {
+            let path = path.split_whitespace().next().unwrap_or(path);
+            let path = path.strip_prefix("b/").unwrap_or(path);
+            if path != "/dev/null" {
+                file = Some(path.to_owned());
+            }
+        } else if let Some(header) = line.strip_prefix("@@ ") {
+            if let Some(new) = header.split('+').nth(1) {
+                let digits: String = new.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(start) = digits.parse::<usize>() {
+                    let location = (
+                        file.clone().unwrap_or_else(|| "unknown file".to_owned()),
+                        start,
+                    );
+                    if !locations.contains(&location) {
+                        locations.push(location);
+                    }
+                }
+            }
+        }
+    }
+    locations
+}
+
+fn patch_hunks(patch: &[u8]) -> Vec<String> {
+    let mut hunks: Vec<String> = patch_locations(patch)
+        .into_iter()
+        .map(|(file, line)| {
+            if file == "unknown file" {
+                format!("hunk at line {line}")
+            } else {
+                format!("{file}@{line}")
+            }
+        })
+        .collect();
+    if hunks.is_empty() {
+        hunks.push("hunk location unknown".to_owned());
+    }
+    hunks
+}
+
+/// All patch hunks, plus a placeholder for any conflicted path the patch did not name.
+fn conflict_hunks(patch: &[u8], paths: &[String]) -> Vec<String> {
+    let mut hunks = patch_hunks(patch);
+    for path in paths {
+        let prefix = format!("{path}@");
+        if !hunks.iter().any(|hunk| hunk.starts_with(&prefix)) {
+            hunks.push(format!("{path}@unknown"));
+        }
+    }
+    hunks
+}
+
+fn hunks_for_path(hunks: &[String], path: &str) -> Vec<String> {
+    let prefix = format!("{path}@");
+    let mut found: Vec<String> = hunks
+        .iter()
+        .filter(|hunk| hunk.starts_with(&prefix))
+        .cloned()
+        .collect();
+    if found.is_empty() {
+        found.push(format!("{path}@unknown"));
+    }
+    found
+}
+
+/// One path's conflict, reduced to the three blob ids and the index mode to restore.
+struct ConflictSides {
+    path: String,
+    ancestor: Option<git2::Oid>,
+    ours: Option<git2::Oid>,
+    theirs: Option<git2::Oid>,
+    mode: u32,
+}
+
+fn collect_conflict_sides(index: &git2::Index) -> Result<Vec<ConflictSides>, ApplyError> {
+    let mut sides = Vec::new();
+    let conflicts = index
+        .conflicts()
+        .map_err(|e| ApplyError::Git(format!("failed to inspect merge: {e}")))?;
+    for conflict in conflicts {
+        let conflict =
+            conflict.map_err(|e| ApplyError::Git(format!("failed to inspect merge: {e}")))?;
+        let entry = conflict
+            .our
+            .as_ref()
+            .or(conflict.their.as_ref())
+            .or(conflict.ancestor.as_ref())
+            .ok_or_else(|| ApplyError::Git("merge conflict has no file entry".to_owned()))?;
+        let path = String::from_utf8_lossy(&entry.path).into_owned();
+        let mode = entry.mode;
+        sides.push(ConflictSides {
+            path,
+            ancestor: conflict.ancestor.map(|entry| entry.id),
+            ours: conflict.our.map(|entry| entry.id),
+            theirs: conflict.their.map(|entry| entry.id),
+            mode,
+        });
+    }
+    Ok(sides)
+}
+
+/// Reads one conflict side. An absent non-base side means that side deleted the file; an absent
+/// base or a binary blob cannot be resolved by a stack rule, so it fails closed.
+fn conflict_blob(
+    repo: &git2::Repository,
+    id: Option<git2::Oid>,
+    required: bool,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let Some(id) = id else {
+        return if required {
+            Err(format!("no base blob for {path}"))
+        } else {
+            Ok(Vec::new())
+        };
+    };
+    let blob = repo
+        .find_blob(id)
+        .map_err(|e| format!("failed to read blob for {path}: {e}"))?;
+    if blob.is_binary() {
+        return Err(format!("binary blob for {path}"));
+    }
+    Ok(blob.content().to_vec())
+}
+
+struct StackResolution {
+    path: String,
+    rule: StackPathRule,
+    bytes: Vec<u8>,
+    mode: u32,
+    hunks: Vec<String>,
+}
+
+/// Returns `Ok(None)` when the stack policy does not cover every conflicted path; the caller
+/// must then fail closed instead of falling back to the job's markers/skip policy.
+fn plan_stack_resolution(
+    repo: &git2::Repository,
+    index: &git2::Index,
+    stack: &StackPolicy,
+    paths: &[String],
+    hunks: &[String],
+) -> Result<Option<Vec<StackResolution>>, ApplyError> {
+    if !stack.covers_all(paths) {
+        return Ok(None);
+    }
+    let sides = collect_conflict_sides(index)?;
+    let mut plan = Vec::with_capacity(paths.len());
+    for path in paths {
+        let side = sides
+            .iter()
+            .find(|side| &side.path == path)
+            .ok_or_else(|| {
+                conflict_error(
+                    paths.to_vec(),
+                    hunks.to_vec(),
+                    format!("missing conflict entry for {path}"),
+                )
+            })?;
+        let fail = |reason: String| {
+            conflict_error(
+                paths.to_vec(),
+                hunks.to_vec(),
+                format!("cannot resolve {path}: {reason}"),
+            )
+        };
+        if side.mode != 0o100644 && side.mode != 0o100755 {
+            return Err(fail(format!("unsupported file mode {:#o}", side.mode)));
+        }
+        let base = conflict_blob(repo, side.ancestor, true, path).map_err(fail)?;
+        let ours = conflict_blob(repo, side.ours, false, path).map_err(fail)?;
+        let theirs = conflict_blob(repo, side.theirs, false, path).map_err(fail)?;
+        let rule = stack.classify(path);
+        let bytes = match rule {
+            StackPathRule::Union => union_lines(&base, &ours, &theirs),
+            StackPathRule::Base => base,
+            StackPathRule::None => unreachable!("covers_all checked above"),
+        };
+        plan.push(StackResolution {
+            path: path.clone(),
+            rule,
+            bytes,
+            mode: side.mode,
+            hunks: hunks_for_path(hunks, path),
+        });
+    }
+    Ok(Some(plan))
+}
+
+/// Keeps every base line (including lines one side deleted), then appends the lines each side
+/// added relative to the base's line multiset, ours first.
+fn union_lines(base: &[u8], ours: &[u8], theirs: &[u8]) -> Vec<u8> {
+    fn lines(bytes: &[u8]) -> Vec<&[u8]> {
+        bytes
+            .split_inclusive(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    fn added_lines<'a>(base_lines: &[&[u8]], side_lines: &[&'a [u8]]) -> Vec<&'a [u8]> {
+        let mut remaining: std::collections::HashMap<&[u8], usize> =
+            std::collections::HashMap::new();
+        for &line in base_lines {
+            *remaining.entry(line).or_default() += 1;
+        }
+        let mut added = Vec::new();
+        for &line in side_lines {
+            if let Some(count) = remaining.get_mut(line) {
+                if *count > 0 {
+                    *count -= 1;
+                    continue;
+                }
+            }
+            added.push(line);
+        }
+        added
+    }
+
+    let base_lines = lines(base);
+    let ours_added = added_lines(&base_lines, &lines(ours));
+    let theirs_added = added_lines(&base_lines, &lines(theirs));
+    let mut out = Vec::with_capacity(base.len() + ours.len() + theirs.len());
+    out.extend_from_slice(base);
+    if !base.is_empty()
+        && !base.ends_with(b"\n")
+        && (!ours_added.is_empty() || !theirs_added.is_empty())
+    {
+        out.push(b'\n');
+    }
+    for line in ours_added.into_iter().chain(theirs_added) {
+        out.extend_from_slice(line);
+        if !line.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+fn conflict_summary(plan: &[StackResolution]) -> String {
+    let files: Vec<String> = plan
+        .iter()
+        .map(|resolution| {
+            let rule = match resolution.rule {
+                StackPathRule::Union => "union",
+                StackPathRule::Base => "base",
+                StackPathRule::None => "none",
+            };
+            format!(
+                "{} [{rule}] hunks {}",
+                resolution.path,
+                resolution.hunks.join(", ")
+            )
+        })
+        .collect();
+    format!("stack policy resolved conflicts in {}", files.join("; "))
+}
+
+/// Writes each resolved file to the worktree and replaces its conflict stages with one staged
+/// blob, so the merge can be committed to a tree without any conflict entries left behind.
+fn stage_stack_resolution(
+    repo: &git2::Repository,
+    index: &mut git2::Index,
+    plan: &[StackResolution],
+) -> Result<String, ApplyError> {
+    for resolution in plan {
+        let oid = repo
+            .blob(&resolution.bytes)
+            .map_err(|e| ApplyError::Git(format!("failed to write resolved blob: {e}")))?;
+        let path = Path::new(&resolution.path);
+        write_resolved_file(repo, path, &resolution.bytes)?;
+        index
+            .conflict_remove(path)
+            .map_err(|e| ApplyError::Git(format!("failed to clear conflict entry: {e}")))?;
+        let entry = git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: resolution.mode,
+            uid: 0,
+            gid: 0,
+            file_size: resolution.bytes.len() as u32,
+            id: oid,
+            flags: 0,
+            flags_extended: 0,
+            path: resolution.path.as_bytes().to_vec(),
+        };
+        index
+            .add(&entry)
+            .map_err(|e| ApplyError::Git(format!("failed to stage resolved file: {e}")))?;
+    }
+    Ok(conflict_summary(plan))
+}
+
+fn write_resolved_file(
+    repo: &git2::Repository,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), ApplyError> {
+    let full = safe_worktree_path(repo, &path.to_string_lossy())?;
+    if let Some(parent) = full.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            ApplyError::Git(format!("failed to create resolved file directory: {e}"))
+        })?;
+    }
+    fs::write(&full, bytes)
+        .map_err(|e| ApplyError::Git(format!("failed to write resolved file: {e}")))
+}
+
+fn checkout_merged_tree(
+    repo: &git2::Repository,
+    merged: &mut git2::Index,
+) -> Result<(), ApplyError> {
+    let merged_oid = merged
+        .write_tree_to(repo)
+        .map_err(|e| ApplyError::Git(format!("failed to write merged tree: {e}")))?;
+    let tree = repo
+        .find_tree(merged_oid)
+        .map_err(|e| ApplyError::Git(format!("failed to read merged tree: {e}")))?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.force().remove_untracked(true);
+    repo.checkout_tree(tree.as_object(), Some(&mut checkout))
+        .map_err(|e| ApplyError::Git(format!("failed to check out merge: {e}")))?;
+    reset_index_to_head(repo)
 }
 
 fn conflict_label(name: &str) -> String {
@@ -1361,25 +1810,7 @@ impl Staging {
 
 /// Best-effort location of the first hunk in a patch, for failure reporting.
 fn patch_location(patch: &[u8]) -> Option<(String, usize)> {
-    let text = String::from_utf8_lossy(patch);
-    let mut file = None;
-    for line in text.lines() {
-        if let Some(path) = line.strip_prefix("+++ ") {
-            let path = path.split_whitespace().next().unwrap_or(path);
-            let path = path.strip_prefix("b/").unwrap_or(path);
-            if path != "/dev/null" {
-                file = Some(path.to_owned());
-            }
-        } else if let Some(header) = line.strip_prefix("@@ ") {
-            if let Some(new) = header.split('+').nth(1) {
-                let digits: String = new.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(start) = digits.parse::<usize>() {
-                    return Some((file.unwrap_or_else(|| "unknown file".to_owned()), start));
-                }
-            }
-        }
-    }
-    None
+    patch_locations(patch).into_iter().next()
 }
 
 /// Applies a patch with the git binary's fuzzy three-way apply. A missing git binary is reported
@@ -2097,7 +2528,10 @@ mod tests {
 
         let error = Staging::apply_dependency_diff(&staged, &patch).unwrap_err();
         match error {
-            ApplyError::Conflict { paths, .. } => assert_eq!(paths, ["README.md"]),
+            ApplyError::Conflict { paths, hunks, .. } => {
+                assert_eq!(paths, ["README.md"]);
+                assert_eq!(hunks, ["README.md@1"]);
+            }
             other => panic!("expected a conflict, got {other}"),
         }
         assert_eq!(

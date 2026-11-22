@@ -1,6 +1,6 @@
 //! SQLite-backed [`crate::Store`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use crate::{
 const CURRENT_SCHEMA_VERSION: i64 = crate::SCHEMA_VERSION;
 
 /// Columns shared by the list/get queries that build a `JobRecord` from positional rows.
-const JOB_SELECT_COLUMNS: &str = "id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,parent_job_id,root_job_id,depth,publish_json";
+const JOB_SELECT_COLUMNS: &str = "id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since";
 
 fn internal<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Internal(e.to_string())
@@ -230,10 +230,10 @@ impl SqliteStore {
                 tx.commit().map_err(internal)?;
                 Ok(())
             }
-            // Schemas 1 and 2 add additive job columns. Fill them with zero/false so older jobs
-            // keep their history and views stay compatible. Each column is checked because a
-            // database briefly opened by a newer binary may already have some of them.
-            Some(1) | Some(2) => {
+            // Schemas 1 through 3 add additive job columns. Fill them with zero/false/NULL so
+            // older jobs keep their history and views stay compatible. Each column is checked
+            // because a database briefly opened by a newer binary may already have some of them.
+            Some(1) | Some(2) | Some(3) => {
                 for (name, ddl) in [
                     (
                         "scrubbed_hits",
@@ -256,13 +256,25 @@ impl SqliteStore {
                         "publish_json",
                         "ALTER TABLE jobs ADD COLUMN publish_json TEXT",
                     ),
+                    ("staged_commit", "ALTER TABLE jobs ADD COLUMN staged_commit TEXT"),
+                    (
+                        "blocked_reason",
+                        "ALTER TABLE jobs ADD COLUMN blocked_reason TEXT",
+                    ),
+                    (
+                        "blocked_since",
+                        "ALTER TABLE jobs ADD COLUMN blocked_since INTEGER",
+                    ),
                 ] {
                     if !job_column_exists(&tx, name)? {
                         tx.execute(ddl, []).map_err(internal)?;
                     }
                 }
-                tx.execute("UPDATE schema_version SET version = 3", [])
-                    .map_err(internal)?;
+                tx.execute(
+                    "UPDATE schema_version SET version = ?1",
+                    params![CURRENT_SCHEMA_VERSION],
+                )
+                .map_err(internal)?;
                 tx.commit().map_err(internal)?;
                 Ok(())
             }
@@ -283,8 +295,8 @@ impl SqliteStore {
     }
 }
 
-/// True when `jobs` already has `name`. Used by the v1 migration so a partially upgraded database
-/// does not fail with `duplicate column name`.
+/// True when `jobs` already has `name`. Used by the v1-v3 migrations so a partially upgraded
+/// database does not fail with `duplicate column name`.
 fn job_column_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool, StoreError> {
     let count: i64 = tx
         .query_row(
@@ -327,7 +339,10 @@ fn apply_baseline(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
             parent_job_id TEXT,
             root_job_id TEXT,
             depth INTEGER NOT NULL DEFAULT 0,
-            publish_json TEXT
+            publish_json TEXT,
+            staged_commit TEXT,
+            blocked_reason TEXT,
+            blocked_since INTEGER
         );
         CREATE TABLE nodes (
             name TEXT PRIMARY KEY,
@@ -420,16 +435,22 @@ fn load_waiting(conn: &Connection, id: &str) -> Result<Vec<JobId>, StoreError> {
     Ok(out)
 }
 
-fn blocked_dependents(
+/// Blocked jobs that depend on `dep`. `only_failed_reason` narrows this to the jobs waiting on a
+/// dead predecessor, which are the ones a retry, TTL or cancel cascade may touch.
+fn blocked_dependents_tx(
     tx: &rusqlite::Transaction<'_>,
     dep: &str,
+    only_failed_reason: bool,
 ) -> Result<Vec<(String, JobSpec)>, StoreError> {
-    let mut stmt = tx
-        .prepare(
-            "SELECT j.id,j.spec_json FROM jobs j JOIN job_deps d ON d.job=j.id
-             WHERE d.dep=?1 AND j.state='blocked'",
-        )
-        .map_err(internal)?;
+    let sql = if only_failed_reason {
+        "SELECT j.id,j.spec_json FROM jobs j JOIN job_deps d ON d.job=j.id
+         WHERE d.dep=?1 AND j.state='blocked' AND j.blocked_reason='predecessor failed'
+         ORDER BY j.id"
+    } else {
+        "SELECT j.id,j.spec_json FROM jobs j JOIN job_deps d ON d.job=j.id
+         WHERE d.dep=?1 AND j.state='blocked' ORDER BY j.id"
+    };
+    let mut stmt = tx.prepare(sql).map_err(internal)?;
     let rows = stmt
         .query_map(params![dep], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -480,7 +501,8 @@ fn release_blocked_job(
     if deps_satisfied(tx, id, include_failed)? {
         tx.execute(
             "UPDATE jobs SET state='queued',updated_at=?2,failure_class=NULL,
-             summary=NULL,finished_at=NULL WHERE id=?1 AND state='blocked'",
+             summary=NULL,finished_at=NULL,blocked_reason=NULL,blocked_since=NULL
+             WHERE id=?1 AND state='blocked'",
             params![id, now.wall_unix],
         )
         .map_err(internal)?;
@@ -493,12 +515,16 @@ fn release_dependents(
     dep: &str,
     now: Now,
 ) -> Result<(), StoreError> {
-    for (id, spec) in blocked_dependents(tx, dep)? {
+    for (id, spec) in blocked_dependents_tx(tx, dep, false)? {
         release_blocked_job(tx, &id, spec.include_failed, now)?;
     }
     Ok(())
 }
 
+/// A dead predecessor does not fail its dependents outright: they stay `blocked` with a reason and
+/// a wall-clock stamp so a retry can reattach them, or the TTL maintenance pass can fail them.
+/// The block propagates transitively along the dependency graph; jobs that opted into failed inputs
+/// are still released as before.
 fn fail_dependents(
     tx: &rusqlite::Transaction<'_>,
     dep: &str,
@@ -507,24 +533,226 @@ fn fail_dependents(
 ) -> Result<(), StoreError> {
     let mut queue = vec![(dep.to_owned(), dep_state.to_owned())];
     while let Some((dep_id, dep_state)) = queue.pop() {
-        for (id, spec) in blocked_dependents(tx, &dep_id)? {
-            // Opting into failed inputs means the dependency is data, not a reason to fail.
+        for (id, spec) in blocked_dependents_tx(tx, &dep_id, false)? {
+            // Opting into failed inputs means the dependency is data, not a reason to block.
             if spec.include_failed {
                 release_blocked_job(tx, &id, spec.include_failed, now)?;
                 continue;
             }
-            let summary = format!("dependency {dep_id} {dep_state}");
+            let summary = format!("dependency {dep_id} {dep_state}; waiting for retry or TTL");
             tx.execute(
-                "UPDATE jobs SET state='failed',failure_class='dependency',summary=?2,
-                 finished_at=?3,updated_at=?3,node=NULL,lease_until_mono_ms=NULL,
-                 recovering_since_mono_ms=NULL,cancel_requested=0 WHERE id=?1",
-                params![id, summary, now.wall_unix],
+                "UPDATE jobs SET state='blocked',blocked_reason='predecessor failed',
+                 blocked_since=?2,updated_at=?2,summary=?3,failure_class=NULL,
+                 finished_at=NULL WHERE id=?1 AND state='blocked'",
+                params![id, now.wall_unix, summary],
             )
             .map_err(internal)?;
-            queue.push((id, JobState::Failed.as_str().to_owned()));
+            // The dependent itself is now a blocked predecessor for the next level.
+            queue.push((id, JobState::Blocked.as_str().to_owned()));
         }
     }
     Ok(())
+}
+
+/// The predecessor named in a blocked job's summary, falling back to its first unfinished dep.
+fn blocked_predecessor(rec: &JobRecord) -> Option<&str> {
+    rec.summary
+        .as_deref()
+        .and_then(|summary| summary.strip_prefix("dependency "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .or_else(|| rec.waiting_on.first().map(|id| id.as_str()))
+}
+
+/// Git object names are exactly 40 lowercase hex digits; nothing else is accepted.
+fn valid_commit(commit: &str) -> bool {
+    commit.len() == 40
+        && commit
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Shared cancel write. The bool says whether the job actually became `cancelled` (rather than
+/// merely getting a cancel request), which is when a dependent cascade is meaningful.
+fn cancel_job_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: &JobId,
+    now: Now,
+) -> Result<(JobRecord, bool), StoreError> {
+    let (mut rec, lease, recov) = get_job_tx(tx, id.as_str())?;
+    let cancelled_now = match rec.state.cancel_effect() {
+        CancelEffect::Now => {
+            check_transition(rec.state, JobState::Cancelled)?;
+            rec.state = JobState::Cancelled;
+            rec.updated_at = now.wall_unix;
+            rec.finished_at = Some(now.wall_unix);
+            update_job_tx(tx, &rec, None, None)?;
+            fail_dependents(tx, rec.id.as_str(), JobState::Cancelled.as_str(), now)?;
+            true
+        }
+        CancelEffect::Request => {
+            rec.cancel_requested = true;
+            rec.updated_at = now.wall_unix;
+            update_job_tx(tx, &rec, lease, recov)?;
+            false
+        }
+        CancelEffect::Refuse => return Err(StoreError::Conflict { length: None }),
+    };
+    rec.waiting_on = load_waiting(tx, rec.id.as_str())?;
+    Ok((rec, cancelled_now))
+}
+
+/// Cancels the blocked dependents that a cancelled predecessor left waiting for a retry.
+fn cancel_blocked_dependents_tx(
+    tx: &rusqlite::Transaction<'_>,
+    root: &JobId,
+    now: Now,
+) -> Result<(), StoreError> {
+    let mut queue = vec![root.clone()];
+    let mut seen = BTreeSet::new();
+    while let Some(parent) = queue.pop() {
+        for (id, _) in blocked_dependents_tx(tx, parent.as_str(), true)? {
+            let id = JobId::parse(&id).map_err(internal)?;
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let (mut rec, _, _) = get_job_tx(tx, id.as_str())?;
+            if rec.state != JobState::Blocked {
+                continue;
+            }
+            check_transition(rec.state, JobState::Cancelled)?;
+            rec.state = JobState::Cancelled;
+            rec.finished_at = Some(now.wall_unix);
+            rec.updated_at = now.wall_unix;
+            rec.blocked_reason = None;
+            rec.blocked_since = None;
+            update_job_tx(tx, &rec, None, None)?;
+            queue.push(id);
+        }
+    }
+    Ok(())
+}
+
+fn remap_spec_after(spec: &JobSpec, rename: &BTreeMap<JobId, JobId>) -> JobSpec {
+    let mut next = spec.clone();
+    next.after = next
+        .after
+        .iter()
+        .map(|id| rename.get(id).cloned().unwrap_or_else(|| id.clone()))
+        .collect();
+    next
+}
+
+/// Replaces one dependency id in `job`'s edges, keeping the original ordering.
+fn remap_job_deps(
+    tx: &rusqlite::Transaction<'_>,
+    job: &str,
+    old: &JobId,
+    new: &JobId,
+) -> Result<(), StoreError> {
+    let ords: Vec<i64> = {
+        let mut stmt = tx
+            .prepare("SELECT ord FROM job_deps WHERE job=?1 AND dep=?2 ORDER BY ord")
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map(params![job, old.as_str()], |r| r.get::<_, i64>(0))
+            .map_err(internal)?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row.map_err(internal)?);
+        }
+        v
+    };
+    if ords.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        "DELETE FROM job_deps WHERE job=?1 AND dep=?2",
+        params![job, old.as_str()],
+    )
+    .map_err(internal)?;
+    for ord in ords {
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM job_deps WHERE job=?1 AND dep=?2",
+                params![job, new.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        if exists.is_none() {
+            tx.execute(
+                "INSERT INTO job_deps(job,dep,ord) VALUES (?1,?2,?3)",
+                params![job, new.as_str(), ord],
+            )
+            .map_err(internal)?;
+        }
+    }
+    Ok(())
+}
+
+/// Points an idempotency key at the newest job for it. A retry deliberately overwrites the old
+/// mapping so submitting the same key again does not resurrect the finished job.
+fn put_idempotency(
+    tx: &rusqlite::Transaction<'_>,
+    spec: &JobSpec,
+    job_id: &JobId,
+) -> Result<(), StoreError> {
+    if let Some(key) = &spec.idempotency_key {
+        tx.execute(
+            "INSERT INTO idempotency(key,spec_hash,job_id) VALUES (?1,?2,?3)
+             ON CONFLICT(key) DO UPDATE SET spec_hash=excluded.spec_hash, job_id=excluded.job_id",
+            params![key, spec.canonical_json(), job_id.as_str()],
+        )
+        .map_err(internal)?;
+    }
+    Ok(())
+}
+
+/// Blocked dependents to clone for a chained retry, in dependency order: a job is only returned
+/// after every predecessor in the captured set has been returned.
+fn chain_dependents_tx(
+    tx: &rusqlite::Transaction<'_>,
+    root: &JobId,
+) -> Result<Vec<JobId>, StoreError> {
+    let mut captured: BTreeSet<JobId> = BTreeSet::new();
+    let mut queue = vec![root.clone()];
+    while let Some(parent) = queue.pop() {
+        for (id, _) in blocked_dependents_tx(tx, parent.as_str(), true)? {
+            let id = JobId::parse(&id).map_err(internal)?;
+            if captured.insert(id.clone()) {
+                queue.push(id);
+            }
+        }
+    }
+    let mut ordered = Vec::new();
+    while !captured.is_empty() {
+        let mut progressed = false;
+        let ids: Vec<JobId> = captured.iter().cloned().collect();
+        for id in ids {
+            let parents: Vec<JobId> = {
+                let mut stmt = tx
+                    .prepare("SELECT dep FROM job_deps WHERE job=?1")
+                    .map_err(internal)?;
+                let rows = stmt
+                    .query_map(params![id.as_str()], |r| r.get::<_, String>(0))
+                    .map_err(internal)?;
+                let mut v = Vec::new();
+                for row in rows {
+                    v.push(JobId::parse(&row.map_err(internal)?).map_err(internal)?);
+                }
+                v
+            };
+            if parents.iter().all(|dep| !captured.contains(dep)) {
+                ordered.push(id.clone());
+                captured.remove(&id);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            return Err(internal("dependency cycle in blocked dependents"));
+        }
+    }
+    Ok(ordered)
 }
 
 /// True when following `job -> dep` edges from `start` can reach `target`. Used to reject an
@@ -561,7 +789,7 @@ fn get_job_tx(
     id: &str,
 ) -> Result<(JobRecord, Option<u64>, Option<u64>), StoreError> {
     let mut stmt = tx
-        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,parent_job_id,root_job_id,depth,publish_json FROM jobs WHERE id=?1")
+        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since FROM jobs WHERE id=?1")
         .map_err(internal)?;
     let row = stmt
         .query_row(params![id], |r| {
@@ -594,6 +822,9 @@ fn get_job_tx(
                 r.get::<_, Option<String>>("root_job_id")?,
                 r.get::<_, i64>("depth")?,
                 r.get::<_, Option<String>>("publish_json")?,
+                r.get::<_, Option<String>>("staged_commit")?,
+                r.get::<_, Option<String>>("blocked_reason")?,
+                r.get::<_, Option<i64>>("blocked_since")?,
             ))
         })
         .optional()
@@ -629,6 +860,9 @@ fn get_job_tx(
         root_job_id,
         depth,
         publish_json,
+        staged_commit,
+        blocked_reason,
+        blocked_since,
     ) = row;
     let idp = JobId::parse(&id_s).map_err(internal)?;
     let state = parse_state(&state_s)?;
@@ -666,6 +900,9 @@ fn get_job_tx(
         scrubbed_hits: scrubbed_hits as u64,
         patch_scrubbed: patch_scrubbed != 0,
         waiting_on: load_waiting(tx, &id_s)?,
+        staged_commit,
+        blocked_reason,
+        blocked_since,
         parent_job_id: parse_job_id_opt(parent_job_id)?,
         root_job_id: parse_job_id_opt(root_job_id)?,
         depth: depth.max(0) as u32,
@@ -691,7 +928,7 @@ fn update_job_tx(
         .transpose()
         .map_err(internal)?;
     tx.execute(
-        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20,diff_bytes=?21,expect_failed=?22,scrubbed_hits=?23,patch_scrubbed=?24,parent_job_id=?25,root_job_id=?26,depth=?27,publish_json=?28 WHERE id=?1",
+        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20,diff_bytes=?21,expect_failed=?22,scrubbed_hits=?23,patch_scrubbed=?24,parent_job_id=?25,root_job_id=?26,depth=?27,publish_json=?28,staged_commit=?29,blocked_reason=?30,blocked_since=?31 WHERE id=?1",
         params![
             rec.id.as_str(),
             state_str(rec.state),
@@ -721,6 +958,9 @@ fn update_job_tx(
             rec.root_job_id.as_ref().map(|id| id.as_str()),
             rec.depth as i64,
             publish_json,
+            rec.staged_commit,
+            rec.blocked_reason,
+            rec.blocked_since,
         ],
     ).map_err(internal)?;
     Ok(())
@@ -768,6 +1008,123 @@ fn refresh_reiki_cordons(tx: &rusqlite::Transaction<'_>, hb: &Heartbeat) -> Resu
         }
     }
     Ok(())
+}
+
+/// Inserts a fresh job and its dependency edges. Callers own the idempotency write so a retry can
+/// point an existing key at the new row instead of resurrecting the old one.
+fn insert_job_tx(
+    tx: &rusqlite::Transaction<'_>,
+    spec: &JobSpec,
+    now: Now,
+    lineage: Option<(&JobId, &JobId, u32)>,
+) -> Result<JobRecord, StoreError> {
+    let id = JobId::new();
+    // Every job is the root of its own spawn tree until a controller explicitly parents it.
+    // Keeping the root id on top-level jobs makes the lineage self-describing and lets the
+    // descendant count subtract exactly one row.
+    let root_job_id = lineage
+        .map(|(_, root, _)| root.clone())
+        .unwrap_or_else(|| id.clone());
+    // BEGIN IMMEDIATE serialises writers, so max+1 is a stable submission sequence even when
+    // several controllers' requests create jobs concurrently.
+    let dispatch_seq: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(dispatch_seq), 0) + 1 FROM jobs",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
+    let mut blocked = false;
+    let collects_files = spec.collect.collects_files();
+    let mut collected_bytes = 0u64;
+    for dep in &spec.after {
+        let (dep_state, diff_bytes): (Option<String>, Option<i64>) = tx
+            .query_row(
+                "SELECT state, diff_bytes FROM jobs WHERE id=?1",
+                params![dep.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(internal)?
+            .unwrap_or((None, None));
+        match dep_state.as_deref() {
+            Some("done") => {}
+            Some("failed" | "cancelled") if spec.include_failed => {}
+            Some("failed" | "cancelled") => return Err(StoreError::DeadDependency(dep.clone())),
+            Some(_) => blocked = true,
+            None => return Err(StoreError::InvalidDependency(dep.clone())),
+        }
+        if collects_files {
+            let bytes = diff_bytes.unwrap_or(0).max(0) as u64;
+            collected_bytes = collected_bytes.saturating_add(bytes);
+            if collected_bytes > MAX_COLLECT_BYTES {
+                return Err(StoreError::InvalidSpec(format!(
+                    "collect: input diffs are {collected_bytes} bytes, over the {MAX_COLLECT_BYTES}-byte cap"
+                )));
+            }
+        }
+    }
+    let canonical = spec.canonical_json();
+    let mut rec = JobRecord {
+        id: id.clone(),
+        state: if spec.draft {
+            JobState::Draft
+        } else if blocked {
+            JobState::Blocked
+        } else {
+            JobState::Queued
+        },
+        spec: spec.clone(),
+        attempt: 1,
+        node: None,
+        assigned_provider: None,
+        assigned_model: None,
+        epoch: 0,
+        created_at: now.wall_unix,
+        updated_at: now.wall_unix,
+        started_at: None,
+        finished_at: None,
+        failure_class: None,
+        summary: None,
+        exit_code: None,
+        artifacts: Vec::new(),
+        cancel_requested: false,
+        log_len: 0,
+        diff_bytes: None,
+        expect_failed: false,
+        scrubbed_hits: 0,
+        patch_scrubbed: false,
+        waiting_on: Vec::new(),
+        staged_commit: None,
+        blocked_reason: None,
+        blocked_since: None,
+        parent_job_id: lineage.map(|(parent, _, _)| parent.clone()),
+        root_job_id: Some(root_job_id.clone()),
+        depth: lineage.map(|(_, _, depth)| depth).unwrap_or(0),
+        publish: None,
+    };
+    tx.execute(
+        "INSERT INTO jobs(id,dispatch_seq,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,lease_until_mono_ms,recovering_since_mono_ms,parent_job_id,root_job_id,depth)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+        params![
+            rec.id.as_str(), dispatch_seq, state_str(rec.state), canonical, 1i64, Option::<String>::None, 0i64,
+            rec.created_at, rec.updated_at, Option::<i64>::None, Option::<i64>::None,
+            Option::<String>::None, Option::<String>::None, Option::<i32>::None,
+            encode_artifacts(&[]), 0i64, 0i64, Option::<i64>::None, Option::<i64>::None,
+            rec.parent_job_id.as_ref().map(|id| id.as_str()),
+            rec.root_job_id.as_ref().map(|id| id.as_str()),
+            rec.depth as i64,
+        ],
+    ).map_err(internal)?;
+    for (ord, dep) in spec.after.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO job_deps(job,dep,ord) VALUES (?1,?2,?3)",
+            params![rec.id.as_str(), dep.as_str(), ord as i64],
+        )
+        .map_err(internal)?;
+    }
+    rec.waiting_on = load_waiting(tx, rec.id.as_str())?;
+    Ok(rec)
 }
 
 impl SqliteStore {
@@ -843,110 +1200,7 @@ impl SqliteStore {
                 return Err(StoreError::LimitExceeded("max_descendants_per_root"));
             }
         }
-        let id = JobId::new();
-        // Every job is the root of its own spawn tree until a controller explicitly parents it.
-        // Keeping the root id on top-level jobs makes the lineage self-describing and lets the
-        // descendant count below subtract exactly one row.
-        let root_job_id = lineage
-            .map(|(_, root, _)| root.clone())
-            .unwrap_or_else(|| id.clone());
-        // BEGIN IMMEDIATE serialises writers, so max+1 is a stable submission sequence even when
-        // several controllers' requests create jobs concurrently.
-        let dispatch_seq: i64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(dispatch_seq), 0) + 1 FROM jobs",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(internal)?;
-        let mut blocked = false;
-        let collects_files = spec.collect.collects_files();
-        let mut collected_bytes = 0u64;
-        for dep in &spec.after {
-            let (dep_state, diff_bytes): (Option<String>, Option<i64>) = tx
-                .query_row(
-                    "SELECT state, diff_bytes FROM jobs WHERE id=?1",
-                    params![dep.as_str()],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()
-                .map_err(internal)?
-                .unwrap_or((None, None));
-            match dep_state.as_deref() {
-                Some("done") => {}
-                Some("failed" | "cancelled") if spec.include_failed => {}
-                Some("failed" | "cancelled") => {
-                    return Err(StoreError::DeadDependency(dep.clone()))
-                }
-                Some(_) => blocked = true,
-                None => return Err(StoreError::InvalidDependency(dep.clone())),
-            }
-            if collects_files {
-                let bytes = diff_bytes.unwrap_or(0).max(0) as u64;
-                collected_bytes = collected_bytes.saturating_add(bytes);
-                if collected_bytes > MAX_COLLECT_BYTES {
-                    return Err(StoreError::InvalidSpec(format!(
-                        "collect: input diffs are {collected_bytes} bytes, over the {MAX_COLLECT_BYTES}-byte cap"
-                    )));
-                }
-            }
-        }
-        let mut rec = JobRecord {
-            id: id.clone(),
-            state: if spec.draft {
-                JobState::Draft
-            } else if blocked {
-                JobState::Blocked
-            } else {
-                JobState::Queued
-            },
-            spec: spec.clone(),
-            attempt: 1,
-            node: None,
-            assigned_provider: None,
-            assigned_model: None,
-            epoch: 0,
-            created_at: now.wall_unix,
-            updated_at: now.wall_unix,
-            started_at: None,
-            finished_at: None,
-            failure_class: None,
-            summary: None,
-            exit_code: None,
-            artifacts: Vec::new(),
-            cancel_requested: false,
-            log_len: 0,
-            diff_bytes: None,
-            expect_failed: false,
-            scrubbed_hits: 0,
-            patch_scrubbed: false,
-            waiting_on: Vec::new(),
-            parent_job_id: lineage.map(|(parent, _, _)| parent.clone()),
-            root_job_id: Some(root_job_id.clone()),
-            depth: lineage.map(|(_, _, depth)| depth).unwrap_or(0),
-            publish: None,
-        };
-        tx.execute(
-            "INSERT INTO jobs(id,dispatch_seq,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,lease_until_mono_ms,recovering_since_mono_ms,parent_job_id,root_job_id,depth)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
-            params![
-                rec.id.as_str(), dispatch_seq, state_str(rec.state), canonical, 1i64, Option::<String>::None, 0i64,
-                rec.created_at, rec.updated_at, Option::<i64>::None, Option::<i64>::None,
-                Option::<String>::None, Option::<String>::None, Option::<i32>::None,
-                encode_artifacts(&[]), 0i64, 0i64, Option::<i64>::None, Option::<i64>::None,
-                rec.parent_job_id.as_ref().map(|id| id.as_str()),
-                rec.root_job_id.as_ref().map(|id| id.as_str()),
-                rec.depth as i64,
-            ],
-        ).map_err(internal)?;
-        for (ord, dep) in spec.after.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO job_deps(job,dep,ord) VALUES (?1,?2,?3)",
-                params![rec.id.as_str(), dep.as_str(), ord as i64],
-            )
-            .map_err(internal)?;
-        }
-        rec.waiting_on = load_waiting(&tx, rec.id.as_str())?;
+        let rec = insert_job_tx(&tx, spec, now, lineage)?;
         if let Some(key) = &spec.idempotency_key {
             tx.execute(
                 "INSERT INTO idempotency(key,spec_hash,job_id) VALUES (?1,?2,?3)",
@@ -990,36 +1244,7 @@ impl Store for SqliteStore {
             ))
             .map_err(internal)?;
         let rows = stmt
-            .query_map(params![parent_job_id.as_str()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                    row.get::<_, Option<String>>(11)?,
-                    row.get::<_, Option<i32>>(12)?,
-                    row.get::<_, String>(13)?,
-                    row.get::<_, i64>(14)?,
-                    row.get::<_, i64>(15)?,
-                    row.get::<_, Option<i64>>(16)?,
-                    row.get::<_, Option<String>>(17)?,
-                    row.get::<_, Option<String>>(18)?,
-                    row.get::<_, i64>(19)?,
-                    row.get::<_, i64>(20)?,
-                    row.get::<_, i64>(21)?,
-                    row.get::<_, Option<String>>(22)?,
-                    row.get::<_, Option<String>>(23)?,
-                    row.get::<_, i64>(24)?,
-                    row.get::<_, Option<String>>(25)?,
-                ))
-            })
+            .query_map(params![parent_job_id.as_str()], row_to_job_tuple)
             .map_err(internal)?;
         let mut out = Vec::new();
         for row in rows {
@@ -1048,36 +1273,7 @@ impl Store for SqliteStore {
             ))
             .map_err(internal)?;
         let t: JobTuple = stmt
-            .query_row(params![id.as_str()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                    row.get::<_, Option<String>>(11)?,
-                    row.get::<_, Option<i32>>(12)?,
-                    row.get::<_, String>(13)?,
-                    row.get::<_, i64>(14)?,
-                    row.get::<_, i64>(15)?,
-                    row.get::<_, Option<i64>>(16)?,
-                    row.get::<_, Option<String>>(17)?,
-                    row.get::<_, Option<String>>(18)?,
-                    row.get::<_, i64>(19)?,
-                    row.get::<_, i64>(20)?,
-                    row.get::<_, i64>(21)?,
-                    row.get::<_, Option<String>>(22)?,
-                    row.get::<_, Option<String>>(23)?,
-                    row.get::<_, i64>(24)?,
-                    row.get::<_, Option<String>>(25)?,
-                ))
-            })
+            .query_row(params![id.as_str()], row_to_job_tuple)
             .optional()
             .map_err(internal)?
             .ok_or(StoreError::NotFound)?;
@@ -1107,35 +1303,8 @@ impl Store for SqliteStore {
             .query_row(
                 params![id.as_str(), node.as_str(), epoch as i64, now.mono_ms as i64],
                 |row| {
-                    let t: JobTuple = (
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                        row.get(11)?,
-                        row.get(12)?,
-                        row.get(13)?,
-                        row.get(14)?,
-                        row.get(15)?,
-                        row.get(16)?,
-                        row.get(17)?,
-                        row.get(18)?,
-                        row.get(19)?,
-                        row.get(20)?,
-                        row.get(21)?,
-                        row.get(22)?,
-                        row.get(23)?,
-                        row.get(24)?,
-                        row.get(25)?,
-                    );
-                    Ok((t, row.get(26)?))
+                    let t: JobTuple = row_to_job_tuple(row)?;
+                    Ok((t, row.get(29)?))
                 },
             )
             .optional()
@@ -1157,36 +1326,7 @@ impl Store for SqliteStore {
                  ORDER BY id DESC LIMIT 1"
                 ),
                 params![key],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, u32>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, Option<i64>>(8)?,
-                        row.get::<_, Option<i64>>(9)?,
-                        row.get::<_, Option<String>>(10)?,
-                        row.get::<_, Option<String>>(11)?,
-                        row.get::<_, Option<i32>>(12)?,
-                        row.get::<_, String>(13)?,
-                        row.get::<_, i64>(14)?,
-                        row.get::<_, i64>(15)?,
-                        row.get::<_, Option<i64>>(16)?,
-                        row.get::<_, Option<String>>(17)?,
-                        row.get::<_, Option<String>>(18)?,
-                        row.get::<_, i64>(19)?,
-                        row.get::<_, i64>(20)?,
-                        row.get::<_, i64>(21)?,
-                        row.get::<_, Option<String>>(22)?,
-                        row.get::<_, Option<String>>(23)?,
-                        row.get::<_, i64>(24)?,
-                        row.get::<_, Option<String>>(25)?,
-                    ))
-                },
+                row_to_job_tuple,
             )
             .optional()
             .ok()??;
@@ -1212,36 +1352,7 @@ impl Store for SqliteStore {
                 sql.push_str(" ORDER BY id DESC LIMIT ?1");
                 let mut stmt = conn.prepare(&sql).map_err(internal)?;
                 let rows = stmt
-                    .query_map(params![limit as i64], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, u32>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                            row.get::<_, i64>(5)?,
-                            row.get::<_, i64>(6)?,
-                            row.get::<_, i64>(7)?,
-                            row.get::<_, Option<i64>>(8)?,
-                            row.get::<_, Option<i64>>(9)?,
-                            row.get::<_, Option<String>>(10)?,
-                            row.get::<_, Option<String>>(11)?,
-                            row.get::<_, Option<i32>>(12)?,
-                            row.get::<_, String>(13)?,
-                            row.get::<_, i64>(14)?,
-                            row.get::<_, i64>(15)?,
-                            row.get::<_, Option<i64>>(16)?,
-                            row.get::<_, Option<String>>(17)?,
-                            row.get::<_, Option<String>>(18)?,
-                            row.get::<_, i64>(19)?,
-                            row.get::<_, i64>(20)?,
-                            row.get::<_, i64>(21)?,
-                            row.get::<_, Option<String>>(22)?,
-                            row.get::<_, Option<String>>(23)?,
-                            row.get::<_, i64>(24)?,
-                            row.get::<_, Option<String>>(25)?,
-                        ))
-                    })
+                    .query_map(params![limit as i64], row_to_job_tuple)
                     .map_err(internal)?;
                 for r in rows {
                     let t = r.map_err(internal)?;
@@ -1255,34 +1366,7 @@ impl Store for SqliteStore {
                 let mut stmt = conn.prepare(&sql).map_err(internal)?;
                 let rows = stmt
                     .query_map(params![state_str(st), limit as i64], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, u32>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                            row.get::<_, i64>(5)?,
-                            row.get::<_, i64>(6)?,
-                            row.get::<_, i64>(7)?,
-                            row.get::<_, Option<i64>>(8)?,
-                            row.get::<_, Option<i64>>(9)?,
-                            row.get::<_, Option<String>>(10)?,
-                            row.get::<_, Option<String>>(11)?,
-                            row.get::<_, Option<i32>>(12)?,
-                            row.get::<_, String>(13)?,
-                            row.get::<_, i64>(14)?,
-                            row.get::<_, i64>(15)?,
-                            row.get::<_, Option<i64>>(16)?,
-                            row.get::<_, Option<String>>(17)?,
-                            row.get::<_, Option<String>>(18)?,
-                            row.get::<_, i64>(19)?,
-                            row.get::<_, i64>(20)?,
-                            row.get::<_, i64>(21)?,
-                            row.get::<_, Option<String>>(22)?,
-                            row.get::<_, Option<String>>(23)?,
-                            row.get::<_, i64>(24)?,
-                            row.get::<_, Option<String>>(25)?,
-                        ))
+                        row_to_job_tuple(row)
                     })
                     .map_err(internal)?;
                 for r in rows {
@@ -1297,34 +1381,7 @@ impl Store for SqliteStore {
                 let mut stmt = conn.prepare(&sql).map_err(internal)?;
                 let rows = stmt
                     .query_map(params![a.as_str(), limit as i64], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, u32>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                            row.get::<_, i64>(5)?,
-                            row.get::<_, i64>(6)?,
-                            row.get::<_, i64>(7)?,
-                            row.get::<_, Option<i64>>(8)?,
-                            row.get::<_, Option<i64>>(9)?,
-                            row.get::<_, Option<String>>(10)?,
-                            row.get::<_, Option<String>>(11)?,
-                            row.get::<_, Option<i32>>(12)?,
-                            row.get::<_, String>(13)?,
-                            row.get::<_, i64>(14)?,
-                            row.get::<_, i64>(15)?,
-                            row.get::<_, Option<i64>>(16)?,
-                            row.get::<_, Option<String>>(17)?,
-                            row.get::<_, Option<String>>(18)?,
-                            row.get::<_, i64>(19)?,
-                            row.get::<_, i64>(20)?,
-                            row.get::<_, i64>(21)?,
-                            row.get::<_, Option<String>>(22)?,
-                            row.get::<_, Option<String>>(23)?,
-                            row.get::<_, i64>(24)?,
-                            row.get::<_, Option<String>>(25)?,
-                        ))
+                        row_to_job_tuple(row)
                     })
                     .map_err(internal)?;
                 for r in rows {
@@ -1339,34 +1396,7 @@ impl Store for SqliteStore {
                 let mut stmt = conn.prepare(&sql).map_err(internal)?;
                 let rows = stmt
                     .query_map(params![state_str(st), a.as_str(), limit as i64], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, u32>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                            row.get::<_, i64>(5)?,
-                            row.get::<_, i64>(6)?,
-                            row.get::<_, i64>(7)?,
-                            row.get::<_, Option<i64>>(8)?,
-                            row.get::<_, Option<i64>>(9)?,
-                            row.get::<_, Option<String>>(10)?,
-                            row.get::<_, Option<String>>(11)?,
-                            row.get::<_, Option<i32>>(12)?,
-                            row.get::<_, String>(13)?,
-                            row.get::<_, i64>(14)?,
-                            row.get::<_, i64>(15)?,
-                            row.get::<_, Option<i64>>(16)?,
-                            row.get::<_, Option<String>>(17)?,
-                            row.get::<_, Option<String>>(18)?,
-                            row.get::<_, i64>(19)?,
-                            row.get::<_, i64>(20)?,
-                            row.get::<_, i64>(21)?,
-                            row.get::<_, Option<String>>(22)?,
-                            row.get::<_, Option<String>>(23)?,
-                            row.get::<_, i64>(24)?,
-                            row.get::<_, Option<String>>(25)?,
-                        ))
+                        row_to_job_tuple(row)
                     })
                     .map_err(internal)?;
                 for r in rows {
@@ -1385,26 +1415,188 @@ impl Store for SqliteStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
+        let (rec, _) = cancel_job_tx(&tx, id, now)?;
+        tx.commit().map_err(internal)?;
+        Ok(rec)
+    }
+
+    fn record_staged_commit(
+        &self,
+        id: &JobId,
+        epoch: u64,
+        commit: &str,
+        now: Now,
+    ) -> Result<JobRecord, StoreError> {
+        if !valid_commit(commit) {
+            return Err(StoreError::InvalidSpec(
+                "staged commit must be exactly 40 lowercase hex digits".to_owned(),
+            ));
+        }
+        let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         let (mut rec, lease, recov) = get_job_tx(&tx, id.as_str())?;
-        match rec.state.cancel_effect() {
-            CancelEffect::Now => {
-                check_transition(rec.state, JobState::Cancelled)?;
-                rec.state = JobState::Cancelled;
-                rec.updated_at = now.wall_unix;
-                rec.finished_at = Some(now.wall_unix);
-                update_job_tx(&tx, &rec, None, None)?;
-                fail_dependents(&tx, rec.id.as_str(), JobState::Cancelled.as_str(), now)?;
+        if rec.epoch != epoch {
+            return Err(StoreError::StaleEpoch);
+        }
+        if !matches!(rec.state, JobState::Leased | JobState::Running) {
+            return Err(StoreError::Conflict { length: None });
+        }
+        rec.staged_commit = Some(commit.to_owned());
+        rec.updated_at = now.wall_unix;
+        update_job_tx(&tx, &rec, lease, recov)?;
+        tx.commit().map_err(internal)?;
+        Ok(rec)
+    }
+
+    fn blocked_dependents(&self, dep: &JobId) -> Result<Vec<JobRecord>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {JOB_SELECT_COLUMNS} FROM jobs j
+                 JOIN job_deps d ON d.job=j.id
+                 WHERE d.dep=?1 AND j.state='blocked'
+                   AND j.blocked_reason='predecessor failed'
+                 ORDER BY j.id"
+            ))
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map(params![dep.as_str()], row_to_job_tuple)
+            .map_err(internal)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let mut rec = tuple_to_job(row.map_err(internal)?)?;
+            rec.waiting_on = load_waiting(&conn, rec.id.as_str())?;
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    fn expire_blocked_dependents(&self, now: Now, ttl_secs: u64) -> Result<Vec<JobId>, StoreError> {
+        let ttl = ttl_secs.min(i64::MAX as u64) as i64;
+        let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM jobs WHERE state='blocked'
+                       AND blocked_reason='predecessor failed'
+                       AND blocked_since IS NOT NULL
+                       AND blocked_since + ?1 <= ?2 ORDER BY id",
+                )
+                .map_err(internal)?;
+            let rows = stmt
+                .query_map(params![ttl, now.wall_unix], |r| r.get::<_, String>(0))
+                .map_err(internal)?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row.map_err(internal)?);
             }
-            CancelEffect::Request => {
-                rec.cancel_requested = true;
-                rec.updated_at = now.wall_unix;
-                update_job_tx(&tx, &rec, lease, recov)?;
-            }
-            CancelEffect::Refuse => return Err(StoreError::Conflict { length: None }),
+            v
+        };
+        let mut moved = Vec::new();
+        for id in ids {
+            let (mut rec, _, _) = get_job_tx(&tx, &id)?;
+            check_transition(rec.state, JobState::Failed)?;
+            let predecessor = blocked_predecessor(&rec)
+                .map(str::to_owned)
+                .unwrap_or_else(|| "unknown predecessor".to_owned());
+            rec.state = JobState::Failed;
+            rec.failure_class = Some(FailureClass::Dependency);
+            rec.summary = Some(format!(
+                "dependency {predecessor} failed; retry TTL {ttl_secs}s expired"
+            ));
+            rec.finished_at = Some(now.wall_unix);
+            rec.updated_at = now.wall_unix;
+            rec.blocked_reason = None;
+            rec.blocked_since = None;
+            rec.cancel_requested = false;
+            update_job_tx(&tx, &rec, None, None)?;
+            moved.push(rec.id);
+        }
+        tx.commit().map_err(internal)?;
+        Ok(moved)
+    }
+
+    fn cancel_job_with_dependents(
+        &self,
+        id: &JobId,
+        now: Now,
+        keep_dependents: bool,
+    ) -> Result<JobRecord, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let (mut rec, cancelled_now) = cancel_job_tx(&tx, id, now)?;
+        if cancelled_now && !keep_dependents {
+            cancel_blocked_dependents_tx(&tx, id, now)?;
         }
         rec.waiting_on = load_waiting(&tx, rec.id.as_str())?;
         tx.commit().map_err(internal)?;
         Ok(rec)
+    }
+
+    fn retry_with_dependents(
+        &self,
+        id: &JobId,
+        spec: &JobSpec,
+        chain: bool,
+        now: Now,
+    ) -> Result<(JobRecord, Vec<(JobId, JobId)>), StoreError> {
+        spec.validate()
+            .map_err(|e| StoreError::InvalidSpec(e.to_string()))?;
+        let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let (old, _, _) = get_job_tx(&tx, id.as_str())?;
+        if !old.state.is_terminal() {
+            return Err(StoreError::Conflict { length: None });
+        }
+        let mut rename = BTreeMap::new();
+        let root = insert_job_tx(&tx, spec, now, None)?;
+        put_idempotency(&tx, spec, &root.id)?;
+        rename.insert(old.id.clone(), root.id.clone());
+        let mut pairs = vec![(old.id.clone(), root.id.clone())];
+
+        if matches!(old.state, JobState::Failed | JobState::Cancelled) {
+            if chain {
+                for old_dep_id in chain_dependents_tx(&tx, &old.id)? {
+                    let (old_dep, _, _) = get_job_tx(&tx, old_dep_id.as_str())?;
+                    if old_dep.state != JobState::Blocked
+                        || old_dep.blocked_reason.as_deref() != Some("predecessor failed")
+                    {
+                        continue;
+                    }
+                    let next_spec = remap_spec_after(&old_dep.spec, &rename);
+                    let new_dep = insert_job_tx(&tx, &next_spec, now, None)?;
+                    put_idempotency(&tx, &new_dep.spec, &new_dep.id)?;
+                    rename.insert(old_dep_id.clone(), new_dep.id.clone());
+                    pairs.push((old_dep_id, new_dep.id));
+                }
+            } else {
+                for (dep_id, _) in blocked_dependents_tx(&tx, id.as_str(), true)? {
+                    remap_job_deps(&tx, &dep_id, &old.id, &root.id)?;
+                    let (mut dep_rec, lease, recov) = get_job_tx(&tx, &dep_id)?;
+                    dep_rec.spec = remap_spec_after(&dep_rec.spec, &rename);
+                    dep_rec.blocked_reason = None;
+                    dep_rec.blocked_since = None;
+                    dep_rec.summary = None;
+                    dep_rec.updated_at = now.wall_unix;
+                    if deps_satisfied(&tx, &dep_id, dep_rec.spec.include_failed)? {
+                        release_blocked_job(&tx, &dep_id, dep_rec.spec.include_failed, now)?;
+                    } else {
+                        update_job_tx(&tx, &dep_rec, lease, recov)?;
+                    }
+                }
+            }
+        }
+        tx.commit().map_err(internal)?;
+        Ok((root, pairs))
     }
 
     fn edit_job(&self, id: &JobId, edit: &JobEdit, now: Now) -> Result<JobRecord, StoreError> {
@@ -2508,6 +2700,7 @@ impl Store for SqliteStore {
             completed_failed: 0,
             completed_cancelled: 0,
             oldest_pending_at: None,
+            waiting_dependents: 0,
         };
         let nodes = conn
             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))
@@ -2560,6 +2753,14 @@ impl Store for SqliteStore {
                 |r| r.get::<_, Option<i64>>(0),
             )
             .map_err(internal)?;
+        let waiting: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state='blocked' AND blocked_reason='predecessor failed'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(internal)?;
+        job_counts.waiting_dependents = waiting.max(0) as u64;
         Ok(job_counts)
     }
 
@@ -2619,6 +2820,9 @@ type JobTuple = (
     Option<String>,
     i64,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
 );
 
 fn row_to_job_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobTuple> {
@@ -2649,6 +2853,9 @@ fn row_to_job_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobTuple> {
         row.get(23)?,
         row.get(24)?,
         row.get(25)?,
+        row.get(26)?,
+        row.get(27)?,
+        row.get(28)?,
     ))
 }
 
@@ -2680,6 +2887,9 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         root_job_id,
         depth,
         publish_json,
+        staged_commit,
+        blocked_reason,
+        blocked_since,
     ) = t;
     Ok(JobRecord {
         id: JobId::parse(&id_s).map_err(internal)?,
@@ -2711,6 +2921,9 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         scrubbed_hits: scrubbed_hits as u64,
         patch_scrubbed: patch_scrubbed != 0,
         waiting_on: Vec::new(),
+        staged_commit,
+        blocked_reason,
+        blocked_since,
         parent_job_id: parse_job_id_opt(parent_job_id)?,
         root_job_id: parse_job_id_opt(root_job_id)?,
         depth: depth.max(0) as u32,
@@ -2779,6 +2992,8 @@ mod tests {
             stuck_after_secs: None,
             idempotency_key: Some("k".to_owned()),
             after: Vec::new(),
+            stack_union_paths: Vec::new(),
+            stack_base_paths: Vec::new(),
             collect: lu_proto::CollectMode::Apply,
             include_failed: false,
             on_conflict: Default::default(),
@@ -2860,7 +3075,7 @@ mod tests {
         {
             let _s = SqliteStore::open(&p).unwrap();
         }
-        for version in [0i64, 4, 9, 999] {
+        for version in [0i64, 5, 9, 999] {
             let conn = rusqlite::Connection::open(&p).unwrap();
             conn.execute("UPDATE schema_version SET version = ?1", params![version])
                 .unwrap();
@@ -2877,7 +3092,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_1_database_upgrades_with_scrub_and_lineage_columns() {
+    fn schema_1_database_upgrades_with_stack_blocking_columns() {
         let p = temp_db("schema1.sqlite");
         {
             let s = SqliteStore::open(&p).unwrap();
@@ -2900,6 +3115,8 @@ mod tests {
                 stuck_after_secs: None,
                 idempotency_key: None,
                 after: Vec::new(),
+                stack_union_paths: Vec::new(),
+                stack_base_paths: Vec::new(),
                 collect: lu_proto::CollectMode::Apply,
                 include_failed: false,
                 on_conflict: Default::default(),
@@ -2943,6 +3160,9 @@ mod tests {
                  ALTER TABLE jobs DROP COLUMN parent_job_id;
                  ALTER TABLE jobs DROP COLUMN root_job_id;
                  ALTER TABLE jobs DROP COLUMN depth;
+                 ALTER TABLE jobs DROP COLUMN staged_commit;
+                 ALTER TABLE jobs DROP COLUMN blocked_reason;
+                 ALTER TABLE jobs DROP COLUMN blocked_since;
                  UPDATE schema_version SET version = 1;",
             )
             .unwrap();
@@ -2952,7 +3172,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let jobs = s.list_jobs(None, 10, None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].scrubbed_hits, 0);
@@ -2960,10 +3180,66 @@ mod tests {
         assert_eq!(jobs[0].parent_job_id, None);
         assert_eq!(jobs[0].root_job_id, None);
         assert_eq!(jobs[0].depth, 0);
+        assert_eq!(jobs[0].staged_commit, None);
+        assert_eq!(jobs[0].blocked_reason, None);
+        assert_eq!(jobs[0].blocked_since, None);
         s.record_scrub(&jobs[0].id, jobs[0].epoch, 3, true).unwrap();
         let job = s.get_job(&jobs[0].id).unwrap();
         assert_eq!(job.scrubbed_hits, 3);
         assert!(job.patch_scrubbed);
+    }
+
+    #[test]
+    fn schema_3_database_gains_stack_blocking_columns() {
+        let p = temp_db("schema3.sqlite");
+        let now = Now {
+            wall_unix: 1,
+            mono_ms: 1,
+        };
+        {
+            let s = SqliteStore::open(&p).unwrap();
+            let (a, _) = s
+                .create_job(&crate::conformance::spec("https://x/a.git", None), now)
+                .unwrap();
+            let mut dependent = crate::conformance::spec("https://x/b.git", None);
+            dependent.after = vec![a.id.clone()];
+            let (b, _) = s.create_job(&dependent, now).unwrap();
+            assert_eq!(b.state, lu_proto::JobState::Blocked);
+        }
+        // Simulate a version-3 database: the three stacked-chain columns did not exist yet.
+        {
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE jobs DROP COLUMN staged_commit;
+                 ALTER TABLE jobs DROP COLUMN blocked_reason;
+                 ALTER TABLE jobs DROP COLUMN blocked_since;
+                 UPDATE schema_version SET version = 3;",
+            )
+            .unwrap();
+        }
+        let s = SqliteStore::open(&p).unwrap();
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let jobs = s.list_jobs(None, 10, None).unwrap();
+        assert_eq!(jobs.len(), 2);
+        for job in &jobs {
+            assert_eq!(job.staged_commit, None);
+            assert_eq!(job.blocked_reason, None);
+            assert_eq!(job.blocked_since, None);
+        }
+        let blocked = jobs
+            .iter()
+            .find(|job| job.state == lu_proto::JobState::Blocked)
+            .expect("the dependent was still blocked");
+        assert_eq!(blocked.waiting_on.len(), 1);
+        // Reopening a migrated database is a no-op.
+        drop(s);
+        drop(conn);
+        let s = SqliteStore::open(&p).unwrap();
+        assert_eq!(s.list_jobs(None, 10, None).unwrap().len(), 2);
     }
 
     #[test]

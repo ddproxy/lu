@@ -347,6 +347,8 @@ mod tests {
             collect: crate::CollectMode::Apply,
             include_failed: false,
             on_conflict: Default::default(),
+            stack_union_paths: Vec::new(),
+            stack_base_paths: Vec::new(),
             allow_empty: false,
             requires: Vec::new(),
             tolerates: Vec::new(),

@@ -6,7 +6,7 @@ use std::process::Command;
 
 use lu_staging::{
     create_input_dir, prepare_inputs, write_input_file, ApplyError, ConflictPolicy, Source,
-    StageRequest, StagedDir, Staging, INPUTS_DIR,
+    StackPathRule, StackPolicy, StageRequest, StagedDir, Staging, INPUTS_DIR,
 };
 
 struct TestDir(PathBuf);
@@ -61,6 +61,17 @@ fn base_repo_with(tmp: &TestDir, files: &[(&str, &str)]) -> PathBuf {
     }
     git(&repo, &["commit", "-q", "-m", "init"]);
     repo
+}
+
+fn unmerged_entries(staged: &StagedDir) -> String {
+    let out = Command::new("git")
+        .args(["ls-files", "-u"])
+        .current_dir(staged.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap()
 }
 
 fn git_available() -> bool {
@@ -185,8 +196,16 @@ fn an_impossible_patch_reports_the_file_and_hunk() {
     let consumer = stage(&staging, &repo, "consumer");
     let error = Staging::apply_dependency_diff(&consumer, text.as_bytes()).unwrap_err();
     match error {
-        ApplyError::Conflict { paths, detail } => {
+        ApplyError::Conflict {
+            paths,
+            hunks,
+            detail,
+        } => {
             assert_eq!(paths, ["docs.md"]);
+            assert!(
+                hunks.iter().any(|hunk| hunk.starts_with("docs.md@")),
+                "{hunks:?}"
+            );
             let detail = detail.unwrap_or_default();
             assert!(detail.contains("docs.md"), "{detail}");
             assert!(detail.contains("hunk at line"), "{detail}");
@@ -285,8 +304,16 @@ fn fail_policy_stops_at_the_conflicting_input() {
     )
     .unwrap_err();
     match error {
-        ApplyError::Conflict { paths, detail } => {
+        ApplyError::Conflict {
+            paths,
+            hunks,
+            detail,
+        } => {
             assert_eq!(paths, ["docs.md"]);
+            assert!(
+                hunks.iter().any(|hunk| hunk.starts_with("docs.md@")),
+                "{hunks:?}"
+            );
             let detail = detail.unwrap_or_default();
             assert!(detail.contains("docs.md"), "{detail}");
             assert!(detail.contains("hunk at line"), "{detail}");
@@ -407,4 +434,311 @@ fn markers_policy_exports_conflicts_and_keeps_later_inputs() {
     assert!(exported.contains("+Feature A: two\n"), "{exported}");
     assert!(!exported.contains(INPUTS_DIR), "{exported}");
     assert!(!exported.contains("report.json"), "{exported}");
+}
+
+#[test]
+fn stack_policy_classifies_paths_with_globs() {
+    let policy = StackPolicy {
+        union_paths: vec!["src/**/*.md".to_owned(), "CHANGELOG.md".to_owned()],
+        base_paths: vec!["notes?.txt".to_owned()],
+    };
+    assert_eq!(policy.classify("src/a/b/README.md"), StackPathRule::Union);
+    assert_eq!(policy.classify("CHANGELOG.md"), StackPathRule::Union);
+    assert_eq!(policy.classify("notes1.txt"), StackPathRule::Base);
+    assert_eq!(policy.classify("other.txt"), StackPathRule::None);
+    assert!(policy.covers_all(&["CHANGELOG.md".to_owned(), "notes2.txt".to_owned()]));
+    assert!(!policy.covers_all(&["CHANGELOG.md".to_owned(), "other.txt".to_owned()]));
+}
+
+/// A stack union rule keeps the base line that each side replaced, then both added lines,
+/// ours before theirs, and leaves no conflict entries behind.
+#[test]
+fn stack_union_policy_keeps_both_added_lines_and_base_lines() {
+    let tmp = TestDir::new("stack-union");
+    let inputs = three_inputs(&tmp);
+    Staging::apply_input_diff(
+        &inputs.consumer,
+        &inputs.first,
+        "first",
+        ConflictPolicy::Fail,
+    )
+    .unwrap();
+
+    let resolved = Staging::apply_input_diff_with_policy(
+        &inputs.consumer,
+        &inputs.second,
+        "second",
+        ConflictPolicy::Fail,
+        Some(&StackPolicy {
+            union_paths: vec!["docs.md".to_owned()],
+            base_paths: Vec::new(),
+        }),
+    )
+    .unwrap();
+    assert!(resolved.applied);
+    assert_eq!(resolved.conflicted_paths, ["docs.md"]);
+    let detail = resolved.detail.unwrap_or_default();
+    assert!(detail.contains("docs.md@"), "{detail}");
+    assert!(detail.contains("union"), "{detail}");
+
+    let docs = fs::read_to_string(inputs.consumer.path().join("docs.md")).unwrap();
+    assert!(docs.contains("Feature A: old\n"), "{docs}");
+    assert!(docs.contains("Feature A: one\nFeature A: two\n"), "{docs}");
+    assert!(!docs.contains("<<<<<<<"), "{docs}");
+    assert_eq!(unmerged_entries(&inputs.consumer), "");
+}
+
+/// A stack union rule also keeps a base line deleted by one side while adding the other side's
+/// replacement.
+#[test]
+fn stack_union_policy_keeps_lines_deleted_by_one_side() {
+    let tmp = TestDir::new("stack-union-deletion");
+    let base = "alpha\nbeta\ngamma\ndelta\n";
+    let repo = base_repo(&tmp, base);
+    let work = tmp.0.join("work");
+    fs::create_dir(&work).unwrap();
+    let staging = Staging::new(&work).unwrap();
+    let producer = stage(&staging, &repo, "producer");
+    let patch = export(&producer, &base.replace("beta\n", "BETA\n"));
+    let consumer = stage(&staging, &repo, "consumer");
+    fs::write(consumer.path().join("docs.md"), base.replace("beta\n", "")).unwrap();
+
+    let resolved = Staging::apply_input_diff_with_policy(
+        &consumer,
+        &patch,
+        "dep",
+        ConflictPolicy::Fail,
+        Some(&StackPolicy {
+            union_paths: vec!["docs.md".to_owned()],
+            base_paths: Vec::new(),
+        }),
+    )
+    .unwrap();
+    assert!(resolved.applied);
+    let docs = fs::read_to_string(consumer.path().join("docs.md")).unwrap();
+    assert!(docs.contains("alpha\nbeta\ngamma\ndelta\n"), "{docs}");
+    assert!(docs.contains("BETA\n"), "{docs}");
+    assert_eq!(unmerged_entries(&consumer), "");
+}
+
+/// A stack base rule writes the base blob back over the conflicted file.
+#[test]
+fn stack_base_policy_writes_the_base_side() {
+    let tmp = TestDir::new("stack-base");
+    let inputs = three_inputs(&tmp);
+    Staging::apply_input_diff(
+        &inputs.consumer,
+        &inputs.first,
+        "first",
+        ConflictPolicy::Fail,
+    )
+    .unwrap();
+
+    let resolved = Staging::apply_input_diff_with_policy(
+        &inputs.consumer,
+        &inputs.second,
+        "second",
+        ConflictPolicy::Fail,
+        Some(&StackPolicy {
+            union_paths: Vec::new(),
+            base_paths: vec!["docs.md".to_owned()],
+        }),
+    )
+    .unwrap();
+    assert!(resolved.applied);
+    assert_eq!(resolved.conflicted_paths, ["docs.md"]);
+    let detail = resolved.detail.unwrap_or_default();
+    assert!(detail.contains("docs.md@"), "{detail}");
+    assert!(detail.contains("base"), "{detail}");
+    assert_eq!(
+        fs::read_to_string(inputs.consumer.path().join("docs.md")).unwrap(),
+        inputs.docs
+    );
+    assert_eq!(unmerged_entries(&inputs.consumer), "");
+}
+
+struct TwoConflictInputs {
+    _tmp: TestDir,
+    consumer: StagedDir,
+    patch: Vec<u8>,
+    docs: String,
+    notes: String,
+}
+
+/// One input patch that conflicts with the consumer in two files at once.
+fn two_conflict_inputs(name: &str) -> TwoConflictInputs {
+    let tmp = TestDir::new(name);
+    let docs = "# Design\nFeature A: old\nfiller 1\nfiller 2\n".to_owned();
+    let notes = "Notes: old\nmore notes\n".to_owned();
+    let base = [("docs.md", docs.as_str()), ("notes.md", notes.as_str())];
+    let repo = base_repo_with(&tmp, &base);
+    let work = tmp.0.join("work");
+    fs::create_dir(&work).unwrap();
+    let staging = Staging::new(&work).unwrap();
+    let producer = stage(&staging, &repo, "producer");
+    fs::write(producer.path().join("docs.md"), docs.replace("old", "two")).unwrap();
+    fs::write(
+        producer.path().join("notes.md"),
+        notes.replace("old", "four"),
+    )
+    .unwrap();
+    let patch = Staging::export_diff(&producer, 1 << 20).unwrap();
+    let consumer = stage(&staging, &repo, "consumer");
+    fs::write(consumer.path().join("docs.md"), docs.replace("old", "one")).unwrap();
+    fs::write(
+        consumer.path().join("notes.md"),
+        notes.replace("old", "three"),
+    )
+    .unwrap();
+    TwoConflictInputs {
+        _tmp: tmp,
+        consumer,
+        patch,
+        docs,
+        notes,
+    }
+}
+
+/// A stack rule that covers only some conflicted paths must fail closed with every path and
+/// hunk, even when the job policy would otherwise leave markers or skip the input.
+#[test]
+fn stack_policy_fails_closed_for_uncovered_paths() {
+    for (name, policy) in [
+        ("fail-closed-markers", ConflictPolicy::Markers),
+        ("fail-closed-skip", ConflictPolicy::Skip),
+    ] {
+        let inputs = two_conflict_inputs(name);
+        let error = Staging::apply_input_diff_with_policy(
+            &inputs.consumer,
+            &inputs.patch,
+            "dep",
+            policy,
+            Some(&StackPolicy {
+                union_paths: vec!["docs.md".to_owned()],
+                base_paths: Vec::new(),
+            }),
+        )
+        .unwrap_err();
+        match error {
+            ApplyError::Conflict {
+                paths,
+                hunks,
+                detail,
+            } => {
+                assert!(paths.iter().any(|path| path == "docs.md"), "{paths:?}");
+                assert!(paths.iter().any(|path| path == "notes.md"), "{paths:?}");
+                assert!(
+                    hunks.iter().any(|hunk| hunk.starts_with("docs.md@")),
+                    "{hunks:?}"
+                );
+                assert!(
+                    hunks.iter().any(|hunk| hunk.starts_with("notes.md@")),
+                    "{hunks:?}"
+                );
+                assert!(detail.unwrap_or_default().contains("hunk"));
+            }
+            other => panic!("expected a conflict, got {other}"),
+        }
+        assert_eq!(
+            fs::read_to_string(inputs.consumer.path().join("docs.md")).unwrap(),
+            inputs.docs.replace("old", "one")
+        );
+        assert_eq!(
+            fs::read_to_string(inputs.consumer.path().join("notes.md")).unwrap(),
+            inputs.notes.replace("old", "three")
+        );
+        assert_eq!(unmerged_entries(&inputs.consumer), "");
+    }
+}
+
+/// When the stack covers every path, the result summary names each file, its hunk and the rule
+/// used; the two files may take different rules from the same policy.
+/// A covered path whose blobs are binary cannot be unioned or reverted from text; it must fail
+/// closed rather than write a mangled file.
+#[test]
+fn stack_policy_fails_closed_on_binary_conflicts() {
+    let tmp = TestDir::new("stack-binary");
+    let repo = base_repo(&tmp, "base\n");
+    let base_blob = b"\0\0\0base binary\0\0";
+    fs::write(repo.join("blob.bin"), base_blob).unwrap();
+    git(&repo, &["add", "blob.bin"]);
+    git(&repo, &["commit", "-q", "-m", "binary"]);
+
+    let work = tmp.0.join("work");
+    fs::create_dir(&work).unwrap();
+    let staging = Staging::new(&work).unwrap();
+    let producer = stage(&staging, &repo, "producer");
+    fs::write(producer.path().join("blob.bin"), b"\0\0\0from dep\0\0").unwrap();
+    let out = Command::new("git")
+        .args(["diff", "--no-color", "--binary", "HEAD", "--", "blob.bin"])
+        .current_dir(producer.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("GIT binary patch"),
+        "expected a binary patch: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let consumer = stage(&staging, &repo, "consumer");
+    let ours = b"\0\0\0from job\0\0";
+    fs::write(consumer.path().join("blob.bin"), ours).unwrap();
+    let error = Staging::apply_input_diff_with_policy(
+        &consumer,
+        &out.stdout,
+        "dep",
+        ConflictPolicy::Fail,
+        Some(&StackPolicy {
+            union_paths: vec!["blob.bin".to_owned()],
+            base_paths: Vec::new(),
+        }),
+    )
+    .unwrap_err();
+    match error {
+        ApplyError::Conflict { paths, hunks, .. } => {
+            assert!(paths.iter().any(|path| path == "blob.bin"), "{paths:?}");
+            assert!(
+                hunks.iter().any(|hunk| hunk == "blob.bin@unknown"),
+                "{hunks:?}"
+            );
+        }
+        other => panic!("expected a conflict, got {other}"),
+    }
+    assert_eq!(fs::read(consumer.path().join("blob.bin")).unwrap(), ours);
+    assert_eq!(unmerged_entries(&consumer), "");
+}
+
+#[test]
+fn stack_summary_names_every_file_and_hunk() {
+    let inputs = two_conflict_inputs("stack-summary");
+    let resolved = Staging::apply_input_diff_with_policy(
+        &inputs.consumer,
+        &inputs.patch,
+        "dep",
+        ConflictPolicy::Fail,
+        Some(&StackPolicy {
+            union_paths: vec!["docs.md".to_owned()],
+            base_paths: vec!["notes.md".to_owned()],
+        }),
+    )
+    .unwrap();
+    assert!(resolved.applied);
+    assert_eq!(resolved.conflicted_paths.len(), 2);
+    let detail = resolved.detail.unwrap_or_default();
+    assert!(detail.contains("docs.md@"), "{detail}");
+    assert!(detail.contains("notes.md@"), "{detail}");
+    assert!(detail.contains("union"), "{detail}");
+    assert!(detail.contains("base"), "{detail}");
+
+    let docs = fs::read_to_string(inputs.consumer.path().join("docs.md")).unwrap();
+    assert!(docs.contains("old"), "{docs}");
+    assert!(docs.contains("one"), "{docs}");
+    assert!(docs.contains("two"), "{docs}");
+    assert_eq!(
+        fs::read_to_string(inputs.consumer.path().join("notes.md")).unwrap(),
+        inputs.notes
+    );
+    assert_eq!(unmerged_entries(&inputs.consumer), "");
 }

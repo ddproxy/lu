@@ -238,6 +238,7 @@ fn controller_config(source_url: &str, db: &Path, artifacts: &Path) -> Controlle
             allow_file_urls: false,
         }],
         groups: Vec::new(),
+        blocked_dependent_ttl: "24h".to_owned(),
     }
 }
 
@@ -321,6 +322,8 @@ fn sample_spec(source_url: &str) -> JobSpec {
         publish: None,
         fallbacks: Vec::new(),
         expect: None,
+        stack_union_paths: Vec::new(),
+        stack_base_paths: Vec::new(),
     }
 }
 

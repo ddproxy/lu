@@ -84,6 +84,25 @@ impl Controller for PackController {
         Box::pin(async move { Ok(Some((self.commit.clone(), self.pack.clone()))) })
     }
 
+    fn set_staged_commit<'a>(
+        &'a self,
+        _id: &'a JobId,
+        _epoch: u64,
+        _commit: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn merge_base<'a>(
+        &'a self,
+        _id: &'a JobId,
+        _epoch: u64,
+        commits: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<String, ApiError>> + Send + 'a>> {
+        let commit = commits.first().cloned().unwrap_or_default();
+        Box::pin(async move { Ok(commit) })
+    }
+
     fn start<'a>(
         &'a self,
         _id: &'a JobId,
@@ -210,6 +229,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         detect: Vec::new(),
         housekeeping: None,
         workspace: None,
+        stack: None,
     };
     let done = Arc::new(AtomicBool::new(false));
     let spec = lu_proto::JobSpec {
@@ -229,6 +249,8 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         idle_timeout_secs: None,
         idempotency_key: None,
         after: Vec::new(),
+        stack_union_paths: Vec::new(),
+        stack_base_paths: Vec::new(),
         collect: lu_proto::CollectMode::Apply,
         include_failed: false,
         on_conflict: Default::default(),

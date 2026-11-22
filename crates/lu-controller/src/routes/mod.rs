@@ -139,16 +139,19 @@ pub fn store_err(e: lu_store::StoreError) -> ApiError {
     }
 }
 
-/// Cancels one job and, by default, every descendant. A terminal descendant is left as it is;
-/// a running descendant receives the same cancel request as its parent.
+/// Cancels one job and, by default, every descendant and blocked dependent. A terminal job is
+/// left as it is; a running job receives the same cancel request as its predecessor. `keep_children`
+/// and `keep_dependents` are the two operator escape hatches.
 pub async fn cancel_job_with_descendants(
     state: &std::sync::Arc<crate::state::AppState>,
     id: &lu_proto::JobId,
     keep_children: bool,
+    keep_dependents: bool,
 ) -> Result<Vec<lu_proto::JobId>, ApiError> {
+    let store = std::sync::Arc::clone(&state.store);
     let mut targets = vec![id.clone()];
     if !keep_children {
-        let store = std::sync::Arc::clone(&state.store);
+        let scan_store = std::sync::Arc::clone(&store);
         let id_for_scan = id.clone();
         let descendants = tokio::task::spawn_blocking(move || {
             fn collect(
@@ -163,7 +166,7 @@ pub async fn cancel_job_with_descendants(
                 Ok(())
             }
             let mut out = Vec::new();
-            collect(store.as_ref(), &id_for_scan, &mut out)?;
+            collect(scan_store.as_ref(), &id_for_scan, &mut out)?;
             Ok::<_, lu_store::StoreError>(out)
         })
         .await;
@@ -173,14 +176,49 @@ pub async fn cancel_job_with_descendants(
             Err(_) => return Err(ApiError::internal()),
         }
     }
-    let store = std::sync::Arc::clone(&state.store);
+    let targets = {
+        let mut seen = std::collections::HashSet::new();
+        targets
+            .into_iter()
+            .filter(|job| seen.insert(job.clone()))
+            .collect::<Vec<_>>()
+    };
+    // Enumerating blocked dependents before the transaction lets the caller wake and audit every
+    // job the store cascade touches, while the store remains responsible for the actual cascade.
+    let mut dependents = Vec::new();
+    if !keep_dependents {
+        let scan_store = std::sync::Arc::clone(&store);
+        let scan_targets = targets.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            for target in scan_targets {
+                for dependent in scan_store.blocked_dependents(&target)? {
+                    out.push(dependent.id);
+                }
+            }
+            Ok::<_, lu_store::StoreError>(out)
+        })
+        .await;
+        match found {
+            Ok(Ok(ids)) => dependents = ids,
+            Ok(Err(error)) => return Err(store_err(error)),
+            Err(_) => return Err(ApiError::internal()),
+        }
+    }
     let result = tokio::task::spawn_blocking(move || {
         let mut changed = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for target in targets {
-            match store.cancel_job(&target, crate::time::now()) {
-                Ok(_) => changed.push(target),
+            match store.cancel_job_with_dependents(&target, crate::time::now(), keep_dependents) {
+                Ok(_) if seen.insert(target.clone()) => changed.push(target),
+                Ok(_) => {}
                 Err(lu_store::StoreError::Conflict { .. }) => {}
                 Err(error) => return Err(error),
+            }
+        }
+        for dependent in dependents {
+            if seen.insert(dependent.clone()) {
+                changed.push(dependent);
             }
         }
         Ok::<_, lu_store::StoreError>(changed)

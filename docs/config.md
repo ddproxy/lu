@@ -23,6 +23,7 @@ At least one of `[controller]` and `[agent]` must be present. A file may contain
 | `max_retries` | no | `1` | Integer `0` to `3`. Node failures retry while `attempt <= max_retries`; `0` means no retry. Provider failures use a separate 100-attempt limit. Execution failures never retry. |
 | `provider_cooldown_secs` | no | `1800` | Integer `60` to `86400`. How long a `(node, provider)` pair is cordoned after a retryable provider failure without `retry_after_secs`. |
 | `recovery_grace_secs` | no | `30` | Integer `0` to `600`. How long a job stays `recovering` before it is requeued or failed. |
+| `blocked_dependent_ttl` | no | `24h` | Duration `1s` to `365d`. How long a dependent blocked by a failed or cancelled predecessor waits for a retry before failing with `failure_class: "dependency"`. |
 | `max_connections` | no | `256` | Integer greater than `0`. Global concurrent connection cap. |
 | `max_connections_per_addr` | no | `64` | Integer `1` to `max_connections`. Concurrent connection cap per remote IP. |
 | `local_repo_roots` | no | `[]` | Absolute local paths, without `..`, that the controller may read job bases from. Each must exist as a directory at startup. With no roots, only configured repository mirrors can serve `GET /v1/agent/jobs/{id}/base`. |
@@ -262,6 +263,32 @@ high_water_percent = 80
 sweep_interval = "60s"
 ```
 
+## `[stack]`
+
+Agent-side, opt-in conflict policies for dependency chains. Omit the table to keep every conflicted
+path fail-closed. Unknown keys are rejected. The semantics and a worked chain are in
+[dependencies.md](dependencies.md#policy-paths-for-known-safe-conflicts).
+
+| Key | Required | Default | Validation |
+| --- | --- | --- | --- |
+| `union_paths` | no | `[]` | At most 16 repo-relative globs of at most 256 bytes each, with `*`, `**` and `?`; no character classes, backslashes or `.`/`..` components. A conflict on a matching path keeps both sides' added lines in order and base deletions. |
+| `base_paths` | no | `[]` | Same bounds as `union_paths`; no pattern may appear in both lists. A conflict on a matching path takes the base side, for generated lock files. |
+
+A conflict on any path not covered by one of these lists fails closed with
+`failure_class: "conflict"`. A covered conflict's summary names every file and hunk, records
+whether the base moved since the dependency was staged, and lists the policy paths used.
+
+A job can set `stack_union_paths` and `stack_base_paths` in its `JobSpec`. Those fields can only
+narrow the agent's lists: every entry must already be in the corresponding `[stack]` list, and the
+two per-job lists must not overlap. An attempt to widen or invent a policy path is refused; the
+agent never grants a job a conflict policy its operator did not configure.
+
+```toml
+[stack]
+union_paths = ["CHANGELOG.md", "docs/*.md"]
+base_paths = ["Cargo.lock", "go.sum"]
+```
+
 ## `[tls]`
 
 | Key | Required | Default | Validation |
@@ -493,6 +520,7 @@ unsafe_inline = false
 - Every `token_sha256` must be unique across all agents and operators.
 - Agent, operator, repository and intake source names are unique within their own arrays.
 - `[[mirror.credentials.repos]]` names are unique; a credential applies to a repo when its name matches the repo name, URL or normalized repo id. Every `[[intake.sources]]` has at least one rule.
+- `[stack] union_paths` and `[stack] base_paths` do not overlap, and each job's `stack_union_paths`/`stack_base_paths` are subsets of the corresponding configured list.
 - When both tables are present, `heartbeat_secs * 2 < lease_secs`.
 
 ## Paths and secret files

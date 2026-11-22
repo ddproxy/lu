@@ -590,7 +590,8 @@ async fn ls_prints_the_no_changes_note_column() {
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
     let header: Vec<&str> = text.lines().next().unwrap().split_whitespace().collect();
-    assert_eq!(header[6], "NOTE", "{text}");
+    assert_eq!(header[6], "BLOCKED", "{text}");
+    assert_eq!(header[7], "NOTE", "{text}");
     let noted_line = text.lines().find(|line| line.contains(&noted_id)).unwrap();
     assert!(noted_line.trim_end().ends_with("no changes"), "{text}");
     let plain_line = text.lines().find(|line| line.contains(&plain_id)).unwrap();
@@ -1609,12 +1610,16 @@ fn finished_job(id: &str, state: &str) -> Value {
     job
 }
 
+fn retry_reply(job: Value) -> Value {
+    json!({"job": job, "retried": [], "waiting_dependents": 0})
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_replaces_or_clears_label_requirements() {
     let id = job_id();
     let new_id = job_id();
     let finished = finished_job(&id, "failed");
-    let created = job_json(&new_id, "queued");
+    let created = retry_reply(job_json(&new_id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1654,7 +1659,7 @@ async fn retry_replaces_or_clears_tolerations() {
     let id = job_id();
     let new_id = job_id();
     let finished = finished_job(&id, "failed");
-    let created = job_json(&new_id, "queued");
+    let created = retry_reply(job_json(&new_id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1701,7 +1706,7 @@ async fn retry_replaces_or_clears_fallback_choices() {
     let id = job_id();
     let new_id = job_id();
     let finished = finished_job(&id, "failed");
-    let created = job_json(&new_id, "queued");
+    let created = retry_reply(job_json(&new_id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1754,7 +1759,7 @@ async fn retry_resubmits_the_finished_spec_and_applies_the_overrides() {
     let id = job_id();
     let new_id = job_id();
     let finished = finished_job(&id, "failed");
-    let created = job_json(&new_id, "queued");
+    let created = retry_reply(job_json(&new_id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1784,14 +1789,14 @@ async fn retry_resubmits_the_finished_spec_and_applies_the_overrides() {
         &dir,
     );
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), new_id);
+    assert_eq!(stdout(&output).trim(), format!("{new_id} queued"));
     let records = server.records.lock().unwrap();
     assert_eq!(records[0].method, "GET");
     assert_eq!(records[0].path, format!("/v1/jobs/{id}"));
     assert_eq!(records[1].method, "POST");
-    assert_eq!(records[1].path, "/v1/jobs");
-    assert_eq!(records[1].header("idempotency-key"), Some("ticket:42"));
+    assert_eq!(records[1].path, format!("/v1/jobs/{id}/retry"));
     let spec: Value = serde_json::from_slice(&records[1].body).unwrap();
+    assert_eq!(spec["idempotency_key"], json!("ticket:42"));
     assert_eq!(spec["source"]["repo"], "/srv/repo");
     assert_eq!(spec["source"]["ref"], "main");
     assert_eq!(spec["task"], "go");
@@ -1812,7 +1817,7 @@ async fn retry_overrides_or_inherits_the_stuck_policy_and_interval() {
     let mut finished = finished_job(&id, "failed");
     finished["spec"]["on_stuck"] = json!("retry");
     finished["spec"]["stuck_after_secs"] = json!(900);
-    let created = job_json(&new_id, "queued");
+    let created = retry_reply(job_json(&new_id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1854,7 +1859,7 @@ async fn retry_keeps_the_old_spec_and_sends_no_idempotency_key_by_default() {
     let id = job_id();
     let new_id = job_id();
     let finished = finished_job(&id, "cancelled");
-    let created = job_json(&new_id, "queued");
+    let created = retry_reply(job_json(&new_id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1867,7 +1872,7 @@ async fn retry_keeps_the_old_spec_and_sends_no_idempotency_key_by_default() {
     let token = write_token(&dir, "operator.token", TOKEN);
     let output = run_with_env(&["retry", &id], &env_for(&server, &token), None, &dir);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), new_id);
+    assert_eq!(stdout(&output).trim(), format!("{new_id} queued"));
     let records = server.records.lock().unwrap();
     assert_eq!(records[1].header("idempotency-key"), None);
     let spec: Value = serde_json::from_slice(&records[1].body).unwrap();
@@ -1888,7 +1893,7 @@ async fn retry_resolves_after_key_to_a_dependency() {
     let dep_id = dep.clone();
     let server = start(move |record| {
         if record.method == "POST" {
-            Reply::json(&job_json(&new_id, "queued"))
+            Reply::json(&retry_reply(job_json(&new_id, "queued")))
         } else if record.query.is_some() {
             Reply::json(&json!({"jobs": [job_json(&dep_id, "done")], "next": null}))
         } else {
@@ -1936,12 +1941,11 @@ async fn retry_refuses_a_job_that_is_not_finished() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retry_json_prints_the_raw_submit_body() {
+async fn retry_json_prints_the_retry_reply() {
     let id = job_id();
     let new_id = job_id();
     let finished = finished_job(&id, "done");
-    let created = job_json(&new_id, "queued");
-    let expected = created.to_string();
+    let created = retry_reply(job_json(&new_id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1959,7 +1963,11 @@ async fn retry_json_prints_the_raw_submit_body() {
         &dir,
     );
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output), format!("{expected}\n"));
+    let reply: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(reply["job"]["id"], json!(new_id));
+    assert_eq!(reply["job"]["state"], json!("queued"));
+    assert_eq!(reply["retried"], json!([]));
+    assert_eq!(reply["waiting_dependents"], json!(0));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1973,7 +1981,7 @@ async fn retry_wait_reports_the_new_jobs_state_and_exit_code() {
     let old_path = id.clone();
     let server = start(move |record| {
         if record.method == "POST" {
-            Reply::json(&job_json(&post_id, "queued"))
+            Reply::json(&retry_reply(job_json(&post_id, "queued")))
         } else if record.path == format!("/v1/jobs/{old_path}") {
             Reply::json(&finished)
         } else {
@@ -1987,7 +1995,7 @@ async fn retry_wait_reports_the_new_jobs_state_and_exit_code() {
 
     let output = run_with_env(&["retry", &id, "--wait"], &envs, None, &dir);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), new_id);
+    assert_eq!(stdout(&output).trim(), format!("{new_id} queued"));
     assert!(
         stderr(&output).contains("state: failed"),
         "{}",

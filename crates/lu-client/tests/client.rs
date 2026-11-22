@@ -219,6 +219,8 @@ fn spec() -> JobSpec {
         publish: None,
         fallbacks: Vec::new(),
         expect: None,
+        stack_union_paths: Vec::new(),
+        stack_base_paths: Vec::new(),
     }
 }
 

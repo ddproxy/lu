@@ -62,6 +62,7 @@ pub async fn status(
         "schema_version": lu_store::SCHEMA_VERSION,
         "db_bytes": db_bytes,
         "recovered_on_boot": state.recovered_on_boot(),
+        "waiting_dependents": counts.waiting_dependents,
         "jobs": jobs,
         "oldest_queued_secs": oldest_queued_secs,
         "drafts": draft_counts.total,

@@ -478,6 +478,8 @@ mod tests {
             idle_timeout_secs: None,
             idempotency_key: None,
             after: Vec::new(),
+            stack_union_paths: Vec::new(),
+            stack_base_paths: Vec::new(),
             collect: lu_proto::CollectMode::Apply,
             include_failed: false,
             on_conflict: Default::default(),

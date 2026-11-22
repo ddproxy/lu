@@ -17,14 +17,18 @@ use serde_json::Value;
 use crate::error::{body_excerpt, ApiError};
 use crate::types::{
     CompletionBody, DependencyView, JobView, ListDrafts, ListJobs, ListNodes, ListRepos, LogPage,
-    NodeStats, NodeView, PollRequest, RepoView, StatusView, WorkspaceCleanResult, WorkspaceRelease,
-    MAX_JSON_BYTES,
+    NodeStats, NodeView, PollRequest, RepoView, RetryReply, StatusView, WorkspaceCleanResult,
+    WorkspaceRelease, MAX_JSON_BYTES,
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
 
 const TOKEN_LIMIT: u64 = 8 * 1024;
 const CA_LIMIT: u64 = 1024 * 1024;
+
+fn valid_commit_id(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 /// Matches the controller's base-pack cap; kept local so the client needs no git dependency.
 const MAX_BASE_PACK_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -302,6 +306,38 @@ impl Client {
         self.scrub(parse_job(&reply.body))
     }
 
+    /// Recreates a finished job. `chain` also recreates its blocked dependents onto the new ids.
+    pub async fn retry(&self, id: &JobId, spec: &JobSpec) -> Result<RetryReply> {
+        self.retry_with_dependents(id, spec, false).await
+    }
+
+    /// Recreates a finished job and, when `chain` is set, its blocked dependents.
+    pub async fn retry_with_dependents(
+        &self,
+        id: &JobId,
+        spec: &JobSpec,
+        chain: bool,
+    ) -> Result<RetryReply> {
+        let route = format!("v1/jobs/{id}/retry");
+        let body = serde_json::to_vec(spec).map_err(|error| ApiError::Decode {
+            message: format!("could not encode the job spec: {error}"),
+        })?;
+        let query = if chain {
+            &[("chain".to_owned(), "1".to_owned())][..]
+        } else {
+            &[][..]
+        };
+        let reply = self
+            .send(Method::POST, &route, Some(body), query, &[], false)
+            .await?;
+        let reply = self.success(reply)?;
+        self.scrub(
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("invalid retry response: {error}"),
+            }),
+        )
+    }
+
     /// The raw job response, so the operator CLI can print what the controller sent.
     pub async fn get_job_raw(&self, id: &JobId) -> Result<String> {
         let route = format!("v1/jobs/{id}");
@@ -371,21 +407,44 @@ impl Client {
     }
 
     pub async fn cancel(&self, id: &JobId) -> Result<JobView> {
-        self.cancel_with_children(id, true).await
+        self.cancel_with_options(id, false, false).await
     }
 
     /// `keep_children = false` leaves descendants running; the default cascade cancels them.
+    /// `keep_dependents = true` leaves blocked dependents waiting instead of cancelling them.
     pub async fn cancel_with_children(&self, id: &JobId, keep_children: bool) -> Result<JobView> {
-        let route = format!("v1/jobs/{id}/cancel");
-        let query = if keep_children {
-            &[("keep_children".to_owned(), "1".to_owned())][..]
-        } else {
-            &[][..]
-        };
+        self.cancel_with_options(id, keep_children, false).await
+    }
+
+    /// Both cancellation escape hatches in one call.
+    pub async fn cancel_with_options(
+        &self,
+        id: &JobId,
+        keep_children: bool,
+        keep_dependents: bool,
+    ) -> Result<JobView> {
         let reply = self
-            .send(Method::POST, &route, None, query, &[], false)
+            .cancel_reply_with_options(id, keep_children, keep_dependents)
             .await?;
         self.cancel_reply(reply, id)
+    }
+
+    async fn cancel_reply_with_options(
+        &self,
+        id: &JobId,
+        keep_children: bool,
+        keep_dependents: bool,
+    ) -> Result<HttpReply> {
+        let route = format!("v1/jobs/{id}/cancel");
+        let mut query = Vec::new();
+        if keep_children {
+            query.push(("keep_children".to_owned(), "1".to_owned()));
+        }
+        if keep_dependents {
+            query.push(("keep_dependents".to_owned(), "1".to_owned()));
+        }
+        self.send(Method::POST, &route, None, &query, &[], false)
+            .await
     }
 
     fn cancel_reply(&self, reply: HttpReply, id: &JobId) -> Result<JobView> {
@@ -398,9 +457,18 @@ impl Client {
 
     /// The raw cancel response. An empty body means the controller cancelled without a view.
     pub async fn cancel_raw(&self, id: &JobId) -> Result<String> {
-        let route = format!("v1/jobs/{id}/cancel");
+        self.cancel_raw_with_options(id, false, false).await
+    }
+
+    /// Raw cancellation response with both escape hatches.
+    pub async fn cancel_raw_with_options(
+        &self,
+        id: &JobId,
+        keep_children: bool,
+        keep_dependents: bool,
+    ) -> Result<String> {
         let reply = self
-            .send(Method::POST, &route, None, &[], &[], false)
+            .cancel_reply_with_options(id, keep_children, keep_dependents)
             .await?;
         let reply = self.success(reply)?;
         Ok(raw_body(&reply))
@@ -992,6 +1060,52 @@ impl Client {
         )
     }
 
+    /// Records the 40-hex commit an agent staged before dependency patches were applied.
+    pub async fn set_staged_commit(&self, id: &JobId, epoch: u64, commit: &str) -> Result<()> {
+        let route = format!("v1/agent/jobs/{id}/staged-commit");
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "commit": commit })).map_err(|error| {
+                ApiError::Decode {
+                    message: format!("could not encode the staged commit: {error}"),
+                }
+            })?;
+        let query = [("epoch".to_owned(), epoch.to_string())];
+        let reply = self
+            .send(Method::POST, &route, Some(body), &query, &[], false)
+            .await?;
+        self.success(reply).map(|_| ())
+    }
+
+    /// Asks the controller for the common ancestor of two or more dependency staged commits.
+    pub async fn merge_base(&self, id: &JobId, epoch: u64, commits: &[String]) -> Result<String> {
+        let route = format!("v1/agent/jobs/{id}/merge-base");
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "commits": commits })).map_err(|error| {
+                ApiError::Decode {
+                    message: format!("could not encode the merge-base request: {error}"),
+                }
+            })?;
+        let query = [("epoch".to_owned(), epoch.to_string())];
+        let reply = self
+            .send(Method::POST, &route, Some(body), &query, &[], false)
+            .await?;
+        let reply = self.success(reply)?;
+        #[derive(serde::Deserialize)]
+        struct MergeBaseReply {
+            commit: String,
+        }
+        let decoded: MergeBaseReply =
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("invalid merge-base response: {error}"),
+            })?;
+        if !valid_commit_id(&decoded.commit) {
+            return Err(ApiError::Decode {
+                message: "merge-base reply has an invalid commit".to_owned(),
+            });
+        }
+        Ok(decoded.commit)
+    }
+
     /// Whether the controller has stored this job's final artifacts and all dependants are done,
     /// so the agent may delete the workspace.
     pub async fn workspace_release(&self, id: &JobId, epoch: u64) -> Result<WorkspaceRelease> {
@@ -1316,6 +1430,30 @@ pub trait Controller: Send + Sync {
         id: &'a JobId,
         epoch: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyView>>> + Send + 'a>>;
+    /// Records a staged base commit. The default keeps fakes that do not model stacks valid.
+    fn set_staged_commit<'a>(
+        &'a self,
+        _id: &'a JobId,
+        _epoch: u64,
+        _commit: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Resolves the common ancestor of disagreeing dependency commits. The default reports the
+    /// absence of a base so a fake without git state behaves like a controller with no ancestor.
+    fn merge_base<'a>(
+        &'a self,
+        _id: &'a JobId,
+        _epoch: u64,
+        _commits: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async {
+            Err(ApiError::BadRequest {
+                status: 409,
+                message: "no common merge base".to_owned(),
+            })
+        })
+    }
     /// Confirms that the controller has stored the job's final artifacts and that any dependants
     /// have finished. The default keeps fakes valid: they have no stored artifacts to wait for.
     fn workspace_release<'a>(
@@ -1426,6 +1564,24 @@ impl Controller for Client {
         epoch: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<DependencyView>>> + Send + 'a>> {
         Box::pin(async move { Client::deps(self, id, epoch).await })
+    }
+
+    fn set_staged_commit<'a>(
+        &'a self,
+        id: &'a JobId,
+        epoch: u64,
+        commit: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move { Client::set_staged_commit(self, id, epoch, commit).await })
+    }
+
+    fn merge_base<'a>(
+        &'a self,
+        id: &'a JobId,
+        epoch: u64,
+        commits: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move { Client::merge_base(self, id, epoch, commits).await })
     }
 
     fn workspace_release<'a>(

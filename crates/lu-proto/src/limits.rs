@@ -45,6 +45,10 @@ pub const MAX_EXPECT_GLOB_BYTES: usize = 256;
 /// The most dependency artifact directories one job may collect into `.lu/inputs`.
 pub const MAX_COLLECT_INPUTS: usize = 16;
 
+/// Per-job stack-policy overrides can only narrow the agent's configured glob lists.
+pub const MAX_STACK_PATHS: usize = 16;
+pub const MAX_STACK_PATH_BYTES: usize = 256;
+
 /// The largest combined size of collected diffs accepted at submission and re-checked at stage
 /// time. One job's own diff is still capped by [`MAX_DIFF_BYTES`].
 pub const MAX_COLLECT_BYTES: u64 = 64 * 1024 * 1024;

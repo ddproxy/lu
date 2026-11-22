@@ -141,7 +141,56 @@ pub struct Config {
     /// Controller-only credentials for private git mirrors.
     #[serde(default)]
     pub mirror: Option<MirrorConfig>,
+    /// Agent-side policies for conflicts in stacked dependency chains.
+    #[serde(default)]
+    pub stack: Option<StackConfig>,
 }
+
+/// `[stack]` — agent-side, fail-closed policies for known-safe conflicted paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StackConfig {
+    /// Globs where both sides' added lines are kept, in order, and base deletions are kept.
+    pub union_paths: Vec<String>,
+    /// Globs where the base side wins, for generated lock files.
+    pub base_paths: Vec<String>,
+}
+
+impl StackConfig {
+    /// Every configured glob, used to check that a job's override only narrows the policy.
+    pub fn all_paths(&self) -> impl Iterator<Item = &str> {
+        self.union_paths
+            .iter()
+            .chain(self.base_paths.iter())
+            .map(String::as_str)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        lu_proto::validate_stack_paths("[stack] union_paths", &self.union_paths).map_err(|e| {
+            ConfigError::Invalid {
+                table: "[stack]".to_owned(),
+                reason: e.reason().to_owned(),
+            }
+        })?;
+        lu_proto::validate_stack_paths("[stack] base_paths", &self.base_paths).map_err(|e| {
+            ConfigError::Invalid {
+                table: "[stack]".to_owned(),
+                reason: e.reason().to_owned(),
+            }
+        })?;
+        for path in &self.union_paths {
+            if self.base_paths.contains(path) {
+                return invalid(
+                    "[stack]",
+                    format!("{path} appears in both union_paths and base_paths"),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+pub const DEFAULT_BLOCKED_DEPENDENT_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// `[drafts]` — how long drafts live and how many may be kept.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -659,6 +708,13 @@ pub struct ControllerConfig {
     /// Concurrency caps for named job groups.
     #[serde(default)]
     pub groups: Vec<ControllerGroup>,
+    /// How long dependents of a failed or cancelled job stay blocked before failing.
+    #[serde(default = "default_blocked_dependent_ttl")]
+    pub blocked_dependent_ttl: String,
+}
+
+fn default_blocked_dependent_ttl() -> String {
+    "24h".to_owned()
 }
 
 fn default_lease_secs() -> u64 {
@@ -813,6 +869,10 @@ pub struct AgentConfig {
     /// `[agent] workspace` key stays an unknown-key error.
     #[serde(default, skip)]
     pub workspace: Option<WorkspaceConfig>,
+    /// Copied from the top-level `[stack]` table by the agent binary. Kept out of TOML so an
+    /// `[agent] stack` key stays an unknown-key error.
+    #[serde(default, skip)]
+    pub stack: Option<StackConfig>,
 }
 
 fn default_heartbeat_secs() -> u64 {
@@ -934,6 +994,7 @@ impl Config {
         self.validate_drafts()?;
         self.validate_intake()?;
         self.validate_mirror()?;
+        self.validate_stack()?;
         if let Some(c) = &self.controller {
             c.validate(self.tls.is_some())?;
         }
@@ -1486,6 +1547,13 @@ impl Config {
         Ok(())
     }
 
+    fn validate_stack(&self) -> Result<(), ConfigError> {
+        if let Some(stack) = &self.stack {
+            stack.validate()?;
+        }
+        Ok(())
+    }
+
     fn validate_cross_scope(&self) -> Result<(), ConfigError> {
         // every token hash unique across agents AND operators
         let mut seen: Vec<(&str, String)> = Vec::new();
@@ -1532,6 +1600,12 @@ impl Config {
 }
 
 impl ControllerConfig {
+    /// How long a blocked dependent waits for its predecessor to be retried, in seconds.
+    pub fn blocked_dependent_ttl_secs(&self) -> u64 {
+        parse_duration_secs(&self.blocked_dependent_ttl)
+            .unwrap_or(DEFAULT_BLOCKED_DEPENDENT_TTL_SECS)
+    }
+
     fn validate(&self, has_tls: bool) -> Result<(), ConfigError> {
         let addr: SocketAddr = self.listen.parse().map_err(|_| ConfigError::Invalid {
             table: "[controller]".to_owned(),
@@ -1548,6 +1622,15 @@ impl ControllerConfig {
                     self.listen
                 ),
             );
+        }
+        match parse_duration_secs(&self.blocked_dependent_ttl) {
+            Some(secs) if (1..=365 * 24 * 60 * 60).contains(&secs) => {}
+            _ => {
+                return invalid(
+                    "[controller]",
+                    "blocked_dependent_ttl must be a duration from 1s to 365d".to_owned(),
+                )
+            }
         }
         validate_abs_no_dotdot("[controller]", "db", &self.db)?;
         validate_abs_no_dotdot("[controller]", "artifacts_dir", &self.artifacts_dir)?;
@@ -2623,6 +2706,56 @@ heartbeat_secs = 15
         assert!(a.label_files.is_empty());
         let cfg = Config::parse(&combined()).unwrap();
         assert_eq!(cfg.log.level, "info");
+    }
+
+    #[test]
+    fn blocked_dependent_ttl_defaults_to_a_day_and_is_validated() {
+        let c = Config::parse(&controller_only())
+            .unwrap()
+            .controller
+            .unwrap();
+        assert_eq!(c.blocked_dependent_ttl, "24h");
+        assert_eq!(
+            c.blocked_dependent_ttl_secs(),
+            DEFAULT_BLOCKED_DEPENDENT_TTL_SECS
+        );
+        let with_ttl = |ttl: &str| {
+            controller_only().replace(
+                "\n[[controller.agents]]",
+                &format!("\nblocked_dependent_ttl = \"{ttl}\"\n[[controller.agents]]"),
+            )
+        };
+        let c = Config::parse(&with_ttl("12h")).unwrap().controller.unwrap();
+        assert_eq!(c.blocked_dependent_ttl_secs(), 12 * 60 * 60);
+        for bad in ["0s", "nope", "999d"] {
+            let text = with_ttl(bad);
+            let (table, reason) = invalid(Config::parse(&text).unwrap_err());
+            assert_eq!(table, "[controller]");
+            assert!(reason.contains("blocked_dependent_ttl"));
+        }
+    }
+
+    #[test]
+    fn stack_policy_is_agent_side_fail_closed_and_strict() {
+        assert!(Config::parse(&agent_only()).unwrap().stack.is_none());
+        let ok = format!(
+            "{}[stack]\nunion_paths = [\"CHANGELOG.md\", \"docs/**\"]\nbase_paths = [\"Cargo.lock\"]\n",
+            agent_only()
+        );
+        let stack = Config::parse(&ok).unwrap().stack.unwrap();
+        assert_eq!(stack.union_paths.len(), 2);
+        assert_eq!(stack.base_paths, vec!["Cargo.lock".to_owned()]);
+        assert_eq!(stack.all_paths().count(), 3);
+
+        for bad in [
+            "[stack]\nunion_paths = [\"../escape\"]\n".to_owned(),
+            "[stack]\nbase_paths = [\"CHANGELOG.md\"]\nunion_paths = [\"CHANGELOG.md\"]\n"
+                .to_owned(),
+            "[stack]\nunknown = true\n".to_owned(),
+        ] {
+            let text = format!("{}{}", agent_only(), bad);
+            assert!(Config::parse(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]

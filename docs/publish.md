@@ -140,10 +140,12 @@ that window safe.
 
 ## What a push contains
 
-Every attempt prepares a temporary checkout from the controller mirror at the job's pinned base,
-applies the stored `diff.patch`, creates one commit and runs the configured gates in that tree. Gate
-commands are direct argv split on whitespace, with a minimal `PATH`, no shell, null stdin and capped
-time. A missing gate name, timeout or spawn error counts as a failure.
+Every attempt prepares a temporary checkout from the controller mirror at the job's pinned base (or
+the base inherited from its dependency chain), applies the stored `diff.patch`, creates one commit
+and runs the configured gates in that tree. For a chained job the patch is relative to that staged
+base, not to a branch tip that may have moved; the operator merges the final patch onto the moved
+branch afterwards. Gate commands are direct argv split on whitespace, with a minimal `PATH`, no
+shell, null stdin and capped time. A missing gate name, timeout or spawn error counts as a failure.
 
 The push uses exactly one exact refspec, `<commit>:refs/heads/<branch>`:
 
@@ -166,7 +168,7 @@ codes.
 `lu show` prints `publish_target` (the effective `remote:branch`, with `(source branch)` for a
 source-branch target) and `publish` (the last attempt's detail, remote, branch and target). `lu top`
 adds a `publish:<detail>:<branch>` note to affected rows. The stored `PublishRecord` is part of the
-jobs table's `publish_json` column in the schema 3 baseline; schema 1 and 2 databases gain the
+jobs table's `publish_json` column in the schema 4 baseline; schema 1, 2 and 3 databases gain the
 column in place at startup.
 
 `/metrics` exports `lu_publish_total{target,result}` since controller start. `target` is `snapshot`

@@ -185,6 +185,7 @@ mod tests {
             operators: Vec::new(),
             repos: Vec::new(),
             groups: Vec::new(),
+            blocked_dependent_ttl: "24h".to_owned(),
         };
         let store = Arc::new(CountingStore {
             lists: AtomicU64::new(0),
