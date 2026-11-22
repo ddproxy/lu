@@ -1347,7 +1347,10 @@ async fn audit_and_metrics_record_scope_actions_without_task_text() {
     let artifacts = read_tree(&srv.artifact_dir);
     for surface in [audit.as_str(), body(&metrics), artifacts.as_str()] {
         for needle in [secret, AGENT_A_TOKEN, OP_TOKEN, "wrong-token"] {
-            assert!(!surface.contains(needle), "{needle} leaked in {surface}");
+            assert!(
+                !surface.contains(needle),
+                "a secret leaked into the audit, metrics or artifacts"
+            );
         }
     }
     // `lu show` is an operator view: task text is expected, credentials are not.

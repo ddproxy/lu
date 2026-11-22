@@ -319,7 +319,10 @@ async fn audit_record_is_off_by_default_and_continues_across_restart() {
     assert!(text.contains("\"event\":\"submitted\""));
     assert!(text.contains("\"actor\":\"ops\""));
     for secret in ["must never be audited", "another secret task", "task"] {
-        assert!(!text.contains(secret), "audit leaked {secret:?}");
+        assert!(
+            !text.contains(secret),
+            "task text leaked into the audit file"
+        );
     }
     // A trusted head verifies a sealed file: its final hash must still be the anchored one.
     lu_audit::verify_bytes(&bytes, Some(&first.head)).unwrap();
