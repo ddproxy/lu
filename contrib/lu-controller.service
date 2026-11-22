@@ -8,6 +8,9 @@ Type=simple
 User=lu
 Group=lu
 WorkingDirectory=/var/lib/lu
+# ProtectHome=yes hides $HOME, and mirror fetches need a readable home and git on PATH.
+Environment=HOME=/var/lib/lu
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # Adjust the binary path if PREFIX was not /usr/local.
 ExecStart=/usr/local/bin/lu serve --config /etc/lu/lu.toml
 Restart=on-failure

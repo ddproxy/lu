@@ -33,8 +33,9 @@ impl StateStyle for State {
             Self::Running | Self::Leased => '▶',
             Self::Blocked => '◌',
             Self::Queued | Self::Recovering | Self::NeedsInput => '○',
+            Self::Draft => '▧',
             Self::Failed => '✗',
-            Self::Cancelled => '–',
+            Self::Cancelled | Self::Expired => '–',
         }
     }
 
@@ -42,10 +43,10 @@ impl StateStyle for State {
         match self {
             Self::Done => Tone::Done,
             Self::Running | Self::Leased => Tone::Good,
-            Self::Blocked => Tone::Blocked,
+            Self::Blocked | Self::Draft => Tone::Blocked,
             Self::Queued | Self::Recovering | Self::NeedsInput => Tone::Warn,
             Self::Failed => Tone::Bad,
-            Self::Cancelled => Tone::Dim,
+            Self::Cancelled | Self::Expired => Tone::Dim,
         }
     }
 

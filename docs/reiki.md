@@ -17,7 +17,7 @@ other is a config error.
 [agent]
 # ... name, controller_url, token_file, work_dir, harness ...
 reiki_health_url = "http://127.0.0.1:4100/v1/health"
-reiki_token_file = "/etc/lu/reiki.token"
+reiki_token_file = "/etc/ting/reiki.token"
 
 [[agent.provider_models]]
 provider = "anthropic"
@@ -34,7 +34,7 @@ model = "gpt-5"
 | `reiki_token_file` | Regular private file, owned by the agent user, mode `0600` or tighter, no symlink or FIFO. The agent reads up to 4 KiB at start and uses one trimmed line as the bearer token. |
 | `[[agent.provider_models]]` | Up to 64 ordered `{ provider, model }` pairs. A pair is published only while Reiki reports that provider `ok`. `provider = "any"` jobs use these pairs in order. |
 
-`lu check` validates the keys but does not open the token file. `lu agent` reads the token at start;
+`lu check` validates the keys but does not open the token file. `ting` reads the token at start;
 a bad token file stops the agent.
 
 ## Health reading
@@ -105,7 +105,8 @@ A running job whose provider stops being usable is stopped by the agent, not by 
 
 A Reiki-derived cordon lifts at expiry or after two consecutive healthy provider heartbeats. A
 non-healthy reading resets that streak. A controller restart clears all cordons through boot
-recovery; Reiki health and new failures set them again. There is no CLI command to clear one. See
+recovery; Reiki health and new failures set them again. An operator can clear one early with
+`lu uncordon <node> [<provider>]`. See
 [Provider cordons and node drains](operations.md#provider-cordons-and-node-drains).
 
 > **Fallback, not Reiki:** For a job with no provider, or a node without a Reiki feed, the agent
@@ -118,7 +119,7 @@ recovery; Reiki health and new failures set them again. There is no CLI command 
 | Command | What to read |
 | --- | --- |
 | `lu show <id>` | `waiting` for a queued job; `failure` and `summary` after a provider stop. |
-| `lu nodes --json` | `providers`, `provider_models`, `cordons` and the opaque `reiki` document for each node. |
+| `lu nodes --json` | `providers`, `provider_models`, `cordon_details` and the opaque `reiki` document for each node. |
 | `lu node <name>` | Latest heartbeat stats, including labels published by probes. |
 | `lu logs <id>` | Harness output; Reiki-derived stops may have no provider marker in it. |
 

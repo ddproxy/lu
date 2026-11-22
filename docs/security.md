@@ -1,7 +1,7 @@
 # Security
 
 This page describes what Lu protects, what it trusts, and the controls and trust boundaries in
-place. It matches the code in this tree. The controller, agent (`lu agent`) and operator CLI are
+place. It matches the code in this tree. The controller, agent (`ting`) and operator CLI are
 implemented. The agent and harness sections cover the deployment and HTTP contract used by this
 tree. See [operations.md](operations.md) for deployment details.
 
@@ -15,16 +15,18 @@ tree. See [operations.md](operations.md) for deployment details.
 | SQLite database | controller host, `[controller] db` | Job specs and tasks, state, leases, epochs, idempotency keys, node state. |
 | Job logs and artifacts | controller host, `artifacts_dir/<job id>/` | Diffs, run logs and reports can contain source code, credentials and model output. |
 | Provider credentials | leaf/agent host | They authorise paid model calls and must not reach the controller or another tenant. |
-| Repository credentials | controller host, `[[controller.repos]].credential_file` | They authorise forge fetches into the controller's bare mirrors and must not reach an agent or appear in a log or error. |
+| Repository credentials | controller host, `[[controller.repos]].credential_file` and `[mirror.credentials]` | They authorise fetches into the controller's bare mirrors and must not reach an agent or appear in a log, artifact, `lu show` or error. |
+| Publish tokens | controller host, `[publish.remotes.<name>].token_file` | They authorise writes to the target repository. Only the controller reads one, for one push, and it must never reach an agent, artifact, `lu show`, audit event or error. |
+| Intake signing keys | controller host, `[[intake.sources]].secret_file` | They authenticate intake events; anyone holding one can submit events for that source, so they are mode `0600` secrets. |
+| Drafts and external context | controller store and job spec | Draft task text is operator-authored; `context` is external data that must never be promoted to instructions. |
 
 ## Threat model
 
 The controller treats everything arriving over the network as hostile: bearer headers, ids,
 node names, JSON bodies, raw log chunks, artifact bytes, lengths, offsets and query strings.
 Requests are authenticated before their bodies are parsed, bodies and logs are size-capped,
-unknown `JobSpec` fields are ignored for forward compatibility while other bodies reject unknown
-fields, ids and names are validated, and artifact file names are chosen by the controller rather
-than supplied by the agent. The controller never connects back to an
+request bodies reject unknown fields, ids and names are validated, and artifact file names are
+chosen by the controller rather than supplied by the agent. The controller never connects back to an
 agent, so there is no inbound path to an agent from the controller or from another agent.
 
 The main adversaries considered are:
@@ -34,6 +36,7 @@ The main adversaries considered are:
 - a compromised or malicious agent host or harness;
 - a malicious operator with a valid token;
 - a local unprivileged user on the controller or agent host;
+- a stranger who can post a comment or other event carrying data that reaches an intake source;
 - a hostile repository, task text, diff or log that tries to exploit parsing, path handling or
   terminal output.
 
@@ -140,6 +143,90 @@ The controller uses the agent's report as the record of what its harness did. An
 job's task and repository content and produces the diff, log and report, so operators open those
 files as untrusted input and place secrets only on trusted nodes.
 
+## Intake and drafts
+
+Intake is off unless `[intake]` is configured. The route `POST /v1/intake/<source>` takes no
+operator or agent bearer token: the source HMAC-SHA256 key is its only credential. A missing,
+malformed or wrong signature all return the same `401`, so a sender cannot probe which check failed. Signatures are checked before bodies are
+capped or parsed, payload text is never written to logs or audit entries, and successful requests
+return only a job id and state. See [intake.md](intake.md) for the configuration and rules.
+
+A stranger who can post a comment or event that reaches a configured source can:
+
+- send a correctly signed event and have it evaluated against that source's rules;
+- influence values copied by `context_from` into the job's external `context`, bounded by a 32 KiB
+  cap with a truncation marker;
+- influence `task` only when the rule sets `unsafe_inline = true` and the pointer is listed in that
+  rule's `task_vars`, with each value length-capped and stripped of control characters;
+- cause an event to be dropped (`204`) by failing `match` or `allow`, or counted as `duplicate`,
+  `rate_limited` (`429`) or `invalid` (`400`/`429` for a full draft cap), or create a draft (or,
+  with `auto_approve`, a queued job) when the rules permit it.
+
+That sender cannot:
+
+- dispatch a job by default, because `auto_approve` defaults to false and the outcome is a `draft`,
+  which is stored and visible but never leased or run; rejection cancels it and TTL expiry ends it
+  in `expired`, a terminal state. An operator may deliberately enable `auto_approve` for a trusted
+  rule, which is an operator decision, not a sender capability;
+- bypass a configured `allow` condition: a failed allowlist drops and counts the event and never
+  creates even a draft;
+- inject arbitrary payload text into `task` while `unsafe_inline = false` (the default). Payload
+  fields go only into `context`, which the agent stages as `.lu/inputs/context.md` under an
+  **UNTRUSTED EXTERNAL TEXT** header, with the harness prompt instructing it to treat the file as
+  data, not instructions. `unsafe_inline = true` removes that separation and is dangerous;
+- read drafts or another job's task text through job-scoped agent paths: `lu_drafts` is an
+  operator-only read tool, and `/v1/scope/*` and `ting mcp` cannot see drafts;
+- see or use signing keys, repository credentials or operator tokens in logs, artifacts,
+  `lu show`, audit events or errors. Mirror fetches use restricted exact refspecs, never `+refs/*`,
+  pin the resolved commit on the job, and intake refuses fork heads unless its rule sets
+  `allow_forks = true`.
+
+Plain HTTP intake is confined to loopback. With `[intake]` enabled, startup refuses a listener
+that has neither TLS nor a loopback bind unless `allow_plain_http = true`; use that flag only
+behind a reverse proxy or tunnel that terminates TLS and keeps the direct listener off untrusted
+networks. Per-source rate limits, bounded dedupe and `[drafts]` caps make a hostile sender noisy but
+not able to exhaust other sources or displace existing drafts. Outcomes are counted in
+`lu_intake_total{source,result}` and `lu_drafts{state}`; see
+[monitoring.md](monitoring.md#series) and [drafts.md](drafts.md#security-boundary).
+
+## Publishing
+
+Publishing is an explicit operator action on a finished job. The controller never gives a push token
+to an agent or a harness, and no payload text can call the publish route. A job has no publish
+target unless an explicit spec remote, a configured redirect or the job's own configured source
+remote selects one; every other source remote is denied. The token file is owner-only, read at push
+time with an 8 KiB cap, and scrubbed from git errors before an operator sees them. Tests walk the
+controller's temporary state after a push and grep every file except the token file so a credential
+cannot leak into a record, view, artifact, log or audit event. See [Publishing](publish.md) for the
+workflow and [Configuration](config.md#publish) for the settings.
+
+A source-branch push is the highest-risk path because it can move a branch other people use. Lu
+requires all of these before attempting one:
+
+- the selected remote opts in with `allow_source_branch_push = true`;
+- the job spec sets `publish.target = "source_branch"`;
+- the origin allowance `publish.allow_source_branch` is true in the operator's job spec or intake
+  rule, never in webhook payload text;
+- an operator submitted the job, or explicitly approved the draft with `lu approve`.
+
+The branch name comes from the controller mirror and `source.ref`, not from the task, context or
+payload. A pull-request head must map to exactly one mirrored branch in the same repository; a
+fork-only or ambiguous head is refused. `main`, `master`, `work` and `release*` are protected by
+default, with operator patterns added through `protected_patterns`. Gates run before the push, and
+`on_gate_failure = "push_labelled"` has no effect on a source-branch push. The push is one exact,
+non-force refspec, so it cannot delete a ref, push a tag, touch another branch or replace a
+non-fast-forward commit. A compare-and-swap preflight checks the advertised tip against the job's
+pinned base commit; on a miss Lu either falls back to `snapshot/<key>` or records
+`no_snapshot_prefix` without touching the source branch.
+
+**This is defence in depth, not a trust boundary on its own.** The CAS preflight is not an atomic
+remote lease: a writer that moves the branch between the check and the push is outside Lu's control.
+Use a dedicated machine account whose token has contents write only on the target repository, and
+enforce branch protection or rulesets at the forge for protected names, required review and direct
+pushes. Source-branch publishing is not recommended without those layers. Every attempt writes a
+`publish` audit event when auditing is on and increments `lu_publish_total{target,result}`; neither
+carries a credential or payload text.
+
 ## Keeping the harness unprivileged
 
 The contributed units use a separate `lu` service account and create an unprivileged
@@ -181,6 +268,28 @@ mode `0600`, directories `0700`, and the database is created `0600`, but backups
 inherit their sensitivity. Treat job storage and backups as sensitive as the repositories and
 credentials of the jobs that ran there.
 
+## Artifact scrubbing
+
+The controller can redact secret-like bytes before writing `diff.patch`, `report.json` and `run.log`. Scrubbing is on by default. Set `[artifacts] scrub = false` to store uploads unchanged. Operator patterns can be added with `[[artifacts.extra_rules]]`; see [config.md](config.md#artifacts).
+
+Built-in rules use generic names. They do not name token issuers.
+
+| Rule | What it matches |
+| --- | --- |
+| `private_key` | A PEM private-key block, including its body. Certificates are left alone. |
+| `bearer_token` | The value after `Authorization: Bearer ` when it is at least 12 characters long. |
+| `token_prefix` | Long values shaped like `ghp_`, `github_pat_`, `sk-` or `AKIA` tokens. |
+| `jwt` | Three base64url segments with JSON-looking first two segments. |
+| `assignment` | `password=`, `token=`, `secret=` and similar assignments with a value of at least 12 characters. Quoted JSON keys are included. |
+
+Every match becomes `[scrubbed:<rule>]`. The controller adds the number of matches to the job's `scrubbed_hits` field. A changed `diff.patch` also sets `patch_scrubbed`.
+
+Patches are scrubbed one line at a time. Hunk headers are never changed. Diff markers and line terminators are kept, and no replacement adds or removes a line. Private-key bodies are tracked across lines without merging them. A scrubbed patch can still fail to apply because its contents changed. `lu collect` refuses a scrubbed input unless `--allow-scrubbed` is given.
+
+Log uploads report the stored length in the `X-Lu-Log-Length` response header, because scrubbing changes the byte count. Agents use that value for the next chunk offset.
+
+Scrubbing is a heuristic, not a guarantee. It only finds shapes it knows, and an operator rule can be too broad or too narrow. Keep provider credentials on the leaf host. Treat stored artifacts, logs, job specs and backups as sensitive data even when `scrubbed_hits` is zero.
+
 ## Denial of service and resource limits
 
 The controller caps JSON bodies at 1 MiB, a log chunk at 64 KiB plus framing, a diff at 10 MiB,
@@ -195,6 +304,11 @@ at a time and six per operator per minute; base packs to four at a time and thir
 minute. Both return `429 rate_limited` on contention. Artifact and log downloads are streamed under
 the same per-file caps instead of being read whole into memory. `lu-supervise` enforces its own run,
 idle and output limits on the harness.
+
+Intake adds per-source body caps, rolling-minute rate limits, a bounded dedupe window and `[drafts]`
+caps; every drop is counted and payload text is not logged, so an unsigned or abusive sender cannot
+turn the route into a job-submission or log-growth channel. See
+[intake.md](intake.md#deduplication-and-rate-limiting).
 
 These are per-request, per-connection and per-principal limits. Disk use follows the number of jobs an operator
 submits and the artifacts an agent uploads within the per-file caps. Filesystem quotas, a

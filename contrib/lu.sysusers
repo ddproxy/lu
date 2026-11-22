@@ -1,10 +1,14 @@
-# Service accounts for Lu. Install as /etc/sysusers.d/lu.conf and run
+# Service accounts for Lu and Ting. Install as /etc/sysusers.d/lu.conf and run
 # systemd-sysusers.
 #
-# lu         runs the controller or agent and owns the token and TLS key files.
-# lu-harness runs the coding-agent process without access to those files.
+# lu         runs the controller and owns the controller config, token hashes and TLS key files.
+# ting       runs the node agent and owns /etc/ting/ting.toml and its token file.
+# lu-harness is the account/group for an optional separate-account harness runner; the unit's
+#            supplementary group alone does not switch the harness away from ting.
 
 g lu -
-u lu - "Lu controller and agent" /var/lib/lu /usr/sbin/nologin
+u lu - "Lu controller" /var/lib/lu /usr/sbin/nologin
+g ting -
+u ting - "Ting node agent" /var/lib/ting /usr/sbin/nologin
 g lu-harness -
 u lu-harness - "Lu unprivileged harness" /var/lib/lu-harness /usr/sbin/nologin

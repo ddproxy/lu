@@ -13,6 +13,7 @@ systemd units are in [install.md](install.md); the agent's isolation model is in
 | Job states, transitions and failure classes | [lifecycle.md](lifecycle.md) |
 | Symptom-first checks and error codes | [troubleshooting.md](troubleshooting.md) |
 | Dependency stacking and the job graph | [dependencies.md](dependencies.md) |
+| Node workspace retention and disk pressure | [workspaces.md](workspaces.md) |
 | Provider and label dispatch | [dispatch.md](dispatch.md) |
 | MCP tools | [mcp.md](mcp.md) |
 | HTTP routes and limits | [api.md](api.md) |
@@ -26,7 +27,7 @@ systemd units are in [install.md](install.md); the agent's isolation model is in
 4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store uses schema version 1. It creates the schema for a new database and refuses a database with any other schema version with a clear message telling the operator to create a new database. Downgrades and in-place upgrades from older schema versions are not supported; create a new database for this binary. Backup and restore follow the same rule.
+The store uses schema version 2. It creates the schema for a new database and refuses a database with any other schema version with a clear message telling the operator to create a new database. Downgrades and in-place upgrades from older schema versions are not supported; create a new database for this binary. Backup and restore follow the same rule.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
 
@@ -188,13 +189,14 @@ These are separate mechanisms:
 - **Drain** stops a node taking any new job. It is set by `POST /v1/nodes/{name}/drain` and cleared by `/undrain`, and is stored in the `nodes` table. It survives a controller restart. A node must have sent a heartbeat at least once to exist; draining an unknown node returns `404 not_found`.
 - **Cordon** stops a node taking jobs whose chosen provider is cordoned. It is created when a retryable provider failure completes, keyed by the pair actually assigned rather than necessarily the primary. A completion with `retry_after_secs` creates a Reiki-derived cordon that lifts after two consecutive healthy provider heartbeats; any other provider failure uses `provider_cooldown_secs` and a fixed expiry. A job with no provider is not blocked by a cordon.
 
-Cordon expiry is still kept as monotonic milliseconds internally so dispatch behaviour is unchanged, while `cordon_details` exposes a wall-clock `until` for fixed cooldowns. Reiki cordons expose `until: null`, `lifts_after_healthy_heartbeats: 2` and a zero-second remaining-time metric. `lu nodes --json` shows both `cordons` and `cordon_details`; human output is described below. Clearing a cordon early needs no database edit: run `lu uncordon <node> [<provider>]`, or call `POST /v1/nodes/{name}/uncordon`. On every controller start, boot recovery clears stored cordons so monotonic deadlines from a previous process cannot block dispatch.
-Cordon deadlines use the controller's monotonic clock. Boot recovery deletes every cordon row, because a stamp from the previous process has no meaning for the new clock. `lu nodes --json` shows the currently unexpired cordons; there is no CLI command to clear one. A cordon expires at its deadline; a Reiki-derived cordon also clears after two consecutive healthy provider heartbeats.
-Cordon deadlines are stored as monotonic milliseconds. Boot recovery clears all cordons on startup
-(0.3.1), so a restart does not carry one over; Reiki health and new failures set them again.
-`lu nodes --json` shows the currently unexpired cordons; there is no CLI command to clear one. Wait
-out the cooldown, let a node report the provider healthy twice for a Reiki-derived cordon, or
-restart the controller knowing that boot recovery also moves in-flight jobs.
+Cordon expiry is stored as monotonic milliseconds internally so dispatch behaviour is unchanged,
+while `cordon_details` exposes a wall-clock `until` for fixed cooldowns. Reiki cordons expose
+`until: null`, `lifts_after_healthy_heartbeats: 2` and a zero-second remaining-time metric.
+`lu nodes --json` shows the active cordons in `cordon_details`; human output is described below.
+Clearing a cordon early needs no database edit: run `lu uncordon <node> [<provider>]`, or call
+`POST /v1/nodes/{name}/uncordon`. Boot recovery deletes every cordon row on each controller start,
+because a monotonic deadline from the previous process has no meaning for the new clock. Reiki
+health and new provider failures set them again.
 
 ## Reading `lu nodes`
 
@@ -202,7 +204,7 @@ For the one-shot controller summary, see [`lu status` on the monitoring page](mo
 
 ```text
 NAME    VERSION  HARNESS  LABELS                        CORDONS      LAST_SEEN            DRAINED
-node-a  0.2.0   idle     !homelab,gpu,php8.3,region=eu   !zen,!mistral 2026-11-16 09:12:00Z no
+node-a  0.4.0   idle     !homelab,gpu,php8.3,region=eu   !zen,!mistral 2026-11-21 09:12:00Z no
 ```
 
 - `NAME` is the node name bound to the agent token.
@@ -213,8 +215,12 @@ node-a  0.2.0   idle     !homelab,gpu,php8.3,region=eu   !zen,!mistral 2026-11-1
 - `LAST_SEEN` is the last heartbeat time in UTC.
 - `DRAINED` shows the drain flag from the controller's node view.
 
-There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods; nodes are offline after a controller restart until their next heartbeat), `draining`, `providers`, `labels`, `label_sources`, `taints`, `current_job`, `cordons`, `cordon_details`, `version` and the opaque `reiki` document. `label_sources` maps a probed label to `probed`; other labels have no entry. Each `cordon_details` entry carries its provider, source, reason, set time, expiry or healthy-lift count.
-There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view: `online` (seen within two lease periods; nodes are offline after a controller restart until their next heartbeat), `draining`, `providers`, `provider_models`, `labels`, `label_sources`, `taints`, `current_job`, `cordons`, `version` and the opaque `reiki` document. `label_sources` maps a probed label to `probed`; other labels have no entry.
+There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view:
+`online` (seen within two lease periods; nodes are offline after a controller restart until their
+next heartbeat), `draining`, `providers`, `provider_models`, `labels`, `label_sources`, `taints`,
+`current_job`, `cordon_details`, `version` and the opaque `reiki` document. `label_sources` maps a
+probed label to `probed`; other labels have no entry. Each `cordon_details` entry carries its
+provider, source, reason, set time, expiry or healthy-lift count.
 
 A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, lacks a required label, reports a taint the job does not tolerate, or (when the job names a provider) cannot serve any of its provider/model choices, including a matching provider cordon, will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
 
@@ -235,6 +241,11 @@ disk_free_bytes   10737418240
 disk_total_bytes  53687091200
 disk_free_percent 20
 uptime_secs       600
+workspace_bytes              3221225472
+workspace_count              7
+workspace_reclaimed_bytes_total 10737418240
+workspace_evictions_total    3
+workspace_delete_errors_total 0
 
 job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
   PID   PPID  STATE  CPU_S  RSS_KB  AGE_S  FILES  COMMAND
@@ -249,13 +260,31 @@ cordons
 
 - `labels` lists the node's current labels; a probed one is followed by ` (probed)`. `lu node <name> --json` includes `labels` and `label_sources` in the stats body.
 - Load, memory and uptime come from the agent's `/proc` sample. `disk_free_bytes`, `disk_total_bytes` and `disk_free_percent` describe the filesystem holding the agent's `work_dir`; each is `-` when the agent cannot read it.
+- The five `workspace_*` rows are the node's latest workspace counters. They describe agent-local workspaces under `work_dir`, not controller artifacts; see [workspaces.md](workspaces.md).
 - Each job is a running job owned by that node. `pgid` is the harness process group, and the process table is capped at the 64 busiest members. `COMMAND` is the first 80 characters of the command line with control characters replaced.
 - `output_idle` is seconds since the harness last wrote output; `cpu_idle` is seconds since any process in the job tree last used CPU. `stuck yes` means both are above 300 seconds while the job is still running.
-- `cordons` lists each active provider with its source, how long ago it was set and either its remaining time or its healthy-heartbeat lift count. The indented line is the stored reason. `-` means no active cordons.
+- The `cordons` section lists each active provider with its source, how long ago it was set and
+  either its remaining time or its healthy-heartbeat lift count. The indented line is the stored
+  reason. `-` means no active cordons.
 - A node that has not sent stats prints `host  -` and `jobs  -`. An unknown node is a 404 and exits `1`.
 - `lu node <name> --json` prints the exact `GET /v1/nodes/{name}/stats` body, including an empty `{}` for a known node with no stats.
+- `lu node <name> --workspaces` prints the agent's oldest-first `JOB`, `STATE`, `BYTES`, `AGE` and `POLICY` listing. It uses the node view, so it also comes from the last heartbeat.
 
 Stats are sampled on the agent at heartbeat time, which may be slower than `lu top`'s two-second refresh. They describe the agent's view, not live controller state.
+
+### Workspace lifecycle
+
+The agent owns job workspaces under `[agent] work_dir`. Policies, TTLs and disk pressure settings are in [workspaces.md](workspaces.md); `[workspace]` is a top-level config table and unknown keys remain errors. Ephemeral workspaces wait for the controller to confirm that the final patch and report are stored and that no active dependant needs the tree; `keep_on_failure` and `keep` use their TTLs. Eviction is oldest first, never touches a running workspace, and retries failed deletions with backoff.
+
+Inspect and clean from an operator host:
+
+```sh
+lu node node-a --workspaces
+lu node node-a clean --all
+lu node node-a clean --job build-api
+```
+
+`--job` accepts a job id or idempotency key. `clean` queues a `clean_workspaces` event for the next agent poll; it returns `queued: 1` for the request, and the agent logs how many workspaces it actually queued, refused as running, or could not find. Watch `workspace_delete_errors_total` and the agent log after a clean; a non-zero error counter means deletions are still being retried.
 
 ### Probe labels
 
@@ -287,7 +316,8 @@ static and file labels under the 32-label cap, and are dropped last when the cap
 ## Disk housekeeping
 
 Long-running harness builds can leave gigabytes behind in directories outside the agent's
-`work_dir`. An optional `[agent.housekeeping]` table removes those directories between jobs:
+`work_dir`. An optional `[agent.housekeeping]` table removes those directories between jobs.
+Workspaces inside `work_dir` are handled by the separate [workspace lifecycle](#workspace-lifecycle):
 
 ```toml
 [agent.housekeeping]
@@ -318,7 +348,7 @@ Safety rules:
 
 ## Display
 
-`lu top` shows the controller and agent versions in its title (`lu top <version> · controller <version>`). The node table includes `VERSION`, `LOAD` (`load1`, one decimal or `-`), and `MEM` (used percent of total, or `-`). Memory is green below 80%, orange at 80%, and red at 95%. A node with `stuck > 0` shows a red `stuck` marker after its state, and a node whose version differs from the controller's is coloured orange.
+`lu top` shows the controller and agent versions in its title (`lu top <version> · controller <version>`). The node table includes `VERSION`, `LOAD` (`load1`, one decimal or `-`), `MEM` (used percent of total, or `-`), `WORKSPACES` (`count/bytes`) and `WS TOTALS` (`reclaimed/evictions/errors`). Memory is green below 80%, orange at 80%, and red at 95%. A node with `stuck > 0` shows a red `stuck` marker after its state, and a node whose version differs from the controller's is coloured orange.
 
 With the job list focused and a running job selected, `x` opens a process pane under the lists. It shows the selected job's three liveness counters (output idle, CPU idle, uploader behind) and its process tree (`PID`, `STATE`, `CPU_S`, `RSS`, `AGE`, `COMMAND`) from `GET /v1/nodes/{name}/stats`, refreshed every two seconds while open. States `D` and `Z` are red; both idle counters above 120 seconds are orange, and a stuck job is red. The pane also draws load and memory-used sparklines for that node from the dashboard's recent samples. `Esc` or `x` closes the pane. `--once` prints the same node columns as plain text.
 

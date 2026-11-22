@@ -28,6 +28,8 @@ pub enum ApiError {
     BadRequest { status: u16, message: String },
     /// The controller asked the client to slow down.
     TooManyRequests { retry_after: Option<u64> },
+    /// A named scope limit was reached. The name is safe to show and to use as a metric label.
+    LimitExceeded { limit: String },
     /// A 5xx response.
     Server { status: u16, message: String },
     /// The request never produced a complete HTTP response.
@@ -48,7 +50,7 @@ impl ApiError {
             Self::Forbidden => Some(403),
             Self::NotFound => Some(404),
             Self::Conflict { .. } | Self::StaleEpoch => Some(409),
-            Self::TooManyRequests { .. } => Some(429),
+            Self::TooManyRequests { .. } | Self::LimitExceeded { .. } => Some(429),
             Self::TooLarge { .. }
             | Self::Network { .. }
             | Self::Decode { .. }
@@ -105,6 +107,7 @@ impl ApiError {
                 Some(seconds) => format!("rate limited; retry after {seconds}s"),
                 None => "rate limited".to_owned(),
             },
+            Self::LimitExceeded { limit } => format!("limit exceeded: {limit}"),
             Self::Server { status, message } => format!("HTTP {status}: {message}"),
             Self::Network { message } => message.clone(),
             Self::Decode { message } => message.clone(),

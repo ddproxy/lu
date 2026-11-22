@@ -5,8 +5,8 @@
 #   chmod 0640 /etc/lu/lu.toml
 #
 # Put the real token hashes here, never the tokens. Generate a token and its hash with:
-#   printf '%s' "$(head -c 32 /dev/urandom | base64)" > /etc/lu/agent.token
-#   sha256sum /etc/lu/agent.token
+#   printf '%s' "$(head -c 32 /dev/urandom | base64)" > /etc/ting/ting.token
+#   sha256sum /etc/ting/ting.token
 # The placeholder hashes below are not valid credentials; replace them before starting.
 
 [controller]

@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{is_name_byte, JobId};
 use crate::label::valid_label;
 use crate::limits::{
-    DEFAULT_PRIORITY, DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_COLLECT_INPUTS,
-    MAX_EXPECT_GLOB_BYTES, MAX_EXPECT_ITEMS, MAX_EXPECT_PATH_BYTES, MAX_FALLBACKS,
-    MAX_GIT_REF_BYTES, MAX_GROUP_BYTES, MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS,
-    MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_PRIORITY, MAX_REPO_BYTES, MAX_REQUIRES_LABELS,
-    MAX_STUCK_AFTER_SECS, MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MAX_TOLERATES, MIN_PRIORITY,
-    MIN_STUCK_AFTER_SECS, MIN_TIMEOUT_SECS,
+    DEFAULT_PRIORITY, DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_CACHE_DIRS, MAX_CACHE_DIR_BYTES,
+    MAX_COLLECT_INPUTS, MAX_CONTEXT_BYTES, MAX_EXPECT_GLOB_BYTES, MAX_EXPECT_ITEMS,
+    MAX_EXPECT_PATH_BYTES, MAX_FALLBACKS, MAX_GIT_REF_BYTES, MAX_GROUP_BYTES,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_IDLE_TIMEOUT_SECS, MAX_MODEL_BYTES, MAX_NAME_BYTES,
+    MAX_ORIGIN_BYTES, MAX_ORIGIN_REF_BYTES, MAX_PRIORITY, MAX_PUBLISH_BRANCH_BYTES,
+    MAX_PUBLISH_GATES, MAX_REPO_BYTES, MAX_REQUIRES_LABELS, MAX_SPAWN_REPOS, MAX_STUCK_AFTER_SECS,
+    MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MAX_TOLERATES, MIN_PRIORITY, MIN_STUCK_AFTER_SECS,
+    MIN_TIMEOUT_SECS,
 };
 
 /// The provider name that asks dispatch to choose a healthy provider from the node's offer.
@@ -122,6 +124,268 @@ impl CollectMode {
     /// Whether dependency diffs are applied to the job's tree.
     pub fn applies_diffs(self) -> bool {
         matches!(self, Self::Apply | Self::Both)
+    }
+}
+
+/// How long a node keeps a job's workspace after the job ends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspacePolicy {
+    /// Delete as soon as the controller has the final artifacts and no dependant needs the tree.
+    #[default]
+    Ephemeral,
+    /// Keep on failure for the agent's `failed_ttl`; delete at once on success.
+    KeepOnFailure,
+    /// Keep for the agent's `keep_ttl`.
+    Keep,
+}
+
+/// The canonical spellings accepted by [`WorkspacePolicy::parse`], in help-text order.
+pub const WORKSPACE_POLICIES: [&str; 3] = ["ephemeral", "keep_on_failure", "keep"];
+
+impl WorkspacePolicy {
+    /// Parses a canonical spelling, case-insensitively.
+    pub fn parse(value: &str) -> Result<Self, WorkspacePolicyError> {
+        let text = value.trim();
+        for name in WORKSPACE_POLICIES {
+            if text.eq_ignore_ascii_case(name) {
+                return Ok(match name {
+                    "ephemeral" => Self::Ephemeral,
+                    "keep_on_failure" => Self::KeepOnFailure,
+                    _ => Self::Keep,
+                });
+            }
+        }
+        Err(WorkspacePolicyError {
+            value: value.to_owned(),
+        })
+    }
+
+    /// The canonical wire spelling, also used in `JobSpec::canonical_json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ephemeral => "ephemeral",
+            Self::KeepOnFailure => "keep_on_failure",
+            Self::Keep => "keep",
+        }
+    }
+}
+
+impl FromStr for WorkspacePolicy {
+    type Err = WorkspacePolicyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl fmt::Display for WorkspacePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A `workspace` value that is not a canonical policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePolicyError {
+    value: String,
+}
+
+impl WorkspacePolicyError {
+    /// The rejected input.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Display for WorkspacePolicyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid workspace policy {:?}; expected one of {}",
+            self.value,
+            WORKSPACE_POLICIES.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for WorkspacePolicyError {}
+
+/// Default branch template. `<key>` is replaced with the job's idempotency key.
+pub const DEFAULT_PUBLISH_BRANCH: &str = "snapshot/<key>";
+
+/// Where a publish attempt pushes its commit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishTarget {
+    /// Push a new `snapshot/<key>` branch. This is the only default.
+    #[default]
+    Snapshot,
+    /// Fast-forward the job's own source branch inside the same repository. Every layer of
+    /// configuration plus an operator approval is required before this is allowed.
+    SourceBranch,
+}
+
+impl PublishTarget {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::SourceBranch => "source_branch",
+        }
+    }
+}
+
+impl fmt::Display for PublishTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What happens when a publish gate reports a failure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateFailureMode {
+    /// Hold the branch: do not push.
+    #[default]
+    Hold,
+    /// Push to `<branch>-failing-gates` so reviewers can inspect the failure.
+    PushLabelled,
+}
+
+/// Canonical spellings for [`GateFailureMode`].
+pub const GATE_FAILURE_MODES: [&str; 2] = ["hold", "push_labelled"];
+
+impl GateFailureMode {
+    pub fn parse(value: &str) -> Result<Self, GateFailureModeError> {
+        match value.trim() {
+            "hold" => Ok(Self::Hold),
+            "push_labelled" => Ok(Self::PushLabelled),
+            _ => Err(GateFailureModeError {
+                value: value.to_owned(),
+            }),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hold => "hold",
+            Self::PushLabelled => "push_labelled",
+        }
+    }
+}
+
+impl FromStr for GateFailureMode {
+    type Err = GateFailureModeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl fmt::Display for GateFailureMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateFailureModeError {
+    value: String,
+}
+
+impl GateFailureModeError {
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Display for GateFailureModeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid gate failure mode {:?}; expected one of {}",
+            self.value,
+            GATE_FAILURE_MODES.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for GateFailureModeError {}
+
+/// Job-spec side of publishing. The controller config owns the remote URL and push credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishSpec {
+    /// Branch template; `<key>` is substituted with the job idempotency key.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Names of configured gates to run on the proposed tree, in order.
+    #[serde(default)]
+    pub gates: Vec<String>,
+    #[serde(default)]
+    pub on_gate_failure: GateFailureMode,
+    /// Name of a `[publish.remotes.<name>]` entry. Defaults to the only configured remote.
+    #[serde(default)]
+    pub remote: Option<String>,
+    /// Push a snapshot branch (the default) or the job's own source branch.
+    #[serde(default)]
+    pub target: PublishTarget,
+    /// Origin-side allowance for source-branch pushes. An operator sets this in the job spec or
+    /// in the intake rule; a webhook payload can never set it.
+    #[serde(default)]
+    pub allow_source_branch: bool,
+}
+
+/// Strict raw form used to convert text-valued enums with field-named errors.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawPublishSpec {
+    #[serde(default)]
+    pub(crate) branch: Option<String>,
+    #[serde(default)]
+    pub(crate) gates: Vec<String>,
+    #[serde(default)]
+    pub(crate) on_gate_failure: Option<String>,
+    #[serde(default)]
+    pub(crate) remote: Option<String>,
+    #[serde(default)]
+    pub(crate) target: Option<String>,
+    #[serde(default)]
+    pub(crate) allow_source_branch: bool,
+}
+
+impl TryFrom<RawPublishSpec> for PublishSpec {
+    type Error = JobSpecError;
+
+    fn try_from(raw: RawPublishSpec) -> Result<Self, Self::Error> {
+        let on_gate_failure = match raw.on_gate_failure.as_deref() {
+            None => GateFailureMode::Hold,
+            Some(text) => GateFailureMode::parse(text).map_err(|e| JobSpecError {
+                field: "publish.on_gate_failure",
+                reason: e.to_string(),
+            })?,
+        };
+        let target = match raw.target.as_deref() {
+            None => PublishTarget::Snapshot,
+            Some("snapshot") => PublishTarget::Snapshot,
+            Some("source_branch") => PublishTarget::SourceBranch,
+            Some(other) => {
+                return Err(JobSpecError {
+                    field: "publish.target",
+                    reason: format!(
+                        "invalid publish target {other:?}; expected snapshot or source_branch"
+                    ),
+                })
+            }
+        };
+        Ok(Self {
+            branch: raw.branch,
+            gates: raw.gates,
+            on_gate_failure,
+            remote: raw.remote,
+            target,
+            allow_source_branch: raw.allow_source_branch,
+        })
     }
 }
 
@@ -629,17 +893,69 @@ pub fn effective_stuck(
     (policy != StuckPolicy::None).then(|| (policy, job_after_secs.unwrap_or(default_after_secs)))
 }
 
+/// The git source a job runs from. `ref` is a branch, tag, commit, or a pull-request ref such
+/// as `refs/pull/42/head`. The controller resolves it to a commit before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSpec {
+    /// An https URL (or an operator-configured local path).
+    pub repo: String,
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    /// An optional 40-hex commit used as the base instead of the ref's tip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+}
+
+impl JobSpec {
+    /// A neutral, valid skeleton for callers that build a spec field by field (for example the
+    /// operator-written intake rules). The caller must fill `source` and `task` before use.
+    pub fn empty() -> Self {
+        crate::view::empty_job_spec()
+    }
+}
+
+impl SourceSpec {
+    /// Checks the source fields, returning the first fault with its field name.
+    pub fn validate(&self) -> Result<(), JobSpecError> {
+        check_repo(&self.repo)?;
+        check_len("source.ref", &self.git_ref, MAX_GIT_REF_BYTES)?;
+        if let Some(commit) = &self.base {
+            check_commit_id(commit)?;
+        }
+        Ok(())
+    }
+}
+
 /// A job to run. `harness` defaults to `opencode` and `timeout_secs` to an hour.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct JobSpec {
-    /// A git URL or an absolute local path.
+    /// The canonical wire representation of the repository and ref.
+    pub source: SourceSpec,
+    /// Normalized fields used by the controller and nodes. Populated from `source` on decode.
+    #[serde(skip)]
     pub repo: String,
+    #[serde(skip)]
     pub git_ref: String,
-    /// An optional 40-hex commit the agent should use as the base instead of the ref's tip.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub base_commit: Option<String>,
     /// The prompt text. Control characters are allowed; they are sanitised for display.
     pub task: String,
+    /// External text. Written to `.lu/inputs/context.md`; never merged into `task`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Who submitted this job: an intake source name or an operator-chosen label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// A length-capped URL or id pointing back at the submitter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_ref: Option<String>,
+    /// Marks `context` as untrusted external text.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub untrusted_context: bool,
+    /// A draft is stored and visible but is never dispatched until approved.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub draft: bool,
     pub harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -691,16 +1007,44 @@ pub struct JobSpec {
     /// Optional concurrency group, capped by `[[controller.groups]]` when configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Whether this job's harness may submit children. Operators set this at submission; a job
+    /// cannot grant itself the right through the scope API.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_spawn: bool,
+    /// Whether children of this job may themselves spawn. Defaults to false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub spawn_inherit: bool,
+    /// Repositories a child may use instead of this job's repo. An allowlist, not a wildcard:
+    /// the empty list means "same repo only".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spawn_repos: Vec<String>,
+    /// How long the agent keeps this job's workspace. Absent uses the node's configured default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspacePolicy>,
+    /// Directories created inside the workspace before the harness starts, for tool caches such
+    /// as Cargo's `target`. They are removed with the workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_dirs: Vec<String>,
+    /// Optional publish step, run only by an explicit `lu publish` after this job finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<PublishSpec>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawJobSpec {
-    repo: String,
-    git_ref: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    base_commit: Option<String>,
+    source: SourceSpec,
     task: String,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    origin_ref: Option<String>,
+    #[serde(default)]
+    untrusted_context: bool,
+    #[serde(default)]
+    draft: bool,
     #[serde(default = "default_harness")]
     harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -743,6 +1087,19 @@ struct RawJobSpec {
     priority: u8,
     #[serde(default)]
     group: Option<String>,
+    #[serde(default)]
+    allow_spawn: bool,
+    #[serde(default)]
+    spawn_inherit: bool,
+    #[serde(default)]
+    spawn_repos: Vec<String>,
+    /// Kept as text so an invalid value is reported as a `workspace` field error.
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    cache_dirs: Vec<String>,
+    #[serde(default)]
+    publish: Option<RawPublishSpec>,
 }
 
 impl TryFrom<RawJobSpec> for JobSpec {
@@ -767,11 +1124,23 @@ impl TryFrom<RawJobSpec> for JobSpec {
             .map(OnConflict::parse)
             .transpose()
             .map_err(|error| invalid("on_conflict", error.to_string()))?;
+        let workspace = raw
+            .workspace
+            .as_deref()
+            .map(WorkspacePolicy::parse)
+            .transpose()
+            .map_err(|error| invalid("workspace", error.to_string()))?;
         let spec = JobSpec {
-            repo: raw.repo,
-            git_ref: raw.git_ref,
-            base_commit: raw.base_commit,
+            repo: raw.source.repo.clone(),
+            git_ref: raw.source.git_ref.clone(),
+            base_commit: raw.source.base.clone(),
+            source: raw.source,
             task: raw.task,
+            context: raw.context,
+            origin: raw.origin,
+            origin_ref: raw.origin_ref,
+            untrusted_context: raw.untrusted_context,
+            draft: raw.draft,
             harness: raw.harness,
             provider: raw.provider,
             model: raw.model,
@@ -791,6 +1160,12 @@ impl TryFrom<RawJobSpec> for JobSpec {
             fallbacks: raw.fallbacks,
             priority: raw.priority,
             group: raw.group,
+            allow_spawn: raw.allow_spawn,
+            spawn_inherit: raw.spawn_inherit,
+            spawn_repos: raw.spawn_repos,
+            workspace,
+            cache_dirs: raw.cache_dirs,
+            publish: raw.publish.map(PublishSpec::try_from).transpose()?,
         };
         spec.validate()?;
         Ok(spec)
@@ -810,12 +1185,28 @@ impl<'de> Deserialize<'de> for JobSpec {
 impl JobSpec {
     /// Checks every field, returning the first fault with the field it belongs to.
     pub fn validate(&self) -> Result<(), JobSpecError> {
+        self.source.validate()?;
         check_repo(&self.repo)?;
         check_len("git_ref", &self.git_ref, MAX_GIT_REF_BYTES)?;
         if let Some(commit) = &self.base_commit {
             check_commit_id(commit)?;
         }
         check_len("task", &self.task, MAX_TASK_BYTES)?;
+        if let Some(context) = &self.context {
+            check_len("context", context, MAX_CONTEXT_BYTES)?;
+        }
+        if let Some(origin) = &self.origin {
+            check_len("origin", origin, MAX_ORIGIN_BYTES)?;
+            if origin.chars().any(char::is_control) {
+                return Err(invalid("origin", "control characters are not allowed"));
+            }
+        }
+        if let Some(origin_ref) = &self.origin_ref {
+            check_len("origin_ref", origin_ref, MAX_ORIGIN_REF_BYTES)?;
+            if origin_ref.chars().any(char::is_control) {
+                return Err(invalid("origin_ref", "control characters are not allowed"));
+            }
+        }
         check_name("harness", &self.harness)?;
         if let Some(provider) = &self.provider {
             check_name("provider", provider)?;
@@ -953,6 +1344,82 @@ impl JobSpec {
                 ));
             }
         }
+        if self.spawn_repos.len() > MAX_SPAWN_REPOS {
+            return Err(invalid(
+                "spawn_repos",
+                format!(
+                    "must name at most {MAX_SPAWN_REPOS} repositories (got {})",
+                    self.spawn_repos.len()
+                ),
+            ));
+        }
+        for (i, repo) in self.spawn_repos.iter().enumerate() {
+            check_repo(repo).map_err(|e| invalid("spawn_repos", e.reason().to_owned()))?;
+            if self.spawn_repos[..i].contains(repo) {
+                return Err(invalid(
+                    "spawn_repos",
+                    format!("duplicate repository {repo}"),
+                ));
+            }
+            if repo == &self.repo {
+                return Err(invalid(
+                    "spawn_repos",
+                    "the parent repo is already allowed; do not repeat it",
+                ));
+            }
+        }
+        if self.cache_dirs.len() > MAX_CACHE_DIRS {
+            return Err(invalid(
+                "cache_dirs",
+                format!(
+                    "must name at most {MAX_CACHE_DIRS} directories (got {})",
+                    self.cache_dirs.len()
+                ),
+            ));
+        }
+        for (i, dir) in self.cache_dirs.iter().enumerate() {
+            check_cache_dir(dir)?;
+            if self.cache_dirs[..i].contains(dir) {
+                return Err(invalid("cache_dirs", format!("duplicate directory {dir}")));
+            }
+        }
+        if let Some(publish) = &self.publish {
+            if let Some(branch) = &publish.branch {
+                if branch.is_empty()
+                    || branch.len() > MAX_PUBLISH_BRANCH_BYTES
+                    || branch.contains("..")
+                    || branch.contains('@')
+                    || branch.starts_with('/')
+                    || branch.ends_with('/')
+                    || branch.chars().any(char::is_control)
+                {
+                    return Err(invalid(
+                        "publish.branch",
+                        format!("invalid branch template {branch:?}"),
+                    ));
+                }
+            }
+            if publish.gates.len() > MAX_PUBLISH_GATES {
+                return Err(invalid(
+                    "publish.gates",
+                    format!("must name at most {MAX_PUBLISH_GATES} gates"),
+                ));
+            }
+            for (i, gate) in publish.gates.iter().enumerate() {
+                if gate.is_empty() || gate.len() > MAX_NAME_BYTES {
+                    return Err(invalid(
+                        "publish.gates",
+                        format!("invalid gate name {gate:?}"),
+                    ));
+                }
+                if publish.gates[..i].contains(gate) {
+                    return Err(invalid("publish.gates", format!("duplicate gate {gate}")));
+                }
+            }
+            if let Some(remote) = &publish.remote {
+                check_name("publish.remote", remote)?;
+            }
+        }
         Ok(())
     }
 
@@ -1006,6 +1473,15 @@ where
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct JobEdit {
+    /// Replacement operator-authored prompt text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Replacement source ref; both the wire source and normalized field are updated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
+    /// Replacement publish settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish: Option<PublishSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1057,6 +1533,15 @@ pub struct JobEdit {
     /// Replaces the continuous stuck threshold in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stuck_after_secs: Option<u64>,
+    /// Grants this job's harness the right to submit children. Only operators may set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_spawn: Option<bool>,
+    /// Grants children of this job the right to spawn. Only operators may set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_inherit: Option<bool>,
+    /// Replaces the child repository allowlist. An empty list means the parent repo only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_repos: Option<Vec<String>>,
 }
 
 fn deserialize_collect_option<'de, D>(deserializer: D) -> Result<Option<CollectMode>, D::Error>
@@ -1121,6 +1606,16 @@ impl JobEdit {
     /// `any` is rejected.
     pub fn apply(&self, spec: &JobSpec) -> Result<JobSpec, JobSpecError> {
         let mut next = spec.clone();
+        if let Some(task) = &self.task {
+            next.task = task.clone();
+        }
+        if let Some(source_ref) = &self.source_ref {
+            next.git_ref = source_ref.clone();
+            next.source.git_ref = source_ref.clone();
+        }
+        if let Some(publish) = &self.publish {
+            next.publish = Some(publish.clone());
+        }
         if let Some(provider) = &self.provider {
             next.provider = Some(provider.clone());
         }
@@ -1182,6 +1677,15 @@ impl JobEdit {
         if let Some(after) = self.stuck_after_secs {
             next.stuck_after_secs = Some(after);
         }
+        if let Some(allow_spawn) = self.allow_spawn {
+            next.allow_spawn = allow_spawn;
+        }
+        if let Some(spawn_inherit) = self.spawn_inherit {
+            next.spawn_inherit = spawn_inherit;
+        }
+        if let Some(spawn_repos) = &self.spawn_repos {
+            next.spawn_repos = spawn_repos.clone();
+        }
         if next.is_any_provider() {
             if self.model.is_some() || self.fallbacks.as_ref().is_some_and(|f| !f.is_empty()) {
                 return Err(invalid("model", "must not be set with provider \"any\""));
@@ -1233,6 +1737,32 @@ fn is_false(value: &bool) -> bool {
 
 fn is_default_conflict(value: &OnConflict) -> bool {
     *value == OnConflict::Fail
+}
+
+/// A cache directory is a relative path with safe, nonempty segments. Absolute paths, `..`,
+/// `.` and symlink names are refused so a job cannot name a directory outside its workspace.
+fn check_cache_dir(value: &str) -> Result<(), JobSpecError> {
+    if value.is_empty() || value.len() > MAX_CACHE_DIR_BYTES {
+        return Err(invalid(
+            "cache_dirs",
+            format!("must be 1 to {MAX_CACHE_DIR_BYTES} bytes"),
+        ));
+    }
+    if value.starts_with('/') || value.contains('\\') {
+        return Err(invalid(
+            "cache_dirs",
+            format!("{value:?} must be a relative path inside the workspace"),
+        ));
+    }
+    for part in value.split('/') {
+        if part.is_empty() || part == "." || part == ".." || !part.bytes().all(is_name_byte) {
+            return Err(invalid(
+                "cache_dirs",
+                format!("{value:?} has an unsafe path segment"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn invalid(field: &'static str, reason: impl Into<String>) -> JobSpecError {
@@ -1338,6 +1868,11 @@ mod tests {
 
     fn sample() -> JobSpec {
         JobSpec {
+            source: crate::SourceSpec {
+                repo: "https://example.net/repo.git".to_owned(),
+                git_ref: "main".to_owned(),
+                base: None,
+            },
             repo: "https://example.net/repo.git".to_owned(),
             git_ref: "main".to_owned(),
             base_commit: None,
@@ -1361,6 +1896,17 @@ mod tests {
             fallbacks: Vec::new(),
             priority: DEFAULT_PRIORITY,
             group: None,
+            allow_spawn: false,
+            spawn_inherit: false,
+            spawn_repos: Vec::new(),
+            workspace: None,
+            cache_dirs: Vec::new(),
+            context: None,
+            origin: None,
+            origin_ref: None,
+            untrusted_context: false,
+            draft: false,
+            publish: None,
         }
     }
 
@@ -1373,6 +1919,7 @@ mod tests {
         assert!(sample().validate().is_ok());
         let mut spec = sample();
         spec.repo = "/srv/git/repo".to_owned();
+        spec.source.repo = "/srv/git/repo".to_owned();
         spec.provider = Some("peer-a".to_owned());
         spec.model = Some("big-pickle".to_owned());
         spec.idle_timeout_secs = Some(30);
@@ -1384,33 +1931,41 @@ mod tests {
     fn every_field_reports_its_own_error() {
         let mut spec = sample();
         spec.repo = String::new();
+        spec.source.repo = String::new();
         assert_eq!(error_field(&spec), "repo");
 
         spec = sample();
         spec.repo = "relative/path".to_owned();
+        spec.source.repo = "relative/path".to_owned();
         assert_eq!(error_field(&spec), "repo");
 
         spec = sample();
         spec.repo = format!("https://example.net/{}", "a".repeat(MAX_REPO_BYTES));
+        spec.source.repo = format!("https://example.net/{}", "a".repeat(MAX_REPO_BYTES));
         assert_eq!(error_field(&spec), "repo");
 
         spec = sample();
         spec.repo = "https://example.net/a\u{0}b".to_owned();
+        spec.source.repo = "https://example.net/a\u{0}b".to_owned();
         assert_eq!(error_field(&spec), "repo");
 
         spec = sample();
         spec.git_ref = String::new();
-        assert_eq!(error_field(&spec), "git_ref");
+        spec.source.git_ref = String::new();
+        assert_eq!(error_field(&spec), "source.ref");
 
         spec = sample();
         spec.git_ref = "a".repeat(MAX_GIT_REF_BYTES + 1);
-        assert_eq!(error_field(&spec), "git_ref");
+        spec.source.git_ref = "a".repeat(MAX_GIT_REF_BYTES + 1);
+        assert_eq!(error_field(&spec), "source.ref");
 
         spec = sample();
         spec.base_commit = Some("abc".to_owned());
+        spec.source.base = Some("abc".to_owned());
         assert_eq!(error_field(&spec), "base_commit");
         spec = sample();
         spec.base_commit = Some(format!("{}z", "a".repeat(39)));
+        spec.source.base = Some(format!("{}z", "a".repeat(39)));
         assert_eq!(error_field(&spec), "base_commit");
 
         spec = sample();
@@ -1545,14 +2100,16 @@ mod tests {
     fn a_validation_error_names_the_field_in_its_message() {
         let mut spec = sample();
         spec.git_ref = String::new();
+        spec.source.git_ref = String::new();
         let error = spec.validate().unwrap_err();
-        assert_eq!(error.field(), "git_ref");
-        assert!(error.to_string().starts_with("git_ref:"), "{error}");
+        assert_eq!(error.field(), "source.ref");
+        assert!(error.to_string().starts_with("source.ref:"), "{error}");
     }
 
     #[test]
     fn defaults_fill_in_for_harness_and_timeout() {
-        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let json =
+            r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go"}"#;
         let spec: JobSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.harness, "opencode");
         assert_eq!(spec.timeout_secs, DEFAULT_TIMEOUT_SECS);
@@ -1568,26 +2125,27 @@ mod tests {
 
     #[test]
     fn an_old_style_spec_without_base_commit_still_deserialises() {
-        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let json =
+            r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go"}"#;
         let spec: JobSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.base_commit, None);
-        assert!(!spec.canonical_json().contains("base_commit"));
+        assert!(!spec.canonical_json().contains("\"base\""));
     }
 
     #[test]
     fn a_pinned_spec_serialises_and_round_trips_base_commit() {
         let mut spec = sample();
         spec.base_commit = Some("0123456789abcdef0123456789abcdef01234567".to_owned());
+        spec.source.base = Some("0123456789abcdef0123456789abcdef01234567".to_owned());
         let json = spec.canonical_json();
-        assert!(json.contains("base_commit"));
+        assert!(json.contains("\"base\""));
         let parsed: JobSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, spec);
     }
 
     #[test]
     fn unknown_fields_are_rejected() {
-        let json =
-            r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go","surprise":1}"#;
+        let json = r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go","surprise":1}"#;
         let err = serde_json::from_str::<JobSpec>(json)
             .unwrap_err()
             .to_string();
@@ -1606,7 +2164,7 @@ mod tests {
         assert_eq!(parsed.canonical_json(), json);
 
         let reordered = format!(
-            r#"{{"task":"{}","timeout_secs":{},"harness":"{}","git_ref":"{}","repo":"{}"}}"#,
+            r#"{{"task":"{}","timeout_secs":{},"harness":"{}","source":{{"ref":"{}","repo":"{}"}}}}"#,
             spec.task, spec.timeout_secs, spec.harness, spec.git_ref, spec.repo
         );
         let parsed: JobSpec = serde_json::from_str(&reordered).unwrap();
@@ -1618,17 +2176,10 @@ mod tests {
         let mut spec = sample();
         spec.provider = Some("peer-a".to_owned());
         let json = spec.canonical_json();
-        let positions: Vec<usize> = [
-            "repo",
-            "git_ref",
-            "task",
-            "harness",
-            "provider",
-            "timeout_secs",
-        ]
-        .iter()
-        .map(|key| json.find(&format!("\"{key}\"")).unwrap())
-        .collect();
+        let positions: Vec<usize> = ["source", "task", "harness", "provider", "timeout_secs"]
+            .iter()
+            .map(|key| json.find(&format!("\"{key}\"")).unwrap())
+            .collect();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{json}");
         assert!(!json.contains("model"), "{json}");
         assert!(!json.contains("idempotency_key"), "{json}");
@@ -1637,8 +2188,9 @@ mod tests {
     #[test]
     fn an_optional_base_commit_round_trips_and_is_omitted_when_absent() {
         let mut spec = sample();
-        assert!(!spec.canonical_json().contains("base_commit"));
+        assert!(!spec.canonical_json().contains("\"base\""));
         spec.base_commit = Some("a".repeat(40));
+        spec.source.base = Some("a".repeat(40));
         let json = spec.canonical_json();
         let parsed: JobSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, spec);
@@ -1707,7 +2259,8 @@ mod tests {
 
     #[test]
     fn collect_defaults_to_apply_and_round_trips_every_mode() {
-        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let json =
+            r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go"}"#;
         let spec: JobSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.collect, CollectMode::Apply);
         assert!(!spec.include_failed);
@@ -1743,13 +2296,12 @@ mod tests {
     fn collect_aliases_are_accepted_on_the_wire_and_reported_by_field() {
         for alias in ["off", "false", "diffs", "diff", "patches", "patch"] {
             let json = format!(
-                r#"{{"repo":"https://example.net/r.git","git_ref":"main","task":"go","collect":"{alias}"}}"#
+                r#"{{"source": {{"repo": "https://example.net/r.git", "ref": "main"}},"task":"go","collect":"{alias}"}}"#
             );
             let spec: JobSpec = serde_json::from_str(&json).unwrap();
             assert!(spec.validate().is_ok(), "{alias}");
         }
-        let json =
-            r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go","collect":"nope"}"#;
+        let json = r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go","collect":"nope"}"#;
         let error = serde_json::from_str::<JobSpec>(json).unwrap_err();
         assert!(error.to_string().contains("collect"), "{error}");
     }
@@ -1795,7 +2347,8 @@ mod tests {
 
     #[test]
     fn on_conflict_defaults_to_fail_and_is_omitted_from_canonical_json() {
-        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let json =
+            r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go"}"#;
         let spec: JobSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.on_conflict, OnConflict::Fail);
         assert!(!spec.canonical_json().contains("on_conflict"));
@@ -1817,7 +2370,7 @@ mod tests {
 
     #[test]
     fn invalid_on_conflict_is_reported_by_field_on_the_wire() {
-        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go","on_conflict":"merge"}"#;
+        let json = r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go","on_conflict":"merge"}"#;
         let error = serde_json::from_str::<JobSpec>(json).unwrap_err();
         assert!(error.to_string().contains("on_conflict"), "{error}");
 
@@ -1844,7 +2397,8 @@ mod tests {
 
     #[test]
     fn allow_empty_defaults_false_and_is_omitted_when_false() {
-        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let json =
+            r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go"}"#;
         let spec: JobSpec = serde_json::from_str(json).unwrap();
         assert!(!spec.allow_empty);
         assert!(!spec.canonical_json().contains("allow_empty"));
@@ -1910,7 +2464,7 @@ mod tests {
 
     #[test]
     fn a_fallback_without_a_model_keeps_the_primary_model_choice_open() {
-        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go",
+        let json = r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go",
             "provider":"peer-a","model":"big","fallbacks":[{"provider":"peer-b"}]}"#;
         let spec: JobSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.fallbacks[0].provider, "peer-b");
@@ -1963,6 +2517,9 @@ mod tests {
         spec.requires = vec!["gpu".to_owned()];
         spec.tolerates = vec!["homelab".to_owned()];
         let edit = JobEdit {
+            task: None,
+            source_ref: None,
+            publish: None,
             provider: Some("new".to_owned()),
             model: None,
             fallbacks: Some(Vec::new()),
@@ -1977,6 +2534,9 @@ mod tests {
             group: None,
             on_stuck: None,
             stuck_after_secs: None,
+            allow_spawn: Some(true),
+            spawn_inherit: Some(true),
+            spawn_repos: Some(vec!["https://example.test/other.git".to_owned()]),
         };
         let next = edit.apply(&spec).unwrap();
         assert_eq!(next.provider.as_deref(), Some("new"));
@@ -1984,6 +2544,12 @@ mod tests {
         assert!(next.fallbacks.is_empty());
         assert!(next.requires.is_empty());
         assert!(next.tolerates.is_empty());
+        assert!(next.allow_spawn);
+        assert!(next.spawn_inherit);
+        assert_eq!(
+            next.spawn_repos,
+            vec!["https://example.test/other.git".to_owned()]
+        );
         assert_eq!(spec.fallbacks.len(), 1);
     }
 
@@ -2042,7 +2608,8 @@ mod tests {
 
     #[test]
     fn expect_defaults_to_absent_and_round_trips() {
-        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let json =
+            r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go"}"#;
         let spec: JobSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.expect, None);
         assert!(!spec.canonical_json().contains("expect"));
@@ -2066,7 +2633,7 @@ mod tests {
 
     #[test]
     fn expect_modes_round_trip_and_default_to_suspect() {
-        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go",
+        let json = r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go",
             "expect":{"files":["REVIEW.md"],"mode":"fail"}}"#;
         let spec: JobSpec = serde_json::from_str(json).unwrap();
         let expect = spec.expect.unwrap();
@@ -2174,7 +2741,8 @@ mod tests {
 
     #[test]
     fn priority_defaults_to_five_and_bounds_are_enforced() {
-        let json = r#"{"repo":"https://example.net/r.git","git_ref":"main","task":"go"}"#;
+        let json =
+            r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go"}"#;
         let spec: JobSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.priority, DEFAULT_PRIORITY);
         assert!(spec
@@ -2183,7 +2751,7 @@ mod tests {
 
         for priority in [MIN_PRIORITY, 1, 9, MAX_PRIORITY] {
             let json = format!(
-                r#"{{"repo":"https://example.net/r.git","git_ref":"main","task":"go","priority":{priority}}}"#
+                r#"{{"source": {{"repo": "https://example.net/r.git", "ref": "main"}},"task":"go","priority":{priority}}}"#
             );
             let spec: JobSpec = serde_json::from_str(&json).unwrap();
             assert_eq!(spec.priority, priority);
@@ -2193,7 +2761,7 @@ mod tests {
         }
         for priority in [255, -1] {
             let json = format!(
-                r#"{{"repo":"https://example.net/r.git","git_ref":"main","task":"go","priority":{priority}}}"#
+                r#"{{"source": {{"repo": "https://example.net/r.git", "ref": "main"}},"task":"go","priority":{priority}}}"#
             );
             assert!(serde_json::from_str::<JobSpec>(&json).is_err());
         }

@@ -11,7 +11,8 @@ use crate::time::now;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use lu_proto::{ArtifactName, Completion, Heartbeat, JobId, NodeStats};
+use lu_audit::{Data, Event, Field};
+use lu_proto::{ArtifactName, Completion, Heartbeat, JobId, JobState, NodeStats, WorkspaceRelease};
 use lu_serve::PeerAddr;
 use lu_staging::{pack_commit_capped, StageError};
 use serde::Deserialize;
@@ -67,6 +68,12 @@ pub async fn poll(
         jobs: body.heartbeat.jobs.clone(),
         labels: body.heartbeat.labels.clone(),
         label_sources: body.heartbeat.label_sources.clone(),
+        workspace_bytes: body.heartbeat.workspace_bytes,
+        workspace_count: body.heartbeat.workspace_count,
+        workspace_reclaimed_bytes_total: body.heartbeat.workspace_reclaimed_bytes_total,
+        workspace_evictions_total: body.heartbeat.workspace_evictions_total,
+        workspace_delete_errors_total: body.heartbeat.workspace_delete_errors_total,
+        workspaces: body.heartbeat.workspaces.clone(),
     };
     state
         .stats
@@ -110,6 +117,14 @@ pub async fn poll(
             .into_iter()
             .map(|(job_id, epoch)| json!({"kind":"cancel","job_id": job_id.to_string(), "epoch": epoch}))
             .collect();
+        if let Some(clean) = state
+            .pending_clean
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&node)
+        {
+            events.extend(clean);
+        }
 
         // try assignment only if no current work implied? store enforces no job held.
         let assignment = {
@@ -126,6 +141,16 @@ pub async fn poll(
             }
         };
         if let Some(a) = assignment {
+            state.record_audit(
+                Event::Leased,
+                Some(a.job_id.as_str()),
+                Some(node.as_str()),
+                node.as_str(),
+                Data::new()
+                    .unsigned(Field::Epoch, a.epoch)
+                    .text(Field::Provider, a.provider.as_deref().unwrap_or("any"))
+                    .text(Field::Model, a.model.as_deref().unwrap_or("")),
+            );
             let mut event = json!({
                 "kind":"assign",
                 "job_id": a.job_id.to_string(),
@@ -240,6 +265,15 @@ pub async fn start_job(
                 move || store.renew_lease(&jid, body.epoch, n2, lease_ms)
             })
             .await;
+            state.record_audit(
+                Event::Started,
+                Some(rec.id.as_str()),
+                Some(node.as_str()),
+                node.as_str(),
+                Data::new()
+                    .unsigned(Field::Attempt, u64::from(rec.attempt))
+                    .unsigned(Field::Epoch, body.epoch),
+            );
             state.waiters.notify_job(rec.id.as_ref());
             state.waiters.notify_work();
             with_version(json_ok(
@@ -370,6 +404,10 @@ pub async fn append_log(
         Ok(b) => b,
         Err(e) => return with_version(e.into_response()),
     };
+    // Logs are scrubbed before they reach disk. The stored length therefore differs from the
+    // sender's byte count; the response reports the new length so the uploader can resume there.
+    let scrubbed = state.scrubber.scrub(&bytes, false);
+    let bytes = scrubbed.data;
     let nbytes = bytes.len() as u64;
     // Data may fill the log up to the cap minus the marker, so any log that is cut ends with the
     // marker and never exceeds the cap; once the marker is in, later chunks are dropped with 200.
@@ -388,6 +426,7 @@ pub async fn append_log(
         (bytes.to_vec(), false)
     };
     let actual_append = to_write.len() as u64;
+    let mut stored_len = current_len;
     if actual_append > 0 {
         let res = tokio::task::spawn_blocking({
             let store = Arc::clone(&state.store);
@@ -400,6 +439,7 @@ pub async fn append_log(
             Ok(Err(e)) => return with_version(store_err(e).into_response()),
             Err(_) => return with_version(ApiError::internal().into_response()),
         };
+        stored_len = new_len;
         let path = state.artifacts_dir.join(job_id.to_string()).join("run.log");
         if let Err(error) = write_log_chunk(&path, offset, &to_write).await {
             tracing::warn!(%error, job = %job_id, "log write failed; releasing the reservation");
@@ -431,7 +471,7 @@ pub async fn append_log(
         })
         .await;
         match res {
-            Ok(Ok(_)) => {}
+            Ok(Ok(new_len)) => stored_len = new_len,
             Ok(Err(lu_store::StoreError::Conflict { length })) => {
                 // if offset mismatch conflict, report; but some impls might reject n=0 differently.
                 return with_version(
@@ -453,8 +493,28 @@ pub async fn append_log(
         move || store.renew_lease(&jid, epoch, n, lease_ms)
     })
     .await;
+    if scrubbed.hits > 0 {
+        let store = Arc::clone(&state.store);
+        let jid = job_id.clone();
+        let hits = scrubbed.hits;
+        match tokio::task::spawn_blocking(move || store.record_scrub(&jid, epoch, hits, false))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(?error, job = %job_id, "could not record log scrub count")
+            }
+            Err(error) => {
+                tracing::warn!(%error, job = %job_id, "log scrub count task failed")
+            }
+        }
+    }
     state.waiters.notify_job(job_id.as_ref());
-    with_version(StatusCode::OK.into_response())
+    let mut response = StatusCode::OK.into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&stored_len.to_string()) {
+        response.headers_mut().insert("x-lu-log-length", value);
+    }
+    with_version(response)
 }
 
 fn artifact_name_from_str(name: &str) -> Option<ArtifactName> {
@@ -516,6 +576,8 @@ async fn put_artifact_impl(
         Ok(b) => b,
         Err(e) => return with_version(e.into_response()),
     };
+    let scrubbed = state.scrubber.scrub(&bytes, art == ArtifactName::DiffPatch);
+    let bytes = scrubbed.data;
     let nbytes = bytes.len() as u64;
     // Record first: the store checks the epoch inside its transaction, so a holder that lost its
     // lease writes nothing. A failed write after this leaves the record without a file, which a
@@ -586,6 +648,25 @@ async fn put_artifact_impl(
         Ok(Err(_)) => return with_version(ApiError::internal().into_response()),
         Err(_) => return with_version(ApiError::internal().into_response()),
     }
+    if scrubbed.hits > 0 {
+        let store = Arc::clone(&state.store);
+        let jid = job_id.clone();
+        let hits = scrubbed.hits;
+        let patch_scrubbed = scrubbed.patch_scrubbed;
+        match tokio::task::spawn_blocking(move || {
+            store.record_scrub(&jid, epoch, hits, patch_scrubbed)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(?error, job = %job_id, "could not record artifact scrub count")
+            }
+            Err(error) => {
+                tracing::warn!(%error, job = %job_id, "artifact scrub count task failed")
+            }
+        }
+    }
     state.waiters.notify_job(job_id.as_ref());
     with_version(StatusCode::OK.into_response())
 }
@@ -633,11 +714,24 @@ pub async fn complete_job(
             Some((class, provider))
         }
     };
+    // Mirrors the store's condition for inserting a provider cordon in `complete`.
+    let cordon_provider = failure
+        .as_ref()
+        .and_then(|(class, provider)| {
+            (*class == lu_proto::FailureClass::Provider).then(|| provider.clone())?
+        })
+        .filter(|_| {
+            lu_proto::FailureClass::Provider.retryable(rec_check.attempt, state.max_retries)
+        });
+    let cordon_ms = cordon_ms_for(&completion, state.cordon_ms);
+    let retry_after_secs = completion.retry_after_secs;
+    let exit_code = completion.exit_code;
+    let completion_outcome = completion.outcome;
+    let epoch = completion.epoch;
     let n = now();
     let res = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         let max_retries = state.max_retries;
-        let cordon_ms = cordon_ms_for(&completion, state.cordon_ms);
         move || store.complete(&completion, failure, n, max_retries, cordon_ms)
     })
     .await;
@@ -649,6 +743,55 @@ pub async fn complete_job(
                 _ => {}
             }
             state.count_stuck_stopped(stuck_mode);
+            let (event, outcome) = match rec.state {
+                lu_proto::JobState::Done => (Event::Finished, "done"),
+                lu_proto::JobState::Failed => (Event::Failed, "failed"),
+                lu_proto::JobState::Queued => (Event::Retried, "retried"),
+                lu_proto::JobState::Cancelled => (Event::Cancelled, "cancelled"),
+                _ => (Event::Failed, "unknown"),
+            };
+            let mut data = Data::new()
+                .unsigned(Field::Attempt, u64::from(rec.attempt))
+                .unsigned(Field::Epoch, epoch)
+                .text(Field::Outcome, outcome)
+                .text(Field::State, rec.state.as_str())
+                .text(Field::ActorKind, "agent");
+            if let lu_proto::Outcome::Failed(class) = completion_outcome {
+                data = data.text(Field::Class, class.as_str());
+            }
+            if let Some(code) = exit_code {
+                data = data.signed(Field::ExitCode, i64::from(code));
+            }
+            if let Some(secs) = retry_after_secs {
+                data = data.unsigned(Field::RetryAfterSecs, secs);
+            }
+            state.record_audit(
+                event,
+                Some(rec.id.as_str()),
+                Some(node.as_str()),
+                node.as_str(),
+                data,
+            );
+            if let Some(provider) = cordon_provider.as_deref() {
+                state.record_audit(
+                    Event::CordonSet,
+                    Some(rec.id.as_str()),
+                    Some(node.as_str()),
+                    node.as_str(),
+                    Data::new()
+                        .text(Field::Provider, provider)
+                        .text(Field::Class, "provider")
+                        .text(
+                            Field::Source,
+                            if retry_after_secs.is_some() {
+                                "reiki"
+                            } else {
+                                "failure"
+                            },
+                        )
+                        .unsigned(Field::CordonMs, cordon_ms),
+                );
+            }
             state.waiters.notify_job(rec.id.as_ref());
             state.waiters.notify_work();
             with_version(json_ok(
@@ -694,6 +837,75 @@ fn epoch_from_uri(uri: &axum::http::Uri) -> Result<u64, Box<Response>> {
 
 fn dependency_diff_path(state: &AppState, dep: &JobId) -> std::path::PathBuf {
     state.artifacts_dir.join(dep.to_string()).join("diff.patch")
+}
+
+/// Confirms that a finished job's artifacts are stored and that no queued or running job still
+/// stacks on or collects from its workspace. The agent uses this instead of keeping stacking
+/// workspaces indefinitely.
+pub async fn workspace_release(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    uri: axum::http::Uri,
+) -> Response {
+    let node = match authenticate_agent(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(n) => n,
+        Err(e) => return with_version(e.into_response()),
+    };
+    let job_id = match JobId::parse(&id) {
+        Ok(i) => i,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let rec = match owned_job(&state, &node, &job_id).await {
+        Ok(rec) => rec,
+        Err(res) => return *res,
+    };
+    let epoch = match epoch_from_uri(&uri) {
+        Ok(epoch) => epoch,
+        Err(res) => return *res,
+    };
+    if rec.epoch != epoch {
+        return with_version(ApiError::stale_epoch().into_response());
+    }
+    let patch_stored = rec.artifacts.contains(&ArtifactName::DiffPatch)
+        || rec.diff_bytes.is_none()
+        || rec.diff_bytes == Some(0);
+    let report_stored = rec.artifacts.contains(&ArtifactName::ReportJson);
+    let active = {
+        let store = Arc::clone(&state.store);
+        match tokio::task::spawn_blocking(move || store.list_jobs(None, 10_000, None)).await {
+            Ok(Ok(jobs)) => jobs,
+            Ok(Err(e)) => return with_version(store_err(e).into_response()),
+            Err(_) => return with_version(ApiError::internal().into_response()),
+        }
+    }
+    .into_iter()
+    .any(|job| {
+        matches!(
+            job.state,
+            JobState::Blocked
+                | JobState::Queued
+                | JobState::Leased
+                | JobState::Running
+                | JobState::Recovering
+                | JobState::NeedsInput
+        ) && job.spec.after.contains(&job_id)
+    });
+    let (can_delete, reason) = if !report_stored || !patch_stored {
+        (false, "final artifacts are not stored yet")
+    } else if active {
+        (false, "dependants still need the workspace")
+    } else {
+        (true, "released")
+    };
+    with_version(json_ok(
+        StatusCode::OK,
+        &WorkspaceRelease {
+            can_delete,
+            reason: reason.to_owned(),
+        },
+    ))
 }
 
 pub async fn list_deps(
@@ -1073,6 +1285,11 @@ mod poll_renewal_tests {
                 id: id.clone(),
                 state: JobState::Running,
                 spec: JobSpec {
+                    source: lu_proto::SourceSpec {
+                        repo: "https://example.net/repo.git".to_owned(),
+                        git_ref: "main".to_owned(),
+                        base: None,
+                    },
                     repo: "https://example.net/repo.git".to_owned(),
                     git_ref: "main".to_owned(),
                     base_commit: None,
@@ -1094,6 +1311,17 @@ mod poll_renewal_tests {
                     tolerates: Vec::new(),
                     priority: DEFAULT_PRIORITY,
                     group: None,
+                    allow_spawn: false,
+                    spawn_inherit: false,
+                    spawn_repos: Vec::new(),
+                    workspace: None,
+                    cache_dirs: Vec::new(),
+                    context: None,
+                    origin: None,
+                    origin_ref: None,
+                    untrusted_context: false,
+                    draft: false,
+                    publish: None,
                     fallbacks: Vec::new(),
                     expect: None,
                 },
@@ -1114,7 +1342,13 @@ mod poll_renewal_tests {
                 log_len: 0,
                 diff_bytes: None,
                 expect_failed: false,
+                scrubbed_hits: 0,
+                patch_scrubbed: false,
                 waiting_on: Vec::new(),
+                parent_job_id: None,
+                root_job_id: None,
+                depth: 0,
+                publish: None,
             })
         }
         fn job_by_key(&self, _key: &str) -> Option<JobRecord> {
@@ -1198,6 +1432,23 @@ mod poll_renewal_tests {
             _bytes: u64,
         ) -> Result<(), StoreError> {
             Ok(())
+        }
+        fn record_scrub(
+            &self,
+            _id: &JobId,
+            _epoch: u64,
+            _hits: u64,
+            _patch: bool,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn record_publish(
+            &self,
+            _: &JobId,
+            _: &lu_proto::PublishRecord,
+            _: Now,
+        ) -> Result<JobRecord, StoreError> {
+            unimplemented!()
         }
         fn complete(
             &self,

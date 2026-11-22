@@ -25,8 +25,8 @@ On the node, write an agent config with an onboarding taint and a label the cana
 [agent]
 name = "node-b"
 controller_url = "https://lu.example.net:7600"
-token_file = "/etc/lu/agent.token"
-work_dir = "/var/lib/lu/work"
+token_file = "/etc/ting/ting.token"
+work_dir = "/var/lib/ting/work"
 harness = "opencode"
 labels = ["canary/node-b"]
 taints = ["onboarding"]
@@ -46,8 +46,8 @@ are offered only while Reiki reports that provider healthy. Keys and validation 
 [Configuration](config.md).
 
 ```sh
-lu check --config /etc/lu/agent.toml
-systemctl enable --now lu-agent.service
+lu check --config /etc/ting/ting.toml
+systemctl enable --now ting.service
 ```
 
 `lu check` reads no token files and creates no directories. The agent creates `work_dir`
@@ -89,7 +89,7 @@ lu node node-b
 | Labels and taints | `lu nodes` `LABELS` | Taints come first with `!`, so `!onboarding,canary/node-b,opencode/cli (probed)`. A long list ends with `+N`. |
 | Probe labels | `lu nodes`, `lu node`, `--json` | A probed label is followed by ` (probed)`; JSON carries it in `label_sources` as `"opencode/cli": "probed"`. |
 | Provider models | `lu nodes --json` | `provider_models` holds the configured pairs that Reiki currently reports healthy. `providers` holds each provider's state (`ok`, `cooling`, `disabled`, `unknown`). |
-| Cordons | `lu nodes --json` | `cordons` lists provider names with an unexpired `(node, provider)` cordon. |
+| Cordons | `lu nodes --json` | `cordon_details` lists active `(node, provider)` cordons with their source, reason and expiry or healthy-lift count. |
 | Host and process stats | `lu node node-b` | `labels`, load, memory, disk for the `work_dir` filesystem and any running job tree. Stats are sampled at heartbeat time and are lost on controller restart until the next heartbeat. |
 
 `lu node <name>` prints stats, not the full node view; an unknown node is a `404` and exits `1`.
@@ -135,7 +135,7 @@ saved ./canary-node-b/report.json
 stores a partial diff. Confirm `lu nodes` shows `harness idle` and `DRAINED no` before treating
 the node as in service.
 
-Now remove `taints = ["onboarding"]` from the agent config and restart `lu agent`. The next
+Now remove `taints = ["onboarding"]` from the agent config and restart `ting`. The next
 heartbeat replaces the taint set; verify `!onboarding` is gone in `lu nodes` and in
 `lu nodes --json`.
 
@@ -143,13 +143,14 @@ heartbeat replaces the taint set; verify `!onboarding` is gone in `lu nodes` and
 
 1. Keep or restore the drain: `lu drain node-b`.
 2. Read `lu show <canary-id>`, `lu logs --follow <canary-id>` and `lu node node-b`.
-3. Check `lu nodes --json` for `cordons` and `label_sources`. A harness crash at launch adds the
+3. Check `lu nodes --json` for `cordon_details` and `label_sources`. A harness crash at launch adds the
    label and taint `harness_ok=false`; a later successful run clears both.
 4. Fix the host or config, restart the agent and repeat from step 2.
 
-There is no CLI command to clear a provider cordon. It expires at its deadline, a Reiki-derived
-cordon clears after two consecutive healthy provider heartbeats, and a controller restart deletes
-all cordons. A drain is cleared with `lu undrain`. See
+Clear a provider cordon early with `lu uncordon node-b [<provider>]` (omit the provider to clear
+all of that node's cordons). Otherwise it expires at its deadline, a Reiki-derived cordon clears
+after two consecutive healthy provider heartbeats, and a controller restart deletes all cordons.
+A drain is cleared with `lu undrain`. See
 [Provider cordons and node drains](operations.md#provider-cordons-and-node-drains) and
 [What Lu does not protect against](limits.md).
 

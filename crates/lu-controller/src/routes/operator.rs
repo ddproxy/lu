@@ -3,22 +3,24 @@ use crate::error::{ApiError, ErrorCode};
 use crate::limits::SYNC_PER_TOKEN;
 use crate::routes::file_body::{file_len, into_response, stream_range};
 use crate::routes::{
-    json_ok, json_value_ok, parse_job_state, read_raw_limited, store_err, with_version,
-    MAX_JSON_BODY,
+    json_ok, json_value_ok, parse_job_state, parse_query, read_raw_limited, store_err,
+    with_version, MAX_JSON_BODY,
 };
 use crate::state::AppState;
 use crate::time::now;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use lu_audit::{Data, Event, Field};
 use lu_proto::{
-    validate_idempotency_key, ArtifactName, CordonView, JobEdit, JobId, JobSpec, JobView, NodeName,
-    NodeView,
+    valid_group, validate_idempotency_key, ArtifactName, CordonView, JobEdit, JobId, JobSpec,
+    JobView, NodeName, NodeView, WorkspaceCleanResult,
 };
 use lu_serve::PeerAddr;
 use lu_store::{
     missing_labels, waiting_reason_with_groups, Cordon, CordonSource, JobRecord, NodeRecord, Now,
 };
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -76,10 +78,18 @@ fn job_view_with(r: &JobRecord, reason: Option<String>) -> JobView {
         cancel_requested: r.cancel_requested,
         after: r.spec.after.clone(),
         waiting_on: r.waiting_on.clone(),
+        parent_job_id: r.parent_job_id.clone(),
+        root_job_id: r.root_job_id.clone(),
+        depth: r.depth,
         waiting_reason: reason,
         outcome_note: outcome_note(r).map(str::to_owned),
         diff_bytes: r.state.is_terminal().then(|| r.diff_bytes.unwrap_or(0)),
+        scrubbed_hits: r.scrubbed_hits,
+        patch_scrubbed: r.patch_scrubbed,
         warnings: None,
+        audit_write_errors: None,
+        publish: r.publish.clone(),
+        publish_target: None,
     }
 }
 
@@ -105,8 +115,11 @@ async fn group_counts(state: &Arc<AppState>) -> Result<HashMap<String, usize>, A
 async fn job_view_for(state: &Arc<AppState>, rec: &JobRecord) -> Result<JobView, ApiError> {
     let nodes = all_nodes(state, now()).await?;
     let counts = group_counts(state).await?;
-    let reason = waiting_reason_with_groups(rec, &nodes, &counts, &state.group_limits);
-    Ok(job_view_with(rec, reason))
+    let reason = waiting_reason_with_groups(rec, &nodes, &counts, &state.group_limits());
+    let mut view = job_view_with(rec, reason);
+    view.audit_write_errors = Some(state.audit_write_errors());
+    view.publish_target = crate::publish::target_text(state, rec);
+    Ok(view)
 }
 
 fn job_views(
@@ -178,6 +191,12 @@ fn node_view(
         mem_available_kb: host.map(|host| host.mem_available_kb),
         mem_total_kb: host.map(|host| host.mem_total_kb),
         stuck: u64::try_from(stuck).unwrap_or(0),
+        workspace_bytes: stats.map_or(0, |s| s.workspace_bytes),
+        workspace_count: stats.map_or(0, |s| s.workspace_count),
+        workspace_reclaimed_bytes_total: stats.map_or(0, |s| s.workspace_reclaimed_bytes_total),
+        workspace_evictions_total: stats.map_or(0, |s| s.workspace_evictions_total),
+        workspace_delete_errors_total: stats.map_or(0, |s| s.workspace_delete_errors_total),
+        workspaces: stats.map_or_else(Vec::new, |s| s.workspaces.clone()),
     }
 }
 
@@ -187,7 +206,7 @@ pub async fn create_job(
     headers: HeaderMap,
     req: axum::extract::Request,
 ) -> Response {
-    let _ = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
         Ok(o) => o,
         Err(e) => return with_version(e.into_response()),
     };
@@ -212,7 +231,10 @@ pub async fn create_job(
         let resolved =
             tokio::task::spawn_blocking(move || mirror.ensure_resolved(&name, &git_ref)).await;
         match resolved {
-            Ok(Ok(commit)) => spec.base_commit = Some(commit),
+            Ok(Ok(commit)) => {
+                spec.base_commit = Some(commit.clone());
+                spec.source.base = Some(commit);
+            }
             Ok(Err(e)) if e.is_unknown_ref() => {
                 return with_version(ApiError::unprocessable(e.to_string()).into_response())
             }
@@ -228,6 +250,14 @@ pub async fn create_job(
             Err(_) => return with_version(ApiError::internal().into_response()),
         }
     }
+    if let Err(error) = crate::routes::enforce_draft_capacity(&state, &spec).await {
+        return with_version(error.into_response());
+    }
+    let submit_data = Data::new()
+        .text(Field::Provider, spec.provider.as_deref().unwrap_or("any"))
+        .text(Field::Model, spec.model.as_deref().unwrap_or(""));
+    let collect_applies = spec.collect.applies_diffs();
+    let collect_mode = spec.collect.as_str();
     let now = now();
     let res = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
@@ -253,11 +283,66 @@ pub async fn create_job(
     };
     body.warnings = Some(warnings);
     if created {
+        state.record_audit(
+            Event::Submitted,
+            Some(rec.id.as_str()),
+            None,
+            &operator,
+            submit_data,
+        );
+        if collect_applies {
+            state.record_audit(
+                Event::CollectApplied,
+                Some(rec.id.as_str()),
+                None,
+                &operator,
+                Data::new().text(Field::Mode, collect_mode),
+            );
+        }
         state.waiters.notify_work();
         with_version(json_ok(StatusCode::CREATED, &body))
     } else {
         with_version(json_ok(StatusCode::OK, &body))
     }
+}
+
+/// Runtime cap body. Unknown keys are refused so a typo cannot silently leave a batch uncapped.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GroupLimitRequest {
+    max_running: usize,
+}
+
+pub async fn set_group_limit(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(group): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
+        return with_version(ApiError::unauthorized().into_response());
+    }
+    if !valid_group(&group) {
+        return with_version(ApiError::bad_request("invalid group name").into_response());
+    }
+    let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
+        Ok(bytes) => bytes,
+        Err(error) => return with_version(error.into_response()),
+    };
+    let body: GroupLimitRequest = match serde_json::from_slice(&bytes) {
+        Ok(body) => body,
+        Err(error) => {
+            return with_version(ApiError::unprocessable(error.to_string()).into_response())
+        }
+    };
+    if let Err(error) = state.set_group_limit(&group, body.max_running) {
+        return with_version(ApiError::bad_request(error).into_response());
+    }
+    with_version(json_value_ok(
+        StatusCode::OK,
+        json!({ "group": group, "max_running": body.max_running }),
+    ))
 }
 
 pub async fn list_jobs(
@@ -295,7 +380,7 @@ pub async fn list_jobs(
         };
         let jobs: Vec<JobRecord> = rec.into_iter().collect();
         let body = json!({
-            "jobs": job_views(&jobs, &nodes, &counts, &state.group_limits),
+            "jobs": job_views(&jobs, &nodes, &counts, &state.group_limits()),
             "next": null,
         });
         return with_version(json_value_ok(StatusCode::OK, body));
@@ -339,7 +424,7 @@ pub async fn list_jobs(
     };
     let next = jobs.last().map(|j| j.id.to_string());
     let body = json!({
-        "jobs": job_views(&jobs, &nodes, &counts, &state.group_limits),
+        "jobs": job_views(&jobs, &nodes, &counts, &state.group_limits()),
         "next": next,
     });
     with_version(json_value_ok(StatusCode::OK, body))
@@ -373,7 +458,9 @@ pub async fn get_job(
     }
 }
 
-pub async fn cancel_job(
+/// Publishes a finished job's diff to its configured target. Operator-only: intake payloads can
+/// never call this route, and the source-branch path rechecks the origin and approval flags.
+pub async fn publish_job(
     State(state): State<Arc<AppState>>,
     peer: axum::Extension<PeerAddr>,
     headers: HeaderMap,
@@ -382,25 +469,109 @@ pub async fn cancel_job(
     if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
         return with_version(ApiError::unauthorized().into_response());
     }
+    let Ok(job_id) = JobId::parse(&id) else {
+        return with_version(ApiError::not_found("not found").into_response());
+    };
+    let rec = match tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        move || store.get_job(&job_id)
+    })
+    .await
+    {
+        Ok(Ok(rec)) => rec,
+        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    };
+    if !rec.state.is_terminal() {
+        return with_version(ApiError::conflict("job is not finished").into_response());
+    }
+    let record = match crate::publish::publish(Arc::clone(&state), rec.clone()).await {
+        Ok(record) => record,
+        Err(error) => {
+            let response = match error {
+                crate::publish::PublishError::NotConfigured => {
+                    ApiError::unprocessable("publishing is not configured")
+                }
+                crate::publish::PublishError::NoSpec => {
+                    ApiError::unprocessable("job has no publish step")
+                }
+                crate::publish::PublishError::Denied(message) => ApiError::forbidden(message),
+                crate::publish::PublishError::Invalid(message)
+                | crate::publish::PublishError::State(message)
+                | crate::publish::PublishError::Git(message) => ApiError::unprocessable(message),
+                crate::publish::PublishError::RateLimited(retry_after) => {
+                    ApiError::rate_limited(retry_after)
+                }
+            };
+            return with_version(response.into_response());
+        }
+    };
+    match job_view_for(&state, &rec).await {
+        Ok(mut view) => {
+            view.publish = Some(record);
+            with_version(json_ok(StatusCode::OK, &view))
+        }
+        Err(error) => with_version(error.into_response()),
+    }
+}
+
+pub async fn cancel_job(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    uri: axum::http::Uri,
+) -> Response {
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(o) => o,
+        Err(e) => return with_version(e.into_response()),
+    };
     let job_id = match JobId::parse(&id) {
         Ok(i) => i,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
     };
-    let n = now();
-    let res = tokio::task::spawn_blocking({
+    // `keep_children=1` is the operator escape hatch; the default cascade protects a tree from
+    // leaving half-finished children behind when its parent is cancelled.
+    let keep_children = crate::routes::parse_query(&uri)
+        .get("keep_children")
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+    let changed =
+        match crate::routes::cancel_job_with_descendants(&state, &job_id, keep_children).await {
+            Ok(ids) => ids,
+            Err(error) => return with_version(error.into_response()),
+        };
+    if !changed.contains(&job_id) {
+        let res = tokio::task::spawn_blocking({
+            let store = Arc::clone(&state.store);
+            move || store.get_job(&job_id).map(|_| ()).map_err(|_| ())
+        })
+        .await;
+        if !matches!(res, Ok(Ok(()))) {
+            return with_version(ApiError::not_found("not found").into_response());
+        }
+        return with_version(ApiError::conflict("job is already terminal").into_response());
+    }
+    for changed_id in &changed {
+        state.record_audit(
+            Event::Cancelled,
+            Some(changed_id.as_str()),
+            None,
+            &operator,
+            Data::new(),
+        );
+        state.waiters.notify_job(changed_id.as_ref());
+    }
+    state.waiters.notify_work();
+    let rec = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
-        move || store.cancel_job(&job_id, n)
+        move || store.get_job(&job_id)
     })
     .await;
-    match res {
-        Ok(Ok(rec)) => {
-            state.waiters.notify_job(rec.id.as_ref());
-            state.waiters.notify_work();
-            match job_view_for(&state, &rec).await {
-                Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
-                Err(error) => with_version(error.into_response()),
-            }
-        }
+    match rec {
+        Ok(Ok(rec)) => match job_view_for(&state, &rec).await {
+            Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
+            Err(error) => with_version(error.into_response()),
+        },
         Ok(Err(e)) => with_version(store_err(e).into_response()),
         Err(_) => with_version(ApiError::internal().into_response()),
     }
@@ -444,6 +615,196 @@ pub async fn edit_job(
         }
         Ok(Err(e)) => with_version(store_err(e).into_response()),
         Err(_) => with_version(ApiError::internal().into_response()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ApproveBody {
+    /// Optional edit applied before approval, for `lu approve --edit`.
+    edit: Option<JobEdit>,
+}
+
+#[derive(Deserialize, Default)]
+struct RejectBody {
+    /// Recorded only as a safe reason code in the audit event; free text is never stored.
+    reason: Option<String>,
+}
+
+/// Operator-only draft inventory, oldest first. Drafts are never dispatched from this route.
+pub async fn list_drafts(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
+        return with_version(ApiError::unauthorized().into_response());
+    }
+    let q = parse_query(&uri);
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(200)
+        .min(1000);
+    let store = Arc::clone(&state.store);
+    let drafts = match tokio::task::spawn_blocking(move || store.list_drafts(limit)).await {
+        Ok(Ok(jobs)) => jobs,
+        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    };
+    let nodes = match all_nodes(&state, now()).await {
+        Ok(nodes) => nodes,
+        Err(error) => return with_version(error.into_response()),
+    };
+    let counts = match group_counts(&state).await {
+        Ok(counts) => counts,
+        Err(error) => return with_version(error.into_response()),
+    };
+    let next = drafts.last().map(|job| job.id.to_string());
+    with_version(json_value_ok(
+        StatusCode::OK,
+        json!({
+            "drafts": job_views(&drafts, &nodes, &counts, &state.group_limits()),
+            "next": next,
+        }),
+    ))
+}
+
+/// Approves a draft. With a body containing `edit`, the edit is applied first; the job stays a
+/// draft until the transition succeeds.
+pub async fn approve_draft(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(operator) => operator,
+        Err(_) => return with_version(ApiError::unauthorized().into_response()),
+    };
+    let Ok(job_id) = JobId::parse(&id) else {
+        return with_version(ApiError::not_found("not found").into_response());
+    };
+    let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
+        Ok(bytes) => bytes,
+        Err(error) => return with_version(error.into_response()),
+    };
+    let edit: Option<JobEdit> = if bytes.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<ApproveBody>(&bytes) {
+            Ok(body) => body.edit,
+            Err(_) => {
+                return with_version(ApiError::bad_request("invalid approval body").into_response())
+            }
+        }
+    };
+    let store = Arc::clone(&state.store);
+    let result = tokio::task::spawn_blocking(move || {
+        let n = now();
+        let rec = store.get_job(&job_id)?;
+        if rec.state != lu_proto::JobState::Draft {
+            return Err(lu_store::StoreError::Conflict { length: None });
+        }
+        let rec = match edit {
+            Some(edit) => store.edit_job(&job_id, &edit, n)?,
+            None => rec,
+        };
+        let target = if rec.waiting_on.is_empty() {
+            lu_proto::JobState::Queued
+        } else {
+            lu_proto::JobState::Blocked
+        };
+        store.approve_draft(&job_id, target, n)
+    })
+    .await;
+    let rec = match result {
+        Ok(Ok(rec)) => rec,
+        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    };
+    // Only an explicit operator approval may enable a source-branch push for an intake job.
+    // The approval is process-local and never written into the job spec.
+    state.mark_approved(&rec.id);
+    if rec.state == lu_proto::JobState::Queued {
+        state.waiters.notify_work();
+    }
+    state.record_audit(
+        Event::DraftApproved,
+        Some(rec.id.as_str()),
+        None,
+        &operator,
+        Data::new().text(Field::State, rec.state.as_str()),
+    );
+    match job_view_for(&state, &rec).await {
+        Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
+        Err(error) => with_version(error.into_response()),
+    }
+}
+
+/// Rejects a draft into terminal `cancelled`. The reason is a safe audit code, never job text.
+pub async fn reject_draft(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(operator) => operator,
+        Err(_) => return with_version(ApiError::unauthorized().into_response()),
+    };
+    let Ok(job_id) = JobId::parse(&id) else {
+        return with_version(ApiError::not_found("not found").into_response());
+    };
+    let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
+        Ok(bytes) => bytes,
+        Err(error) => return with_version(error.into_response()),
+    };
+    let reason = if bytes.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<RejectBody>(&bytes) {
+            Ok(body) => body.reason,
+            Err(_) => {
+                return with_version(
+                    ApiError::bad_request("invalid rejection body").into_response(),
+                )
+            }
+        }
+    };
+    let store = Arc::clone(&state.store);
+    let result = tokio::task::spawn_blocking(move || {
+        let n = now();
+        let rec = store.get_job(&job_id)?;
+        if rec.state != lu_proto::JobState::Draft {
+            return Err(lu_store::StoreError::Conflict { length: None });
+        }
+        store.cancel_job(&job_id, n)
+    })
+    .await;
+    let rec = match result {
+        Ok(Ok(rec)) => rec,
+        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    };
+    let code = match reason.as_deref() {
+        Some("duplicate") => "duplicate",
+        Some("spam") => "spam",
+        Some("unsafe") => "unsafe",
+        _ => "rejected",
+    };
+    state.record_audit(
+        Event::DraftRejected,
+        Some(rec.id.as_str()),
+        None,
+        &operator,
+        Data::new().text(Field::Mode, code),
+    );
+    match job_view_for(&state, &rec).await {
+        Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
+        Err(error) => with_version(error.into_response()),
     }
 }
 
@@ -649,6 +1010,81 @@ pub async fn get_node_stats(
     }
 }
 
+/// Queues a workspace-clean event for a node. Deletion happens on the agent's next poll, and
+/// running jobs are always refused there.
+pub async fn clean_workspaces(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    uri: axum::http::Uri,
+) -> Response {
+    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
+        return with_version(ApiError::unauthorized().into_response());
+    }
+    let node = match NodeName::parse(&name) {
+        Ok(n) => n,
+        Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let query = parse_query(&uri);
+    for key in query.keys() {
+        if key != "all" && key != "job" {
+            return with_version(ApiError::bad_request("unknown query parameter").into_response());
+        }
+    }
+    let all = match query.get("all").map(String::as_str) {
+        None | Some("false") | Some("0") => false,
+        Some("true") | Some("1") => true,
+        Some(_) => return with_version(ApiError::bad_request("invalid all").into_response()),
+    };
+    let job = match query.get("job") {
+        Some(value) => match JobId::parse(value) {
+            Ok(id) => Some(id),
+            Err(_) => return with_version(ApiError::bad_request("invalid job").into_response()),
+        },
+        None => None,
+    };
+    if all == job.is_some() {
+        return with_version(
+            ApiError::bad_request("pass either all=true or job=<key>").into_response(),
+        );
+    }
+    let n = now();
+    let res = tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        let lease_ms = state.lease_ms;
+        move || store.nodes(n, lease_ms)
+    })
+    .await;
+    let nodes = match res {
+        Ok(Ok(nodes)) => nodes,
+        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    };
+    if !nodes.iter().any(|record| record.name == node) {
+        return with_version(ApiError::not_found("not found").into_response());
+    }
+    let mut event = serde_json::json!({ "kind": "clean_workspaces", "all": all });
+    if let Some(job) = job {
+        event["job"] = serde_json::json!(job.to_string());
+    }
+    state
+        .pending_clean
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(node)
+        .or_default()
+        .push(event);
+    with_version(json_ok(
+        StatusCode::OK,
+        &WorkspaceCleanResult {
+            queued: 1,
+            refused_running: 0,
+            missing: 0,
+        },
+    ))
+}
+
 pub async fn list_repos(
     State(state): State<Arc<AppState>>,
     peer: axum::Extension<PeerAddr>,
@@ -702,13 +1138,15 @@ pub async fn set_drain(
     Path(name): Path<String>,
     draining: bool,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
-    }
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(o) => o,
+        Err(e) => return with_version(e.into_response()),
+    };
     let node = match NodeName::parse(&name) {
         Ok(n) => n,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
     };
+    let audit_node = node.as_str().to_owned();
     let res = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         move || store.set_draining(&node, draining)
@@ -716,6 +1154,13 @@ pub async fn set_drain(
     .await;
     match res {
         Ok(Ok(())) => {
+            state.record_audit(
+                Event::Drain,
+                None,
+                Some(&audit_node),
+                &operator,
+                Data::new().bool(Field::State, draining),
+            );
             state.waiters.notify_work();
             with_version(
                 (
@@ -740,9 +1185,10 @@ pub async fn uncordon_node(
     Path(name): Path<String>,
     req: axum::extract::Request,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
-    }
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(o) => o,
+        Err(e) => return with_version(e.into_response()),
+    };
     let node = match NodeName::parse(&name) {
         Ok(n) => n,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
@@ -786,6 +1232,7 @@ pub async fn uncordon_node(
         Ok(Err(e)) => return with_version(store_err(e).into_response()),
         Err(_) => return with_version(ApiError::internal().into_response()),
     }
+    let audit_node = node.as_str().to_owned();
     let res = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         move || store.uncordon(&node, provider.as_deref())
@@ -793,6 +1240,15 @@ pub async fn uncordon_node(
     .await;
     match res {
         Ok(Ok(removed)) => {
+            for provider in &removed {
+                state.record_audit(
+                    Event::CordonCleared,
+                    None,
+                    Some(&audit_node),
+                    &operator,
+                    Data::new().text(Field::Provider, provider),
+                );
+            }
             state.waiters.notify_work();
             with_version(json_ok(StatusCode::OK, &json!({ "removed": removed })))
         }
@@ -833,6 +1289,11 @@ mod tests {
             id: JobId::new(),
             state,
             spec: JobSpec {
+                source: lu_proto::SourceSpec {
+                    repo: "https://example.net/repo.git".to_owned(),
+                    git_ref: "main".to_owned(),
+                    base: None,
+                },
                 repo: "https://example.net/repo.git".to_owned(),
                 git_ref: "main".to_owned(),
                 base_commit: None,
@@ -854,6 +1315,17 @@ mod tests {
                 tolerates: Vec::new(),
                 priority: lu_proto::DEFAULT_PRIORITY,
                 group: None,
+                allow_spawn: false,
+                spawn_inherit: false,
+                spawn_repos: Vec::new(),
+                workspace: None,
+                cache_dirs: Vec::new(),
+                context: None,
+                origin: None,
+                origin_ref: None,
+                untrusted_context: false,
+                draft: false,
+                publish: None,
                 fallbacks: Vec::new(),
                 expect: None,
             },
@@ -873,8 +1345,14 @@ mod tests {
             cancel_requested: false,
             log_len: 0,
             diff_bytes,
-            waiting_on: Vec::new(),
             expect_failed: false,
+            scrubbed_hits: 0,
+            patch_scrubbed: false,
+            waiting_on: Vec::new(),
+            parent_job_id: None,
+            root_job_id: None,
+            depth: 0,
+            publish: None,
         }
     }
 

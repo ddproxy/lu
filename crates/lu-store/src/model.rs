@@ -11,7 +11,7 @@ use lu_proto::{
 };
 
 use crate::conformance::hb;
-use crate::{CordonSource, JobRecord, Now, Store, StoreError};
+use crate::{CordonSource, JobRecord, Now, ScopeLimits, Store, StoreError};
 
 const OPS: usize = 300;
 const LONG_OPS: usize = 3_000;
@@ -443,6 +443,9 @@ impl<S: Store> Model<S> {
                 87..=90 => self.op_drain(),
                 91..=93 => self.op_expire(),
                 94..=96 => self.op_requeue(),
+                97..=98 => self.op_draft(),
+                99 => self.op_draft_decision(),
+                _ if self.rng.chance(1, 8) => self.op_spawn(),
                 _ => self.op_recover_on_boot(),
             }
             self.refresh_and_check();
@@ -464,12 +467,14 @@ impl<S: Store> Model<S> {
     }
 
     fn fresh_spec(&mut self, seq: u64) -> JobSpec {
-        let provider = if self.rng.chance(2, 5) {
-            Some(PROVIDERS[self.rng.index(PROVIDERS.len())].to_owned())
-        } else {
-            None
-        };
+        let provider = self.rng.chance(1, 4).then(|| "peer-a".to_owned());
+        let allow_spawn = self.rng.chance(1, 4);
         JobSpec {
+            source: lu_proto::SourceSpec {
+                repo: format!("https://example.test/r{seq}.git"),
+                git_ref: "main".to_owned(),
+                base: None,
+            },
             repo: format!("https://example.test/r{seq}.git"),
             git_ref: "main".to_owned(),
             task: format!("model task {seq}"),
@@ -491,6 +496,17 @@ impl<S: Store> Model<S> {
             tolerates: Vec::new(),
             priority: lu_proto::DEFAULT_PRIORITY,
             group: None,
+            allow_spawn,
+            spawn_inherit: allow_spawn && self.rng.chance(1, 2),
+            spawn_repos: Vec::new(),
+            workspace: None,
+            cache_dirs: Vec::new(),
+            context: None,
+            origin: None,
+            origin_ref: None,
+            untrusted_context: false,
+            draft: false,
+            publish: None,
             fallbacks: Vec::new(),
             expect: None,
         }
@@ -514,11 +530,24 @@ impl<S: Store> Model<S> {
         if self.records.is_empty() || !self.rng.chance(1, 2) {
             return Vec::new();
         }
-        let ids: Vec<JobId> = self
+        let records: Vec<JobRecord> = self
             .records_in_submit_order()
             .into_iter()
-            .map(|record| record.id)
+            .filter(|record| {
+                !matches!(
+                    record.state,
+                    JobState::Draft
+                        | JobState::Done
+                        | JobState::Failed
+                        | JobState::Cancelled
+                        | JobState::Expired
+                )
+            })
             .collect();
+        let ids: Vec<JobId> = records.iter().map(|record| record.id.clone()).collect();
+        if ids.is_empty() {
+            return Vec::new();
+        }
         let start = self.rng.index(ids.len());
         let mut out = vec![ids[start].clone()];
         if ids.len() > 1 && self.rng.chance(1, 3) {
@@ -567,7 +596,12 @@ impl<S: Store> Model<S> {
         let expected_dead = spec.after.iter().find_map(|dep| {
             self.records
                 .get(dep)
-                .filter(|record| matches!(record.state, JobState::Failed | JobState::Cancelled))
+                .filter(|record| {
+                    matches!(
+                        record.state,
+                        JobState::Failed | JobState::Cancelled | JobState::Expired
+                    )
+                })
                 .map(|_| dep.clone())
         });
         self.note(format!(
@@ -632,6 +666,132 @@ impl<S: Store> Model<S> {
                 assert_eq!(err, StoreError::DeadDependency(dead));
             }
         }
+    }
+
+    fn op_draft(&mut self) {
+        if self.records.len() >= MAX_JOBS {
+            return;
+        }
+        let seq = self.seq;
+        self.seq = self.seq.saturating_add(1);
+        let mut spec = self.fresh_spec(seq);
+        spec.draft = true;
+        spec.origin = Some("model-intake".to_owned());
+        spec.origin_ref = Some(format!("delivery-{seq}"));
+        spec.untrusted_context = true;
+        spec.context = Some(format!("external note {seq}"));
+        let (record, created) = self
+            .store
+            .create_job(&spec, self.now)
+            .expect("create draft");
+        assert!(created);
+        assert_eq!(record.state, JobState::Draft);
+        assert_eq!(record.spec, spec);
+        assert!(record.waiting_on.is_empty());
+        assert_eq!(record.node, None);
+        assert_eq!(record.finished_at, None);
+        assert_eq!(record.attempt, 1);
+        self.artifacts.insert(record.id.clone(), BTreeSet::new());
+        self.submit_order
+            .insert(record.id.clone(), self.next_submit);
+        self.next_submit = self.next_submit.saturating_add(1);
+        self.node_retries.insert(record.id.clone(), 0);
+        self.dirty.insert(record.id.clone());
+        self.records.insert(record.id.clone(), record);
+    }
+
+    fn op_draft_decision(&mut self) {
+        let drafts: Vec<JobId> = self
+            .records
+            .iter()
+            .filter(|(_, record)| record.state == JobState::Draft)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let Some(id) = drafts.get(self.rng.index(drafts.len())).cloned() else {
+            return;
+        };
+        if self.rng.chance(1, 2) {
+            let got = self
+                .store
+                .approve_draft(&id, JobState::Queued, self.now)
+                .expect("approve draft");
+            assert_eq!(got.state, JobState::Queued);
+            assert!(got.waiting_on.is_empty());
+            self.records.insert(id, got);
+        } else {
+            let n = self
+                .store
+                .expire_drafts(self.now.wall_unix + 1, self.now)
+                .unwrap();
+            assert!(n >= 1);
+            for draft in drafts {
+                let got = self
+                    .store
+                    .get_job(&draft)
+                    .expect("expired draft is readable");
+                assert_eq!(got.state, JobState::Expired);
+                assert!(got.finished_at.is_some());
+                self.records.insert(draft, got);
+            }
+        }
+    }
+
+    fn op_spawn(&mut self) {
+        if self.records.len() >= MAX_JOBS {
+            return;
+        }
+        let candidates: Vec<JobRecord> = self
+            .records
+            .values()
+            .filter(|record| record.spec.allow_spawn && record.depth < 2)
+            .cloned()
+            .collect();
+        let Some(parent) = candidates.get(self.rng.index(candidates.len())).cloned() else {
+            return;
+        };
+        let seq = self.seq;
+        self.seq = self.seq.saturating_add(1);
+        let mut spec = self.fresh_spec(seq);
+        spec.repo = parent.spec.repo.clone();
+        spec.source.repo = parent.spec.repo.clone();
+        spec.idempotency_key = Some(format!("scope-{:016X}-{seq}", self.seed));
+        spec.allow_spawn = parent.spec.spawn_inherit;
+        spec.spawn_inherit = parent.spec.spawn_inherit;
+        let depth = parent.depth.saturating_add(1);
+        let root = parent
+            .root_job_id
+            .clone()
+            .unwrap_or_else(|| parent.id.clone());
+        self.note(format!(
+            "spawn parent={} depth={depth} root={root}",
+            parent.id
+        ));
+        let (record, created) = self
+            .store
+            .create_scoped_job(
+                &spec,
+                self.now,
+                &parent.id,
+                &root,
+                depth,
+                ScopeLimits {
+                    max_children: 64,
+                    max_descendants: 256,
+                },
+            )
+            .expect("scoped create");
+        assert!(created, "a fresh scoped key must create a child");
+        assert_eq!(record.parent_job_id.as_ref(), Some(&parent.id));
+        assert_eq!(record.root_job_id.as_ref(), Some(&root));
+        assert_eq!(record.depth, depth);
+        assert_eq!(record.spec, spec);
+        self.artifacts.insert(record.id.clone(), BTreeSet::new());
+        self.submit_order
+            .insert(record.id.clone(), self.next_submit);
+        self.next_submit = self.next_submit.saturating_add(1);
+        self.node_retries.insert(record.id.clone(), 0);
+        self.dirty.insert(record.id.clone());
+        self.records.insert(record.id.clone(), record);
     }
 
     fn op_heartbeat(&mut self) {
@@ -1444,6 +1604,28 @@ impl<S: Store> Model<S> {
                 "job {} depends on itself",
                 record.id
             );
+            let root = record
+                .root_job_id
+                .as_ref()
+                .unwrap_or_else(|| panic!("job {} has no root_job_id", record.id));
+            match &record.parent_job_id {
+                None => {
+                    assert_eq!(root, &record.id, "top-level job is its own root");
+                    assert_eq!(record.depth, 0, "top-level job has depth zero");
+                }
+                Some(parent) => {
+                    let parent_record = current
+                        .get(parent)
+                        .unwrap_or_else(|| panic!("job {} has missing parent {parent}", record.id));
+                    assert_eq!(parent_record.root_job_id.as_ref(), Some(root));
+                    assert_eq!(
+                        record.depth,
+                        parent_record.depth.saturating_add(1),
+                        "depth of {} must follow its parent",
+                        record.id
+                    );
+                }
+            }
             assert_eq!(
                 record.waiting_on.iter().cloned().collect::<BTreeSet<_>>(),
                 not_done,
@@ -1459,7 +1641,10 @@ impl<S: Store> Model<S> {
                     );
                     for dep in &not_done {
                         assert!(
-                            !matches!(current[dep].state, JobState::Failed | JobState::Cancelled),
+                            !matches!(
+                                current[dep].state,
+                                JobState::Failed | JobState::Cancelled | JobState::Expired
+                            ),
                             "blocked job {} waits on terminal dependency {dep}",
                             record.id
                         );
@@ -1497,7 +1682,7 @@ impl<S: Store> Model<S> {
                         }
                     }
                 }
-                JobState::Done | JobState::Failed | JobState::Cancelled => {
+                JobState::Done | JobState::Failed | JobState::Cancelled | JobState::Expired => {
                     assert!(
                         record.finished_at.is_some(),
                         "terminal job {} has no finished_at",
@@ -1508,6 +1693,10 @@ impl<S: Store> Model<S> {
                         "terminal job {} still has a lease",
                         record.id
                     );
+                }
+                JobState::Draft => {
+                    assert_eq!(record.finished_at, None);
+                    assert_eq!(record.node, None);
                 }
                 JobState::NeedsInput => panic!("needs_input is not reachable"),
             }

@@ -11,8 +11,9 @@ use crate::ids::{is_name_byte, JobId, NodeName};
 use crate::label::{valid_label, LABEL_SOURCE_PROBED};
 use crate::limits::{
     MAX_LABEL_BYTES, MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_NODE_LABELS, MAX_PROVIDERS,
-    MAX_REIKI_BYTES, MAX_STATS_BYTES, MAX_TAINTS, MAX_VERSION_BYTES,
+    MAX_REIKI_BYTES, MAX_STATS_BYTES, MAX_TAINTS, MAX_VERSION_BYTES, MAX_WORKSPACES,
 };
+use crate::view::WorkspaceView;
 
 /// Why a string was not a recognised harness state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +117,38 @@ impl FromStr for ProviderState {
     }
 }
 
+/// What the agent is doing with one job's workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceState {
+    /// The harness is still using the tree.
+    Running,
+    /// Waiting for the controller to confirm the artifacts are stored and dependants are done.
+    Waiting,
+    /// Kept until its TTL expires or an eviction reclaims it.
+    Kept,
+    /// A deletion is queued or being retried.
+    Deleting,
+}
+
+impl WorkspaceState {
+    /// The wire spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Kept => "kept",
+            Self::Deleting => "deleting",
+        }
+    }
+}
+
+impl fmt::Display for WorkspaceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One provider and its state, as reported by the peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -190,6 +223,24 @@ pub struct NodeStats {
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub label_sources: BTreeMap<String, String>,
+    /// Bytes in workspaces currently on disk.
+    #[serde(default)]
+    pub workspace_bytes: u64,
+    /// Workspaces currently on disk.
+    #[serde(default)]
+    pub workspace_count: u64,
+    /// Bytes reclaimed by workspace deletion since the agent started.
+    #[serde(default)]
+    pub workspace_reclaimed_bytes_total: u64,
+    /// Workspaces removed by high-water or size-cap eviction.
+    #[serde(default)]
+    pub workspace_evictions_total: u64,
+    /// Failed deletion attempts; failures are retried and never silently ignored.
+    #[serde(default)]
+    pub workspace_delete_errors_total: u64,
+    /// Kept and pending workspaces, oldest first, as last reported by the agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<WorkspaceView>,
 }
 
 /// A periodic message from an agent. `reiki` is the opaque health document, forwarded unchanged.
@@ -218,6 +269,24 @@ pub struct Heartbeat {
     /// Taints a job must tolerate before it may run here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub taints: Vec<String>,
+    /// Bytes in workspaces currently on disk.
+    #[serde(default)]
+    pub workspace_bytes: u64,
+    /// Workspaces currently on disk.
+    #[serde(default)]
+    pub workspace_count: u64,
+    /// Bytes reclaimed by workspace deletion since the agent started.
+    #[serde(default)]
+    pub workspace_reclaimed_bytes_total: u64,
+    /// Workspaces removed by high-water or size-cap eviction.
+    #[serde(default)]
+    pub workspace_evictions_total: u64,
+    /// Failed deletion attempts; failures are retried and never silently ignored.
+    #[serde(default)]
+    pub workspace_delete_errors_total: u64,
+    /// Workspaces the agent is tracking, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<WorkspaceView>,
 }
 
 #[derive(Deserialize)]
@@ -246,6 +315,18 @@ struct RawHeartbeat {
     /// Taints a job must tolerate before it may run here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub taints: Vec<String>,
+    #[serde(default)]
+    pub workspace_bytes: u64,
+    #[serde(default)]
+    pub workspace_count: u64,
+    #[serde(default)]
+    pub workspace_reclaimed_bytes_total: u64,
+    #[serde(default)]
+    pub workspace_evictions_total: u64,
+    #[serde(default)]
+    pub workspace_delete_errors_total: u64,
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceView>,
 }
 
 impl TryFrom<RawHeartbeat> for Heartbeat {
@@ -263,6 +344,12 @@ impl TryFrom<RawHeartbeat> for Heartbeat {
             labels: raw.labels,
             label_sources: raw.label_sources,
             taints: raw.taints,
+            workspace_bytes: raw.workspace_bytes,
+            workspace_count: raw.workspace_count,
+            workspace_reclaimed_bytes_total: raw.workspace_reclaimed_bytes_total,
+            workspace_evictions_total: raw.workspace_evictions_total,
+            workspace_delete_errors_total: raw.workspace_delete_errors_total,
+            workspaces: raw.workspaces,
         };
         hb.trim_stats();
         hb.validate()?;
@@ -308,6 +395,13 @@ impl Heartbeat {
             jobs: self.jobs.clone(),
             labels: Vec::new(),
             label_sources: BTreeMap::new(),
+            // The workspace counters are a handful of numbers; the listing is bounded separately.
+            workspace_bytes: self.workspace_bytes,
+            workspace_count: self.workspace_count,
+            workspace_reclaimed_bytes_total: self.workspace_reclaimed_bytes_total,
+            workspace_evictions_total: self.workspace_evictions_total,
+            workspace_delete_errors_total: self.workspace_delete_errors_total,
+            workspaces: Vec::new(),
         };
         serde_json::to_vec(&stats)
             .map(|bytes| bytes.len())
@@ -407,6 +501,19 @@ impl Heartbeat {
                 });
             }
         }
+        if self.workspaces.len() > MAX_WORKSPACES {
+            return Err(HeartbeatError::TooManyWorkspaces {
+                got: self.workspaces.len(),
+            });
+        }
+        for (index, workspace) in self.workspaces.iter().enumerate() {
+            if JobId::parse(&workspace.job_key).is_err() {
+                return Err(HeartbeatError::WorkspaceJobKey {
+                    index,
+                    key: workspace.job_key.clone(),
+                });
+            }
+        }
         if let Some(reiki) = &self.reiki {
             let size = serde_json::to_vec(reiki)
                 .map_err(|_| HeartbeatError::ReikiNotSerializable)?
@@ -435,6 +542,8 @@ pub enum HeartbeatError {
     LabelSource { label: String, source: String },
     TooManyTaints { got: usize },
     Taint { value: String },
+    TooManyWorkspaces { got: usize },
+    WorkspaceJobKey { index: usize, key: String },
     ReikiTooLarge { got: usize },
     ReikiNotSerializable,
 }
@@ -494,6 +603,14 @@ impl std::fmt::Display for HeartbeatError {
                 f,
                 "invalid node taint {value:?}; it must be 1 to {MAX_LABEL_BYTES} characters from A-Z a-z 0-9 . _ - / with at most one '='"
             ),
+            Self::TooManyWorkspaces { got } => write!(
+                f,
+                "a heartbeat may list at most {MAX_WORKSPACES} workspaces (got {got})"
+            ),
+            Self::WorkspaceJobKey { index, key } => write!(
+                f,
+                "workspace #{index} has an invalid job key {key:?}"
+            ),
             Self::ReikiTooLarge { got } => write!(
                 f,
                 "the forwarded reiki document is larger than {MAX_REIKI_BYTES} bytes (got {got})"
@@ -534,6 +651,12 @@ mod tests {
             labels: Vec::new(),
             label_sources: BTreeMap::new(),
             taints: Vec::new(),
+            workspace_bytes: 0,
+            workspace_count: 0,
+            workspace_reclaimed_bytes_total: 0,
+            workspace_evictions_total: 0,
+            workspace_delete_errors_total: 0,
+            workspaces: Vec::new(),
         }
     }
 
@@ -920,6 +1043,12 @@ mod tests {
             jobs: parsed.jobs,
             labels: Vec::new(),
             label_sources: BTreeMap::new(),
+            workspace_bytes: 0,
+            workspace_count: 0,
+            workspace_reclaimed_bytes_total: 0,
+            workspace_evictions_total: 0,
+            workspace_delete_errors_total: 0,
+            workspaces: Vec::new(),
         };
         assert!(serde_json::to_vec(&stats).unwrap().len() <= MAX_STATS_BYTES);
     }

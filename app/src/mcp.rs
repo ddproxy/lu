@@ -208,6 +208,7 @@ mod tests {
     use super::*;
     use crate::mock::{job_id, job_json, start, Reply, TestServer, TOKEN};
     use serde_json::{json, Value};
+    use std::fs;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     async fn exchange(script: &str, host: &Host) -> Vec<Value> {
@@ -394,7 +395,7 @@ mod tests {
         assert!(replies[0]["result"]["serverInfo"]["version"].is_string());
         assert!(replies[0]["result"]["instructions"].is_string());
         assert_eq!(replies[1]["result"], json!({}));
-        assert_eq!(replies[2]["result"]["tools"].as_array().unwrap().len(), 15);
+        assert_eq!(replies[2]["result"]["tools"].as_array().unwrap().len(), 17);
         assert_eq!(replies[3]["result"]["protocolVersion"], "2025-06-18");
         for (reply, id) in replies.iter().zip([json!(1), json!(2), json!(3), json!(4)]) {
             assert_eq!(reply["id"], id);
@@ -464,7 +465,7 @@ mod tests {
         let lines = vec![request("tools/list", json!({}), json!(1))];
         let replies = exchange(&script(&initialize_then(&lines)), &host).await;
         let tools = replies[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 17);
         let mut names = Vec::new();
         for tool in tools {
             let name = tool["name"].as_str().unwrap();
@@ -474,6 +475,7 @@ mod tests {
                 name,
                 "lu_status"
                     | "lu_jobs"
+                    | "lu_drafts"
                     | "lu_job"
                     | "lu_logs"
                     | "lu_nodes"
@@ -508,6 +510,7 @@ mod tests {
             vec![
                 "lu_status",
                 "lu_jobs",
+                "lu_drafts",
                 "lu_job",
                 "lu_logs",
                 "lu_nodes",
@@ -515,6 +518,7 @@ mod tests {
                 "lu_graph",
                 "lu_submit",
                 "lu_submit_many",
+                "lu_submit_batch",
                 "lu_result",
                 "lu_cancel",
                 "lu_retry",
@@ -540,6 +544,20 @@ mod tests {
             jobs["items"]["required"],
             json!(["name", "repo", "ref", "task"])
         );
+        let batch = tools
+            .iter()
+            .find(|tool| tool["name"] == "lu_submit_batch")
+            .unwrap();
+        let batch_schema = &batch["inputSchema"];
+        assert_eq!(batch_schema["required"], json!(["path", "key_prefix"]));
+        let batch_props = batch_schema["properties"].as_object().unwrap();
+        assert_eq!(batch_props["path"]["type"], "string");
+        assert_eq!(batch_props["key_prefix"]["type"], "string");
+        assert_eq!(batch_props["defaults"]["type"], "string");
+        assert_eq!(batch_props["chain"]["type"], "boolean");
+        assert_eq!(batch_props["dry_run"]["type"], "boolean");
+        assert_eq!(batch_props["max_parallel"]["minimum"], 1);
+        assert_eq!(batch_props["max_parallel"]["maximum"], 64);
         for tool in tools {
             let name = tool["name"].as_str().unwrap();
             if !matches!(name, "lu_submit" | "lu_submit_many" | "lu_retry") {
@@ -955,6 +973,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_batch_dry_run_needs_no_controller() {
+        let dir = tempfile::tempdir().unwrap();
+        let checklist = dir.path().join("tasks.md");
+        let defaults = dir.path().join("defaults.toml");
+        fs::write(
+            &checklist,
+            "# Work\n- [ ] First task\n- [ ] Second task\n  - [ ] nested detail\n",
+        )
+        .unwrap();
+        fs::write(&defaults, "repo = \"/srv/repo\"\nref = \"main\"\n").unwrap();
+        let host = Host::failed("controller is unavailable");
+        let (text, structured, failed) = tool_result(
+            &call_tool(
+                &host,
+                "lu_submit_batch",
+                json!({
+                    "path": checklist.to_string_lossy(),
+                    "key_prefix": "plan",
+                    "defaults": defaults.to_string_lossy(),
+                    "chain": true,
+                    "dry_run": true
+                }),
+            )
+            .await,
+        );
+        assert!(!failed, "{text}");
+        assert_eq!(structured["dry_run"], true);
+        assert_eq!(structured["chain"], true);
+        assert_eq!(structured["max_parallel"], Value::Null);
+        let jobs = structured["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["key"], "plan-first-task");
+        assert_eq!(jobs[0]["after"], json!([]));
+        assert_eq!(jobs[1]["key"], "plan-second-task");
+        assert_eq!(jobs[1]["after"], json!(["plan-first-task"]));
+        assert!(jobs[1]["source"]
+            .as_str()
+            .unwrap()
+            .starts_with(checklist.to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn submit_batch_rejects_all_errors_before_any_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let checklist = dir.path().join("tasks.md");
+        fs::write(&checklist, "- [ ] Same\n- [ ] Same\n").unwrap();
+        let server = start(|_| Reply::json(&job_json(&job_id(), "queued"))).await;
+        let client = Client::new(&server.url, TOKEN, None).unwrap();
+        let host = Host::connected(client);
+        let (text, _, failed) = tool_result(
+            &call_tool(
+                &host,
+                "lu_submit_batch",
+                json!({
+                    "path": checklist.to_string_lossy(),
+                    "key_prefix": "dup",
+                    "repo": "/srv/repo",
+                    "ref": "main"
+                }),
+            )
+            .await,
+        );
+        assert!(failed);
+        assert!(text.contains("duplicate job key"), "{text}");
+        assert_eq!(posts(&server), 0);
+    }
+
+    #[tokio::test]
+    async fn submit_batch_chains_and_caps_one_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let checklist = dir.path().join("tasks.md");
+        let defaults = dir.path().join("defaults.toml");
+        fs::write(&checklist, "- [ ] Alpha\n- [ ] Beta\n").unwrap();
+        fs::write(&defaults, "repo = \"/srv/repo\"\nref = \"main\"\n").unwrap();
+        let server = start(
+            |record| match (record.method.as_str(), record.path.as_str()) {
+                ("PUT", path) if path.ends_with("/limit") => {
+                    Reply::json(&json!({"group": "run", "max_running": 2}))
+                }
+                ("POST", "/v1/jobs") => {
+                    let spec: Value = serde_json::from_slice(&record.body).unwrap();
+                    Reply::json(&submitted_job(&spec, "queued"))
+                }
+                _ => Reply::status(404),
+            },
+        )
+        .await;
+        let client = Client::new(&server.url, TOKEN, None).unwrap();
+        let host = Host::connected(client);
+        let (text, structured, failed) = tool_result(
+            &call_tool(
+                &host,
+                "lu_submit_batch",
+                json!({
+                    "path": checklist.to_string_lossy(),
+                    "key_prefix": "run",
+                    "defaults": defaults.to_string_lossy(),
+                    "chain": true,
+                    "max_parallel": 2
+                }),
+            )
+            .await,
+        );
+        assert!(!failed, "{text}");
+        assert_eq!(structured["submitted_count"], 2);
+        let jobs = structured["jobs"].as_array().unwrap();
+        assert_eq!(jobs[0]["key"], "run-alpha");
+        assert_eq!(jobs[1]["key"], "run-beta");
+        let bodies = post_bodies(&server);
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["idempotency_key"], "run-alpha");
+        assert_eq!(bodies[1]["idempotency_key"], "run-beta");
+        assert!(bodies[0]["after"].is_null());
+        assert_eq!(bodies[1]["after"], json!([jobs[0]["id"]]));
+        for body in &bodies {
+            assert_eq!(body["group"], "run");
+        }
+        let puts = server
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.method == "PUT")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].path, "/v1/groups/run/limit");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&puts[0].body).unwrap(),
+            json!({"max_running": 2})
+        );
+    }
+
+    #[tokio::test]
     async fn submit_maps_all_new_fields_to_the_wire() {
         let dependency = job_id();
         let dep_job = job_json(&dependency, "done");
@@ -1116,7 +1268,7 @@ mod tests {
         let dependency = job_id();
         let mut source = job_json(&done, "done");
         source["spec"] = json!({
-            "repo": "/srv/repo", "git_ref": "main", "task": "go",
+            "source": {"repo": "/srv/repo", "ref": "main"}, "task": "go",
             "provider": "primary", "harness": "opencode",
             "requires": ["gpu"], "fallbacks": [{"provider": "copilot"}],
             "collect": "files", "include_failed": false,

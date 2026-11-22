@@ -1,18 +1,20 @@
 //! Tool table for `lu mcp`. No transport code lives here.
 
 use std::collections::{HashSet, VecDeque};
+use std::path::Path;
 
 use lu_client::{ApiError, Client, JobView, ListNodes, NodeStats, NodeView};
 use lu_proto::{
     truncate_chars, ArtifactName, Choice, CollectMode, ExpectMode, ExpectSpec, HarnessState, JobId,
     JobSpec, JobState, NodeName, OnConflict, StuckPolicy, DEFAULT_PRIORITY, DEFAULT_TIMEOUT_SECS,
-    MAX_AFTER_JOBS, MAX_DIFF_BYTES, MAX_EXPECT_ITEMS, MAX_FALLBACKS, MAX_IDLE_TIMEOUT_SECS,
-    MAX_PRIORITY, MAX_REQUIRES_LABELS, MAX_STUCK_AFTER_SECS, MAX_TIMEOUT_SECS, MIN_PRIORITY,
-    MIN_STUCK_AFTER_SECS, MIN_TIMEOUT_SECS,
+    MAX_AFTER_JOBS, MAX_DIFF_BYTES, MAX_EXPECT_ITEMS, MAX_FALLBACKS, MAX_GROUP_RUNNING,
+    MAX_IDLE_TIMEOUT_SECS, MAX_PRIORITY, MAX_REQUIRES_LABELS, MAX_STUCK_AFTER_SECS,
+    MAX_TIMEOUT_SECS, MIN_PRIORITY, MIN_STUCK_AFTER_SECS, MIN_TIMEOUT_SECS,
 };
 use lu_tui::graph::{self, Graph};
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
+
+use crate::batch::{self, SubmissionEntry};
 
 use super::format::{
     cap_chars, cap_result, cap_result_with, clean, first_line, one_line, strip_ansi, unix_now,
@@ -436,6 +438,18 @@ const TOOLS: &[ToolDef] = &[
         destructive: false,
     },
     ToolDef {
+        name: "lu_drafts",
+        description: "Compact list of stored drafts, oldest first (operator only).",
+        fields: &[bounded(
+            optional("limit", "integer", "Maximum drafts, at most 100"),
+            1,
+            100,
+            20,
+        )],
+        read_only: true,
+        destructive: false,
+    },
+    ToolDef {
         name: "lu_job",
         description: "Full detail for one job, including its spec and artifacts.",
         fields: &[ID_FIELD],
@@ -530,6 +544,47 @@ const TOOLS: &[ToolDef] = &[
             1,
             SUBMIT_MANY_LIMIT as i64,
         )],
+        read_only: false,
+        destructive: false,
+    },
+    ToolDef {
+        name: "lu_submit_batch",
+        description:
+            "Submit a task directory or Markdown checklist as idempotent jobs, or dry run its plan.",
+        fields: &[
+            required(
+                "path",
+                "string",
+                "Task directory or Markdown checklist on the controller host",
+            ),
+            required(
+                "key_prefix",
+                "string",
+                "Idempotency key prefix; every job key is <prefix>-<slug>",
+            ),
+            optional("repo", "string", "Repository URL or absolute local path"),
+            optional("ref", "string", "Git ref to check out"),
+            optional(
+                "defaults",
+                "string",
+                "TOML defaults file supplying repo, ref and shared job fields",
+            ),
+            optional("chain", "boolean", "Chain each job after the previous one"),
+            limited(
+                optional(
+                    "max_parallel",
+                    "integer",
+                    "Cap the batch's concurrency group at this many running jobs",
+                ),
+                1,
+                MAX_GROUP_RUNNING as i64,
+            ),
+            optional(
+                "dry_run",
+                "boolean",
+                "Return the plan without submitting anything",
+            ),
+        ],
         read_only: false,
         destructive: false,
     },
@@ -826,6 +881,7 @@ pub async fn call(host: &Host, name: &str, args: &Value) -> Result<ToolOutput, T
     let output = match name {
         "lu_status" => status(host).await?,
         "lu_jobs" => jobs(host, &args).await?,
+        "lu_drafts" => drafts(host, &args).await?,
         "lu_job" => job(host, &args).await?,
         "lu_logs" => logs(host, &args).await?,
         "lu_nodes" => nodes(host).await?,
@@ -833,6 +889,7 @@ pub async fn call(host: &Host, name: &str, args: &Value) -> Result<ToolOutput, T
         "lu_graph" => graph(host).await?,
         "lu_submit" => submit(host, &args).await?,
         "lu_submit_many" => submit_many(host, &args).await?,
+        "lu_submit_batch" => submit_batch(host, &args).await?,
         "lu_cancel" => cancel(host, &args).await?,
         "lu_retry" => retry(host, &args).await?,
         "lu_drain" => drain(host, &args, true).await?,
@@ -1037,6 +1094,11 @@ fn validate_spec(spec: &JobSpec) -> Result<(), ToolError> {
 
 fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
     let spec = JobSpec {
+        source: lu_proto::SourceSpec {
+            repo: args["repo"].as_str().unwrap_or_default().to_owned(),
+            git_ref: args["ref"].as_str().unwrap_or_default().to_owned(),
+            base: None,
+        },
         repo: args["repo"].as_str().unwrap_or_default().to_owned(),
         git_ref: args["ref"].as_str().unwrap_or_default().to_owned(),
         base_commit: None,
@@ -1046,6 +1108,17 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
         model: optional_string(args, "model"),
         priority: spec_priority(args),
         group: optional_string(args, "group"),
+        allow_spawn: false,
+        spawn_inherit: false,
+        spawn_repos: Vec::new(),
+        workspace: None,
+        cache_dirs: Vec::new(),
+        context: None,
+        origin: None,
+        origin_ref: None,
+        untrusted_context: false,
+        draft: false,
+        publish: None,
         timeout_secs: spec_timeout(args).unwrap_or(DEFAULT_TIMEOUT_SECS),
         idle_timeout_secs: spec_idle_timeout(args),
         on_stuck: spec_stuck_policy(args)?,
@@ -1066,17 +1139,6 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
     };
     validate_spec(&spec)?;
     Ok(spec)
-}
-
-fn derived_key(spec: &JobSpec) -> String {
-    let mut plain = spec.clone();
-    plain.idempotency_key = None;
-    let digest = Sha256::digest(plain.canonical_json().as_bytes());
-    let mut key = String::from("mcp-");
-    for byte in &digest[..8] {
-        key.push_str(&format!("{byte:02x}"));
-    }
-    key
 }
 
 fn graph_position(view: &JobView) -> String {
@@ -1185,7 +1247,7 @@ async fn submit(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     let after = resolve_after(client, &ids, &keys).await?;
     let mut spec = build_spec(args, after)?;
     if spec.idempotency_key.is_none() {
-        spec.idempotency_key = Some(derived_key(&spec));
+        spec.idempotency_key = Some(batch::derived_key(&spec));
     }
     reserve(host, 1)?;
     let view = client.submit(&spec).await.map_err(failure)?;
@@ -1267,6 +1329,49 @@ fn preflight(entries: &[BatchEntry]) -> Result<(), ToolError> {
     Ok(())
 }
 
+fn batch_failure(failure: batch::SubmitFailure) -> ToolError {
+    if failure.preflight {
+        return ToolError::Failed(failure.reason);
+    }
+    let total = failure.submitted.len() + failure.not_submitted.len();
+    let text = format!(
+        "submitted {} of {total} jobs; not submitted: {}; error: {}",
+        failure.submitted.len(),
+        if failure.not_submitted.is_empty() {
+            "-".to_owned()
+        } else {
+            failure.not_submitted.join(", ")
+        },
+        failure.reason
+    );
+    let submitted = failure
+        .submitted
+        .iter()
+        .map(|outcome| submitted_record(&outcome.label, &outcome.view))
+        .collect::<Vec<_>>();
+    ToolError::Detailed {
+        text,
+        structured: json!({
+            "error": failure.reason,
+            "submitted": submitted,
+            "not_submitted": failure.not_submitted,
+            "submitted_count": failure.submitted.len(),
+            "not_submitted_count": failure.not_submitted.len()
+        }),
+    }
+}
+
+fn submitted_record(name: &str, view: &JobView) -> Value {
+    let output = submit_output(view);
+    json!({
+        "name": clean(name),
+        "id": clean(view.id.as_str()),
+        "state": crate::operator::state_name(view.state),
+        "after": view.after.iter().map(|id| clean(id.as_str())).collect::<Vec<_>>(),
+        "graph": output.structured["graph"]
+    })
+}
+
 async fn submit_many(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     let jobs = args["jobs"]
         .as_array()
@@ -1274,91 +1379,50 @@ async fn submit_many(host: &Host, args: &Value) -> Result<ToolOutput, ToolError>
     let mut entries = Vec::with_capacity(jobs.len());
     for entry in jobs {
         let name = entry["name"].as_str().unwrap_or_default().to_owned();
-        let after_names = field_strings(entry, "after_names");
-        let after_keys = field_strings(entry, "after_keys");
         let spec = build_spec(entry, Vec::new())?;
         entries.push(BatchEntry {
             name,
-            after_names,
-            after_keys,
+            after_names: field_strings(entry, "after_names"),
+            after_keys: field_strings(entry, "after_keys"),
             spec,
         });
     }
     preflight(&entries)?;
     let client = connected(host)?;
-    for entry in &mut entries {
-        entry.spec.after = resolve_after(client, &entry.spec.after, &entry.after_keys).await?;
-    }
-    reserve(host, entries.len())?;
-    let mut ids_by_name: std::collections::HashMap<String, JobId> =
-        std::collections::HashMap::new();
-    let mut submitted = Vec::new();
-    let mut lines = Vec::new();
-    for (at, entry) in entries.iter().enumerate() {
-        let mut after = Vec::new();
-        for name in &entry.after_names {
-            let id = ids_by_name
-                .get(name.as_str())
-                .expect("preflight resolved every after_names entry")
-                .clone();
-            if !after.contains(&id) {
-                after.push(id);
-            }
-        }
-        let mut spec = entry.spec.clone();
-        for id in after {
-            if !spec.after.contains(&id) {
-                spec.after.push(id);
-            }
-        }
-        if spec.idempotency_key.is_none() {
-            spec.idempotency_key = Some(derived_key(&spec));
-        }
-        validate_spec(&spec)?;
-        match client.submit(&spec).await {
-            Ok(view) => {
-                ids_by_name.insert(entry.name.clone(), view.id.clone());
-                let output = submit_output(&view);
-                lines.push(format!(
-                    "submitted name={} id={} state={} graph={}",
-                    clean(&entry.name),
-                    clean(view.id.as_str()),
-                    crate::operator::state_name(view.state),
-                    output.structured["graph"].as_str().unwrap_or_default()
-                ));
-                submitted.push(json!({
-                    "name": clean(&entry.name),
-                    "id": clean(view.id.as_str()),
-                    "state": crate::operator::state_name(view.state),
-                    "after": view.after.iter().map(|id| clean(id.as_str())).collect::<Vec<_>>(),
-                    "graph": output.structured["graph"]
-                }));
-            }
-            Err(error) => {
-                let reason = one_line(&error.to_string());
-                let not_submitted = entries[at..]
-                    .iter()
-                    .map(|entry| clean(&entry.name))
-                    .collect::<Vec<_>>();
-                let text = format!(
-                    "submitted {} of {} jobs; not submitted: {}; error: {reason}",
-                    submitted.len(),
-                    entries.len(),
-                    not_submitted.join(", ")
-                );
-                return Err(ToolError::Detailed {
-                    text,
-                    structured: json!({
-                        "error": reason,
-                        "submitted": submitted,
-                        "not_submitted": not_submitted,
-                        "submitted_count": submitted.len(),
-                        "not_submitted_count": not_submitted.len()
-                    }),
-                });
-            }
-        }
-    }
+    let shared = entries
+        .into_iter()
+        .map(|entry| SubmissionEntry {
+            label: entry.name,
+            after_names: entry.after_names,
+            after_keys: entry.after_keys,
+            spec: entry.spec,
+        })
+        .collect();
+    let ready = batch::resolve_entries(client, shared)
+        .await
+        .map_err(batch_failure)?;
+    reserve(host, ready.len())?;
+    let prepared = batch::PreparedBatch::new(ready);
+    let outcomes = batch::submit_prepared(client, &prepared)
+        .await
+        .map_err(batch_failure)?;
+    let lines = outcomes
+        .iter()
+        .map(|outcome| {
+            let record = submitted_record(&outcome.label, &outcome.view);
+            format!(
+                "submitted name={} id={} state={} graph={}",
+                record["name"].as_str().unwrap_or_default(),
+                record["id"].as_str().unwrap_or_default(),
+                record["state"].as_str().unwrap_or_default(),
+                record["graph"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>();
+    let submitted = outcomes
+        .iter()
+        .map(|outcome| submitted_record(&outcome.label, &outcome.view))
+        .collect::<Vec<_>>();
     Ok(ToolOutput {
         text: lines.join("\n"),
         structured: json!({
@@ -1367,6 +1431,62 @@ async fn submit_many(host: &Host, args: &Value) -> Result<ToolOutput, ToolError>
             "not_submitted": Vec::<String>::new()
         }),
     })
+}
+
+async fn submit_batch(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
+    let path = args["path"].as_str().unwrap_or_default().to_owned();
+    let key_prefix = args["key_prefix"].as_str().unwrap_or_default().to_owned();
+    let defaults = optional_string(args, "defaults");
+    let options = batch::BatchOptions {
+        path: Path::new(&path),
+        key_prefix: &key_prefix,
+        defaults: defaults.as_deref().map(Path::new),
+        repo: args.get("repo").and_then(Value::as_str),
+        git_ref: args.get("ref").and_then(Value::as_str),
+        chain: args.get("chain").and_then(Value::as_bool).unwrap_or(false),
+        max_parallel: args
+            .get("max_parallel")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+    };
+    let plan = batch::plan(&options).map_err(|errors| ToolError::Failed(errors.join("; ")))?;
+    if plan.is_empty() {
+        return Err(ToolError::Failed("batch produced no jobs".to_owned()));
+    }
+    if args
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(ToolOutput {
+            text: format!("dry run: {} job(s)", plan.len()),
+            structured: batch::plan_structured(&plan),
+        });
+    }
+    let client = connected(host)?;
+    let prepared = batch::prepare(client, &plan).await.map_err(batch_failure)?;
+    reserve(host, plan.len())?;
+    match batch::submit_prepared(client, &prepared).await {
+        Ok(outcomes) => {
+            let lines = outcomes
+                .iter()
+                .map(|outcome| {
+                    format!(
+                        "key={} name={} id={} state={}",
+                        clean(&outcome.key),
+                        clean(&outcome.label),
+                        clean(outcome.view.id.as_str()),
+                        crate::operator::state_name(outcome.view.state)
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok(ToolOutput {
+                text: lines.join("\n"),
+                structured: batch::outcomes_structured(&outcomes, &[]),
+            })
+        }
+        Err(failure) => Err(batch_failure(failure)),
+    }
 }
 
 fn diff_stats(diff: &str) -> (usize, usize, usize) {
@@ -1662,13 +1782,15 @@ async fn status(host: &Host) -> Result<ToolOutput, ToolError> {
         .collect::<Vec<_>>()
         .join(" ");
     let text = format!(
-        "version {} uptime_secs={} schema_version={} db_bytes={} recovered_on_boot={} jobs=[{queue}] oldest_queued_secs={} nodes={} nodes_online={} lease_secs={}",
+        "version {} uptime_secs={} schema_version={} db_bytes={} recovered_on_boot={} jobs=[{queue}] oldest_queued_secs={} drafts={} oldest_draft_secs={} nodes={} nodes_online={} lease_secs={}",
         clean(&status.version),
         status.uptime_secs,
         status.schema_version,
         status.db_bytes,
         status.recovered_on_boot,
         status.oldest_queued_secs,
+        status.drafts,
+        status.oldest_draft_secs,
         status.nodes,
         status.nodes_online,
         status.lease_secs
@@ -1683,6 +1805,8 @@ async fn status(host: &Host) -> Result<ToolOutput, ToolError> {
             "recovered_on_boot": status.recovered_on_boot,
             "jobs": jobs,
             "oldest_queued_secs": status.oldest_queued_secs,
+            "drafts": status.drafts,
+            "oldest_draft_secs": status.oldest_draft_secs,
             "nodes": status.nodes,
             "nodes_online": status.nodes_online,
             "lease_secs": status.lease_secs
@@ -1737,6 +1861,37 @@ async fn jobs(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
     Ok(ToolOutput {
         text: lines.join("\n"),
         structured: json!({"jobs": rows, "next": page.next.as_ref().map(|next| clean(next))}),
+    })
+}
+
+async fn drafts(host: &Host, args: &Value) -> Result<ToolOutput, ToolError> {
+    let limit = args["limit"].as_i64().unwrap_or(20) as u32;
+    let page = connected(host)?
+        .drafts(Some(limit))
+        .await
+        .map_err(failure)?;
+    let now = unix_now();
+    let mut rows = Vec::new();
+    let mut lines = Vec::new();
+    for view in &page.jobs {
+        let row = json!({
+            "id": clean(view.id.as_str()),
+            "state": crate::operator::state_name(view.state),
+            "age_secs": now.saturating_sub(view.created_at),
+            "origin": view.spec.origin.as_deref().map(clean),
+            "origin_ref": view.spec.origin_ref.as_deref().map(clean),
+            "untrusted_context": view.spec.untrusted_context,
+            "title": clean(&crate::operator::job_title(&view.spec.task)),
+        });
+        lines.push(format!(
+            "{} {} age={}s origin={} title={}",
+            row["id"], row["state"], row["age_secs"], row["origin"], row["title"]
+        ));
+        rows.push(row);
+    }
+    Ok(ToolOutput {
+        text: lines.join("\n"),
+        structured: json!({"drafts": rows, "next": page.next.as_ref().map(|next| clean(next))}),
     })
 }
 

@@ -22,6 +22,8 @@ impl std::error::Error for ParseJobStateError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
+    /// Stored and visible, but never dispatched until an operator approves it.
+    Draft,
     /// Submitted, but at least one dependency is not finished.
     Blocked,
     Queued,
@@ -34,6 +36,8 @@ pub enum JobState {
     Done,
     Failed,
     Cancelled,
+    /// A draft that was never approved before its TTL elapsed.
+    Expired,
 }
 
 /// What cancelling a job in a given state does. One rule for every store.
@@ -51,6 +55,7 @@ impl JobState {
     /// The wire spelling documented in `docs/api.md`.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Draft => "draft",
             Self::Blocked => "blocked",
             Self::Queued => "queued",
             Self::Leased => "leased",
@@ -60,12 +65,14 @@ impl JobState {
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
         }
     }
 
     /// Parses the wire spelling documented in `docs/api.md`.
     pub fn parse(text: &str) -> Result<Self, ParseJobStateError> {
         Ok(match text {
+            "draft" => Self::Draft,
             "blocked" => Self::Blocked,
             "queued" => Self::Queued,
             "leased" => Self::Leased,
@@ -75,6 +82,7 @@ impl JobState {
             "done" => Self::Done,
             "failed" => Self::Failed,
             "cancelled" => Self::Cancelled,
+            "expired" => Self::Expired,
             _ => return Err(ParseJobStateError),
         })
     }
@@ -82,14 +90,15 @@ impl JobState {
     /// What a cancel does in this state.
     pub fn cancel_effect(self) -> CancelEffect {
         match self {
-            Self::Blocked | Self::Queued | Self::Recovering => CancelEffect::Now,
+            Self::Draft | Self::Blocked | Self::Queued | Self::Recovering => CancelEffect::Now,
             Self::Leased | Self::Running | Self::NeedsInput => CancelEffect::Request,
-            Self::Done | Self::Failed | Self::Cancelled => CancelEffect::Refuse,
+            Self::Done | Self::Failed | Self::Cancelled | Self::Expired => CancelEffect::Refuse,
         }
     }
 
     /// Every state, in declaration order.
-    pub const ALL: [JobState; 9] = [
+    pub const ALL: [JobState; 11] = [
+        Self::Draft,
         Self::Blocked,
         Self::Queued,
         Self::Leased,
@@ -99,11 +108,15 @@ impl JobState {
         Self::Done,
         Self::Failed,
         Self::Cancelled,
+        Self::Expired,
     ];
 
     /// A terminal state has no outgoing edges.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Done | Self::Failed | Self::Cancelled | Self::Expired
+        )
     }
 
     /// Whether the controller may move a job from `from` to `to`. The table test below lists
@@ -113,11 +126,16 @@ impl JobState {
     /// controller restart, resuming or finishing.
     pub fn can_transition(from: Self, to: Self) -> bool {
         use JobState::{
-            Blocked, Cancelled, Done, Failed, Leased, NeedsInput, Queued, Recovering, Running,
+            Blocked, Cancelled, Done, Draft, Expired, Failed, Leased, NeedsInput, Queued,
+            Recovering, Running,
         };
         matches!(
             (from, to),
-            (Blocked, Queued)
+            (Draft, Blocked)
+                | (Draft, Queued)
+                | (Draft, Cancelled)
+                | (Draft, Expired)
+                | (Blocked, Queued)
                 | (Blocked, Cancelled)
                 | (Blocked, Failed)
                 | (Queued, Leased)
@@ -167,6 +185,10 @@ mod tests {
     #[test]
     fn the_transition_table_is_exactly_the_allowed_edges() {
         let allowed = [
+            (Draft, Blocked),
+            (Draft, Queued),
+            (Draft, Cancelled),
+            (Draft, Expired),
             (Blocked, Queued),
             (Blocked, Cancelled),
             (Blocked, Failed),
@@ -220,7 +242,7 @@ mod tests {
         for state in JobState::ALL {
             assert_eq!(
                 state.is_terminal(),
-                matches!(state, Done | Failed | Cancelled),
+                matches!(state, Done | Failed | Cancelled | Expired),
                 "{state:?}"
             );
         }
@@ -256,9 +278,10 @@ mod tests {
 
     #[test]
     fn job_state_strings_match_docs_api_md() {
-        // docs/api.md, "JobView": one of `blocked`, `queued`, `leased`, `running`, `recovering`,
-        // `needs_input`, `done`, `failed`, `cancelled`.
+        // docs/api.md, "JobView": one of `draft`, `blocked`, `queued`, `leased`, `running`,
+        // `recovering`, `needs_input`, `done`, `failed`, `cancelled`, `expired`.
         let documented = [
+            "draft",
             "blocked",
             "queued",
             "leased",
@@ -268,6 +291,7 @@ mod tests {
             "done",
             "failed",
             "cancelled",
+            "expired",
         ];
         let actual: Vec<&str> = JobState::ALL.iter().map(|state| state.as_str()).collect();
         assert_eq!(actual, documented);

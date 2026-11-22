@@ -49,12 +49,17 @@ jobs:
           rustup toolchain install 1.99 --profile minimal -t x86_64-unknown-linux-musl
           rustup default 1.99
       - name: Build
-        run: cargo build --release --locked -p lu --features tui --target x86_64-unknown-linux-musl
+        run: |
+          cargo build --release --locked -p lu --features tui --target x86_64-unknown-linux-musl
+          cargo build --release --locked -p tuishou-ting --target x86_64-unknown-linux-musl
         env:
           CFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
-      - name: Smoke-run the static binary
+      - name: Smoke-run the static binaries
         run: |
           bin=target/x86_64-unknown-linux-musl/release/lu
           "$bin" --version
           "$bin" check --config lu.toml
           file "$bin" | grep -Eq "statically linked|static-pie linked"
+          ting=target/x86_64-unknown-linux-musl/release/ting
+          "$ting" --version
+          file "$ting" | grep -Eq "statically linked|static-pie linked"

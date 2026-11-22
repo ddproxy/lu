@@ -46,6 +46,39 @@ saved results/report.json
 
 See [dependencies](dependencies.md).
 
+## Batch from a checklist
+
+A checklist can build, test and publish in one idempotent call. Unchecked items become jobs; an
+indented `after:` hint names a prerequisite. A sibling sidecar supplies shared job fields; `repo`
+and `ref` come from flags or a defaults file.
+
+```sh
+mkdir -p /srv/app/tasks
+cat > /srv/app/tasks/release.md <<'EOF'
+- [ ] Build the artifacts
+- [ ] Test the artifacts
+  after: build
+- [ ] Publish the artifacts
+  after: test
+EOF
+cat > /srv/app/tasks/release.toml <<'EOF'
+group = "release"
+require = ["linux"]
+EOF
+
+lu submit --batch /srv/app/tasks/release.md --repo /srv/app --ref main \
+  --key-prefix release-1 --max-parallel 2 --dry-run
+lu submit --batch /srv/app/tasks/release.md --repo /srv/app --ref main \
+  --key-prefix release-1 --max-parallel 2
+```
+
+The dry run prints the derived keys, dependencies, group and task sizes without contacting the
+controller. The real call adds a runtime cap of two to the `release` group before submitting. Each
+key is `release-1-<slug>`, so a retry with the same prefix returns the same jobs. All input errors
+are reported before the first request.
+
+Full input rules are in [Batch submissions](batch.md).
+
 ## Retry with a provider override
 
 `lu retry` needs a terminal job. Absent fields are inherited from the source spec; supplied fields

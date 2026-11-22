@@ -14,6 +14,7 @@ pub enum ErrorCode {
     StaleEpoch,
     TooLarge,
     RateLimited,
+    LimitExceeded,
     Internal,
 }
 
@@ -29,6 +30,7 @@ impl ErrorCode {
             Self::StaleEpoch => "stale_epoch",
             Self::TooLarge => "too_large",
             Self::RateLimited => "rate_limited",
+            Self::LimitExceeded => "limit_exceeded",
             Self::Internal => "internal",
         }
     }
@@ -44,6 +46,7 @@ impl ErrorCode {
             Self::StaleEpoch => StatusCode::CONFLICT,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::LimitExceeded => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -55,6 +58,8 @@ pub struct ApiError {
     pub message: String,
     pub log_length: Option<u64>,
     pub retry_after_secs: Option<u64>,
+    /// The configured limit name for a typed `limit_exceeded` response.
+    pub limit: Option<String>,
     pub www_authenticate: bool,
 }
 
@@ -65,6 +70,7 @@ impl ApiError {
             message: message.into(),
             log_length: None,
             retry_after_secs: None,
+            limit: None,
             www_authenticate: false,
         }
     }
@@ -100,6 +106,11 @@ impl ApiError {
         e.retry_after_secs = Some(retry_after_secs.max(1));
         e
     }
+    pub fn limit_exceeded(limit: &'static str) -> Self {
+        let mut e = Self::new(ErrorCode::LimitExceeded, format!("limit exceeded: {limit}"));
+        e.limit = Some(limit.to_owned());
+        e
+    }
     pub fn internal() -> Self {
         Self::new(ErrorCode::Internal, "internal error")
     }
@@ -116,6 +127,8 @@ struct ErrorBody<'a> {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     length: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<String>,
 }
 
 /// Returns a message safe to emit: control chars neutralized and bounded.
@@ -139,6 +152,7 @@ impl IntoResponse for ApiError {
             error: code,
             message: safe_message(&self.message),
             length: self.log_length,
+            limit: self.limit,
         };
         let json = serde_json::to_string(&body).unwrap_or_else(|_| {
             "{\"error\":\"internal\",\"message\":\"internal error\"}".to_owned()

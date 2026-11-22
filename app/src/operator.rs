@@ -12,8 +12,8 @@ use lu_client::{
 use lu_proto::{
     printable, truncate_chars, ArtifactName, CollectMode, ExpectEdit, ExpectMode, ExpectSpec,
     FailureClass, HarnessState, JobEdit, JobId, JobSpec, JobState, NodeName, OnConflict,
-    StuckPolicy, DEFAULT_TIMEOUT_SECS, LABEL_SOURCE_PROBED, MAX_STUCK_AFTER_SECS, MAX_TASK_BYTES,
-    MIN_STUCK_AFTER_SECS,
+    PublishSpec, StuckPolicy, WorkspacePolicy, DEFAULT_TIMEOUT_SECS, LABEL_SOURCE_PROBED,
+    MAX_STUCK_AFTER_SECS, MAX_TASK_BYTES, MIN_STUCK_AFTER_SECS,
 };
 use lu_tui::graph::{self, Graph};
 use lu_tui::model::Tone;
@@ -28,12 +28,43 @@ const SUMMARY_CHARS: usize = 2000;
 
 #[derive(Debug, clap::Args)]
 pub struct SubmitArgs {
-    /// Repository URL or absolute local path.
-    #[arg(long)]
-    pub repo: String,
-    /// Git ref to check out.
-    #[arg(long = "ref")]
-    pub git_ref: String,
+    /// Repository URL or absolute local path. Required unless --batch supplies it in --defaults.
+    #[arg(long, required_unless_present = "batch")]
+    pub repo: Option<String>,
+    /// Git ref to check out. Required unless --batch supplies it in --defaults.
+    #[arg(long = "ref", required_unless_present = "batch")]
+    pub git_ref: Option<String>,
+    /// Read many tasks from a directory or Markdown checklist. Batch inputs use --defaults
+    /// instead of the single-job flags.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "key_prefix",
+        conflicts_with_all = [
+            "task", "task_file", "key", "provider", "model", "fallbacks", "timeout",
+            "idle_timeout", "on_stuck", "stuck_after", "after", "after_key", "collect",
+            "include_failed", "on_conflict", "allow_empty", "expect_files", "expect_changed",
+            "forbid_changed", "min_diff_bytes", "max_diff_bytes", "expect_mode", "require",
+            "tolerate", "priority", "group", "allow_spawn", "spawn_inherit", "spawn_repos",
+            "workspace", "cache_dirs", "wait"
+        ]
+    )]
+    pub batch: Option<PathBuf>,
+    /// Idempotency key prefix for --batch; each job key is <prefix>-<slug>.
+    #[arg(long, value_name = "PREFIX", requires = "batch")]
+    pub key_prefix: Option<String>,
+    /// Shared TOML defaults for --batch.
+    #[arg(long, value_name = "FILE", requires = "batch")]
+    pub defaults: Option<PathBuf>,
+    /// Print the batch plan and submit nothing.
+    #[arg(long, requires = "batch")]
+    pub dry_run: bool,
+    /// Make each batch job depend on the previous one in file order.
+    #[arg(long, requires = "batch")]
+    pub chain: bool,
+    /// Cap the batch's concurrency group at N running jobs (1 to 64).
+    #[arg(long, value_name = "N", requires = "batch", value_parser = parse_max_parallel)]
+    pub max_parallel: Option<usize>,
     /// Harness name.
     #[arg(long, default_value = "opencode")]
     pub harness: String,
@@ -110,6 +141,21 @@ pub struct SubmitArgs {
     /// Concurrency group name (1-64 chars from A-Z a-z 0-9 . _ -).
     #[arg(long)]
     pub group: Option<String>,
+    /// Let this job's harness submit children through its scoped socket.
+    #[arg(long)]
+    pub allow_spawn: bool,
+    /// Let children of this job submit their own children.
+    #[arg(long)]
+    pub spawn_inherit: bool,
+    /// Repository a child may use instead of the parent repo (repeatable).
+    #[arg(long = "spawn-repo")]
+    pub spawn_repos: Vec<String>,
+    /// Workspace policy: ephemeral, keep_on_failure or keep. Omit to use the node default.
+    #[arg(long, value_parser = parse_workspace_policy)]
+    pub workspace: Option<WorkspacePolicy>,
+    /// Relative directory inside the workspace to keep as a build cache (repeatable).
+    #[arg(long = "cache-dir")]
+    pub cache_dirs: Vec<String>,
     /// Idempotency key.
     #[arg(long)]
     pub key: Option<String>,
@@ -153,9 +199,19 @@ pub struct CollectArgs {
     /// Job timeout in seconds.
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
+    /// Workspace policy: ephemeral, keep_on_failure or keep. Omit to use the node default.
+    #[arg(long, value_parser = parse_workspace_policy)]
+    pub workspace: Option<WorkspacePolicy>,
+    /// Relative directory inside the workspace to keep as a build cache (repeatable).
+    #[arg(long = "cache-dir")]
+    pub cache_dirs: Vec<String>,
     /// Wait for the job to finish.
     #[arg(long)]
     pub wait: bool,
+    /// Allow inputs whose patch was changed by controller-side scrubbing. Such patches may no
+    /// longer apply cleanly.
+    #[arg(long)]
+    pub allow_scrubbed: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -320,6 +376,75 @@ pub struct EditArgs {
     /// Clear the concurrency group.
     #[arg(long = "no-group", conflicts_with = "group")]
     pub no_group: bool,
+    /// Set or clear whether this job's harness may submit children.
+    #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+    pub allow_spawn: Option<bool>,
+    /// Set or clear whether children of this job may themselves submit children.
+    #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+    pub spawn_inherit: Option<bool>,
+    /// Replace the child repository allowlist (repeatable).
+    #[arg(long = "spawn-repo", conflicts_with = "no_spawn_repos")]
+    pub spawn_repos: Vec<String>,
+    /// Clear the child repository allowlist.
+    #[arg(long = "no-spawn-repos", conflicts_with = "spawn_repos")]
+    pub no_spawn_repos: bool,
+    /// Replace the task text with the contents of a UTF-8 file (drafts only).
+    #[arg(long = "task-file", value_name = "PATH")]
+    pub task_file: Option<PathBuf>,
+    /// Replace the source ref, for example a branch, tag or `refs/pull/12/head` (drafts only).
+    #[arg(long = "source-ref", value_name = "REF")]
+    pub source_ref: Option<String>,
+    /// Replace publish settings with a JSON object (drafts only).
+    #[arg(long = "publish", value_name = "JSON")]
+    pub publish: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct DraftsArgs {
+    /// Maximum number of drafts to return.
+    #[arg(long, value_parser = parse_limit)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ApproveArgs {
+    /// Draft id.
+    #[arg(value_parser = parse_job_id)]
+    pub id: JobId,
+    /// Apply edits before approving. Accepts the same flags as `lu edit`.
+    #[arg(long)]
+    pub edit: bool,
+    /// Replace the task text with the contents of a UTF-8 file.
+    #[arg(long = "task-file", requires = "edit")]
+    pub task_file: Option<PathBuf>,
+    /// Replace the source ref.
+    #[arg(long = "source-ref", requires = "edit")]
+    pub source_ref: Option<String>,
+    /// Replace publish settings with a JSON object.
+    #[arg(long = "publish", requires = "edit")]
+    pub publish: Option<String>,
+    /// Change the provider while approving.
+    #[arg(long, requires = "edit")]
+    pub provider: Option<String>,
+    /// Change the model while approving.
+    #[arg(long, requires = "edit")]
+    pub model: Option<String>,
+    /// Change the priority while approving.
+    #[arg(long, requires = "edit", value_parser = clap::value_parser!(u8).range(0..=9))]
+    pub priority: Option<u8>,
+    /// Change the concurrency group while approving.
+    #[arg(long, requires = "edit")]
+    pub group: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct RejectArgs {
+    /// Draft id.
+    #[arg(value_parser = parse_job_id)]
+    pub id: JobId,
+    /// Reason recorded in the audit log. Only coarse categories are stored.
+    #[arg(long)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -330,11 +455,21 @@ pub struct LsArgs {
     /// Maximum number of jobs to return.
     #[arg(long, value_parser = parse_limit)]
     pub limit: Option<u32>,
+    /// Group jobs by parent instead of showing a flat list.
+    #[arg(long)]
+    pub tree: bool,
 }
 
 #[derive(Debug, clap::Args)]
 pub struct ShowArgs {
     /// Job id.
+    #[arg(value_parser = parse_job_id)]
+    pub id: JobId,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct PublishArgs {
+    /// Job id whose diff should be published.
     #[arg(value_parser = parse_job_id)]
     pub id: JobId,
 }
@@ -367,6 +502,9 @@ pub struct CancelArgs {
     /// Job id.
     #[arg(value_parser = parse_job_id)]
     pub id: JobId,
+    /// Leave this job's descendants running instead of cancelling them too.
+    #[arg(long)]
+    pub keep_children: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -393,6 +531,34 @@ pub struct GraphArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct NodeArgs {
+    /// Node name.
+    #[arg(value_parser = parse_node)]
+    pub node: NodeName,
+    /// List the agent's job workspaces instead of its node stats.
+    #[arg(long)]
+    pub workspaces: bool,
+    #[command(subcommand)]
+    pub action: Option<NodeAction>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum NodeAction {
+    /// Ask the agent to delete kept workspaces.
+    Clean(NodeCleanArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct NodeCleanArgs {
+    /// Delete every kept workspace that is not running.
+    #[arg(long, conflicts_with = "job")]
+    pub all: bool,
+    /// Delete only this job's workspace, by job id or idempotency key.
+    #[arg(long = "job", conflicts_with = "all")]
+    pub job: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct NodeTargetArgs {
     /// Node name.
     #[arg(value_parser = parse_node)]
     pub node: NodeName,
@@ -427,8 +593,24 @@ pub async fn ls(args: LsArgs, config: &Path, json: bool) -> ExitCode {
     finish(ls_inner(args, config, json).await)
 }
 
+pub async fn drafts(args: DraftsArgs, config: &Path, json: bool) -> ExitCode {
+    finish(drafts_inner(args, config, json).await)
+}
+
+pub async fn approve(args: ApproveArgs, config: &Path, json: bool) -> ExitCode {
+    finish(approve_inner(args, config, json).await)
+}
+
+pub async fn reject(args: RejectArgs, config: &Path, json: bool) -> ExitCode {
+    finish(reject_inner(args, config, json).await)
+}
+
 pub async fn show(args: ShowArgs, config: &Path, json: bool) -> ExitCode {
     finish(show_inner(args, config, json).await)
+}
+
+pub async fn publish(args: PublishArgs, config: &Path, json: bool) -> ExitCode {
+    finish(publish_inner(args, config, json).await)
 }
 
 pub async fn logs(args: LogsArgs, config: &Path, json: bool) -> ExitCode {
@@ -467,11 +649,11 @@ pub async fn graph(args: GraphArgs, config: &Path, json: bool) -> ExitCode {
     finish(graph_inner(args, config, json).await)
 }
 
-pub async fn drain(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
+pub async fn drain(args: NodeTargetArgs, config: &Path, json: bool) -> ExitCode {
     finish(drain_inner(args, config, json, true).await)
 }
 
-pub async fn undrain(args: NodeArgs, config: &Path, json: bool) -> ExitCode {
+pub async fn undrain(args: NodeTargetArgs, config: &Path, json: bool) -> ExitCode {
     finish(drain_inner(args, config, json, false).await)
 }
 
@@ -480,6 +662,15 @@ pub async fn uncordon(args: UncordonArgs, config: &Path, json: bool) -> ExitCode
 }
 
 async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    if args.batch.is_some() {
+        return submit_batch_inner(args, config, json).await;
+    }
+    let Some(repo) = args.repo.clone() else {
+        return Err("lu: --repo is required".to_owned());
+    };
+    let Some(git_ref) = args.git_ref.clone() else {
+        return Err("lu: --ref is required".to_owned());
+    };
     let task = read_task(&args)?;
     let client = connect(config)?;
     let Some(after) = resolve_after(&client, &args.after, &args.after_key).await? else {
@@ -494,14 +685,30 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         mode: args.expect_mode,
     };
     let spec = JobSpec {
-        repo: args.repo,
-        git_ref: args.git_ref,
+        source: lu_proto::SourceSpec {
+            repo: repo.clone(),
+            git_ref: git_ref.clone(),
+            base: None,
+        },
+        repo,
+        git_ref,
         base_commit: None,
         task,
         harness: args.harness,
         provider: args.provider,
         priority: args.priority,
         group: args.group,
+        allow_spawn: args.allow_spawn,
+        spawn_inherit: args.spawn_inherit,
+        spawn_repos: args.spawn_repos,
+        workspace: args.workspace,
+        cache_dirs: args.cache_dirs,
+        context: None,
+        origin: None,
+        origin_ref: None,
+        untrusted_context: false,
+        draft: false,
+        publish: None,
         model: args.model,
         timeout_secs: args.timeout,
         idle_timeout_secs: args.idle_timeout,
@@ -521,6 +728,76 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
     spec.validate().map_err(|error| error.to_string())?;
 
     submit_and_report(&client, &spec, json, args.wait).await
+}
+
+async fn submit_batch_inner(
+    args: SubmitArgs,
+    config: &Path,
+    json: bool,
+) -> Result<ExitCode, String> {
+    let path = args
+        .batch
+        .expect("clap requires --batch for a batch submit");
+    let prefix = args
+        .key_prefix
+        .as_deref()
+        .expect("clap requires --key-prefix with --batch");
+    let options = crate::batch::BatchOptions {
+        path: &path,
+        key_prefix: prefix,
+        defaults: args.defaults.as_deref(),
+        repo: args.repo.as_deref(),
+        git_ref: args.git_ref.as_deref(),
+        chain: args.chain,
+        max_parallel: args.max_parallel,
+    };
+    let plan = match crate::batch::plan(&options) {
+        Ok(plan) => plan,
+        Err(errors) => {
+            for error in errors {
+                eprintln!("lu: {error}");
+            }
+            return Ok(ExitCode::from(EXIT_USAGE));
+        }
+    };
+    if args.dry_run {
+        crate::batch::print_plan(&plan, json)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let client = connect(config)?;
+    let prepared = match crate::batch::prepare(&client, &plan).await {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            eprintln!("lu: {}", failure.reason);
+            return Ok(ExitCode::from(if failure.preflight {
+                EXIT_USAGE
+            } else {
+                EXIT_ERROR
+            }));
+        }
+    };
+    match crate::batch::submit_prepared(&client, &prepared).await {
+        Ok(outcomes) => {
+            crate::batch::print_outcomes(&outcomes, json)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(failure) => {
+            crate::batch::print_outcomes(&failure.submitted, json)?;
+            eprintln!(
+                "lu: submitted {} of {} jobs; not submitted: {}; error: {}",
+                failure.submitted.len(),
+                plan.len(),
+                if failure.not_submitted.is_empty() {
+                    "-".to_owned()
+                } else {
+                    failure.not_submitted.join(", ")
+                },
+                failure.reason
+            );
+            Ok(ExitCode::from(EXIT_ERROR))
+        }
+    }
 }
 
 async fn collect_inner(args: CollectArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
@@ -564,6 +841,13 @@ async fn collect_inner(args: CollectArgs, config: &Path, json: bool) -> Result<E
                 }
             }
         };
+        if view.patch_scrubbed && !args.allow_scrubbed {
+            eprintln!(
+                "lu: job {} has a scrubbed patch ({} scrubbed value(s)); pass --allow-scrubbed to collect it",
+                view.id, view.scrubbed_hits
+            );
+            return Ok(ExitCode::from(EXIT_USAGE));
+        }
         if view.state == JobState::Failed && view.diff_bytes.unwrap_or(0) > 0 {
             include_failed = true;
         }
@@ -573,6 +857,11 @@ async fn collect_inner(args: CollectArgs, config: &Path, json: bool) -> Result<E
     }
 
     let spec = JobSpec {
+        source: lu_proto::SourceSpec {
+            repo: args.repo.clone(),
+            git_ref: args.git_ref.clone(),
+            base: None,
+        },
         repo: args.repo,
         git_ref: args.git_ref,
         base_commit: None,
@@ -581,6 +870,17 @@ async fn collect_inner(args: CollectArgs, config: &Path, json: bool) -> Result<E
         provider: args.provider,
         priority: lu_proto::DEFAULT_PRIORITY,
         group: None,
+        allow_spawn: false,
+        spawn_inherit: false,
+        spawn_repos: Vec::new(),
+        workspace: args.workspace,
+        cache_dirs: args.cache_dirs,
+        context: None,
+        origin: None,
+        origin_ref: None,
+        untrusted_context: false,
+        draft: false,
+        publish: None,
         model: args.model,
         timeout_secs: args.timeout,
         idle_timeout_secs: None,
@@ -701,6 +1001,42 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
     submit_and_report(&client, &spec, json, args.wait).await
 }
 
+fn task_from_file(path: &Path) -> Result<String, String> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() > MAX_TASK_BYTES {
+        return Err(format!(
+            "task file is {} bytes, limit is {MAX_TASK_BYTES}",
+            bytes.len()
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| format!("task file is not UTF-8: {error}"))
+}
+
+fn publish_from_json(raw: &str) -> Result<PublishSpec, String> {
+    serde_json::from_str(raw).map_err(|error| format!("invalid --publish JSON: {error}"))
+}
+
+/// Builds only the fields an operator explicitly supplied. Draft edits accept task text, source
+/// ref and publish settings in addition to the fields shared with queued jobs.
+fn draft_edit(
+    task_file: Option<&Path>,
+    source_ref: Option<String>,
+    publish: Option<&str>,
+) -> Result<Option<JobEdit>, String> {
+    let task = task_file.map(task_from_file).transpose()?;
+    let publish = publish.map(publish_from_json).transpose()?;
+    if task.is_none() && source_ref.is_none() && publish.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(JobEdit {
+        task,
+        source_ref,
+        publish,
+        ..JobEdit::default()
+    }))
+}
+
 async fn edit_inner(args: EditArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
     if args.provider.as_deref() == Some(lu_proto::ANY_PROVIDER)
         && (args.model.is_some() || !args.fallbacks.is_empty())
@@ -725,7 +1061,15 @@ async fn edit_inner(args: EditArgs, config: &Path, json: bool) -> Result<ExitCod
         max_diff_bytes: args.max_diff_bytes,
         mode: args.expect_mode,
     };
+    let draft = draft_edit(
+        args.task_file.as_deref(),
+        args.source_ref,
+        args.publish.as_deref(),
+    )?;
     let edit = JobEdit {
+        task: draft.as_ref().and_then(|edit| edit.task.clone()),
+        source_ref: draft.as_ref().and_then(|edit| edit.source_ref.clone()),
+        publish: draft.as_ref().and_then(|edit| edit.publish.clone()),
         provider: args.provider,
         model: args.model,
         fallbacks: (!args.fallbacks.is_empty() || args.no_fallbacks).then_some(args.fallbacks),
@@ -746,6 +1090,15 @@ async fn edit_inner(args: EditArgs, config: &Path, json: bool) -> Result<ExitCod
         },
         on_stuck: args.on_stuck,
         stuck_after_secs: args.stuck_after,
+        allow_spawn: args.allow_spawn,
+        spawn_inherit: args.spawn_inherit,
+        spawn_repos: if !args.spawn_repos.is_empty() {
+            Some(args.spawn_repos)
+        } else if args.no_spawn_repos {
+            Some(Vec::new())
+        } else {
+            None
+        },
     };
     let (view, raw) = client
         .edit_with_raw(&args.id, &edit)
@@ -812,9 +1165,19 @@ async fn ls_inner(args: LsArgs, config: &Path, json: bool) -> Result<ExitCode, S
     }
 
     let page = client
-        .list_jobs(args.state, args.limit)
+        .list_jobs(if args.tree { None } else { args.state }, {
+            if args.tree {
+                None
+            } else {
+                args.limit
+            }
+        })
         .await
         .map_err(|error| error.to_string())?;
+    if args.tree {
+        print_job_tree(&page.jobs);
+        return Ok(ExitCode::SUCCESS);
+    }
     let rows = page
         .jobs
         .iter()
@@ -844,6 +1207,104 @@ async fn ls_inner(args: LsArgs, config: &Path, json: bool) -> Result<ExitCode, S
     Ok(ExitCode::SUCCESS)
 }
 
+async fn drafts_inner(args: DraftsArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    let page = client
+        .drafts(args.limit)
+        .await
+        .map_err(|error| error.to_string())?;
+    if json {
+        let raw = serde_json::to_string(&page.jobs).map_err(|error| error.to_string())?;
+        print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let rows = page
+        .jobs
+        .iter()
+        .map(|draft| {
+            vec![
+                draft.id.to_string(),
+                draft
+                    .spec
+                    .origin
+                    .as_deref()
+                    .map(display_field)
+                    .unwrap_or_else(|| "-".to_owned()),
+                draft
+                    .spec
+                    .origin_ref
+                    .as_deref()
+                    .map(display_field)
+                    .unwrap_or_else(|| "-".to_owned()),
+                draft
+                    .spec
+                    .task
+                    .lines()
+                    .next()
+                    .map(|line| truncate_chars(line, 80))
+                    .unwrap_or_default(),
+                time(draft.created_at),
+            ]
+        })
+        .collect();
+    print_table(&["ID", "ORIGIN", "ORIGIN_REF", "TASK", "CREATED"], rows);
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn approve_inner(args: ApproveArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let mut edit = if args.edit {
+        draft_edit(
+            args.task_file.as_deref(),
+            args.source_ref,
+            args.publish.as_deref(),
+        )?
+    } else {
+        if args.task_file.is_some() || args.source_ref.is_some() || args.publish.is_some() {
+            return Err("lu: edit flags require --edit".to_owned());
+        }
+        None
+    };
+    if edit.is_none()
+        && (args.provider.is_some()
+            || args.model.is_some()
+            || args.priority.is_some()
+            || args.group.is_some())
+    {
+        edit = Some(JobEdit::default());
+    }
+    if let Some(edit) = edit.as_mut() {
+        edit.provider = args.provider;
+        edit.model = args.model;
+        edit.priority = args.priority;
+        edit.group = args.group.map(Some);
+    }
+    let client = connect(config)?;
+    let view = client
+        .approve_draft(&args.id, edit.as_ref())
+        .await
+        .map_err(|error| error.to_string())?;
+    if json {
+        print_raw(&serde_json::to_string(&view).map_err(|error| error.to_string())?);
+    } else {
+        println!("{} {}", view.id, state_name(view.state));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn reject_inner(args: RejectArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    let view = client
+        .reject_draft(&args.id, args.reason.as_deref())
+        .await
+        .map_err(|error| error.to_string())?;
+    if json {
+        print_raw(&serde_json::to_string(&view).map_err(|error| error.to_string())?);
+    } else {
+        println!("{} {}", view.id, state_name(view.state));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 async fn show_inner(args: ShowArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
     let client = connect(config)?;
     if json {
@@ -870,6 +1331,26 @@ async fn show_inner(args: ShowArgs, config: &Path, json: bool) -> Result<ExitCod
             ""
         };
         println!("after  {id}  {state}{waiting}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn publish_inner(args: PublishArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    let view = client
+        .publish(&args.id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if json {
+        print_raw(&serde_json::to_string(&view).map_err(|error| error.to_string())?);
+    } else {
+        match &view.publish {
+            Some(record) => println!(
+                "{} {} {} ({})",
+                record.detail, record.remote, record.branch, record.target
+            ),
+            None => println!("{} pending", view.id),
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -966,7 +1447,7 @@ async fn cancel_inner(args: CancelArgs, config: &Path, json: bool) -> Result<Exi
         return Ok(ExitCode::SUCCESS);
     }
     let view = client
-        .cancel(&args.id)
+        .cancel_with_children(&args.id, args.keep_children)
         .await
         .map_err(|error| error.to_string())?;
     print_job(&view);
@@ -1085,12 +1566,45 @@ async fn sync_repo_inner(args: SyncArgs, config: &Path, json: bool) -> Result<Ex
 
 async fn node_inner(args: NodeArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
     let client = connect(config)?;
+    if args.workspaces && args.action.is_some() {
+        eprintln!("lu: --workspaces cannot be combined with clean");
+        return Ok(ExitCode::from(EXIT_USAGE));
+    }
     if json {
         let raw = client
             .node_stats_raw(&args.node)
             .await
             .map_err(|error| error.to_string())?;
         print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(NodeAction::Clean(clean)) = &args.action {
+        if !clean.all && clean.job.is_none() {
+            eprintln!("lu: clean needs --all or --job <key>");
+            return Ok(ExitCode::from(EXIT_USAGE));
+        }
+        let job = match clean.job.as_deref() {
+            Some(value) => Some(resolve_job_ref(&client, value).await?),
+            None => None,
+        };
+        let result = client
+            .clean_workspaces(&args.node, clean.all, job.as_ref())
+            .await
+            .map_err(|error| error.to_string())?;
+        println!(
+            "queued {}  refused_running {}  missing {}",
+            result.queued, result.refused_running, result.missing
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    if args.workspaces {
+        let nodes = client.nodes().await.map_err(|error| error.to_string())?;
+        let view = nodes
+            .nodes
+            .iter()
+            .find(|node| node.name == args.node)
+            .ok_or_else(|| format!("node {} not found", args.node))?;
+        print_workspaces(&view.workspaces);
         return Ok(ExitCode::SUCCESS);
     }
     let stats = client
@@ -1106,6 +1620,44 @@ async fn node_inner(args: NodeArgs, config: &Path, json: bool) -> Result<ExitCod
     print_node_stats(&args.node, &stats);
     print_cordons(view);
     Ok(ExitCode::SUCCESS)
+}
+
+/// Resolves a job id or idempotency key for `--job`. A missing key is a usage error.
+async fn resolve_job_ref(client: &Client, value: &str) -> Result<JobId, String> {
+    if let Ok(id) = JobId::parse(value) {
+        return Ok(id);
+    }
+    match client
+        .job_by_key(value)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        Some(view) => Ok(view.id),
+        None => {
+            eprintln!("lu: no job with idempotency key {value:?}");
+            Err(format!("unknown job reference {value:?}"))
+        }
+    }
+}
+
+fn print_workspaces(workspaces: &[lu_proto::WorkspaceView]) {
+    if workspaces.is_empty() {
+        println!("workspaces  -");
+        return;
+    }
+    let rows = workspaces
+        .iter()
+        .map(|workspace| {
+            vec![
+                printable(&workspace.job_key),
+                workspace.state.as_str().to_owned(),
+                workspace.bytes.to_string(),
+                short_duration(workspace.age_secs),
+                workspace.policy.as_str().to_owned(),
+            ]
+        })
+        .collect();
+    print_table(&["JOB", "STATE", "BYTES", "AGE", "POLICY"], rows);
 }
 
 const GRAPH_WIDTH: usize = 120;
@@ -1214,7 +1766,7 @@ fn ansi(tone: Tone) -> Option<&'static str> {
 }
 
 async fn drain_inner(
-    args: NodeArgs,
+    args: NodeTargetArgs,
     config: &Path,
     json: bool,
     drain: bool,
@@ -1395,6 +1947,73 @@ fn write_artifact(
     Ok(path)
 }
 
+/// Prints the job list as an indentation tree. Jobs whose parent is absent from the page are
+/// shown as roots, so a limited view never silently drops a branch.
+fn print_job_tree(jobs: &[JobView]) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut children: BTreeMap<Option<String>, Vec<&JobView>> = BTreeMap::new();
+    let mut ids = BTreeSet::new();
+    for job in jobs {
+        ids.insert(job.id.to_string());
+    }
+    for job in jobs {
+        let parent = job
+            .parent_job_id
+            .as_ref()
+            .map(ToString::to_string)
+            .filter(|parent| ids.contains(parent));
+        children.entry(parent).or_default().push(job);
+    }
+    fn walk(
+        parent: Option<&str>,
+        children: &BTreeMap<Option<String>, Vec<&JobView>>,
+        depth: usize,
+        seen: &mut BTreeSet<String>,
+    ) {
+        let Some(rows) = children.get(&parent.map(str::to_owned)) else {
+            return;
+        };
+        for job in rows {
+            if !seen.insert(job.id.to_string()) {
+                continue;
+            }
+            let marker = if job.parent_job_id.is_none() {
+                ""
+            } else {
+                "└─ "
+            };
+            println!(
+                "{}{}{}  {:<9} {}",
+                "  ".repeat(depth),
+                marker,
+                job.id,
+                state_name(job.state),
+                job_title(&job.spec.task)
+            );
+            walk(Some(job.id.as_str()), children, depth + 1, seen);
+        }
+    }
+    if jobs.is_empty() {
+        println!("no jobs");
+        return;
+    }
+    let mut seen = BTreeSet::new();
+    walk(None, &children, 0, &mut seen);
+    // A cycle cannot be created through the scope API, but a hand-edited database could contain
+    // one. Show those jobs rather than hiding them.
+    for job in jobs {
+        if seen.insert(job.id.to_string()) && job.parent_job_id.is_some() {
+            println!(
+                "? {}  {:<9} {}",
+                job.id,
+                state_name(job.state),
+                job_title(&job.spec.task)
+            );
+        }
+    }
+}
+
 fn print_job(view: &JobView) {
     let fallbacks = view
         .spec
@@ -1413,6 +2032,56 @@ fn print_job(view: &JobView) {
     let rows = vec![
         ("id", view.id.to_string()),
         ("state", state_name(view.state).to_owned()),
+        (
+            "parent",
+            view.parent_job_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        (
+            "root",
+            view.root_job_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        ("depth", view.depth.to_string()),
+        (
+            "origin",
+            view.spec
+                .origin
+                .as_deref()
+                .map(display_field)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        (
+            "origin_ref",
+            view.spec
+                .origin_ref
+                .as_deref()
+                .map(display_field)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        ("untrusted_context", view.spec.untrusted_context.to_string()),
+        (
+            "context_bytes",
+            view.spec
+                .context
+                .as_ref()
+                .map(|text| text.len().to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        ("allow_spawn", view.spec.allow_spawn.to_string()),
+        ("spawn_inherit", view.spec.spawn_inherit.to_string()),
+        (
+            "spawn_repos",
+            if view.spec.spawn_repos.is_empty() {
+                "-".to_owned()
+            } else {
+                view.spec.spawn_repos.join(", ")
+            },
+        ),
         ("priority", view.spec.priority.to_string()),
         (
             "group",
@@ -1484,6 +2153,36 @@ fn print_job(view: &JobView) {
                 .map(|bytes| bytes.to_string())
                 .unwrap_or_else(|| "-".to_owned()),
         ),
+        ("scrubbed_hits", view.scrubbed_hits.to_string()),
+        ("patch_scrubbed", view.patch_scrubbed.to_string()),
+        (
+            "publish_target",
+            view.publish_target
+                .as_deref()
+                .map(display_field)
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        (
+            "publish",
+            view.publish
+                .as_ref()
+                .map(|p| {
+                    format!(
+                        "{} {} {} ({})",
+                        display_field(&p.detail),
+                        display_field(&p.remote),
+                        display_field(&p.branch),
+                        p.target
+                    )
+                })
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        (
+            "audit_write_errors",
+            view.audit_write_errors
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
     ];
     print_pairs(&rows);
 }
@@ -1499,6 +2198,17 @@ fn print_status(status: &StatusView) {
         ("nodes", status.nodes.to_string()),
         ("nodes_online", status.nodes_online.to_string()),
         ("lease_secs", status.lease_secs.to_string()),
+        ("audit_write_errors", status.audit_write_errors.to_string()),
+        ("scope_enabled", status.scope_enabled.to_string()),
+        ("scope_max_depth", status.scope_max_depth.to_string()),
+        (
+            "scope_max_children_per_job",
+            status.scope_max_children_per_job.to_string(),
+        ),
+        (
+            "scope_max_descendants_per_root",
+            status.scope_max_descendants_per_root.to_string(),
+        ),
     ]);
     println!();
     let rows: Vec<Vec<String>> = JobState::ALL
@@ -1623,6 +2333,23 @@ fn print_node_stats(node: &NodeName, stats: &NodeStats) {
         ]),
         None => println!("host  -"),
     }
+    println!();
+    print_pairs(&[
+        ("workspace_bytes", stats.workspace_bytes.to_string()),
+        ("workspace_count", stats.workspace_count.to_string()),
+        (
+            "workspace_reclaimed_bytes_total",
+            stats.workspace_reclaimed_bytes_total.to_string(),
+        ),
+        (
+            "workspace_evictions_total",
+            stats.workspace_evictions_total.to_string(),
+        ),
+        (
+            "workspace_delete_errors_total",
+            stats.workspace_delete_errors_total.to_string(),
+        ),
+    ]);
     if stats.jobs.is_empty() {
         println!("jobs  -");
         return;
@@ -1714,7 +2441,7 @@ fn print_pairs(rows: &[(&str, String)]) {
     }
 }
 
-fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
+pub(crate) fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
     let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
     for row in &rows {
         for (index, cell) in row.iter().enumerate() {
@@ -1919,6 +2646,10 @@ fn parse_node(value: &str) -> Result<NodeName, String> {
     NodeName::parse(value).map_err(|error| error.to_string())
 }
 
+fn parse_workspace_policy(value: &str) -> Result<WorkspacePolicy, String> {
+    WorkspacePolicy::parse(value).map_err(|error| error.to_string())
+}
+
 /// The shared shape of the six expectation flags on submit, retry and edit.
 struct ExpectFlags {
     files: Vec<String>,
@@ -2043,6 +2774,19 @@ fn parse_limit(value: &str) -> Result<u32, String> {
     Ok(limit)
 }
 
+fn parse_max_parallel(value: &str) -> Result<usize, String> {
+    let max: usize = value
+        .parse()
+        .map_err(|_| format!("max_parallel must be a positive integer (got {value:?})"))?;
+    if !(1..=lu_proto::MAX_GROUP_RUNNING).contains(&max) {
+        return Err(format!(
+            "max_parallel must be 1 to {} (got {max})",
+            lu_proto::MAX_GROUP_RUNNING
+        ));
+    }
+    Ok(max)
+}
+
 fn parse_stuck_policy(value: &str) -> Result<StuckPolicy, String> {
     StuckPolicy::parse(value).map_err(|error| error.to_string())
 }
@@ -2149,7 +2893,7 @@ mod collect_cli_tests {
 
     #[derive(Debug, clap::Subcommand)]
     enum Command {
-        Submit(SubmitArgs),
+        Submit(Box<SubmitArgs>),
         Collect(CollectArgs),
         Retry(RetryArgs),
         Edit(EditArgs),
@@ -2355,7 +3099,7 @@ mod expect_cli_tests {
 
     #[derive(Debug, clap::Subcommand)]
     enum Command {
-        Submit(SubmitArgs),
+        Submit(Box<SubmitArgs>),
         Retry(RetryArgs),
         Edit(EditArgs),
     }

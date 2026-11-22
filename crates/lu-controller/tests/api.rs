@@ -1,6 +1,9 @@
 use git2::Signature;
 use lu_auth::sha256_hex;
-use lu_config::{ControllerAgent, ControllerConfig, ControllerOperator, ControllerRepo};
+use lu_config::{
+    ArtifactsConfig, ControllerAgent, ControllerConfig, ControllerOperator, ControllerRepo,
+    ScrubRuleConfig,
+};
 use lu_controller::limits::{PACK_PER_TOKEN, SYNC_PER_TOKEN};
 use lu_controller::{build_router, recover_on_boot, run_background, AppState};
 use lu_proto::{
@@ -85,6 +88,19 @@ async fn start_server_full(
     pack_cap: Option<usize>,
     repos: Vec<ControllerRepo>,
 ) -> TestServer {
+    start_server_inner(roots, pack_cap, repos, None).await
+}
+
+async fn start_server_with_artifacts(artifacts: Option<ArtifactsConfig>) -> TestServer {
+    start_server_inner(Vec::new(), None, Vec::new(), artifacts).await
+}
+
+async fn start_server_inner(
+    roots: Vec<String>,
+    pack_cap: Option<usize>,
+    repos: Vec<ControllerRepo>,
+    artifacts: Option<ArtifactsConfig>,
+) -> TestServer {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("lu.db");
     let artifacts_dir = tmp.path().join("artifacts");
@@ -92,7 +108,8 @@ async fn start_server_full(
     cfg.local_repo_roots = roots;
     cfg.repos = repos;
     let store = Arc::new(SqliteStore::open(&db).unwrap());
-    let mut state = AppState::from_config(&cfg, store.clone()).unwrap();
+    let mut state =
+        AppState::from_config_with_artifacts(&cfg, store.clone(), artifacts.as_ref()).unwrap();
     state.max_pack_bytes = pack_cap.unwrap_or(lu_staging::PACK_CAP_BYTES);
     let state = Arc::new(state);
     recover_on_boot(&state).await.unwrap();
@@ -182,6 +199,11 @@ fn body_str(resp: &str) -> &str {
 
 fn sample_spec(key: Option<&str>) -> JobSpec {
     JobSpec {
+        source: lu_proto::SourceSpec {
+            repo: "https://example.net/repo.git".to_owned(),
+            git_ref: "main".to_owned(),
+            base: None,
+        },
         repo: "https://example.net/repo.git".to_owned(),
         git_ref: "main".to_owned(),
         base_commit: None,
@@ -203,6 +225,17 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         stuck_after_secs: None,
         priority: lu_proto::DEFAULT_PRIORITY,
         group: None,
+        allow_spawn: false,
+        spawn_inherit: false,
+        spawn_repos: Vec::new(),
+        workspace: None,
+        cache_dirs: Vec::new(),
+        context: None,
+        origin: None,
+        origin_ref: None,
+        untrusted_context: false,
+        draft: false,
+        publish: None,
         fallbacks: Vec::new(),
         expect: None,
     }
@@ -569,10 +602,16 @@ async fn post_edit_changes_a_queued_job_and_rejects_bad_states() {
         after: None,
         priority: None,
         group: None,
+        allow_spawn: Some(false),
+        spawn_inherit: Some(false),
+        spawn_repos: Some(Vec::new()),
         collect: None,
         include_failed: None,
         expect: None,
         on_conflict: Default::default(),
+        publish: None,
+        source_ref: None,
+        task: None,
     };
     let r = edit_job(srv.addr, &id, &edit).await;
     assert_eq!(status(&r), 200, "{r}");
@@ -1201,6 +1240,15 @@ async fn node_stats_are_served_bounded_to_operator_and_clear_on_next_heartbeat()
     let stats_url = |node: &str| {
         format!("GET /v1/nodes/{node}/stats HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")
     };
+    let zero_workspace_stats = || {
+        json!({
+            "workspace_bytes": 0,
+            "workspace_count": 0,
+            "workspace_reclaimed_bytes_total": 0,
+            "workspace_evictions_total": 0,
+            "workspace_delete_errors_total": 0
+        })
+    };
 
     // unknown node, before any heartbeat
     let r = raw_request(srv.addr, &stats_url("node-b")).await;
@@ -1214,7 +1262,7 @@ async fn node_stats_are_served_bounded_to_operator_and_clear_on_next_heartbeat()
     .await;
     assert_eq!(status(&r), 401, "{r}");
 
-    // a known node with no reported stats serializes as an empty object
+    // a known node with no reported stats still reports zeroed workspace counters
     let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
     let req = format!(
         "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -1225,7 +1273,7 @@ async fn node_stats_are_served_bounded_to_operator_and_clear_on_next_heartbeat()
     let r = raw_request(srv.addr, &stats_url("node-a")).await;
     assert_eq!(status(&r), 200, "{r}");
     let empty: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
-    assert_eq!(empty, json!({}), "{r}");
+    assert_eq!(empty, zero_workspace_stats(), "{r}");
 
     let job_id = JobId::new().to_string();
     let heartbeat = json!({
@@ -1302,7 +1350,7 @@ async fn node_stats_are_served_bounded_to_operator_and_clear_on_next_heartbeat()
     let r = raw_request(srv.addr, &stats_url("node-a")).await;
     assert_eq!(status(&r), 200, "{r}");
     let cleared: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
-    assert_eq!(cleared, json!({}), "{r}");
+    assert_eq!(cleared, zero_workspace_stats(), "{r}");
 
     let _ = srv.shutdown.send(());
 }
@@ -1397,8 +1445,7 @@ async fn oversize_bodies_refused_and_error_bodies_have_no_control_chars() {
     // oversize JSON body (>1MiB) create job
     let big_task = "a".repeat(1024 * 1024 + 100);
     let spec = json!({
-        "repo":"https://example.net/repo.git",
-        "git_ref":"main",
+        "source": {"repo": "https://example.net/repo.git", "ref": "main"},
         "task": big_task,
         "harness":"opencode",
         "timeout_secs": 3600
@@ -2764,8 +2811,10 @@ async fn base_route_serves_a_pack_with_auth_node_and_epoch_fencing() {
     let (repo, commit) = repo_with_two_commits(root.path());
     let srv = start_server_with(vec![root.path().to_string_lossy().into_owned()], None).await;
     let mut spec = sample_spec(None);
-    spec.repo = repo;
+    spec.repo = repo.clone();
+    spec.source.repo = repo;
     spec.base_commit = Some(commit.clone());
+    spec.source.base = Some(commit.clone());
     let (id, epoch) = assigned_epoch(&srv, &spec).await;
 
     let r = raw_request_bytes(
@@ -2829,8 +2878,10 @@ async fn base_packs_are_rate_limited_per_agent() {
     let (repo, commit) = repo_with_two_commits(root.path());
     let srv = start_server_with(vec![root.path().to_string_lossy().into_owned()], None).await;
     let mut spec = sample_spec(None);
-    spec.repo = repo;
-    spec.base_commit = Some(commit);
+    spec.repo = repo.clone();
+    spec.source.repo = repo;
+    spec.base_commit = Some(commit.clone());
+    spec.source.base = Some(commit);
     let (id, epoch) = assigned_epoch(&srv, &spec).await;
 
     for _ in 0..PACK_PER_TOKEN {
@@ -2865,7 +2916,9 @@ async fn a_mirrored_repository_pins_at_submit_and_serves_its_base_from_the_mirro
 
     let mut spec = sample_spec(None);
     spec.repo = url.clone();
+    spec.source.repo = url.clone();
     spec.git_ref = "main".to_owned();
+    spec.source.git_ref = "main".to_owned();
     let (id, epoch) = assigned_epoch(&srv, &spec).await;
 
     let r = base_request(srv.addr, &id, epoch, AGENT_A_TOKEN).await;
@@ -2891,6 +2944,7 @@ async fn base_route_is_404_without_a_provider_and_413_over_the_cap() {
     let srv = start_server().await;
     let mut spec = sample_spec(None);
     spec.base_commit = Some("a".repeat(40));
+    spec.source.base = Some("a".repeat(40));
     let (id, epoch) = assigned_epoch(&srv, &spec).await;
     let r = base_request(srv.addr, &id, epoch, AGENT_A_TOKEN).await;
     assert_eq!(
@@ -2908,8 +2962,10 @@ async fn base_route_is_404_without_a_provider_and_413_over_the_cap() {
     let (repo, commit) = repo_with_two_commits(root.path());
     let srv = start_server_with(vec![root.path().to_string_lossy().into_owned()], Some(1)).await;
     let mut spec = sample_spec(None);
-    spec.repo = repo;
-    spec.base_commit = Some(commit);
+    spec.repo = repo.clone();
+    spec.source.repo = repo;
+    spec.base_commit = Some(commit.clone());
+    spec.source.base = Some(commit);
     let (id, epoch) = assigned_epoch(&srv, &spec).await;
     let r = base_request(srv.addr, &id, epoch, AGENT_A_TOKEN).await;
     assert_eq!(
@@ -2944,25 +3000,30 @@ async fn configured_repositories_sync_list_and_pin_branch_tag_and_commit() {
 
     let mut spec = sample_spec(None);
     spec.repo = url.clone();
+    spec.source.repo = url.clone();
     spec.git_ref = "main".to_owned();
+    spec.source.git_ref = "main".to_owned();
     let r = post_job(srv.addr, &spec).await;
     assert_eq!(status(&r), 201, "{r}");
     let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
-    assert_eq!(job["spec"]["base_commit"], second);
+    assert_eq!(job["spec"]["source"]["base"], second);
 
     spec.git_ref = "v1".to_owned();
+    spec.source.git_ref = "v1".to_owned();
     let r = post_job(srv.addr, &spec).await;
     assert_eq!(status(&r), 201, "{r}");
     let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
-    assert_eq!(job["spec"]["base_commit"], first);
+    assert_eq!(job["spec"]["source"]["base"], first);
 
     spec.git_ref = first.clone();
+    spec.source.git_ref = first.clone();
     let r = post_job(srv.addr, &spec).await;
     assert_eq!(status(&r), 201, "{r}");
     let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
-    assert_eq!(job["spec"]["base_commit"], first);
+    assert_eq!(job["spec"]["source"]["base"], first);
 
     spec.git_ref = "missing-branch".to_owned();
+    spec.source.git_ref = "missing-branch".to_owned();
     let r = post_job(srv.addr, &spec).await;
     assert_eq!(status(&r), 422, "{r}");
     assert!(body_str(&r).contains("missing-branch"), "{r}");
@@ -2984,6 +3045,40 @@ async fn configured_repositories_sync_list_and_pin_branch_tag_and_commit() {
     )
     .await;
     assert_eq!(status(&r), 401, "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn a_pull_request_ref_is_pinned_at_submit_without_a_wildcard_sync() {
+    let repo_tmp = tempfile::tempdir().unwrap();
+    let (url, first, _second) = local_repo(repo_tmp.path());
+    let source = git2::Repository::open(repo_tmp.path()).unwrap();
+    source
+        .reference(
+            "refs/pull/42/head",
+            git2::Oid::from_str(&first).unwrap(),
+            false,
+            "pr head",
+        )
+        .unwrap();
+    let srv = start_server_with_repos(vec![repo_entry(&url)]).await;
+
+    let mut spec = sample_spec(None);
+    spec.repo = url.clone();
+    spec.source.repo = url;
+    spec.git_ref = "refs/pull/42/head".to_owned();
+    spec.source.git_ref = "refs/pull/42/head".to_owned();
+    let r = post_job(srv.addr, &spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["spec"]["source"]["base"], first);
+
+    // A PR submission must not run the branch/tag sync that wildcard-fetches every head.
+    let r = raw_request(srv.addr, &operator_get("/v1/repos")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let listed: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(listed["repos"][0]["heads"], json!({}));
 
     let _ = srv.shutdown.send(());
 }
@@ -3036,5 +3131,173 @@ async fn a_sync_error_never_contains_the_credential() {
     assert_eq!(status(&r), 500, "{r}");
     assert!(!r.contains("super-secret-token"), "{r}");
     assert!(!r.contains("user:super-secret-token"), "{r}");
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn artifacts_and_logs_are_scrubbed_before_storage() {
+    let artifacts = ArtifactsConfig {
+        scrub: true,
+        extra_rules: vec![ScrubRuleConfig {
+            name: "internal_ref".to_owned(),
+            pattern: r"INTERNAL-[A-Z0-9]{6,}".to_owned(),
+        }],
+    };
+    let srv = start_server_with_artifacts(Some(artifacts)).await;
+    let (id, job_id, epoch) = assign_and_start(&srv).await;
+
+    let patch = b"@@ -1,3 +1,3 @@\n context\n-token=abcdefghijklmnop\n+ghp_abcdefghijklmnopqrst\n INTERNAL-ABC12345\n";
+    let req = format!(
+        "PUT /v1/agent/jobs/{id}/artifacts/diff.patch?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n",
+        patch.len()
+    );
+    let mut packet = req.into_bytes();
+    packet.extend_from_slice(patch);
+    let r = raw_request_bytes(srv.addr, &packet).await;
+    assert_eq!(
+        response_status(&r),
+        200,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
+
+    let report = br#"{"password":"supersecretvalue"}"#;
+    let req = format!(
+        "PUT /v1/agent/jobs/{id}/artifacts/report.json?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n",
+        report.len()
+    );
+    let mut packet = req.into_bytes();
+    packet.extend_from_slice(report);
+    let r = raw_request_bytes(srv.addr, &packet).await;
+    assert_eq!(
+        response_status(&r),
+        200,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
+
+    let chunk = b"Authorization: Bearer abcdefghijklmnopqrst\n";
+    let expected_log = b"Authorization: Bearer [scrubbed:bearer_token]\n";
+    let req = format!(
+        "POST /v1/agent/jobs/{id}/log?epoch={epoch}&offset=0 HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n",
+        chunk.len()
+    );
+    let mut packet = req.into_bytes();
+    packet.extend_from_slice(chunk);
+    let r = raw_request_bytes(srv.addr, &packet).await;
+    assert_eq!(
+        response_status(&r),
+        200,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
+    let expected_len = expected_log.len().to_string();
+    assert_eq!(
+        response_header(&r, "x-lu-log-length").as_deref(),
+        Some(expected_len.as_str())
+    );
+
+    let stored_patch = raw_request(
+        srv.addr,
+        &operator_get(&format!("/v1/jobs/{id}/artifacts/diff.patch")),
+    )
+    .await;
+    let stored_patch = body_str(&stored_patch).to_owned();
+    assert!(
+        stored_patch.starts_with("@@ -1,3 +1,3 @@\n"),
+        "{stored_patch}"
+    );
+    assert_eq!(
+        stored_patch.lines().count(),
+        patch.split(|b| *b == b'\n').count() - 1
+    );
+    assert!(
+        stored_patch.contains("[scrubbed:assignment]"),
+        "{stored_patch}"
+    );
+    assert!(
+        stored_patch.contains("[scrubbed:token_prefix]"),
+        "{stored_patch}"
+    );
+    assert!(
+        stored_patch.contains("[scrubbed:internal_ref]"),
+        "{stored_patch}"
+    );
+    assert!(!stored_patch.contains("abcdefghijklmnop"), "{stored_patch}");
+    assert!(
+        !stored_patch.contains("INTERNAL-ABC12345"),
+        "{stored_patch}"
+    );
+
+    let stored_report = raw_request(
+        srv.addr,
+        &operator_get(&format!("/v1/jobs/{id}/artifacts/report.json")),
+    )
+    .await;
+    assert!(
+        body_str(&stored_report).contains("[scrubbed:assignment]"),
+        "{stored_report}"
+    );
+    assert!(
+        !body_str(&stored_report).contains("supersecretvalue"),
+        "{stored_report}"
+    );
+
+    let stored_log = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}/logs"))).await;
+    assert_eq!(body_str(&stored_log), String::from_utf8_lossy(expected_log));
+
+    let view = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}"))).await;
+    let view: serde_json::Value = serde_json::from_str(body_str(&view)).unwrap();
+    assert_eq!(view["scrubbed_hits"], 5, "{view}");
+    assert_eq!(view["patch_scrubbed"], true, "{view}");
+
+    let rec = srv.store.get_job(&job_id).unwrap();
+    assert_eq!(rec.scrubbed_hits, 5);
+    assert!(rec.patch_scrubbed);
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_can_set_a_runtime_group_limit() {
+    let srv = start_server().await;
+    let put = |path: &str, body: &str| {
+        format!(
+            "PUT {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        )
+    };
+
+    let ok = raw_request(
+        srv.addr,
+        &put("/v1/groups/batch/limit", r#"{"max_running":2}"#),
+    )
+    .await;
+    assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+    let view: serde_json::Value = serde_json::from_str(body_str(&ok)).unwrap();
+    assert_eq!(view, json!({"group": "batch", "max_running": 2}));
+    assert_eq!(srv.state.group_limits().get("batch"), Some(&2));
+
+    let unknown = raw_request(
+        srv.addr,
+        &put("/v1/groups/batch/limit", r#"{"max_running":2,"oops":1}"#),
+    )
+    .await;
+    assert!(unknown.starts_with("HTTP/1.1 422"), "{unknown}");
+
+    let range = raw_request(
+        srv.addr,
+        &put("/v1/groups/batch/limit", r#"{"max_running":0}"#),
+    )
+    .await;
+    assert!(range.starts_with("HTTP/1.1 400"), "{range}");
+    assert!(body_str(&range).contains("max_running must be 1 to 64"));
+
+    let group = raw_request(
+        srv.addr,
+        &put("/v1/groups/bad%20name/limit", r#"{"max_running":2}"#),
+    )
+    .await;
+    assert!(group.starts_with("HTTP/1.1 400"), "{group}");
+    assert_eq!(srv.state.group_limits().get("batch"), Some(&2));
     let _ = srv.shutdown.send(());
 }

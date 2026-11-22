@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     FailureClass, HarnessState, JobId, JobSpec, JobState, NodeName, ProviderModel, ProviderStatus,
+    PublishRecord, WorkspacePolicy, WorkspaceState,
 };
 
 /// A submitted job as returned by the controller.
@@ -52,6 +53,15 @@ pub struct JobView {
     pub after: Vec<JobId>,
     #[serde(default)]
     pub waiting_on: Vec<JobId>,
+    /// Parent of a job submitted through a harness's scoped socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_job_id: Option<JobId>,
+    /// Root of the spawn tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_job_id: Option<JobId>,
+    /// Distance from the root; top-level jobs are depth 0.
+    #[serde(default)]
+    pub depth: u32,
     #[serde(default)]
     pub waiting_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,8 +69,23 @@ pub struct JobView {
     /// Size of `diff.patch`, present for terminal jobs (zero when none was stored).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_bytes: Option<u64>,
+    /// Number of secrets replaced in stored artifacts and logs.
+    #[serde(default)]
+    pub scrubbed_hits: u64,
+    /// Whether `diff.patch` was changed by scrubbing and may no longer apply cleanly.
+    #[serde(default)]
+    pub patch_scrubbed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warnings: Option<Vec<String>>,
+    /// Audit enqueue/write failures on the controller that built this view, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_write_errors: Option<u64>,
+    /// Publish status for a job with a publish step, after an attempt has been made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<PublishRecord>,
+    /// Effective publish target computed from config and spec, shown even before an attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_target: Option<String>,
 }
 
 impl JobView {
@@ -86,10 +111,18 @@ impl JobView {
             cancel_requested: false,
             after: Vec::new(),
             waiting_on: Vec::new(),
+            parent_job_id: None,
+            root_job_id: None,
+            depth: 0,
             waiting_reason: None,
             outcome_note: None,
             diff_bytes: None,
+            scrubbed_hits: 0,
+            patch_scrubbed: false,
             warnings: None,
+            audit_write_errors: None,
+            publish: None,
+            publish_target: None,
         }
     }
 
@@ -153,6 +186,52 @@ pub struct NodeView {
     pub mem_total_kb: Option<u64>,
     #[serde(default)]
     pub stuck: u64,
+    /// Bytes in workspaces currently on disk.
+    #[serde(default)]
+    pub workspace_bytes: u64,
+    /// Workspaces currently on disk.
+    #[serde(default)]
+    pub workspace_count: u64,
+    /// Bytes reclaimed by workspace deletion since the agent started.
+    #[serde(default)]
+    pub workspace_reclaimed_bytes_total: u64,
+    /// Workspaces removed by eviction.
+    #[serde(default)]
+    pub workspace_evictions_total: u64,
+    /// Failed deletion attempts, all retried by the agent.
+    #[serde(default)]
+    pub workspace_delete_errors_total: u64,
+    /// The agent's workspace listing from its latest heartbeat, oldest first.
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceView>,
+}
+
+/// One workspace from an agent's `lu node <name> --workspaces` listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceView {
+    pub job_key: String,
+    pub state: WorkspaceState,
+    pub bytes: u64,
+    pub age_secs: u64,
+    pub policy: WorkspacePolicy,
+}
+
+/// Result of an operator's workspace clean request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceCleanResult {
+    pub queued: u64,
+    pub refused_running: u64,
+    pub missing: u64,
+}
+
+/// The controller's answer to an agent's "may I delete this workspace yet?" question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRelease {
+    pub can_delete: bool,
+    /// A short, operator-safe explanation; never a filesystem path.
+    pub reason: String,
 }
 
 impl NodeView {
@@ -177,12 +256,23 @@ impl NodeView {
             mem_available_kb: None,
             mem_total_kb: None,
             stuck: 0,
+            workspace_bytes: 0,
+            workspace_count: 0,
+            workspace_reclaimed_bytes_total: 0,
+            workspace_evictions_total: 0,
+            workspace_delete_errors_total: 0,
+            workspaces: Vec::new(),
         }
     }
 }
 
-fn empty_job_spec() -> JobSpec {
+pub(crate) fn empty_job_spec() -> JobSpec {
     JobSpec {
+        source: crate::SourceSpec {
+            repo: String::new(),
+            git_ref: String::new(),
+            base: None,
+        },
         repo: String::new(),
         git_ref: String::new(),
         base_commit: None,
@@ -206,5 +296,16 @@ fn empty_job_spec() -> JobSpec {
         fallbacks: Vec::new(),
         priority: crate::DEFAULT_PRIORITY,
         group: None,
+        allow_spawn: false,
+        spawn_inherit: false,
+        spawn_repos: Vec::new(),
+        workspace: None,
+        cache_dirs: Vec::new(),
+        context: None,
+        origin: None,
+        origin_ref: None,
+        untrusted_context: false,
+        draft: false,
+        publish: None,
     }
 }

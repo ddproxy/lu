@@ -44,6 +44,12 @@ pub struct NodeRow {
     pub mem_available_kb: Option<u64>,
     pub mem_total_kb: Option<u64>,
     pub stuck: u64,
+    /// Bytes in workspaces currently on disk.
+    pub workspace_bytes: u64,
+    pub workspace_count: u64,
+    pub workspace_reclaimed_bytes_total: u64,
+    pub workspace_evictions_total: u64,
+    pub workspace_delete_errors_total: u64,
     /// Free-form labels the node publishes, shown after its providers.
     pub labels: Vec<String>,
 }
@@ -71,6 +77,10 @@ pub struct Snapshot {
     pub nodes: Vec<NodeRow>,
     pub jobs: Vec<JobRow>,
     pub controller_version: Option<String>,
+    /// Number of stored drafts.
+    pub drafts: u64,
+    /// Age of the oldest stored draft in seconds, zero when there are none.
+    pub oldest_draft_secs: u64,
 }
 
 /// Which pane the selection keys act on. The Jobs table and the graph share one selected job.
@@ -989,10 +999,10 @@ fn job_tone(state: &str) -> Tone {
     match state.parse::<JobState>() {
         Ok(JobState::Done) => Tone::Done,
         Ok(JobState::Running | JobState::Leased) => Tone::Good,
-        Ok(JobState::Blocked) => Tone::Blocked,
+        Ok(JobState::Blocked | JobState::Draft) => Tone::Blocked,
         Ok(JobState::Queued | JobState::Recovering | JobState::NeedsInput) => Tone::Warn,
         Ok(JobState::Failed) => Tone::Bad,
-        Ok(JobState::Cancelled) | Err(_) => Tone::Dim,
+        Ok(JobState::Cancelled | JobState::Expired) | Err(_) => Tone::Dim,
     }
 }
 
@@ -1019,6 +1029,21 @@ fn charts(history: &[Sample]) -> Vec<Chart> {
         series("busy nodes", |s| s.busy_nodes),
         series("providers ok", |s| s.providers_ok),
     ]
+}
+
+fn compact_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{}{}", bytes, UNITS[unit])
+    } else {
+        format!("{size:.1}{}", UNITS[unit])
+    }
 }
 
 fn mem_used_pct(node: &NodeRow) -> Option<u64> {
@@ -1097,6 +1122,17 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
         .map(|p| format!("{p}%"))
         .unwrap_or_else(|| "-".to_owned());
     let mem_text_tone = mem_pct.map(mem_tone).unwrap_or(Tone::Plain);
+    let workspace_text = format!(
+        "{}/{}",
+        node.workspace_count,
+        compact_bytes(node.workspace_bytes)
+    );
+    let workspace_total_text = format!(
+        "{}/{}/{}",
+        compact_bytes(node.workspace_reclaimed_bytes_total),
+        node.workspace_evictions_total,
+        node.workspace_delete_errors_total
+    );
 
     let state_segments = if node.stuck > 0 {
         vec![
@@ -1147,6 +1183,13 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
     segments.push(Segment::new(pad_left(&load_text, 6), Tone::Plain));
     segments.push(Segment::new(" ", Tone::Plain));
     segments.push(Segment::new(pad_left(&mem_text, 5), mem_text_tone));
+    segments.push(Segment::new(" ", Tone::Plain));
+    segments.push(Segment::new(pad_left(&workspace_text, 12), Tone::Plain));
+    segments.push(Segment::new(" ", Tone::Plain));
+    segments.push(Segment::new(
+        pad_left(&workspace_total_text, 16),
+        Tone::Plain,
+    ));
     segments.push(Segment::new("  ", Tone::Plain));
     if provider_cells.is_empty() {
         // nothing
@@ -1188,35 +1231,41 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
     // ensure plain text matches expected formatting for providers spacing
     if !providers_plain.is_empty() {
         let expected_prefix = format!(
-            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5}  ",
+            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}  ",
             clip(&node.name, 12),
             clip(&version, 10),
             clip(&state_plain, 14),
             pad_right(&seen, 8).trim_end(),
             load_text,
-            mem_text
+            mem_text,
+            workspace_text,
+            workspace_total_text
         );
         // rebuild plain text cleanly
         line.text = format!(
-            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5}  {}",
+            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}  {}",
             clip(&node.name, 12),
             clip(&version, 10),
             clip(&state_plain, 14),
             seen,
             load_text,
             mem_text,
+            workspace_text,
+            workspace_total_text,
             providers_plain
         );
         let _ = expected_prefix;
     } else {
         line.text = format!(
-            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5}",
+            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}",
             clip(&node.name, 12),
             clip(&version, 10),
             clip(&state_plain, 14),
             seen,
             load_text,
-            mem_text
+            mem_text,
+            workspace_text,
+            workspace_total_text
         );
     }
     if !node.labels.is_empty() {
@@ -1356,8 +1405,8 @@ impl ViewModel {
         } = args;
         let mut lines = vec![Line::new(
             format!(
-                "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5}  PROVIDERS",
-                "NODE", "VERSION", "STATE", "SEEN", "LOAD", "MEM"
+                "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}  PROVIDERS",
+                "NODE", "VERSION", "STATE", "SEEN", "LOAD", "MEM", "WORKSPACES", "WS TOTALS"
             ),
             Tone::Heading,
         )];
@@ -1460,8 +1509,17 @@ impl ViewModel {
             .map(printable)
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "-".to_owned());
+        let drafts = if snapshot.drafts == 0 {
+            "drafts 0".to_owned()
+        } else {
+            format!(
+                "drafts {} oldest {}",
+                snapshot.drafts,
+                short_age(snapshot.oldest_draft_secs)
+            )
+        };
         let title = format!(
-            "lu top {} · controller {}",
+            "lu top {} · controller {} · {drafts}",
             env!("CARGO_PKG_VERSION"),
             controller
         );
@@ -1588,6 +1646,11 @@ mod tests {
             mem_available_kb: None,
             mem_total_kb: None,
             stuck: 0,
+            workspace_bytes: 0,
+            workspace_count: 0,
+            workspace_reclaimed_bytes_total: 0,
+            workspace_evictions_total: 0,
+            workspace_delete_errors_total: 0,
             labels: Vec::new(),
         }
     }
@@ -1614,6 +1677,8 @@ mod tests {
             ],
             jobs: vec![job("01ABC", "running"), job("01BLK", "blocked")],
             controller_version: None,
+            drafts: 0,
+            oldest_draft_secs: 0,
         }
     }
 
@@ -1954,6 +2019,11 @@ mod tests {
             mem_available_kb,
             mem_total_kb,
             stuck,
+            workspace_bytes: 0,
+            workspace_count: 0,
+            workspace_reclaimed_bytes_total: 0,
+            workspace_evictions_total: 0,
+            workspace_delete_errors_total: 0,
             labels: Vec::new(),
         }
     }
@@ -1983,6 +2053,8 @@ mod tests {
         let t0 = Instant::now();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: vec![
                     node_full(
@@ -2070,6 +2142,8 @@ mod tests {
         row.stuck = 2;
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: vec![row],
                 jobs: Vec::new(),
@@ -2098,6 +2172,8 @@ mod tests {
         let t0 = Instant::now();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: Some("0.2.0".to_owned()),
                 nodes: vec![
                     node_full("same", "idle", Some(1), Some("0.2.0"), None, None, None, 0),
@@ -2156,6 +2232,8 @@ mod tests {
         for i in 0..160u64 {
             dashboard.apply(
                 Ok(Snapshot {
+                    drafts: 0,
+                    oldest_draft_secs: 0,
                     controller_version: None,
                     nodes: vec![node_full(
                         "n1",
@@ -2175,6 +2253,8 @@ mod tests {
         // open process pane to expose spark data
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: vec![node_full(
                     "n1",
@@ -2214,6 +2294,8 @@ mod tests {
         let t0 = Instant::now();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: vec![node_full(
                     "n1",
@@ -2356,6 +2438,8 @@ mod tests {
         let t0 = Instant::now();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: Some("ctrl\u{1b}[31m".to_owned()),
                 nodes: vec![node_full(
                     "node\u{1b}[31m",

@@ -28,9 +28,17 @@ token_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 # [agent]
 # name = "node-a"
 # controller_url = "https://lu.example.net:7600"
-# token_file = "/etc/lu/agent.token"   # mode 0600 or tighter
+# token_file = "/etc/ting/ting.token"   # mode 0600 or tighter
 # work_dir = "/srv/work/lu"
 # harness = "opencode"
+
+# Controller-side scrubbing is on by default. Add operator patterns like this:
+# [artifacts]
+# scrub = true
+#
+# [[artifacts.extra_rules]]
+# name = "internal_ref"
+# pattern = "INTERNAL-[A-Z0-9]{6,}"
 
 [log]
 level = "info"

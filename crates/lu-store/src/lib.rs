@@ -9,7 +9,7 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 3;
 
 #[cfg(test)]
 pub mod conformance;
@@ -20,13 +20,20 @@ use std::collections::HashMap;
 
 use lu_proto::{
     ArtifactName, Completion, FailureClass, Heartbeat, JobEdit, JobId, JobSpec, JobState, NodeName,
-    ProviderState,
+    ProviderState, PublishRecord,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Now {
     pub wall_unix: i64,
     pub mono_ms: u64,
+}
+
+/// Bounds checked atomically when a child is created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeLimits {
+    pub max_children: u64,
+    pub max_descendants: u64,
 }
 
 /// Where a provider cordon came from. Reiki-derived cordons lift after healthy heartbeats;
@@ -85,8 +92,20 @@ pub struct JobRecord {
     pub diff_bytes: Option<u64>,
     /// A `done` job whose expectations were not met in suspect mode.
     pub expect_failed: bool,
+    /// Number of secret-like matches the controller scrubbed from this job's artifacts and logs.
+    pub scrubbed_hits: u64,
+    /// Whether the stored `diff.patch` was scrubbed; such a patch may no longer apply.
+    pub patch_scrubbed: bool,
     /// Dependencies that are not yet `done`; empty once the job may run.
     pub waiting_on: Vec<JobId>,
+    /// Set only for jobs submitted through a harness's scoped socket.
+    pub parent_job_id: Option<JobId>,
+    /// The root of the spawn tree; equal to this job's id for a top-level job.
+    pub root_job_id: Option<JobId>,
+    /// Distance from the root job: top-level jobs have depth 0.
+    pub depth: u32,
+    /// Publish status, set only for jobs with a publish step after an attempt.
+    pub publish: Option<PublishRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,13 +265,79 @@ pub enum StoreError {
     DependencyCycle,
     /// The spec itself is invalid; normally the API validates before reaching the store.
     InvalidSpec(String),
+    /// A configured scope limit was reached. The name is safe for the `limit_exceeded` error code
+    /// and metrics label.
+    LimitExceeded(&'static str),
     Internal(String),
+}
+
+/// Draft inventory used by the controller to enforce limits and show `lu top`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DraftCounts {
+    /// Number of jobs in `draft`.
+    pub total: u64,
+    /// Number of drafts per `origin` label. Unlabelled drafts use the empty string.
+    pub by_origin: Vec<(String, u64)>,
+    /// Wall-clock time of the oldest draft, if any.
+    pub oldest_created_at: Option<i64>,
 }
 
 pub trait Store: Send + Sync + 'static {
     /// Creates a job, or returns the existing one for the same key and spec (`false`).
     fn create_job(&self, spec: &JobSpec, now: Now) -> Result<(JobRecord, bool), StoreError>;
+    /// Creates a child job with explicit lineage. The store owns the lineage write so a child is
+    /// never recorded without its parent and root. Stores that do not implement scope return an
+    /// error rather than silently dropping the right.
+    fn create_scoped_job(
+        &self,
+        spec: &JobSpec,
+        now: Now,
+        parent_job_id: &JobId,
+        root_job_id: &JobId,
+        depth: u32,
+        limits: ScopeLimits,
+    ) -> Result<(JobRecord, bool), StoreError> {
+        let _ = (spec, now, parent_job_id, root_job_id, depth, limits);
+        Err(StoreError::InvalidSpec(
+            "job scoping is not supported by this store".to_owned(),
+        ))
+    }
+    /// Children of one job, newest first.
+    fn children(&self, parent_job_id: &JobId) -> Result<Vec<JobRecord>, StoreError> {
+        let _ = parent_job_id;
+        Ok(Vec::new())
+    }
+    /// Number of descendants with this root, excluding the root itself.
+    fn descendants(&self, root_job_id: &JobId) -> Result<u64, StoreError> {
+        let _ = root_job_id;
+        Ok(0)
+    }
     fn get_job(&self, id: &JobId) -> Result<JobRecord, StoreError>;
+    /// Reads a job only while it is actively leased to `node` at `epoch`. The monotonic lease
+    /// deadline and state are checked in one query so an expired lease cannot be used after the
+    /// maintenance task has missed a tick. Stores without lease columns fall back to the stable
+    /// fields in [`JobRecord`].
+    fn leased_job(
+        &self,
+        id: &JobId,
+        node: &NodeName,
+        epoch: u64,
+        now: Now,
+        lease_ms: u64,
+    ) -> Result<JobRecord, StoreError> {
+        let _ = (now, lease_ms);
+        let job = self.get_job(id)?;
+        if job.node.as_ref() != Some(node)
+            || job.epoch != epoch
+            || !matches!(
+                job.state,
+                JobState::Leased | JobState::Running | JobState::NeedsInput
+            )
+        {
+            return Err(StoreError::StaleEpoch);
+        }
+        Ok(job)
+    }
     /// The newest job submitted with an idempotency key, if there is one.
     fn job_by_key(&self, key: &str) -> Option<JobRecord>;
     /// Newest first. `after` is a cursor: jobs strictly older than it.
@@ -271,6 +356,39 @@ pub trait Store: Send + Sync + 'static {
     /// number at most 16 and must not form a cycle. The job moves between `blocked` and `queued`
     /// as its dependencies change.
     fn edit_job(&self, id: &JobId, edit: &JobEdit, now: Now) -> Result<JobRecord, StoreError>;
+
+    /// Drafts, oldest first.
+    fn list_drafts(&self, limit: usize) -> Result<Vec<JobRecord>, StoreError> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
+    /// Inventory of drafts for limits, `lu top` and metrics.
+    fn draft_counts(&self) -> Result<DraftCounts, StoreError> {
+        Ok(DraftCounts::default())
+    }
+    /// Moves a draft to `queued` or `blocked`. Only those two targets are accepted.
+    fn approve_draft(
+        &self,
+        id: &JobId,
+        target: JobState,
+        now: Now,
+    ) -> Result<JobRecord, StoreError> {
+        let _ = (id, target, now);
+        Err(StoreError::InvalidSpec(
+            "drafts are not supported by this store".to_owned(),
+        ))
+    }
+    /// Moves every draft created strictly before `older_than` to terminal `expired`.
+    fn expire_drafts(&self, older_than: i64, now: Now) -> Result<u64, StoreError> {
+        let _ = (older_than, now);
+        Ok(0)
+    }
+    /// Expires up to `count` oldest drafts to make room under a capacity limit. Returns the
+    /// number moved to terminal `expired`. Drafts are never deleted silently.
+    fn expire_oldest_drafts(&self, count: u64, now: Now) -> Result<u64, StoreError> {
+        let _ = (count, now);
+        Ok(0)
+    }
 
     /// Records the heartbeat and the time it was seen.
     fn heartbeat(&self, hb: &Heartbeat, now: Now) -> Result<(), StoreError>;
@@ -313,6 +431,21 @@ pub trait Store: Send + Sync + 'static {
         name: ArtifactName,
         bytes: u64,
     ) -> Result<(), StoreError>;
+    /// Adds scrub counts for a stored artifact or log chunk. `patch` marks a scrubbed diff.
+    fn record_scrub(
+        &self,
+        id: &JobId,
+        epoch: u64,
+        hits: u64,
+        patch: bool,
+    ) -> Result<(), StoreError>;
+    /// Records (or replaces) publish status for a job. No credential is ever stored here.
+    fn record_publish(
+        &self,
+        id: &JobId,
+        record: &PublishRecord,
+        now: Now,
+    ) -> Result<JobRecord, StoreError>;
     /// Finishes the attempt. Success is `done`; a node or provider failure with attempts left
     /// returns the job to `queued` (attempt + 1) and cordons `(node, provider)` for a provider
     /// failure; anything else is `failed`. `cordon_ms` and `max_retries` come from config.

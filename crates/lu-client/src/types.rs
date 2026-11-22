@@ -5,12 +5,15 @@
 
 use lu_proto::{
     AgentEvent, FailureClass, HarnessState, Heartbeat, JobId, JobState, NodeName, Outcome,
-    ProviderModel, ProviderStatus,
+    ProviderModel, ProviderStatus, WorkspaceView,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub use lu_proto::{HostStats, JobStats, JobView, NodeStats, NodeView, ProcessStats};
+pub use lu_proto::{
+    HostStats, JobStats, JobView, NodeStats, NodeView, ProcessStats, WorkspaceCleanResult,
+    WorkspaceRelease,
+};
 
 /// Largest JSON response the client will read. Artifacts have their own per-file cap.
 pub const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
@@ -47,6 +50,15 @@ pub struct DependencyView {
 pub struct ListJobs {
     #[serde(default)]
     pub jobs: Vec<JobView>,
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
+/// A page of draft jobs, oldest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListDrafts {
+    #[serde(default)]
+    pub drafts: Vec<JobView>,
     #[serde(default)]
     pub next: Option<String>,
 }
@@ -96,11 +108,26 @@ pub struct StatusView {
     #[serde(default)]
     pub oldest_queued_secs: u64,
     #[serde(default)]
+    pub drafts: u64,
+    #[serde(default)]
+    pub oldest_draft_secs: u64,
+    #[serde(default)]
     pub nodes: u64,
     #[serde(default)]
     pub nodes_online: u64,
     #[serde(default)]
     pub lease_secs: u64,
+    /// Audit enqueue/write failures since the controller started (zero when auditing is off).
+    #[serde(default)]
+    pub audit_write_errors: u64,
+    #[serde(default)]
+    pub scope_enabled: bool,
+    #[serde(default)]
+    pub scope_max_depth: u32,
+    #[serde(default)]
+    pub scope_max_children_per_job: u64,
+    #[serde(default)]
+    pub scope_max_descendants_per_root: u64,
 }
 
 /// What an agent sends when it asks for work. The token already identifies the node, so `node`
@@ -131,8 +158,30 @@ pub struct PollRequest {
     pub label_sources: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub taints: Vec<String>,
+    /// Bytes in workspaces currently on disk.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub workspace_bytes: u64,
+    /// Workspaces currently on disk.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub workspace_count: u64,
+    /// Bytes reclaimed by workspace deletion since the agent started.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub workspace_reclaimed_bytes_total: u64,
+    /// Workspaces removed by high-water or size-cap eviction.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub workspace_evictions_total: u64,
+    /// Failed deletion attempts; failures are retried and never silently ignored.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub workspace_delete_errors_total: u64,
+    /// Workspaces the agent is tracking, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<WorkspaceView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_secs: Option<u64>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl From<Heartbeat> for PollRequest {
@@ -149,6 +198,12 @@ impl From<Heartbeat> for PollRequest {
             labels: beat.labels,
             label_sources: beat.label_sources,
             taints: beat.taints,
+            workspace_bytes: beat.workspace_bytes,
+            workspace_count: beat.workspace_count,
+            workspace_reclaimed_bytes_total: beat.workspace_reclaimed_bytes_total,
+            workspace_evictions_total: beat.workspace_evictions_total,
+            workspace_delete_errors_total: beat.workspace_delete_errors_total,
+            workspaces: beat.workspaces,
             wait_secs: None,
         }
     }
@@ -299,14 +354,14 @@ fn _assert_send_sync() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lu_proto::FailureClass;
+    use lu_proto::{FailureClass, WorkspacePolicy, WorkspaceState};
 
     #[test]
     fn job_view_ignores_future_fields_and_keeps_known_ones() {
         let id = JobId::new();
         let json = format!(
             r#"{{"id":"{id}","state":"running","attempt":2,"created_at":10,
-                "spec":{{"repo":"/srv/repo","git_ref":"main","task":"go"}},
+                "spec":{{"source": {{"repo": "/srv/repo", "ref": "main"}},"task":"go"}},
                 "failure_class":"execution","future":{{"x":1}}}}"#
         );
         let view: JobView = serde_json::from_str(&json).unwrap();
@@ -369,6 +424,46 @@ mod tests {
         assert_eq!(json, r#"{"taints":["homelab"]}"#);
         let parsed: PollRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.taints, vec!["homelab"]);
+    }
+
+    #[test]
+    fn poll_requests_carry_workspace_heartbeat_fields() {
+        let workspace = WorkspaceView {
+            job_key: JobId::new().to_string(),
+            state: WorkspaceState::Kept,
+            bytes: 64,
+            age_secs: 12,
+            policy: WorkspacePolicy::Keep,
+        };
+        let beat = Heartbeat {
+            node: NodeName::parse("node-a").unwrap(),
+            harness: HarnessState::Busy,
+            version: None,
+            providers: Vec::new(),
+            provider_models: Vec::new(),
+            reiki: None,
+            host: None,
+            jobs: Vec::new(),
+            labels: Vec::new(),
+            label_sources: BTreeMap::new(),
+            taints: Vec::new(),
+            workspace_bytes: 64,
+            workspace_count: 1,
+            workspace_reclaimed_bytes_total: 128,
+            workspace_evictions_total: 2,
+            workspace_delete_errors_total: 3,
+            workspaces: vec![workspace.clone()],
+        };
+        let request = PollRequest::from(beat);
+        assert_eq!(request.workspace_bytes, 64);
+        assert_eq!(request.workspace_count, 1);
+        assert_eq!(request.workspace_reclaimed_bytes_total, 128);
+        assert_eq!(request.workspace_evictions_total, 2);
+        assert_eq!(request.workspace_delete_errors_total, 3);
+        assert_eq!(request.workspaces, vec![workspace]);
+        let json = serde_json::to_string(&request).unwrap();
+        let parsed: PollRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, request);
     }
 
     #[test]

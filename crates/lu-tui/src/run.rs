@@ -354,6 +354,8 @@ mod tests {
         let mut dashboard = Dashboard::new();
         dashboard.apply(
             Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
                 controller_version: None,
                 nodes: vec![NodeRow {
                     name: "peer-a".to_owned(),
@@ -367,6 +369,11 @@ mod tests {
                     mem_available_kb: None,
                     mem_total_kb: None,
                     stuck: 0,
+                    workspace_bytes: 0,
+                    workspace_count: 0,
+                    workspace_reclaimed_bytes_total: 0,
+                    workspace_evictions_total: 0,
+                    workspace_delete_errors_total: 0,
                     labels: Vec::new(),
                 }],
                 jobs: vec![

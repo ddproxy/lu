@@ -34,6 +34,8 @@ set -euo pipefail
 umask 077
 LU="${LU:-$PWD/target/release/lu}"
 if [ ! -x "$LU" ]; then LU=lu; fi   # use your PATH build when make build was not run here
+TING="${TING:-$PWD/target/release/ting}"
+if [ ! -x "$TING" ]; then TING=ting; fi   # use your PATH build when make build was not run here
 DEMO="$HOME/lu-demo"
 REPO="/home/you/src/demo"
 
@@ -103,7 +105,7 @@ curl -fsS http://127.0.0.1:7600/v1/health
 export LU_URL=http://127.0.0.1:7600
 export LU_TOKEN_FILE="$DEMO/operator.token"
 
-"$LU" agent --config "$DEMO/lu.toml" > "$DEMO/agent.log" 2>&1 &
+"$TING" --config "$DEMO/lu.toml" > "$DEMO/agent.log" 2>&1 &
 AGENT=$!
 trap 'kill "$AGENT" "$CONTROLLER" 2>/dev/null || true' EXIT
 
@@ -117,9 +119,9 @@ done
 Expected health response and node row; times and version vary:
 
 ```text
-{"db":"ok","ok":true,"version":"0.3.2"}
-NAME    VERSION  HARNESS  LABELS  LAST_SEEN             DRAINED
-node-a  0.3.2    idle     -       2026-11-21 14:22:00Z  no
+{"db":"ok","ok":true,"version":"0.4.0"}
+NAME    VERSION  HARNESS  LABELS  CORDONS  LAST_SEEN             DRAINED
+node-a  0.4.0    idle     -       -        2026-11-21 14:22:00Z  no
 ```
 
 If the node row does not appear, read `$DEMO/agent.log` and `$DEMO/controller.log`.
@@ -145,6 +147,8 @@ Expected submission output and the first rows of `lu show`:
 state: done                  <- stderr
 id                 01M7Z7FMB95WRHQ790HK90EYM2
 state              done
+priority           5
+group              -
 node               node-a
 assigned_provider  -
 fallbacks          -
@@ -163,6 +167,30 @@ diff_bytes         <size of stored diff.patch>
 
 `lu submit --wait` exits `0` for `done` and `3` for `failed` or `cancelled`. A connection, token
 or config error exits `1`; a bad flag exits `2`.
+
+### Optional: submit a batch
+
+Put one task per file in a directory. A TOML file with a different name supplies shared defaults;
+a sidecar named after a task overrides those fields for that task.
+
+```sh
+mkdir -p "$DEMO/tasks"
+printf 'Run lint. Do not edit tracked files.\n' > "$DEMO/tasks/lint.md"
+printf 'Run the test suite. Do not edit tracked files.\n' > "$DEMO/tasks/test.md"
+cat > "$DEMO/tasks/defaults.toml" <<EOF
+repo = "$REPO"
+ref = "main"
+EOF
+
+"$LU" submit --batch "$DEMO/tasks" --key-prefix demo-1 \
+  --defaults "$DEMO/tasks/defaults.toml" --chain --dry-run
+"$LU" submit --batch "$DEMO/tasks" --key-prefix demo-1 \
+  --defaults "$DEMO/tasks/defaults.toml" --chain
+```
+
+The dry run prints one row per task and sends no request. The real run returns a row per job with
+its key, id, state and source name. Rerunning it with the same prefix returns the same jobs. See
+[Batch submissions](batch.md).
 
 ## 4. Fetch and verify
 
@@ -202,6 +230,7 @@ The controller stops accepting connections on `SIGTERM` and drains in-flight req
 | --- | --- | --- | --- | --- |
 | `lu check` | Config is valid | Config or database error | — | — |
 | `lu submit --wait` | Job `done` | API, connection or token error | Usage error | Job `failed` or `cancelled` |
+| `lu submit --batch` | All jobs submitted | Controller failure after validation | Validation or usage error | — |
 | `lu logs --follow` | Job `done` | API, connection or token error | Usage error | Job `failed` or `cancelled` |
 | `lu fetch` | At least one artifact saved | No artifacts, write or API error | Usage error | — |
 
@@ -213,4 +242,4 @@ The controller stops accepting connections on `SIGTERM` and drains in-flight req
   then fails the job; `lu show` reports `failure provider`. See
   [Running the opencode harness](opencode-harness.md).
 - There is no config reload. Restart `lu serve` after editing config or token hashes, and restart
-  `lu agent` after editing its config.
+  `ting` after editing its config.

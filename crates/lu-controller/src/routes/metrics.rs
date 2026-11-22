@@ -79,6 +79,7 @@ pub async fn metrics(
     };
 
     let mut out = String::new();
+    let group_limits = state.group_limits();
 
     let version = escape_label(env!("CARGO_PKG_VERSION"));
     out.push_str("# HELP lu_build_info Controller build version\n");
@@ -138,17 +139,29 @@ pub async fn metrics(
         out.push('\n');
     }
 
-    if !state.group_limits.is_empty() {
-        out.push_str("# HELP lu_group_running Jobs active in a configured group\n");
+    out.push_str("# HELP lu_drafts Draft and expired jobs by state\n");
+    out.push_str("# TYPE lu_drafts gauge\n");
+    for (state, count) in &counts.jobs {
+        if matches!(
+            state,
+            lu_proto::JobState::Draft | lu_proto::JobState::Expired
+        ) {
+            out.push_str(&gauge("lu_drafts", &[("state", state.as_str())], *count));
+            out.push('\n');
+        }
+    }
+
+    if !group_limits.is_empty() {
+        out.push_str("# HELP lu_group_running Jobs active in a capped group\n");
         out.push_str("# TYPE lu_group_running gauge\n");
-        out.push_str("# HELP lu_group_limit Configured concurrency cap for a group\n");
+        out.push_str("# HELP lu_group_limit Active concurrency cap for a group\n");
         out.push_str("# TYPE lu_group_limit gauge\n");
-        let mut names: Vec<_> = state.group_limits.keys().collect();
+        let mut names: Vec<_> = group_limits.keys().collect();
         names.sort();
         for name in names {
             let label = escape_label(name);
             let running = group_counts.get(name).copied().unwrap_or(0) as u64;
-            let limit = state.group_limits.get(name).copied().unwrap_or(0) as u64;
+            let limit = group_limits.get(name).copied().unwrap_or(0) as u64;
             out.push_str(&gauge("lu_group_running", &[("group", &label)], running));
             out.push('\n');
             out.push_str(&gauge("lu_group_limit", &[("group", &label)], limit));
@@ -171,6 +184,67 @@ pub async fn metrics(
     out.push_str(&gauge("lu_nodes_drained", &[], counts.nodes_drained));
     out.push('\n');
 
+    // Workspace lifecycle counters from the latest agent heartbeats.
+    let mut node_stats: Vec<_> = state
+        .stats
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(node, stats)| (node.to_string(), stats.clone()))
+        .collect();
+    node_stats.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, help, kind, value) in [
+        (
+            "lu_node_workspace_bytes",
+            "Bytes in a node's job workspaces",
+            "gauge",
+            0,
+        ),
+        (
+            "lu_node_workspace_count",
+            "Number of job workspaces on a node",
+            "gauge",
+            1,
+        ),
+        (
+            "lu_node_workspace_reclaimed_bytes_total",
+            "Bytes reclaimed by a node's workspace cleanup",
+            "counter",
+            2,
+        ),
+        (
+            "lu_node_workspace_evictions_total",
+            "Workspaces removed by a node's eviction sweeps",
+            "counter",
+            3,
+        ),
+        (
+            "lu_node_workspace_delete_errors_total",
+            "Failed workspace deletions on a node",
+            "counter",
+            4,
+        ),
+    ] {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+        for (node, stats) in &node_stats {
+            let label = escape_label(node);
+            let number = match value {
+                0 => stats.workspace_bytes,
+                1 => stats.workspace_count,
+                2 => stats.workspace_reclaimed_bytes_total,
+                3 => stats.workspace_evictions_total,
+                _ => stats.workspace_delete_errors_total,
+            };
+            let line = if kind == "counter" {
+                counter(name, &[("node", &label)], number)
+            } else {
+                gauge(name, &[("node", &label)], number)
+            };
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
     out.push_str("# HELP lu_controller_up Whether the controller is up (1) or down (0)\n");
     out.push_str("# TYPE lu_controller_up gauge\n");
     out.push_str("lu_controller_up 1\n");
@@ -186,6 +260,19 @@ pub async fn metrics(
             .map(|at| n.wall_unix.saturating_sub(at).max(0) as u64)
             .unwrap_or(0);
         out.push_str(&gauge("lu_repo_last_sync_seconds", &[("repo", &name)], age));
+        out.push('\n');
+    }
+
+    out.push_str("# HELP lu_intake_total Intake requests by source and result\n");
+    out.push_str("# TYPE lu_intake_total counter\n");
+    for (source, result, value) in state.intake_totals() {
+        let source = escape_label(&source);
+        let result = escape_label(&result);
+        out.push_str(&counter(
+            "lu_intake_total",
+            &[("source", &source), ("result", &result)],
+            value,
+        ));
         out.push('\n');
     }
 
@@ -240,6 +327,35 @@ pub async fn metrics(
             "lu_jobs_stuck_stopped_total",
             &[("mode", mode.as_str())],
             state.stuck_stopped_total(mode),
+        ));
+        out.push('\n');
+    }
+
+    out.push_str("# HELP lu_scope_requests_total Job-scoped actions by route and result\n");
+    out.push_str("# TYPE lu_scope_requests_total counter\n");
+    let mut scope_rows = state.scope_request_counts();
+    scope_rows.sort_by(|a, b| a.0.cmp(&b.0));
+    for ((route, result), value) in &scope_rows {
+        let route = escape_label(route);
+        let result = escape_label(result);
+        out.push_str(&counter(
+            "lu_scope_requests_total",
+            &[("route", &route), ("result", &result)],
+            *value,
+        ));
+        out.push('\n');
+    }
+
+    out.push_str(
+        "# HELP lu_scope_limit_exceeded_total Job-scoped requests refused by a named limit\n",
+    );
+    out.push_str("# TYPE lu_scope_limit_exceeded_total counter\n");
+    for (limit, value) in state.scope_limit_counts() {
+        let label = escape_label(&limit);
+        out.push_str(&counter(
+            "lu_scope_limit_exceeded_total",
+            &[("limit", &label)],
+            value,
         ));
         out.push('\n');
     }
@@ -359,6 +475,30 @@ pub async fn metrics(
         ));
         out.push('\n');
     }
+
+    out.push_str("# HELP lu_publish_total Publish attempts by target and result\n");
+    out.push_str("# TYPE lu_publish_total counter\n");
+    for (target, result, value) in state.publish_totals() {
+        let target = escape_label(&target);
+        let result = escape_label(&result);
+        out.push_str(&counter(
+            "lu_publish_total",
+            &[("target", &target), ("result", &result)],
+            value,
+        ));
+        out.push('\n');
+    }
+
+    out.push_str(
+        "# HELP lu_audit_write_errors_total Audit record enqueue or write failures since this controller started\n",
+    );
+    out.push_str("# TYPE lu_audit_write_errors_total counter\n");
+    out.push_str(&counter(
+        "lu_audit_write_errors_total",
+        &[],
+        state.audit_write_errors(),
+    ));
+    out.push('\n');
 
     (
         StatusCode::OK,

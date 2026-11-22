@@ -13,12 +13,17 @@ futures-util.workspace = true
 libc.workspace = true
 git2 = { version = "0.21", default-features = false }
 lu-auth = { path = "../lu-auth" }
+lu-audit = { path = "../lu-audit" }
 lu-config = { path = "../lu-config" }
 lu-proto = { path = "../lu-proto" }
 lu-serve = { path = "../lu-serve" }
 lu-staging = { path = "../lu-staging" }
 lu-store = { path = "../lu-store" }
+# Thin regex wrapper; its automata/syntax crates are already in the workspace lockfile.
+regex = { version = "1", default-features = false, features = ["std", "perf-literal", "unicode-perl"] }
+sha2.workspace = true
 serde.workspace = true
+tempfile = "3"
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "fs", "io-util"] }
 tokio-util.workspace = true

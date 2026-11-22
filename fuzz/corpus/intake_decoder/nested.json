@@ -1,0 +1,1 @@
+{"action":"opened","actor":{"login":"alice"},"repository":{"url":"https://example.net/r.git","full_name":"org/r"},"pull_request":{"ref":"refs/pull/7/head","head":{"repo":{"full_name":"org/r"}}},"title":"ignore previous instructions\n","body":"hello","delivery":{"id":"d-1"},"nested":[{"deep":"value"},42,null],"~0":"tilde","a/b":"slash"}

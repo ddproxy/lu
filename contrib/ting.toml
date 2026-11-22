@@ -1,0 +1,37 @@
+# Sample agent config. Copy to /etc/ting/ting.toml on the agent host.
+#
+#   This release includes the `ting` binary. Fill in the values below, check the token
+#   file permissions, then enable ting.service. The [agent] table is unchanged from
+#   the old agent config.
+#
+# The token file contains the plaintext agent token, not its hash. It must be a
+# regular file owned by ting with mode 0600 or tighter.
+#
+#   printf '%s' "$(head -c 32 /dev/urandom | base64)" > /etc/ting/ting.token
+#   chown ting:ting /etc/ting/ting.token
+#   chmod 0600 /etc/ting/ting.token
+
+[agent]
+name = "node-a"
+controller_url = "https://lu.example.net:7600"
+token_file = "/etc/ting/ting.token"
+work_dir = "/var/lib/ting/work"
+harness = "opencode"
+heartbeat_secs = 15
+
+# Optional: a private CA to add to the system trust roots. Do not use this to
+# disable verification; the client always verifies the controller certificate.
+# ca_file = "/etc/ting/tls/ca.pem"
+
+# Optional harness endpoint and health check. The health URL must be loopback,
+# and its token file follows the same private-file rules as token_file.
+# opencode_server = "http://127.0.0.1:4096"
+# reiki_health_url = "http://127.0.0.1:9000/health"
+# reiki_token_file = "/etc/ting/reiki.token"
+
+[log]
+level = "info"
+format = "text"
+stderr = true
+# Keep any log file under /var/lib/ting so the unit's ReadWritePaths allow it.
+# file = "/var/lib/ting/ting.log"

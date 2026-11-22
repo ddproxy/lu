@@ -166,11 +166,10 @@ async fn send_one(
             seq: offset,
             data: data.clone(),
         };
-        match controller.append_log(&chunk).await {
-            Ok(()) => {
-                let len = u64::try_from(chunk.data.len()).unwrap_or(u64::MAX);
+        match controller.append_log_len(&chunk).await {
+            Ok(stored_len) => {
                 return Ok(Sent {
-                    next: offset.saturating_add(len),
+                    next: stored_len,
                     fault: None,
                 });
             }
