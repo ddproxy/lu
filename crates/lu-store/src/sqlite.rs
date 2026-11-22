@@ -1481,7 +1481,7 @@ impl Store for SqliteStore {
         let conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT {JOB_SELECT_COLUMNS} FROM jobs WHERE state='draft' ORDER BY created_at ASC, id ASC LIMIT ?1"
+                "SELECT {JOB_SELECT_COLUMNS} FROM jobs WHERE state='draft' ORDER BY created_at ASC, rowid ASC LIMIT ?1"
             ))
             .map_err(internal)?;
         let rows = stmt
@@ -1598,7 +1598,9 @@ impl Store for SqliteStore {
             .map_err(internal)?;
         let ids: Vec<String> = {
             let mut stmt = tx
-                .prepare("SELECT id FROM jobs WHERE state='draft' ORDER BY created_at, id LIMIT ?1")
+                .prepare(
+                    "SELECT id FROM jobs WHERE state='draft' ORDER BY created_at, rowid LIMIT ?1",
+                )
                 .map_err(internal)?;
             let rows = stmt
                 .query_map(params![count.min(i64::MAX as u64) as i64], |r| {
