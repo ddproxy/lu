@@ -80,7 +80,7 @@ Each `submit` prints its new job id; use that id with `lu show`.
 | Idempotency | Submit sends `Idempotency-Key` when the spec has a key. Same key and spec returns the existing job; same key and different spec is `409 conflict`. |
 | Uploads | Agent log and artifact uploads use `Content-Type: application/octet-stream`. Log appends must use the current stored offset. |
 | Redirects | Never followed; a `3xx` becomes an error so the token cannot leak through `Location`. |
-| Retries | Failed GETs and other retryable reads are retried up to 3 attempts for network failures, 429 and 5xx, with exponential backoff from 100 ms. A 429 error reports `Retry-After` seconds. |
+| Retries | Failed GETs and other retryable reads are retried up to 3 attempts for network failures, 429 and 5xx, with exponential backoff from a 100 ms base (first retry waits 200 ms, then 400 ms). A 429 error reports `Retry-After` seconds. |
 | Bodies | JSON responses are capped at 8 MiB (the controller caps JSON request bodies at 1 MiB); artifacts use their per-file caps (10 MiB diff, 50 MiB log, 1 MiB report). |
 | Secrets | The token is redacted from `Debug` output and error text, including text echoed by a hostile controller. |
 

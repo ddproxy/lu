@@ -23,7 +23,7 @@ unconfigured remote: config validation rejects a redirect that names an unknown 
 committer_name = "Lu Publish"
 committer_email = "lu-publish@localhost"
 allow_scrubbed = false
-protected_patterns = ["hotfix/*", "stable"]
+protected_patterns = ["hotfix-*", "stable"]
 
 [publish.remotes.forge]
 url = "https://git.example.net/team/app.git"
@@ -166,12 +166,13 @@ codes.
 `lu show` prints `publish_target` (the effective `remote:branch`, with `(source branch)` for a
 source-branch target) and `publish` (the last attempt's detail, remote, branch and target). `lu top`
 adds a `publish:<detail>:<branch>` note to affected rows. The stored `PublishRecord` is part of the
-existing jobs table's `publish_json`; this feature adds no schema version.
+jobs table's `publish_json` column in the schema 3 baseline; schema 1 and 2 databases gain the
+column in place at startup.
 
 `/metrics` exports `lu_publish_total{target,result}` since controller start. `target` is `snapshot`
-or `source_branch`; `result` is one of `gates_running`, `hold`, `gates_failed`, `published`,
+or `source_branch`; `result` is one of `hold`, `gates_failed`, `published`,
 `published_snapshot_fallback`, `no_snapshot_prefix`, `failed`, `denied`, `invalid`, `state`, `git` or
-`rate_limited`. When `[audit] path` is set, every outcome also writes a `publish` event with
+`rate_limited`. `gates_running` is only the initial stored detail, not a counted outcome. When `[audit] path` is set, every outcome also writes a `publish` event with
 `target`, `result`, `remote` and `state` fields. Neither the metric nor the audit event carries a
 token, task text or branch text from a payload.
 

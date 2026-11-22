@@ -1145,3 +1145,281 @@ pub fn print_outcomes(outcomes: &[SubmitOutcome], json: bool) -> Result<(), Stri
     crate::operator::print_table(&["KEY", "ID", "STATE", "AFTER", "NAME"], rows);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lu_proto::MAX_IDEMPOTENCY_KEY_BYTES;
+
+    fn write(path: &Path, name: &str, text: &str) -> PathBuf {
+        let file = path.join(name);
+        std::fs::write(&file, text).unwrap();
+        file
+    }
+
+    fn options<'a>(root: &'a Path, prefix: &'a str) -> BatchOptions<'a> {
+        BatchOptions {
+            path: root,
+            key_prefix: prefix,
+            defaults: None,
+            repo: Some("https://example.net/repo.git"),
+            git_ref: Some("main"),
+            chain: false,
+            max_parallel: None,
+        }
+    }
+
+    #[test]
+    fn checklist_nesting_fences_and_after_hints_are_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write(
+            tmp.path(),
+            "tasks.md",
+            r#"# Release
+- [ ] Build
+  Compile first.
+  after: setup
+- [ ] Publish
+  - [ ] Smoke test
+- [x] Done
+  - [ ] Ignored context
+```
+- [ ] Fenced
+```
+"#,
+        );
+        let plan = plan(&options(&path, "release")).unwrap();
+        assert_eq!(plan.len(), 2);
+        let entries = plan.entries();
+        assert_eq!(entries[0].label, "build");
+        assert!(entries[0].spec.task.contains("Compile first."));
+        assert_eq!(entries[0].after_keys, ["setup"]);
+        assert_eq!(entries[1].label, "publish");
+        assert!(entries[1].spec.task.contains("Smoke test"));
+        let text = serde_json::to_string(&plan_structured(&plan)).unwrap();
+        assert!(!text.contains("ignored context"), "{text}");
+        assert!(!text.contains("fenced"), "{text}");
+    }
+
+    #[test]
+    fn directory_inputs_ignore_hidden_toml_files_and_subdirectories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "b.txt", "second");
+        write(root, "a.md", "first");
+        write(root, ".hidden", "no job");
+        write(root, "shared.toml", "bogus = true\n");
+        std::fs::create_dir(root.join("nested")).unwrap();
+        let plan = plan(&options(root, "batch")).unwrap();
+        let labels: Vec<_> = plan
+            .entries()
+            .iter()
+            .map(|entry| entry.label.clone())
+            .collect();
+        assert_eq!(labels, ["a", "b"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_symlinks_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let real = write(root, "a.md", "go");
+        std::os::unix::fs::symlink(real, root.join("link.md")).unwrap();
+        let errors = plan(&options(root, "batch"))
+            .err()
+            .expect("expected input errors");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("refusing symlinked batch file")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn slugs_collide_when_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let long = "a".repeat(SLUG_BYTES);
+        write(root, &format!("{long}-one.md"), "first");
+        write(root, &format!("{long}-two.md"), "second");
+        let errors = plan(&options(root, "batch"))
+            .err()
+            .expect("expected input errors");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("duplicate job key")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn prefix_and_combined_key_limits_are_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "build.md", "go");
+        let errors = plan(&BatchOptions {
+            key_prefix: "bad prefix",
+            ..options(root, "")
+        })
+        .err()
+        .expect("expected input errors");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("key_prefix") && error.contains("A-Z a-z")),
+            "{errors:?}"
+        );
+        let prefix = "a".repeat(MAX_IDEMPOTENCY_KEY_BYTES);
+        let errors = plan(&BatchOptions {
+            key_prefix: &prefix,
+            ..options(root, "")
+        })
+        .err()
+        .expect("expected input errors");
+        assert!(
+            errors.iter().any(|error| error.contains("128 bytes")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn max_parallel_requires_one_shared_group_and_derives_a_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "build.md", "go");
+        write(root, "test.md", "go");
+        let built = plan(&BatchOptions {
+            max_parallel: Some(2),
+            ..options(root, "release-1")
+        })
+        .unwrap();
+        let plan_json = plan_structured(&built);
+        assert_eq!(plan_json["group"], "release-1");
+        assert_eq!(plan_json["max_parallel"], 2);
+
+        write(root, "build.toml", "group = \"custom\"\n");
+        let errors = plan(&BatchOptions {
+            max_parallel: Some(2),
+            ..options(root, "release-1")
+        })
+        .err()
+        .expect("expected input errors");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("every job must set the same group")),
+            "{errors:?}"
+        );
+
+        let errors = plan(&BatchOptions {
+            max_parallel: Some(65),
+            ..options(root, "release-1")
+        })
+        .err()
+        .expect("expected input errors");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("max_parallel") && error.contains("64")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn chain_counts_dependencies_and_later_hints_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for at in 0..MAX_AFTER_JOBS + 1 {
+            write(root, &format!("{at:02}.md"), "go");
+        }
+        let built = plan(&BatchOptions {
+            chain: true,
+            ..options(root, "chain")
+        })
+        .unwrap();
+        assert_eq!(
+            built.entries()[MAX_AFTER_JOBS].after_names.len(),
+            MAX_AFTER_JOBS
+        );
+
+        write(root, "17.md", "go");
+        let errors = plan(&BatchOptions {
+            chain: true,
+            ..options(root, "chain")
+        })
+        .err()
+        .expect("expected input errors");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("after has 17 keys")),
+            "{errors:?}"
+        );
+
+        let hint_path = write(
+            tmp.path(),
+            "hints.md",
+            "- [ ] First\n  after: second\n- [ ] Second\n",
+        );
+        let errors = plan(&options(&hint_path, "chain"))
+            .err()
+            .expect("expected input errors");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("later or current job")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn defaults_and_sidecars_overlay_and_clear_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let defaults = write(
+            root,
+            "defaults.toml",
+            "repo = \"https://example.net/repo.git\"\nref = \"main\"\nprovider = \"default\"\nrequire = [\"linux\"]\n",
+        );
+        write(root, "build.md", "go");
+        write(root, "build.toml", "require = []\nprovider = \"sidecar\"\n");
+        let plan = plan(&BatchOptions {
+            path: root,
+            key_prefix: "batch",
+            defaults: Some(&defaults),
+            repo: None,
+            git_ref: None,
+            chain: false,
+            max_parallel: None,
+        })
+        .unwrap();
+        let spec = &plan.entries()[0].spec;
+        assert_eq!(spec.provider.as_deref(), Some("sidecar"));
+        assert!(spec.requires.is_empty());
+        assert_eq!(spec.repo, "https://example.net/repo.git");
+        assert_eq!(spec.git_ref, "main");
+    }
+
+    #[test]
+    fn unknown_toml_keys_and_empty_tasks_are_input_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "build.md", "   \n");
+        write(root, "test.md", "go");
+        write(root, "test.toml", "bogus = true\n");
+        let errors = plan(&options(root, "batch"))
+            .err()
+            .expect("expected input errors");
+        assert!(
+            errors.iter().any(|error| error.contains("unknown field")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|error| error.contains("task is empty")),
+            "{errors:?}"
+        );
+    }
+}

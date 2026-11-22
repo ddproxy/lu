@@ -97,7 +97,7 @@ mirror and a token file.
 
 | Key | Required | Default | Validation |
 | --- | --- | --- | --- |
-| `name` | yes | — | A `[[controller.repos]]` name, its URL, or a normalized repo id (`host/owner/repo`); a configured entry takes precedence over that repo's `credential_file`. |
+| `name` | yes | — | A `[[controller.repos]]` name, its URL, or a normalized repo id (`host/owner/repo`); 1 to 512 characters from `A-Z a-z 0-9 . _ - / :`. A configured entry takes precedence over that repo's `credential_file`. |
 | `token_file` | yes | — | Non-empty path, checked like other secret files: regular file, owned by the effective user, mode `0600` or tighter, no symlink or FIFO. The token is passed to git through a private helper and scrubbed from errors. |
 
 ```toml
@@ -348,7 +348,7 @@ A gate runs against the prepared publish tree with a minimal `PATH`, null stdin 
 
 ```toml
 [publish]
-protected_patterns = ["hotfix/*"]
+protected_patterns = ["hotfix-*"]
 
 [publish.remotes.forge]
 url = "https://git.example.net/team/app.git"
@@ -400,10 +400,11 @@ A draft is stored and visible but never dispatched until approval.
 | `max_drafts` | no | `10000` | Positive integer total cap on stored drafts. |
 | `max_drafts_per_source` | no | `1000` | Positive integer cap per `origin` label; must not exceed `max_drafts`. |
 
-When space is needed, the oldest expired drafts are removed first. If that does not make room, a
-new draft is refused: intake answers `429 limit_exceeded` with `limit: max_drafts` and counts the
-event as `invalid`. `lu drafts` shows the inventory and `lu top` shows the draft count and oldest
-draft age. See [drafts.md](drafts.md#limits-and-expiry).
+When either draft cap is full, the oldest drafts are moved to `expired` first regardless of their
+TTL; expired drafts remain stored. If that does not free room under both caps, a new draft is
+refused: intake answers `429 limit_exceeded` with `limit: max_drafts` and counts the event as
+`invalid`. `lu drafts` shows the inventory and `lu top` shows the draft count and oldest draft age.
+See [drafts.md](drafts.md#limits-and-expiry).
 
 ```toml
 [drafts]

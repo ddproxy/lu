@@ -992,6 +992,12 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
     if let Some(on_conflict) = args.on_conflict {
         spec.on_conflict = on_conflict;
     }
+    if let Some(on_stuck) = args.on_stuck {
+        spec.on_stuck = Some(on_stuck);
+    }
+    if let Some(stuck_after) = args.stuck_after {
+        spec.stuck_after_secs = Some(stuck_after);
+    }
     let merged_expect = expect.merged(spec.expect.as_ref());
     spec.expect = merged_expect;
     // A retry is a new job; only --key gives it an idempotency key.
@@ -2744,9 +2750,12 @@ fn parse_state(value: &str) -> Result<JobState, String> {
         return Ok(JobState::Cancelled);
     }
     normalized.parse().map_err(|_| {
-        format!(
-            "unknown job state {normalized:?}; expected blocked, queued, leased, running, recovering, needs_input, done, failed, or cancelled"
-        )
+        let expected = JobState::ALL
+            .iter()
+            .map(|state| state.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("unknown job state {normalized:?}; expected {expected}")
     })
 }
 
@@ -3209,5 +3218,21 @@ mod expect_cli_tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("expect-mode"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn parse_state_lists_every_wire_state_in_its_error() {
+        assert_eq!(parse_state("draft").unwrap(), JobState::Draft);
+        assert_eq!(parse_state("expired").unwrap(), JobState::Expired);
+
+        let error = parse_state("bogus").unwrap_err();
+        for state in JobState::ALL {
+            assert!(error.contains(state.as_str()), "{error}");
+        }
     }
 }

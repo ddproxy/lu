@@ -1471,7 +1471,7 @@ impl Config {
         let mut names = Vec::new();
         for (i, cred) in creds.repos.iter().enumerate() {
             let table = format!("[mirror.credentials.repos] #{i} ({})", cred.name);
-            validate_name(&table, &cred.name)?;
+            validate_mirror_credential_name(&table, &cred.name)?;
             if names.contains(&cred.name) {
                 return invalid(
                     &table,
@@ -2042,6 +2042,23 @@ fn validate_name(table: &str, name: &str) -> Result<(), ConfigError> {
         invalid(
             table,
             "name must be 1 to 64 characters from A-Z a-z 0-9 . _ -".to_owned(),
+        )
+    }
+}
+
+/// Mirror credentials are matched against a repo's name, its full URL and its normalized id, so
+/// the name may contain URL separators as well as the ordinary name alphabet.
+fn validate_mirror_credential_name(table: &str, name: &str) -> Result<(), ConfigError> {
+    let ok = (1..=512).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/' | b':'));
+    if ok {
+        Ok(())
+    } else {
+        invalid(
+            table,
+            "name must be 1 to 512 characters from A-Z a-z 0-9 . _ - / :".to_owned(),
         )
     }
 }
@@ -3510,6 +3527,33 @@ heartbeat_secs = 15
             "[controller]\nlisten=\"127.0.0.1:1\"\ndb=\"/db\"\nartifacts_dir=\"/a\"\n[tls]\ncert=\"/c\"\nkey=\"\"\n",
             "[tls]",
         );
+    }
+
+    #[test]
+    fn mirror_credential_names_accept_repo_urls_and_normalized_ids() {
+        let base = controller_only();
+        let mut text = format!("{base}\n[mirror.credentials]\n");
+        for name in [
+            "app",
+            "https://example.net/team/app.git",
+            "example.net/team/app",
+            "ssh://example.net/team/app.git",
+        ] {
+            text.push_str(&format!(
+                "[[mirror.credentials.repos]]\nname = \"{name}\"\ntoken_file = \"/tmp/lu-token\"\n"
+            ));
+        }
+        Config::parse(&text).unwrap();
+
+        let bad = format!(
+            "{base}\n[mirror.credentials]\n[[mirror.credentials.repos]]\nname = \"bad name\"\ntoken_file = \"/tmp/lu-token\"\n"
+        );
+        let (table, reason) = invalid(Config::parse(&bad).unwrap_err());
+        assert!(
+            table.starts_with("[mirror.credentials.repos] #0"),
+            "{table}"
+        );
+        assert!(reason.contains("A-Z a-z 0-9"), "{reason}");
     }
 }
 

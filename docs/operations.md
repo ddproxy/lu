@@ -27,7 +27,7 @@ systemd units are in [install.md](install.md); the agent's isolation model is in
 4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store uses schema version 2. It creates the schema for a new database and refuses a database with any other schema version with a clear message telling the operator to create a new database. Downgrades and in-place upgrades from older schema versions are not supported; create a new database for this binary. Backup and restore follow the same rule.
+The store uses schema version 3. It creates the schema for a new database and migrates schema 1 and 2 databases in place on startup, adding the scrubbing, lineage and publish columns. Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly schema version 3, so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
 
@@ -116,14 +116,18 @@ systemctl start lu-controller.service
 ```
 
 `lu restore` verifies the snapshot, refuses a file that is not a Lu database (an empty or
-foreign SQLite file would replace your data with nothing), checks that every Lu table required by
-its schema version is supported, and refuses when
-the database is still in use, so stop the controller first.
+foreign SQLite file would replace your data with nothing), requires exactly schema version 3 and
+every table that version creates, and refuses when the database is still in use, so stop the
+controller first.
 Only one restore runs at a time. It stages the copy beside the database with the old file's
 owner and mode `0600`, moves the current database and every `-wal`, `-shm` and `-journal` file
 to `<db>.pre-restore-<unix seconds>` names, then renames the staged copy into place. Run it as
 root or as the controller's own account; either way the installed file keeps the old owner.
 Boot recovery then applies to jobs that were leased or running in the snapshot.
+
+An older backup is refused by `lu restore`. Point `[controller] db` at a copy of it, start the
+controller once so startup migrates it in place, stop the controller, and take a fresh `lu backup`
+before restoring that snapshot.
 
 If a restore is interrupted, the previous database is still under its `pre-restore` name:
 `mv <db>.pre-restore-<seconds> <db>`, and the same for each `-wal` or `-shm` file, puts it back.

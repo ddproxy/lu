@@ -65,7 +65,7 @@ The command table in [README.md](../README.md#commands) lists the rest of the CL
 ```sh
 lu drafts
 lu show 01ARZ3NDEKTSV4RRFFQ69G5FAV
-lu edit 01ARZ3NDEKTSV4RRFFQ69G5FAV --task "Triage the reported issue, then update the docs"
+lu edit 01ARZ3NDEKTSV4RRFFQ69G5FAV --task-file task.txt
 lu approve 01ARZ3NDEKTSV4RRFFQ69G5FAV
 lu reject 01ARZ3NDEKTSV4RRFFQ69G5FBV --reason "duplicate"
 ```
@@ -105,9 +105,10 @@ The top-level `[drafts]` table controls retention and capacity:
 | `max_drafts` | `10000` | Total draft cap; per-origin caps apply in addition to the total. |
 | `max_drafts_per_source` | `1000` | Per-origin cap; must not exceed `max_drafts`. |
 
-When space is needed, the oldest expired drafts are removed first. If neither an expired draft nor
-room under the cap is available, new drafts are refused with `429 limit_exceeded` and the intake
-route counts the outcome as `invalid`. See [config.md](config.md#drafts) for the full table.
+When space is needed, the oldest drafts are moved to `expired` first (regardless of their TTL).
+If that does not free room under both caps, new drafts are refused with `429 limit_exceeded` and
+the intake route counts the outcome as `invalid`. See [config.md](config.md#drafts) for the full
+table.
 
 ## Observing drafts
 
