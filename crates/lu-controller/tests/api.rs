@@ -3141,6 +3141,7 @@ async fn a_sync_error_never_contains_the_credential() {
 async fn artifacts_and_logs_are_scrubbed_before_storage() {
     let artifacts = ArtifactsConfig {
         scrub: true,
+        scrub_patch: true,
         extra_rules: vec![ScrubRuleConfig {
             name: "internal_ref".to_owned(),
             pattern: r"INTERNAL-[A-Z0-9]{6,}".to_owned(),
@@ -3257,6 +3258,106 @@ async fn artifacts_and_logs_are_scrubbed_before_storage() {
     let rec = srv.store.get_job(&job_id).unwrap();
     assert_eq!(rec.scrubbed_hits, 5);
     assert!(rec.patch_scrubbed);
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patch_secret_hits_reported_without_scrubbing_patch() {
+    let srv = start_server().await;
+    let (job_id, job, epoch) = assign_and_start(&srv).await;
+
+    let pk_begin = ["-----BEGIN ", "PRIVATE KEY-----"].concat();
+    let pk_end = ["-----END ", "PRIVATE KEY-----"].concat();
+    let context_assign = ["pass", "word=abcdefghijkl"].concat();
+    let patch = format!(
+        "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,4 @@\n {context_assign}\n+{pk_begin}\n+QUJDREVG\n+{pk_end}\n"
+    );
+    let patch_bytes = patch.as_bytes();
+    let req = format!(
+        "PUT /v1/agent/jobs/{job_id}/artifacts/diff.patch?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n",
+        patch_bytes.len()
+    );
+    let mut packet = req.into_bytes();
+    packet.extend_from_slice(patch_bytes);
+    let r = raw_request_bytes(srv.addr, &packet).await;
+    assert_eq!(
+        response_status(&r),
+        200,
+        "{:?}",
+        String::from_utf8_lossy(&r)
+    );
+
+    let stored_patch = raw_request(
+        srv.addr,
+        &operator_get(&format!("/v1/jobs/{job_id}/artifacts/diff.patch")),
+    )
+    .await;
+    assert_eq!(
+        body_str(&stored_patch).as_bytes(),
+        patch_bytes,
+        "patch must be stored unchanged"
+    );
+    let apply_dir = tempfile::tempdir().unwrap();
+    let apply = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(apply_dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    apply(&["init", "-q"]);
+    apply(&["config", "user.email", "t@t"]);
+    apply(&["config", "user.name", "t"]);
+    std::fs::write(
+        apply_dir.path().join("f.txt"),
+        format!("{context_assign}\n"),
+    )
+    .unwrap();
+    apply(&["add", "f.txt"]);
+    apply(&["commit", "-qm", "init"]);
+    let patch_file = apply_dir.path().join("diff.patch");
+    std::fs::write(&patch_file, patch_bytes).unwrap();
+    apply(&["apply", "--check", patch_file.to_str().unwrap()]);
+
+    let view = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{job_id}"))).await;
+    let view_text = body_str(&view).to_owned();
+    let view: serde_json::Value = serde_json::from_str(&view_text).unwrap();
+    assert_eq!(view["patch_scrubbed"], false, "{view}");
+    assert_eq!(view["patch_secret_hits"]["count"], 3, "{view}");
+    let rules = view["patch_secret_hits"]["rules"].as_array().unwrap();
+    assert!(rules.iter().any(|r| r == "private_key"), "{view}");
+    assert!(
+        !view_text.contains(&pk_begin),
+        "secret text must not appear in view"
+    );
+    assert!(
+        !view_text.contains("QUJDREVG"),
+        "secret text must not appear in view"
+    );
+
+    let rec = srv.store.get_job(&job).unwrap();
+    assert!(!rec.patch_scrubbed);
+    assert_eq!(rec.patch_secret_hits.count, 3);
+
+    // logs/reports still scrubbed while patch scrubbing is disabled
+    let token = format!("{}{}", "ghp_", "abcdefghijklmnopqrstuvwxyz012345");
+    let chunk = format!("value={token}\n");
+    let req = format!(
+        "POST /v1/agent/jobs/{job_id}/log?epoch={epoch}&offset=0 HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n{}",
+        chunk.len(),
+        chunk
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let stored_log = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{job_id}/logs"))).await;
+    assert!(body_str(&stored_log).contains("[scrubbed:token_prefix]"));
+    assert!(!body_str(&stored_log).contains(&token));
+
     let _ = srv.shutdown.send(());
 }
 

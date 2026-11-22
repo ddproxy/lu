@@ -208,8 +208,8 @@ pub struct CollectArgs {
     /// Wait for the job to finish.
     #[arg(long)]
     pub wait: bool,
-    /// Allow inputs whose patch was changed by controller-side scrubbing. Such patches may no
-    /// longer apply cleanly.
+    /// Allow inputs whose patch was changed by controller-side scrubbing or flagged for
+    /// high-confidence secret hits. Such patches may need review before applying or publishing.
     #[arg(long)]
     pub allow_scrubbed: bool,
 }
@@ -853,6 +853,15 @@ async fn collect_inner(args: CollectArgs, config: &Path, json: bool) -> Result<E
             eprintln!(
                 "lu: job {} has a scrubbed patch ({} scrubbed value(s)); pass --allow-scrubbed to collect it",
                 view.id, view.scrubbed_hits
+            );
+            return Ok(ExitCode::from(EXIT_USAGE));
+        }
+        if view.patch_secret_hits.count > 0 && !args.allow_scrubbed {
+            eprintln!(
+                "lu: job {} has {} high-confidence patch secret hit(s) (rules: {}); pass --allow-scrubbed to collect it",
+                view.id,
+                view.patch_secret_hits.count,
+                view.patch_secret_hits.rules.join(", ")
             );
             return Ok(ExitCode::from(EXIT_USAGE));
         }
@@ -2231,6 +2240,18 @@ fn print_job(view: &JobView) {
         ),
         ("scrubbed_hits", view.scrubbed_hits.to_string()),
         ("patch_scrubbed", view.patch_scrubbed.to_string()),
+        (
+            "patch_secret_hits",
+            if view.patch_secret_hits.count == 0 {
+                "0".to_owned()
+            } else {
+                format!(
+                    "{} ({})",
+                    view.patch_secret_hits.count,
+                    view.patch_secret_hits.rules.join(", ")
+                )
+            },
+        ),
         (
             "publish_target",
             view.publish_target

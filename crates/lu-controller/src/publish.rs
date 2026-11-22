@@ -551,10 +551,20 @@ fn read_token(path: &str, remote_name: &str) -> Result<String, PublishError> {
 }
 
 fn read_diff(state: &AppState, job: &JobRecord) -> Result<Vec<u8>, PublishError> {
-    if job.patch_scrubbed && !state.publish_config().is_some_and(|c| c.allow_scrubbed) {
+    let allow = state.publish_config().is_some_and(|c| c.allow_scrubbed);
+    if job.patch_scrubbed && !allow {
         return Err(PublishError::State(
             "the stored diff was changed by scrubbing; enable [publish] allow_scrubbed to publish it"
                 .to_owned(),
+        ));
+    }
+    if job.patch_secret_hits.count > 0 && !allow {
+        return Err(PublishError::State(
+            format!(
+                "the stored diff has {} high-confidence patch secret hit(s) (rules: {}); enable [publish] allow_scrubbed to publish it",
+                job.patch_secret_hits.count,
+                job.patch_secret_hits.rules.join(", ")
+            ),
         ));
     }
     let path = state.artifacts_dir.join(job.id.as_str()).join("diff.patch");

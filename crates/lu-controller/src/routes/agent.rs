@@ -700,6 +700,37 @@ async fn put_artifact_impl(
             }
         }
     }
+    if art == ArtifactName::DiffPatch && scrubbed.patch_secret_hits.count > 0 {
+        let hits_view = lu_proto::view::PatchSecretHitsView {
+            count: scrubbed.patch_secret_hits.count,
+            rules: scrubbed.patch_secret_hits.rules.clone(),
+        };
+        let store = Arc::clone(&state.store);
+        let jid = job_id.clone();
+        let hits_view_for_store = hits_view.clone();
+        match tokio::task::spawn_blocking(move || {
+            store.record_patch_secret_hits(&jid, epoch, &hits_view_for_store)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(?error, job = %job_id, "could not record patch secret hits")
+            }
+            Err(error) => {
+                tracing::warn!(%error, job = %job_id, "patch secret hits task failed")
+            }
+        }
+        state.record_audit(
+            Event::PatchSecretDetected,
+            Some(job_id.as_str()),
+            Some(node.as_str()),
+            node.as_str(),
+            Data::new()
+                .unsigned(Field::Count, hits_view.count)
+                .text(Field::Rules, &hits_view.rules.join("+")),
+        );
+    }
     state.waiters.notify_job(job_id.as_ref());
     with_version(StatusCode::OK.into_response())
 }
@@ -1528,6 +1559,7 @@ mod poll_renewal_tests {
                 expect_failed: false,
                 scrubbed_hits: 0,
                 patch_scrubbed: false,
+                patch_secret_hits: lu_proto::view::PatchSecretHitsView::default(),
                 waiting_on: Vec::new(),
                 staged_commit: None,
                 blocked_reason: None,
@@ -1626,6 +1658,14 @@ mod poll_renewal_tests {
             _epoch: u64,
             _hits: u64,
             _patch: bool,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn record_patch_secret_hits(
+            &self,
+            _id: &JobId,
+            _epoch: u64,
+            _hits: &lu_proto::view::PatchSecretHitsView,
         ) -> Result<(), StoreError> {
             Ok(())
         }

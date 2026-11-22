@@ -552,6 +552,10 @@ pub struct ArtifactsConfig {
     /// Turn scrubbing on (the default) or off.
     #[serde(default = "default_scrub")]
     pub scrub: bool,
+    /// Scrub `diff.patch` in place. When false (the default), patches are stored unchanged and
+    /// inspected for high-confidence secrets in added lines.
+    #[serde(default = "default_scrub_patch")]
+    pub scrub_patch: bool,
     /// Operator patterns, tried after the built-in rules.
     #[serde(default)]
     pub extra_rules: Vec<ScrubRuleConfig>,
@@ -559,6 +563,10 @@ pub struct ArtifactsConfig {
 
 fn default_scrub() -> bool {
     true
+}
+
+fn default_scrub_patch() -> bool {
+    false
 }
 
 /// One `[[artifacts.extra_rules]]` entry. `name` becomes the `[scrubbed:<name>]` tag.
@@ -573,6 +581,7 @@ impl Default for ArtifactsConfig {
     fn default() -> Self {
         Self {
             scrub: default_scrub(),
+            scrub_patch: default_scrub_patch(),
             extra_rules: Vec::new(),
         }
     }

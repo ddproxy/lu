@@ -270,7 +270,7 @@ credentials of the jobs that ran there.
 
 ## Artifact scrubbing
 
-The controller can redact secret-like bytes before writing `diff.patch`, `report.json` and `run.log`. Scrubbing is on by default. Set `[artifacts] scrub = false` to store uploads unchanged. Operator patterns can be added with `[[artifacts.extra_rules]]`; see [config.md](config.md#artifacts).
+The controller can redact secret-like bytes before writing `report.json` and `run.log`. Scrubbing is on by default. Set `[artifacts] scrub = false` to store uploads unchanged. Operator patterns can be added with `[[artifacts.extra_rules]]`; see [config.md](config.md#artifacts).
 
 Built-in rules use generic names. They do not name token issuers.
 
@@ -284,11 +284,13 @@ Built-in rules use generic names. They do not name token issuers.
 
 Every match becomes `[scrubbed:<rule>]`. The controller adds the number of matches to the job's `scrubbed_hits` field. A changed `diff.patch` also sets `patch_scrubbed`.
 
-Patches are scrubbed one line at a time. Hunk headers are never changed. Diff markers and line terminators are kept, and no replacement adds or removes a line. Private-key bodies are tracked across lines without merging them. A scrubbed patch can still fail to apply because its contents changed. `lu collect` refuses a scrubbed input unless `--allow-scrubbed` is given.
+Patch handling is controlled by `[artifacts] scrub_patch` (default `false`). When `scrub_patch` is `false`, the controller stores `diff.patch` byte for byte as uploaded and sets `patch_scrubbed` to `false`. It inspects the patch without changing it: only added lines (`+`, not `+++`) are scanned with high-confidence rules (`private_key`, `jwt`, `bearer_token`, `token_prefix`; not generic `assignment`). Hits are recorded in `patch_secret_hits` as a count and rule names, never matched text. The job view shows the field, `lu show` renders it, and the controller writes an audit event with no secret text. Publishing and `lu collect` refuse a patch with `patch_secret_hits.count > 0` unless the operator passes the same existing opt-in flag (`[publish] allow_scrubbed = true` or `--allow-scrubbed`).
+
+When `scrub_patch` is `true`, patches are scrubbed one line at a time. Hunk headers are never changed. Diff markers and line terminators are kept, and no replacement adds or removes a line. Private-key bodies are tracked across lines without merging them. A scrubbed patch can still fail to apply because its contents changed. `lu collect` refuses a scrubbed input unless `--allow-scrubbed` is given.
 
 Log uploads report the stored length in the `X-Lu-Log-Length` response header, because scrubbing changes the byte count. Agents use that value for the next chunk offset.
 
-Scrubbing is a heuristic, not a guarantee. It only finds shapes it knows, and an operator rule can be too broad or too narrow. Keep provider credentials on the leaf host. Treat stored artifacts, logs, job specs and backups as sensitive data even when `scrubbed_hits` is zero.
+Scrubbing is a heuristic, not a guarantee. It only finds shapes it knows, and an operator rule can be too broad or too narrow. Keep provider credentials on the leaf host. Treat stored artifacts, logs, job specs and backups as sensitive data even when `scrubbed_hits` is zero and `patch_secret_hits.count` is zero.
 
 ## Denial of service and resource limits
 

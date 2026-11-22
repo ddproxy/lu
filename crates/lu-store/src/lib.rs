@@ -9,7 +9,7 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 #[cfg(test)]
 pub mod conformance;
@@ -96,6 +96,8 @@ pub struct JobRecord {
     pub scrubbed_hits: u64,
     /// Whether the stored `diff.patch` was scrubbed; such a patch may no longer apply.
     pub patch_scrubbed: bool,
+    /// High-confidence secret hits in added patch lines when patch scrubbing is off.
+    pub patch_secret_hits: lu_proto::view::PatchSecretHitsView,
     /// Dependencies that are not yet `done`; empty once the job may run. A job blocked by a dead
     /// predecessor keeps the dead id here until it is retried or expires.
     pub waiting_on: Vec<JobId>,
@@ -501,6 +503,13 @@ pub trait Store: Send + Sync + 'static {
         epoch: u64,
         hits: u64,
         patch: bool,
+    ) -> Result<(), StoreError>;
+    /// Records high-confidence secret hits found in added patch lines.
+    fn record_patch_secret_hits(
+        &self,
+        id: &JobId,
+        epoch: u64,
+        hits: &lu_proto::view::PatchSecretHitsView,
     ) -> Result<(), StoreError>;
     /// Records (or replaces) publish status for a job. No credential is ever stored here.
     fn record_publish(

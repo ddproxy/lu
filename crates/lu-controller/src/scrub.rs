@@ -19,6 +19,7 @@ pub const SCRUB_TAG_SUFFIX: &[u8] = b"]";
 /// One compiled pattern and the fixed text that replaces a whole match.
 #[derive(Debug, Clone)]
 struct Pattern {
+    name: String,
     re: Regex,
     replacement: Vec<u8>,
     /// Safe to apply to a single patch line (never consumes a line terminator).
@@ -31,7 +32,23 @@ struct Pattern {
 #[derive(Debug, Clone)]
 pub struct Scrubber {
     enabled: bool,
+    scrub_patch: bool,
     patterns: Vec<Pattern>,
+}
+
+/// High-confidence secret hits found in added patch lines when patch scrubbing is off.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PatchSecretHits {
+    /// Number of matching added lines/spans.
+    pub count: u64,
+    /// Rule names that matched, deduplicated in first-seen order.
+    pub rules: Vec<String>,
+}
+
+impl PatchSecretHits {
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 }
 
 /// Result of scrubbing one artifact (or one log chunk).
@@ -43,6 +60,8 @@ pub struct ScrubOutcome {
     pub hits: u64,
     /// True when a `diff.patch` was changed.
     pub patch_scrubbed: bool,
+    /// High-confidence secret hits in added patch lines. Only set when patch scrubbing is off.
+    pub patch_secret_hits: PatchSecretHits,
 }
 
 /// Used only for the multi-line PEM block in whole artifacts.
@@ -76,15 +95,29 @@ fn tag(rule: &str) -> Vec<u8> {
     out
 }
 
-fn pattern(source: &str, replacement: Vec<u8>, patch_safe: bool, whole_safe: bool) -> Pattern {
+fn pattern(
+    name: &str,
+    source: &str,
+    replacement: Vec<u8>,
+    patch_safe: bool,
+    whole_safe: bool,
+) -> Pattern {
     let re = Regex::new(source)
         .unwrap_or_else(|e| panic!("built-in scrub pattern must compile: {source}: {e}"));
     Pattern {
+        name: name.to_owned(),
         re,
         replacement,
         patch_safe,
         whole_safe,
     }
+}
+
+fn high_confidence_rule(name: &str) -> bool {
+    matches!(
+        name,
+        "private_key" | "bearer_token" | "token_prefix" | "jwt"
+    )
 }
 
 impl Default for Scrubber {
@@ -99,32 +132,60 @@ impl Scrubber {
         self.enabled
     }
 
-    /// Built-in rules only, with scrubbing enabled.
+    /// Whether diff patches are scrubbed in place. When false, patches are stored unchanged and
+    /// inspected for high-confidence secrets instead.
+    pub fn scrub_patch_enabled(&self) -> bool {
+        self.enabled && self.scrub_patch
+    }
+
+    /// Built-in rules only, with scrubbing enabled and patch scrubbing off (default).
     fn builtins() -> Self {
         let patterns = vec![
-            pattern(PRIVATE_KEY_BLOCK, tag("private_key"), false, true),
-            pattern(PRIVATE_KEY_MARKER, tag("private_key"), true, false),
             pattern(
+                "private_key",
+                PRIVATE_KEY_BLOCK,
+                tag("private_key"),
+                false,
+                true,
+            ),
+            pattern(
+                "private_key",
+                PRIVATE_KEY_MARKER,
+                tag("private_key"),
+                true,
+                false,
+            ),
+            pattern(
+                "bearer_token",
                 BEARER,
                 b"${1}${2}[scrubbed:bearer_token]".to_vec(),
                 true,
                 true,
             ),
-            pattern(TOKEN_PREFIX, tag("token_prefix"), true, true),
-            pattern(JWT, tag("jwt"), true, true),
             pattern(
+                "token_prefix",
+                TOKEN_PREFIX,
+                tag("token_prefix"),
+                true,
+                true,
+            ),
+            pattern("jwt", JWT, tag("jwt"), true, true),
+            pattern(
+                "assignment",
                 ASSIGNMENT_BARE,
                 b"${1}[scrubbed:assignment]".to_vec(),
                 true,
                 true,
             ),
             pattern(
+                "assignment",
                 ASSIGNMENT_DOUBLE,
                 b"${1}[scrubbed:assignment]${3}".to_vec(),
                 true,
                 true,
             ),
             pattern(
+                "assignment",
                 ASSIGNMENT_SINGLE,
                 b"${1}[scrubbed:assignment]${3}".to_vec(),
                 true,
@@ -133,6 +194,7 @@ impl Scrubber {
         ];
         Self {
             enabled: true,
+            scrub_patch: false,
             patterns,
         }
     }
@@ -146,10 +208,12 @@ impl Scrubber {
         if !config.scrub {
             return Ok(Self {
                 enabled: false,
+                scrub_patch: false,
                 patterns: Vec::new(),
             });
         }
         let mut this = Self::builtins();
+        this.scrub_patch = config.scrub_patch;
         for rule in &config.extra_rules {
             let re = Regex::new(&rule.pattern).map_err(|e| {
                 format!(
@@ -158,6 +222,7 @@ impl Scrubber {
                 )
             })?;
             this.patterns.push(Pattern {
+                name: rule.name.clone(),
                 re,
                 replacement: tag(&rule.name),
                 patch_safe: true,
@@ -189,16 +254,27 @@ impl Scrubber {
                 data: input.to_vec(),
                 hits: 0,
                 patch_scrubbed: false,
+                patch_secret_hits: PatchSecretHits::default(),
             };
         }
         if patch {
-            self.scrub_patch(input)
+            if self.scrub_patch {
+                self.scrub_patch(input)
+            } else {
+                ScrubOutcome {
+                    data: input.to_vec(),
+                    hits: 0,
+                    patch_scrubbed: false,
+                    patch_secret_hits: self.inspect_patch(input),
+                }
+            }
         } else {
             let (data, hits) = self.apply(input, |p| p.whole_safe);
             ScrubOutcome {
                 data,
                 hits,
                 patch_scrubbed: false,
+                patch_secret_hits: PatchSecretHits::default(),
             }
         }
     }
@@ -268,7 +344,68 @@ impl Scrubber {
             data,
             hits,
             patch_scrubbed: hits > 0,
+            patch_secret_hits: PatchSecretHits::default(),
         }
+    }
+
+    /// Inspects added patch lines for high-confidence secrets without changing bytes.
+    fn inspect_patch(&self, input: &[u8]) -> PatchSecretHits {
+        let begin = Regex::new(PRIVATE_KEY_BEGIN).expect("valid private key marker");
+        let end = Regex::new(PRIVATE_KEY_END).expect("valid private key marker");
+        let mut hits = 0u64;
+        let mut rules: Vec<String> = Vec::new();
+        let mut in_key = false;
+
+        for raw in input.split_inclusive(|b| *b == b'\n') {
+            let (_, body_end) = if raw.ends_with(b"\r\n") {
+                (2, raw.len() - 2)
+            } else if raw.ends_with(b"\n") {
+                (1, raw.len() - 1)
+            } else {
+                (0, raw.len())
+            };
+            let line = &raw[..body_end];
+            let added = line.first() == Some(&b'+') && !line.starts_with(b"+++");
+            if !added {
+                if in_key && line.starts_with(b"@@") {
+                    in_key = false;
+                }
+                continue;
+            }
+            let content = &line[1..];
+
+            if in_key {
+                hits += 1;
+                if !rules.iter().any(|r| r == "private_key") {
+                    rules.push("private_key".to_owned());
+                }
+                if end.is_match(content) {
+                    in_key = false;
+                }
+                continue;
+            }
+
+            for p in self
+                .patterns
+                .iter()
+                .filter(|p| p.patch_safe && high_confidence_rule(&p.name))
+            {
+                let found = p.re.find_iter(content).count() as u64;
+                if found == 0 {
+                    continue;
+                }
+                hits += found;
+                if !rules.iter().any(|r| r == &p.name) {
+                    rules.push(p.name.clone());
+                }
+            }
+            if begin.is_match(content) && !end.is_match(content) {
+                // Marker line was already counted by the private_key marker pattern above.
+                in_key = true;
+            }
+        }
+
+        PatchSecretHits { count: hits, rules }
     }
 }
 
@@ -282,7 +419,13 @@ mod tests {
     }
 
     fn scrub_patch(text: &str) -> ScrubOutcome {
-        Scrubber::default().scrub(text.as_bytes(), true)
+        Scrubber::from_config(Some(&ArtifactsConfig {
+            scrub: true,
+            scrub_patch: true,
+            extra_rules: Vec::new(),
+        }))
+        .unwrap()
+        .scrub(text.as_bytes(), true)
     }
 
     fn text(outcome: &ScrubOutcome) -> String {
@@ -404,6 +547,7 @@ mod tests {
     fn operator_rules_are_applied_after_builtins_and_can_be_disabled() {
         let artifacts = ArtifactsConfig {
             scrub: true,
+            scrub_patch: false,
             extra_rules: vec![ScrubRuleConfig {
                 name: "internal_id".to_owned(),
                 pattern: r"ACME-[A-Z0-9]{16}".to_owned(),
@@ -419,6 +563,7 @@ mod tests {
 
         let off = ArtifactsConfig {
             scrub: false,
+            scrub_patch: false,
             extra_rules: vec![ScrubRuleConfig {
                 name: "internal_id".to_owned(),
                 pattern: r"ACME-[A-Z0-9]{16}".to_owned(),
@@ -435,6 +580,7 @@ mod tests {
     fn malformed_operator_pattern_is_rejected() {
         let artifacts = ArtifactsConfig {
             scrub: true,
+            scrub_patch: false,
             extra_rules: vec![ScrubRuleConfig {
                 name: "broken".to_owned(),
                 pattern: "([".to_owned(),
@@ -507,5 +653,68 @@ mod tests {
                 assert!(!name.contains(provider), "provider name in rule {name}");
             }
         }
+    }
+
+    fn pem_private_key_block() -> String {
+        let begin = ["-----BEGIN ", "PRIVATE KEY-----"].concat();
+        let end = ["-----END ", "PRIVATE KEY-----"].concat();
+        format!("{begin}\nQUJDREVG\n{end}\n")
+    }
+
+    #[test]
+    fn patch_scrub_disabled_stores_patch_unchanged_and_reports_hits() {
+        let _key = pem_private_key_block();
+        let patch = format!(
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,1 +1,4 @@\n+{key_line1}\n+QUJDREVG\n+{key_line3}\n context\n",
+            key_line1 = ["-----BEGIN ", "PRIVATE KEY-----"].concat(),
+            key_line3 = ["-----END ", "PRIVATE KEY-----"].concat(),
+        );
+        let out = Scrubber::default().scrub(patch.as_bytes(), true);
+        assert_eq!(out.data, patch.as_bytes());
+        assert_eq!(out.hits, 0);
+        assert!(!out.patch_scrubbed);
+        assert!(out.patch_secret_hits.count > 0);
+        assert!(out
+            .patch_secret_hits
+            .rules
+            .iter()
+            .any(|r| r == "private_key"));
+    }
+
+    #[test]
+    fn patch_scrub_disabled_ignores_context_and_generic_assignment() {
+        let assignment = format!("{}={}", "password", "abcdefghijkl");
+        let patch = format!(
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n {assignment}\n+ordinary line\n"
+        );
+        let out = Scrubber::default().scrub(patch.as_bytes(), true);
+        assert_eq!(out.data, patch.as_bytes());
+        assert_eq!(out.patch_secret_hits.count, 0);
+        assert!(out.patch_secret_hits.rules.is_empty());
+        assert!(!out.patch_scrubbed);
+    }
+
+    #[test]
+    fn patch_scrub_enabled_keeps_old_patch_scrubbing_behavior() {
+        let assignment = format!("{}={}", "password", "abcdefghijkl");
+        let patch = format!("@@ -1 +1 @@\n+{assignment}\n");
+        let out = scrub_patch(&patch);
+        assert!(out.patch_scrubbed);
+        assert!(out.hits > 0);
+        assert!(text(&out).contains("[scrubbed:assignment]"));
+        assert_eq!(out.patch_secret_hits.count, 0);
+    }
+
+    #[test]
+    fn logs_and_reports_still_scrubbed_when_patch_scrub_disabled() {
+        let token = format!("{}{}", "ghp_", "abcdefghijklmnopqrstuvwxyz012345");
+        let input = format!("value={token}");
+        let out = Scrubber::default().scrub(input.as_bytes(), false);
+        assert!(
+            text(&out).contains("[scrubbed:token_prefix]"),
+            "got: {}",
+            text(&out)
+        );
+        assert!(out.hits > 0, "got: {}", text(&out));
     }
 }

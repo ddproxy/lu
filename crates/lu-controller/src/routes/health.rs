@@ -109,6 +109,14 @@ mod tests {
         fn record_scrub(&self, _: &JobId, _: u64, _: u64, _: bool) -> Result<(), StoreError> {
             unimplemented!()
         }
+        fn record_patch_secret_hits(
+            &self,
+            _: &JobId,
+            _: u64,
+            _: &lu_proto::view::PatchSecretHitsView,
+        ) -> Result<(), StoreError> {
+            unimplemented!()
+        }
         fn record_publish(
             &self,
             _: &JobId,

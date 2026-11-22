@@ -13,6 +13,7 @@ uses semantic versioning once it reaches 1.0.
 
 ### Changed
 
+- `[artifacts] scrub_patch` (default `false`) controls patch redaction. With the default, `diff.patch` is stored byte for byte as uploaded; added lines are inspected for high-confidence secret rules and hits are recorded in `JobView.patch_secret_hits` (count and rule names, no matched text), shown by `lu show`, audited without secret text, and refused by `lu collect`/publishing unless the existing `--allow-scrubbed`/`[publish].allow_scrubbed` opt-in is set. `scrub_patch = true` keeps the old in-place patch scrubbing. Store schema is now version 5.
 - The store has a single baseline at schema version 4, adding `staged_commit`, `blocked_reason` and `blocked_since` to jobs. Databases at versions 1, 2 and 3 migrate in place at startup; backups and restores require exactly version 4. The Ting rename still does not change the schema baseline. Schema references were updated across the operator docs.
 
 ## [0.5.0]

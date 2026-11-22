@@ -21,7 +21,7 @@ use crate::{
 const CURRENT_SCHEMA_VERSION: i64 = crate::SCHEMA_VERSION;
 
 /// Columns shared by the list/get queries that build a `JobRecord` from positional rows.
-const JOB_SELECT_COLUMNS: &str = "id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since";
+const JOB_SELECT_COLUMNS: &str = "id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since";
 
 fn internal<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Internal(e.to_string())
@@ -230,10 +230,10 @@ impl SqliteStore {
                 tx.commit().map_err(internal)?;
                 Ok(())
             }
-            // Schemas 1 through 3 add additive job columns. Fill them with zero/false/NULL so
+            // Schemas 1 through 4 add additive job columns. Fill them with zero/false/NULL so
             // older jobs keep their history and views stay compatible. Each column is checked
             // because a database briefly opened by a newer binary may already have some of them.
-            Some(1) | Some(2) | Some(3) => {
+            Some(1) | Some(2) | Some(3) | Some(4) => {
                 for (name, ddl) in [
                     (
                         "scrubbed_hits",
@@ -242,6 +242,10 @@ impl SqliteStore {
                     (
                         "patch_scrubbed",
                         "ALTER TABLE jobs ADD COLUMN patch_scrubbed INTEGER NOT NULL DEFAULT 0",
+                    ),
+                    (
+                        "patch_secret_hits_json",
+                        "ALTER TABLE jobs ADD COLUMN patch_secret_hits_json TEXT NOT NULL DEFAULT '{\"count\":0,\"rules\":[]}'",
                     ),
                     (
                         "parent_job_id",
@@ -336,6 +340,7 @@ fn apply_baseline(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
             expect_failed INTEGER NOT NULL DEFAULT 0,
             scrubbed_hits INTEGER NOT NULL DEFAULT 0,
             patch_scrubbed INTEGER NOT NULL DEFAULT 0,
+            patch_secret_hits_json TEXT NOT NULL DEFAULT '{\"count\":0,\"rules\":[]}',
             parent_job_id TEXT,
             root_job_id TEXT,
             depth INTEGER NOT NULL DEFAULT 0,
@@ -789,7 +794,7 @@ fn get_job_tx(
     id: &str,
 ) -> Result<(JobRecord, Option<u64>, Option<u64>), StoreError> {
     let mut stmt = tx
-        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since FROM jobs WHERE id=?1")
+        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since FROM jobs WHERE id=?1")
         .map_err(internal)?;
     let row = stmt
         .query_row(params![id], |r| {
@@ -818,6 +823,7 @@ fn get_job_tx(
                 r.get::<_, i64>("expect_failed")?,
                 r.get::<_, i64>("scrubbed_hits")?,
                 r.get::<_, i64>("patch_scrubbed")?,
+                r.get::<_, String>("patch_secret_hits_json")?,
                 r.get::<_, Option<String>>("parent_job_id")?,
                 r.get::<_, Option<String>>("root_job_id")?,
                 r.get::<_, i64>("depth")?,
@@ -856,6 +862,7 @@ fn get_job_tx(
         expect_failed,
         scrubbed_hits,
         patch_scrubbed,
+        patch_secret_hits_json,
         parent_job_id,
         root_job_id,
         depth,
@@ -899,6 +906,7 @@ fn get_job_tx(
         expect_failed: expect_failed != 0,
         scrubbed_hits: scrubbed_hits as u64,
         patch_scrubbed: patch_scrubbed != 0,
+        patch_secret_hits: serde_json::from_str(&patch_secret_hits_json).unwrap_or_default(),
         waiting_on: load_waiting(tx, &id_s)?,
         staged_commit,
         blocked_reason,
@@ -927,8 +935,9 @@ fn update_job_tx(
         .map(serde_json::to_string)
         .transpose()
         .map_err(internal)?;
+    let patch_secret_hits_json = serde_json::to_string(&rec.patch_secret_hits).map_err(internal)?;
     tx.execute(
-        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20,diff_bytes=?21,expect_failed=?22,scrubbed_hits=?23,patch_scrubbed=?24,parent_job_id=?25,root_job_id=?26,depth=?27,publish_json=?28,staged_commit=?29,blocked_reason=?30,blocked_since=?31 WHERE id=?1",
+        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20,diff_bytes=?21,expect_failed=?22,scrubbed_hits=?23,patch_scrubbed=?24,parent_job_id=?25,root_job_id=?26,depth=?27,publish_json=?28,staged_commit=?29,blocked_reason=?30,blocked_since=?31,patch_secret_hits_json=?32 WHERE id=?1",
         params![
             rec.id.as_str(),
             state_str(rec.state),
@@ -961,6 +970,7 @@ fn update_job_tx(
             rec.staged_commit,
             rec.blocked_reason,
             rec.blocked_since,
+            patch_secret_hits_json,
         ],
     ).map_err(internal)?;
     Ok(())
@@ -1094,6 +1104,7 @@ fn insert_job_tx(
         expect_failed: false,
         scrubbed_hits: 0,
         patch_scrubbed: false,
+        patch_secret_hits: lu_proto::view::PatchSecretHitsView::default(),
         waiting_on: Vec::new(),
         staged_commit: None,
         blocked_reason: None,
@@ -1304,7 +1315,7 @@ impl Store for SqliteStore {
                 params![id.as_str(), node.as_str(), epoch as i64, now.mono_ms as i64],
                 |row| {
                     let t: JobTuple = row_to_job_tuple(row)?;
-                    Ok((t, row.get(29)?))
+                    Ok((t, row.get(30)?))
                 },
             )
             .optional()
@@ -2239,6 +2250,26 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn record_patch_secret_hits(
+        &self,
+        id: &JobId,
+        epoch: u64,
+        hits: &lu_proto::view::PatchSecretHitsView,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let (mut rec, lease, recov) = get_job_tx(&tx, id.as_str())?;
+        if rec.epoch != epoch {
+            return Err(StoreError::StaleEpoch);
+        }
+        rec.patch_secret_hits = hits.clone();
+        update_job_tx(&tx, &rec, lease, recov)?;
+        tx.commit().map_err(internal)?;
+        Ok(())
+    }
+
     fn record_publish(
         &self,
         id: &JobId,
@@ -2816,6 +2847,7 @@ type JobTuple = (
     i64,
     i64,
     i64,
+    String,
     Option<String>,
     Option<String>,
     i64,
@@ -2856,6 +2888,7 @@ fn row_to_job_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobTuple> {
         row.get(26)?,
         row.get(27)?,
         row.get(28)?,
+        row.get(29)?,
     ))
 }
 
@@ -2883,6 +2916,7 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         expect_failed,
         scrubbed_hits,
         patch_scrubbed,
+        patch_secret_hits_json,
         parent_job_id,
         root_job_id,
         depth,
@@ -2920,6 +2954,7 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         expect_failed: expect_failed != 0,
         scrubbed_hits: scrubbed_hits as u64,
         patch_scrubbed: patch_scrubbed != 0,
+        patch_secret_hits: serde_json::from_str(&patch_secret_hits_json).unwrap_or_default(),
         waiting_on: Vec::new(),
         staged_commit,
         blocked_reason,
@@ -3075,7 +3110,7 @@ mod tests {
         {
             let _s = SqliteStore::open(&p).unwrap();
         }
-        for version in [0i64, 5, 9, 999] {
+        for version in [0i64, 6, 9, 999] {
             let conn = rusqlite::Connection::open(&p).unwrap();
             conn.execute("UPDATE schema_version SET version = ?1", params![version])
                 .unwrap();
@@ -3172,11 +3207,13 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let jobs = s.list_jobs(None, 10, None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].scrubbed_hits, 0);
         assert!(!jobs[0].patch_scrubbed);
+        assert_eq!(jobs[0].patch_secret_hits.count, 0);
+        assert!(jobs[0].patch_secret_hits.rules.is_empty());
         assert_eq!(jobs[0].parent_job_id, None);
         assert_eq!(jobs[0].root_job_id, None);
         assert_eq!(jobs[0].depth, 0);
@@ -3222,13 +3259,15 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let jobs = s.list_jobs(None, 10, None).unwrap();
         assert_eq!(jobs.len(), 2);
         for job in &jobs {
             assert_eq!(job.staged_commit, None);
             assert_eq!(job.blocked_reason, None);
             assert_eq!(job.blocked_since, None);
+            assert_eq!(job.patch_secret_hits.count, 0);
+            assert!(job.patch_secret_hits.rules.is_empty());
         }
         let blocked = jobs
             .iter()

@@ -11,6 +11,14 @@ use crate::{
     PublishRecord, WorkspacePolicy, WorkspaceState,
 };
 
+/// High-confidence secret hits found in added `diff.patch` lines when patch scrubbing is off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PatchSecretHitsView {
+    pub count: u64,
+    #[serde(default)]
+    pub rules: Vec<String>,
+}
+
 /// A submitted job as returned by the controller.
 ///
 /// `outcome_note` is absent unless the controller has one; `warnings` appears only on submit
@@ -85,6 +93,9 @@ pub struct JobView {
     /// Whether `diff.patch` was changed by scrubbing and may no longer apply cleanly.
     #[serde(default)]
     pub patch_scrubbed: bool,
+    /// High-confidence secret hits in added `diff.patch` lines when patch scrubbing is off.
+    #[serde(default)]
+    pub patch_secret_hits: PatchSecretHitsView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warnings: Option<Vec<String>>,
     /// Audit enqueue/write failures on the controller that built this view, when known.
@@ -132,6 +143,7 @@ impl JobView {
             diff_bytes: None,
             scrubbed_hits: 0,
             patch_scrubbed: false,
+            patch_secret_hits: PatchSecretHitsView::default(),
             warnings: None,
             audit_write_errors: None,
             publish: None,

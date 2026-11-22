@@ -239,6 +239,10 @@ fn job_and_node_views_match_the_documented_json() {
         diff_bytes: None,
         scrubbed_hits: 3,
         patch_scrubbed: true,
+        patch_secret_hits: lu_proto::view::PatchSecretHitsView {
+            count: 1,
+            rules: vec!["private_key".to_owned()],
+        },
         warnings: Some(Vec::new()),
         audit_write_errors: None,
         publish: None,
@@ -281,6 +285,7 @@ fn job_and_node_views_match_the_documented_json() {
         "waiting_reason": null,
         "scrubbed_hits": 3u64,
         "patch_scrubbed": true,
+        "patch_secret_hits": {"count": 1u64, "rules": ["private_key"]},
         "warnings": []
     });
     assert_eq!(serde_json::to_value(&job).unwrap(), expected_job);

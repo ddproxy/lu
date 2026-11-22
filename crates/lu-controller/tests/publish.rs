@@ -977,3 +977,43 @@ async fn max_pushes_per_hour_limits_successful_pushes() {
     fixture.wait_for_audit("snapshot", "rate_limited").await;
     fixture.assert_token_is_private();
 }
+
+#[tokio::test]
+async fn publish_refuses_patch_with_secret_hits_unless_allow_scrubbed() {
+    let fixture = Fixture::new(|config, _| {
+        config
+            .remotes
+            .get_mut("forge")
+            .unwrap()
+            .allow_source_branch_push = true;
+    })
+    .await;
+    let mut job = fixture.job(|_| {});
+    job.patch_secret_hits = lu_proto::view::PatchSecretHitsView {
+        count: 1,
+        rules: vec!["private_key".to_owned()],
+    };
+
+    let record = fixture.publish(&job).await.unwrap();
+    assert_eq!(record.detail, "failed", "{record:?}");
+    assert_eq!(fixture.metric("source_branch", "failed"), 1);
+
+    let allowed_fixture = Fixture::new(|config, _| {
+        config
+            .remotes
+            .get_mut("forge")
+            .unwrap()
+            .allow_source_branch_push = true;
+        config.allow_scrubbed = true;
+    })
+    .await;
+    let mut allowed = allowed_fixture.job(|spec| {
+        spec.idempotency_key = Some("psh-allowed".to_owned());
+    });
+    allowed.patch_secret_hits = lu_proto::view::PatchSecretHitsView {
+        count: 1,
+        rules: vec!["private_key".to_owned()],
+    };
+    let record = allowed_fixture.publish(&allowed).await.unwrap();
+    assert_eq!(record.detail, "published", "{record:?}");
+}
