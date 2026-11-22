@@ -53,6 +53,9 @@ pub enum Event {
     /// One controller-side publish attempt. `data.target` is `snapshot` or `source_branch`,
     /// `data.result` is a fixed outcome code and `data.remote` is a configured remote name.
     Publish,
+    /// High-confidence secret patterns found in added patch lines. `data.count` is the number of
+    /// hits and `data.rules` names the rules; no matched secret text is recorded.
+    PatchSecretDetected,
 }
 
 impl Event {
@@ -75,6 +78,7 @@ impl Event {
             Self::DraftRejected => "draft_rejected",
             Self::DraftExpired => "draft_expired",
             Self::Publish => "publish",
+            Self::PatchSecretDetected => "patch_secret_detected",
         }
     }
 }
@@ -104,6 +108,7 @@ pub enum Field {
     Remote,
     Result,
     RetryAfterSecs,
+    Rules,
     Source,
     State,
     Target,

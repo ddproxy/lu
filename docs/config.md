@@ -314,6 +314,7 @@ Controller-side redaction of bytes before they reach the artifact directory. The
 | Key | Required | Default | Validation |
 | --- | --- | --- | --- |
 | `scrub` | no | `true` | Boolean. When `false`, the controller stores uploads unchanged. |
+| `scrub_patch` | no | `false` | Boolean. When `false`, `diff.patch` is stored byte for byte as uploaded and only high-confidence added-line secret hits are recorded in `patch_secret_hits`. When `true`, patches are scrubbed in place like other artifacts. |
 | `extra_rules` | no | `[]` | Up to 16 operator regexes. Each entry needs `name` and `pattern`. |
 
 Each `[[artifacts.extra_rules]]` entry has these fields.

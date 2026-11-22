@@ -169,6 +169,7 @@ semantics are in [drafts.md](drafts.md#job-fields).
 | `diff_bytes` | integer or null | Present only for terminal jobs (`done`, `failed`, `cancelled`, `expired`). Size of the stored `diff.patch` in bytes, or `0` when none is stored. A failed job can have a non-empty partial diff; clients can fetch it with `GET /v1/jobs/{id}/artifacts/diff.patch`. |
 | `scrubbed_hits` | integer | Number of secret-like matches replaced in stored artifacts and logs. Zero when scrubbing is off or nothing matched. |
 | `patch_scrubbed` | boolean | True when controller-side scrubbing changed the stored `diff.patch`. Such a patch may no longer apply cleanly; `lu collect` requires `--allow-scrubbed`. |
+| `patch_secret_hits` | object | High-confidence secret hits found in added patch lines when `[artifacts] scrub_patch = false`. Shape: `{"count": <integer>, "rules": [<string>]}`. Rules name the matched detectors and never include matched text. `lu collect` and publishing refuse a patch with `count > 0` unless the same opt-in flag is given. |
 | `outcome_note` | string or null | Omitted when absent. `no_changes` when the job is `done` and its stored diff is empty and `allow_empty` is false; otherwise `expect_failed` when a suspect expectation failed. `no_changes` takes precedence when both apply. |
 | `warnings` | array of strings | Submit replies only. |
 | `audit_write_errors` | integer | Omitted by agent-facing job views. Present on operator-facing views: audit enqueue/write failures since this controller process started, or `0` when auditing is off. |

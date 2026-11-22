@@ -625,6 +625,7 @@ async fn show_prints_the_no_changes_outcome_note() {
         view["outcome_note"] = json!("no_changes");
         view["scrubbed_hits"] = json!(4);
         view["patch_scrubbed"] = json!(true);
+        view["patch_secret_hits"] = json!({"count": 2, "rules": ["private_key", "jwt"]});
         Reply::json(&view)
     })
     .await;
@@ -649,6 +650,13 @@ async fn show_prints_the_no_changes_outcome_note() {
     };
     assert_eq!(field("scrubbed_hits"), "4", "{text}");
     assert_eq!(field("patch_scrubbed"), "true", "{text}");
+    let psh_line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("patch_secret_hits"))
+        .unwrap_or("");
+    assert!(psh_line.contains("2"), "{text}");
+    assert!(psh_line.contains("private_key"), "{text}");
+    assert!(psh_line.contains("jwt"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2371,6 +2379,74 @@ async fn collect_refuses_scrubbed_patches_unless_explicitly_allowed() {
         .unwrap()
         .iter()
         .any(|r| r.method == "POST"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collect_refuses_patch_secret_hits_unless_explicitly_allowed() {
+    let dep = job_id();
+    let new_id = job_id();
+    let dep_id = dep.clone();
+    let reply_id = new_id.clone();
+    let server = start(move |record| {
+        if record.method == "GET" {
+            let mut view = collected_view(&dep_id, "done", 10);
+            view["patch_secret_hits"] = json!({"count": 1, "rules": ["private_key"]});
+            if record.path.starts_with("/v1/jobs/") {
+                return Reply::json(&view);
+            }
+            return Reply::json(&json!({"jobs": [view], "next": null}));
+        }
+        Reply::json(&job_json(&reply_id, "blocked"))
+    })
+    .await;
+    let dir = scratch("collect-psh");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+
+    let refused = run_with_env(
+        &[
+            "collect",
+            &dep,
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+        ],
+        &envs,
+        None,
+        &dir,
+    );
+    assert!(!refused.status.success());
+    let err = stderr(&refused);
+    assert!(err.contains("--allow-scrubbed"), "{err}");
+    assert!(err.contains("patch secret hit"), "{err}");
+    assert!(err.contains("private_key"), "{err}");
+    assert!(
+        !server
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.method == "POST"),
+        "a refused collect must not submit a job"
+    );
+
+    let allowed = run_with_env(
+        &[
+            "collect",
+            &dep,
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--allow-scrubbed",
+        ],
+        &envs,
+        None,
+        &dir,
+    );
+    assert!(allowed.status.success(), "{}", stderr(&allowed));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

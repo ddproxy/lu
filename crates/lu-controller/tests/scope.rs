@@ -1031,6 +1031,7 @@ async fn child_artifact_reads_are_hardened() {
     // `[artifacts] scrub = false` must not silently serve raw bytes to a harness.
     let no_scrub = ArtifactsConfig {
         scrub: false,
+        scrub_patch: false,
         extra_rules: Vec::new(),
     };
     let srv =
