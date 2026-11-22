@@ -109,9 +109,9 @@ A `draft` is created by intake or by an operator who submits a job in draft mode
 visible, and an operator can edit it, but it is never dispatched: no lease, agent event or harness
 run happens until approval. Approval moves `draft` to `queued` when all dependencies are `done`,
 or to `blocked` when they are not; rejection moves it to `cancelled`. A draft that is still a draft
-after the `[drafts] ttl` (default 7 days) moves to `expired`, which is terminal. Expired drafts are
-removed oldest first when the store needs room; an over-limit draft creation is refused with a
-typed error.
+after the `[drafts] ttl` (default 7 days) moves to `expired`, which is terminal. When a draft cap is
+full, the oldest drafts are moved to `expired` first regardless of TTL; an over-limit draft creation
+is refused with a typed error when that does not free room.
 
 Draft text has two provenance classes. `task` is operator-authored (an intake rule builds it from
 an operator-written `task_template`); `context` is external data copied from the event. The agent

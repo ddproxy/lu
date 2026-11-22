@@ -1497,4 +1497,21 @@ mod tests {
         std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(mirror.credential_for(&config).is_err());
     }
+
+    #[test]
+    fn credentials_match_name_url_and_normalized_id() {
+        let repo = repo_config("https://example.net/team/app.git");
+        for name in [
+            "local",
+            "https://example.net/team/app.git",
+            "example.net/team/app",
+            "ssh://example.net/team/app.git",
+        ] {
+            let entry = MirrorCredential {
+                name: name.to_owned(),
+                token_file: "/tmp/lu-token".to_owned(),
+            };
+            assert!(credential_matches(&entry, &repo), "{name}");
+        }
+    }
 }

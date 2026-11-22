@@ -1806,6 +1806,50 @@ async fn retry_resubmits_the_finished_spec_and_applies_the_overrides() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_overrides_or_inherits_the_stuck_policy_and_interval() {
+    let id = job_id();
+    let new_id = job_id();
+    let mut finished = finished_job(&id, "failed");
+    finished["spec"]["on_stuck"] = json!("retry");
+    finished["spec"]["stuck_after_secs"] = json!(900);
+    let created = job_json(&new_id, "queued");
+    let server = start(move |record| {
+        if record.method == "POST" {
+            Reply::json(&created)
+        } else {
+            Reply::json(&finished)
+        }
+    })
+    .await;
+    let dir = scratch("retry-stuck");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let env = env_for(&server, &token);
+
+    let output = run_with_env(
+        &["retry", &id, "--on-stuck", "cancel", "--stuck-after", "120"],
+        &env,
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = run_with_env(&["retry", &id], &env, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let records = server.records.lock().unwrap();
+    let posts: Vec<Value> = records
+        .iter()
+        .filter(|record| record.method == "POST")
+        .map(|record| serde_json::from_slice(&record.body).unwrap())
+        .collect();
+    assert_eq!(posts[0]["on_stuck"], json!("cancel"));
+    assert_eq!(posts[0]["stuck_after_secs"], json!(120));
+    assert_eq!(posts[1]["on_stuck"], json!("retry"));
+    assert_eq!(posts[1]["stuck_after_secs"], json!(900));
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_keeps_the_old_spec_and_sends_no_idempotency_key_by_default() {
     let id = job_id();
     let new_id = job_id();

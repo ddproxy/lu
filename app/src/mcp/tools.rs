@@ -555,7 +555,7 @@ const TOOLS: &[ToolDef] = &[
             required(
                 "path",
                 "string",
-                "Task directory or Markdown checklist on the controller host",
+                "Task directory or Markdown checklist on the MCP host",
             ),
             required(
                 "key_prefix",
@@ -2300,4 +2300,23 @@ async fn graph(host: &Host) -> Result<ToolOutput, ToolError> {
         text,
         structured: json!({"nodes": nodes}),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_path_is_described_as_mcp_host_local() {
+        let def = TOOLS
+            .iter()
+            .find(|tool| tool.name == "lu_submit_batch")
+            .unwrap();
+        let path = def.fields.iter().find(|field| field.key == "path").unwrap();
+        assert!(
+            path.description.contains("MCP host"),
+            "{}",
+            path.description
+        );
+    }
 }

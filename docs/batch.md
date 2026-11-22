@@ -5,7 +5,7 @@ task. It is meant for repeating a known set of jobs safely: every job gets a det
 idempotency key, the whole input is validated before the first request, and a dry run prints the
 plan without connecting to a controller or reading an operator token.
 
-The schema version stays at `2`. Batch inputs only populate fields that `JobSpec` already has.
+The store schema version is `3`. Batch inputs only populate fields that `JobSpec` already has and do not change the store schema.
 
 ## Inputs
 
@@ -138,7 +138,7 @@ lu submit --batch ./tasks \
   "dry_run": true,
   "chain": true,
   "max_parallel": 2,
-  "group": "release-1",
+  "group": "release",
   "jobs": [
     {"key": "release-1-build", "slug": "build", "group": "release", "after": [], "bytes": 24, "source": "tasks/build.md"}
   ]

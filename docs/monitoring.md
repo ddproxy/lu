@@ -36,11 +36,11 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_build_info{version}` | gauge | Always `1`; controller build version. |
 | `lu_uptime_seconds` | gauge | Seconds since the controller process started. |
 | `lu_db_bytes` | gauge | SQLite file size, excluding `-wal` and `-shm`. |
-| `lu_schema_version` | gauge | Schema version the binary expects; currently `2`. |
+| `lu_schema_version` | gauge | Schema version the binary expects; currently `3`. |
 | `lu_recovered_on_boot` | gauge | Jobs moved to `recovering` by this process's boot recovery. |
 | `lu_queue_oldest_seconds` | gauge | Age of the oldest `queued` or `blocked` job, or `0` when none. |
 | `lu_jobs{state}` | gauge | Jobs in each of eleven zero-filled states: `draft`, `blocked`, `queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`, `expired`. |
-| `lu_drafts{state}` | gauge | Draft inventory by state; `draft` counts waiting drafts and `expired` counts TTL-expired drafts. |
+| `lu_drafts{state}` | gauge | Draft inventory by state; `draft` counts waiting drafts and `expired` counts drafts expired by TTL or capacity pressure. |
 | `lu_intake_total{source,result}` | counter | Intake events by source and `result`: `accepted`, `dropped`, `bad_signature`, `duplicate`, `rate_limited`, `invalid`. |
 | `lu_group_running{group}` | gauge | Jobs in that configured or runtime-capped group currently `leased`, `running`, `recovering` or `needs_input`. |
 | `lu_group_limit{group}` | gauge | Active `max_running` cap for that group, from config or a runtime update. |
@@ -65,9 +65,12 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_node_workspace_reclaimed_bytes_total{node}` | counter | Bytes reclaimed by workspace deletion since the agent started. |
 | `lu_node_workspace_evictions_total{node}` | counter | Workspaces removed by eviction since the agent started. |
 | `lu_node_workspace_delete_errors_total{node}` | counter | Failed workspace deletions since the agent started; failures are retried with backoff. |
+| `lu_scope_requests_total{route,result}` | counter | Scoped job requests by route and `result` (`ok` or a failure code such as `bad_request`, `limit_exceeded` or `internal`), since controller start. |
+| `lu_scope_limit_exceeded_total{limit}` | counter | Scoped requests refused by a named cap, since controller start; the same names appear in `429 limit_exceeded` errors. |
 
 `lu_drafts{state}` follows the draft inventory; an `expired` count that keeps growing means approved
-review is not keeping up with the `[drafts] ttl`. `lu_intake_total` counts intake outcomes, never
+review is not keeping up with the `[drafts] ttl` or that draft caps are forcing older drafts out.
+`lu_intake_total` counts intake outcomes, never
 payload text: a rise in `bad_signature` points at a sender or signing-key mismatch, while
 `rate_limited` or `duplicate` can be normal retry traffic. Drop reasons are not attributed to a
 particular rule, so correlate with the operator's intake logs and [intake.md](intake.md#outcomes-and-metrics).
@@ -76,7 +79,7 @@ Node label, provider, disk and last-seen series come from the controller store's
 
 ## `lu status`
 
-`GET /v1/status` and `lu status` return the same fields: `version`, `uptime_secs`, `schema_version`, `db_bytes`, `recovered_on_boot`, `jobs` (eleven zero-filled counts, including `draft` and `expired`), `oldest_queued_secs`, `drafts`, `oldest_draft_secs`, `nodes`, `nodes_online`, `lease_secs` and `audit_write_errors`. The last field is the same counter as `lu_audit_write_errors_total`; `lu show <id>` also prints it in the job view. Draft counts and the oldest draft age are visible in `lu top`; see [drafts.md](drafts.md#observing-drafts).
+`GET /v1/status` and `lu status` return the same fields: `version`, `uptime_secs`, `schema_version`, `db_bytes`, `recovered_on_boot`, `jobs` (eleven zero-filled counts, including `draft` and `expired`), `oldest_queued_secs`, `drafts`, `oldest_draft_secs`, `nodes`, `nodes_online`, `lease_secs`, `audit_write_errors`, `scope_enabled`, `scope_max_depth`, `scope_max_children_per_job` and `scope_max_descendants_per_root`. `audit_write_errors` is the same counter as `lu_audit_write_errors_total`; `lu show <id>` also prints it in the job view. Draft counts and the oldest draft age are visible in `lu top`; see [drafts.md](drafts.md#observing-drafts).
 
 Worked example:
 
@@ -88,7 +91,7 @@ lu status --json
 {
   "version": "0.5.0",
   "uptime_secs": 3600,
-  "schema_version": 2,
+  "schema_version": 3,
   "db_bytes": 81920,
   "recovered_on_boot": 2,
   "jobs": {"draft": 3, "blocked": 0, "queued": 1, "leased": 1, "running": 2, "recovering": 0, "needs_input": 0, "done": 12, "failed": 1, "cancelled": 0, "expired": 1},
@@ -98,7 +101,11 @@ lu status --json
   "nodes": 3,
   "nodes_online": 2,
   "lease_secs": 60,
-  "audit_write_errors": 0
+  "audit_write_errors": 0,
+  "scope_enabled": false,
+  "scope_max_depth": 2,
+  "scope_max_children_per_job": 8,
+  "scope_max_descendants_per_root": 32
 }
 ```
 
