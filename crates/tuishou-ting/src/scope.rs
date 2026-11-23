@@ -643,7 +643,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.contains("symlinked scope root"), "{err}");
+        assert!(err.contains("symlinked scope root"), "wrong refusal reason");
     }
 
     #[test]
