@@ -965,6 +965,54 @@ fn provider_text(cell: &ProviderCell, cordon: Option<&CordonCell>) -> (String, T
     }
 }
 
+/// A suffix for the title naming providers that queued jobs need but no usable node can offer:
+/// ` · waiting for zen 14h54m (3 queued)`. Empty when nothing is queued or every provider has at
+/// least one node that is ready.
+fn waiting_on_providers(snapshot: &Snapshot) -> String {
+    let queued = snapshot
+        .jobs
+        .iter()
+        .filter(|job| job.state.parse::<JobState>() == Ok(JobState::Queued))
+        .count();
+    if queued == 0 {
+        return String::new();
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for node in snapshot.nodes.iter().filter(|n| !n.drained) {
+        for cell in &node.providers {
+            if !names.contains(&cell.name.as_str()) {
+                names.push(&cell.name);
+            }
+        }
+    }
+    let mut waiting = Vec::new();
+    for name in names {
+        let cells: Vec<&ProviderCell> = snapshot
+            .nodes
+            .iter()
+            .filter(|n| !n.drained)
+            .flat_map(|n| &n.providers)
+            .filter(|c| c.name == name)
+            .collect();
+        let any_ok = cells
+            .iter()
+            .any(|c| c.state.parse::<ProviderState>() == Ok(ProviderState::Ok));
+        if any_ok {
+            continue;
+        }
+        let soonest = cells.iter().filter_map(|c| c.soonest_secs).min();
+        waiting.push(match soonest {
+            Some(secs) => format!("{} {}", printable(name), short_age(secs)),
+            None => printable(name),
+        });
+    }
+    if waiting.is_empty() {
+        String::new()
+    } else {
+        format!(" · waiting for {} ({queued} queued)", waiting.join(", "))
+    }
+}
+
 fn cordon_pane_view(node: &NodeRow) -> ProcessPaneView {
     let mut lines = Vec::new();
     for cordon in &node.cordons {
@@ -1149,7 +1197,9 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
         base_state
     };
 
-    let provider_cells: Vec<(String, Tone)> = node
+    // Problems come first so a narrow terminal truncates the healthy providers, not the cooling
+    // one an operator needs to see.
+    let mut provider_cells: Vec<(String, Tone)> = node
         .providers
         .iter()
         .map(|cell| {
@@ -1157,6 +1207,7 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
             provider_text(cell, cordon)
         })
         .collect();
+    provider_cells.sort_by_key(|(_, tone)| *tone == Tone::Good);
     let providers_plain = provider_cells
         .iter()
         .map(|(text, _)| text.as_str())
@@ -1518,8 +1569,9 @@ impl ViewModel {
                 short_age(snapshot.oldest_draft_secs)
             )
         };
+        let waiting = waiting_on_providers(snapshot);
         let title = format!(
-            "lu top {} · controller {} · {drafts}",
+            "lu top {} · controller {} · {drafts}{waiting}",
             env!("CARGO_PKG_VERSION"),
             controller
         );
@@ -2774,5 +2826,52 @@ mod tests {
         assert_eq!(dashboard.view(Instant::now()).selected_line, Some(7));
         dashboard.scroll_table(false);
         assert_eq!(dashboard.view(Instant::now()).selected_line, Some(4));
+    }
+
+    #[test]
+    fn title_names_providers_that_queued_jobs_are_waiting_for() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        let mut snap = snapshot();
+        snap.jobs = vec![job("01Q", "queued"), job("01R", "queued")];
+        dashboard.apply(Ok(snap), t0);
+        let text = dashboard.view(t0).plain_text();
+        assert!(text.contains("waiting for zen 2h00m (2 queued)"), "{text}");
+
+        // A node that can run zen again clears the note, and so does an empty queue.
+        let mut snap = snapshot();
+        snap.jobs = vec![job("01Q", "queued")];
+        snap.nodes[1].providers[0].state = "ok".to_owned();
+        snap.nodes[1].providers[0].soonest_secs = None;
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Ok(snap), t0);
+        assert!(!dashboard.view(t0).plain_text().contains("waiting for"));
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(Ok(snapshot()), t0);
+        assert!(!dashboard.view(t0).plain_text().contains("waiting for"));
+    }
+
+    #[test]
+    fn problem_providers_sort_before_healthy_ones_in_the_node_row() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        let mut snap = snapshot();
+        snap.nodes[0].providers = vec![
+            ProviderCell {
+                name: "alpha".to_owned(),
+                state: "ok".to_owned(),
+                soonest_secs: None,
+            },
+            ProviderCell {
+                name: "zen".to_owned(),
+                state: "cooling".to_owned(),
+                soonest_secs: Some(60),
+            },
+        ];
+        dashboard.apply(Ok(snap), t0);
+        let text = dashboard.view(t0).plain_text();
+        let zen = text.find("zen cooling").expect(&text);
+        let alpha = text.find("alpha ok").expect(&text);
+        assert!(zen < alpha, "{text}");
     }
 }

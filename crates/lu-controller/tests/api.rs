@@ -3846,3 +3846,40 @@ async fn repo_userinfo_is_refused_on_submit() {
     assert!(body_str(&r).contains("credentials"), "{r}");
     let _ = srv.shutdown.send(());
 }
+
+#[tokio::test]
+async fn status_summarises_provider_states_across_online_nodes() {
+    let srv = start_server().await;
+    let poll_body = serde_json::to_string(&serde_json::json!({
+        "heartbeat": {
+            "node": "node-a",
+            "harness": "idle",
+            "providers": [
+                {"name": "prov-a", "state": "ok"},
+                {"name": "prov-b", "state": "cooling", "soonest_secs": 600}
+            ]
+        },
+        "wait_secs": 0
+    }))
+    .unwrap();
+    let r = agent_call(srv.addr, AGENT_A_TOKEN, "POST /v1/agent/poll", &poll_body).await;
+    assert_eq!(status(&r), 204, "{r}");
+    let r = raw_request(
+        srv.addr,
+        &format!(
+            "GET /v1/status HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    let v: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(v["providers"]["prov-a"]["ok"], 1, "{v}");
+    assert_eq!(v["providers"]["prov-b"]["cooling"], 1, "{v}");
+    assert_eq!(v["providers"]["prov-b"]["soonest_secs"], 600, "{v}");
+    assert_eq!(
+        v["providers"]["prov-a"]["soonest_secs"],
+        serde_json::Value::Null,
+        "{v}"
+    );
+    let _ = srv.shutdown.send(());
+}
