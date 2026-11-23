@@ -30,39 +30,138 @@ impl Default for LayoutInfo {
     }
 }
 
-fn style_for(tone: Tone) -> Style {
-    match tone {
-        Tone::Plain => Style::default(),
-        Tone::Heading => Style::default().add_modifier(Modifier::BOLD),
-        Tone::Good => Style::default()
-            .fg(Color::LightGreen)
-            .add_modifier(Modifier::BOLD),
-        Tone::Warn => Style::default().fg(Color::Yellow),
-        Tone::Bad => Style::default().fg(Color::Red),
-        Tone::Dim => Style::default().fg(Color::DarkGray),
-        Tone::Done => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::DIM),
-        Tone::Blocked => Style::default().fg(Color::Rgb(255, 140, 0)),
+/// Named badge colours. Foregrounds are chosen for contrast on both light and dark terminals.
+mod badge {
+    use super::Color;
+    pub const AMBER: Color = Color::Rgb(255, 176, 0);
+    pub const GREEN: Color = Color::Rgb(22, 163, 74);
+    pub const RED: Color = Color::Rgb(190, 32, 32);
+    pub const BLUE: Color = Color::Rgb(37, 74, 160);
+    pub const ON_LIGHT: Color = Color::Black;
+    pub const ON_DARK: Color = Color::White;
+}
+
+/// What the terminal can show. `NO_COLOR` turns colours off; without a 24-bit `COLORTERM` badges
+/// use bold plus reverse video instead of background colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Theme {
+    pub color: bool,
+    pub truecolor: bool,
+}
+
+impl Theme {
+    pub fn from_env() -> Self {
+        let truecolor =
+            std::env::var("COLORTERM").is_ok_and(|value| value == "truecolor" || value == "24bit");
+        Self {
+            color: std::env::var_os("NO_COLOR").is_none(),
+            truecolor,
+        }
+    }
+
+    pub fn plain() -> Self {
+        Self {
+            color: false,
+            truecolor: false,
+        }
+    }
+
+    pub fn standard() -> Self {
+        Self {
+            color: true,
+            truecolor: false,
+        }
+    }
+
+    pub fn truecolor() -> Self {
+        Self {
+            color: true,
+            truecolor: true,
+        }
     }
 }
 
-fn model_line(line: &crate::model::Line, selected: bool) -> Line<'static> {
+/// A filled badge: a real background in 24-bit, otherwise bold + reverse video.
+fn filled_badge(theme: Theme, fg: Color, bg: Color, ansi: Color) -> Style {
+    if !theme.color {
+        Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else if !theme.truecolor {
+        Style::default()
+            .fg(ansi)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default().fg(fg).bg(bg)
+    }
+}
+
+/// A text badge without a background, reduced to bold when colours are unavailable.
+fn text_badge(theme: Theme, color: Color, ansi: Color, modifiers: Modifier) -> Style {
+    if !theme.color {
+        Style::default().add_modifier(modifiers | Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(if theme.truecolor { color } else { ansi })
+            .add_modifier(modifiers)
+    }
+}
+
+fn style_for(tone: Tone, theme: Theme) -> Style {
+    match tone {
+        Tone::Plain => Style::default(),
+        Tone::Heading => Style::default().add_modifier(Modifier::BOLD),
+        Tone::Good => {
+            if theme.color {
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            }
+        }
+        Tone::Warn => text_badge(theme, Color::Yellow, Color::Yellow, Modifier::empty()),
+        Tone::Bad => text_badge(theme, Color::Red, Color::LightRed, Modifier::empty()),
+        Tone::Dim => Style::default().fg(if theme.color {
+            Color::DarkGray
+        } else {
+            Color::Reset
+        }),
+        Tone::Done => text_badge(theme, Color::Green, Color::Green, Modifier::DIM),
+        Tone::Blocked => text_badge(
+            theme,
+            Color::Rgb(255, 140, 0),
+            Color::Yellow,
+            Modifier::empty(),
+        ),
+        Tone::NodeBusy => filled_badge(theme, badge::ON_LIGHT, badge::AMBER, Color::Yellow),
+        Tone::NodeIdle => text_badge(theme, Color::Green, Color::Green, Modifier::DIM),
+        Tone::NodeDrained => filled_badge(theme, badge::ON_DARK, badge::BLUE, Color::Blue),
+        Tone::NodeOffline => filled_badge(theme, badge::ON_DARK, badge::RED, Color::Red),
+        Tone::JobRunning => filled_badge(theme, badge::ON_LIGHT, badge::GREEN, Color::Green),
+        Tone::JobQueued => text_badge(theme, badge::AMBER, Color::Yellow, Modifier::empty()),
+        Tone::JobFailed => filled_badge(theme, badge::ON_DARK, badge::RED, Color::Red),
+        Tone::JobDone => text_badge(theme, Color::Green, Color::Green, Modifier::DIM),
+        Tone::JobCancelled => text_badge(theme, Color::DarkGray, Color::DarkGray, Modifier::DIM),
+    }
+}
+
+fn model_line(line: &crate::model::Line, selected: bool, theme: Theme) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = if line.segments.is_empty() {
-        vec![Span::styled(line.text.clone(), style_for(line.tone))]
+        vec![Span::styled(line.text.clone(), style_for(line.tone, theme))]
     } else {
         line.segments
             .iter()
-            .map(|segment| Span::styled(segment.text.clone(), style_for(segment.tone)))
+            .map(|segment| Span::styled(segment.text.clone(), style_for(segment.tone, theme)))
             .collect()
     };
     if selected {
+        // Underline rather than reverse: reverse is used by the 16-colour badges.
         spans = spans
             .into_iter()
             .map(|span| {
                 Span::styled(
                     span.content.into_owned(),
-                    span.style.add_modifier(Modifier::REVERSED),
+                    span.style
+                        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
                 )
             })
             .collect();
@@ -70,20 +169,25 @@ fn model_line(line: &crate::model::Line, selected: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-fn pane_line(line: &crate::model::Line) -> Line<'static> {
+fn pane_line(line: &crate::model::Line, theme: Theme) -> Line<'static> {
     if line.segments.is_empty() {
-        Line::from(Span::styled(line.text.clone(), style_for(line.tone)))
+        Line::from(Span::styled(line.text.clone(), style_for(line.tone, theme)))
     } else {
         Line::from(
             line.segments
                 .iter()
-                .map(|segment| Span::styled(segment.text.clone(), style_for(segment.tone)))
+                .map(|segment| Span::styled(segment.text.clone(), style_for(segment.tone, theme)))
                 .collect::<Vec<_>>(),
         )
     }
 }
 
-fn draw_process_pane(frame: &mut Frame, pane: &crate::model::ProcessPaneView, area: Rect) {
+fn draw_process_pane(
+    frame: &mut Frame,
+    pane: &crate::model::ProcessPaneView,
+    area: Rect,
+    theme: Theme,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -108,7 +212,11 @@ fn draw_process_pane(frame: &mut Frame, pane: &crate::model::ProcessPaneView, ar
             Sparkline::default()
                 .block(Block::bordered().title(load_title))
                 .data(&load_data)
-                .style(Style::default().fg(Color::Cyan)),
+                .style(Style::default().fg(if theme.color {
+                    Color::Cyan
+                } else {
+                    Color::Reset
+                })),
             load_area,
         );
         let mem_width = mem_area.width.saturating_sub(2) as usize;
@@ -119,11 +227,19 @@ fn draw_process_pane(frame: &mut Frame, pane: &crate::model::ProcessPaneView, ar
             Sparkline::default()
                 .block(Block::bordered().title(mem_title))
                 .data(&mem_data)
-                .style(Style::default().fg(Color::Magenta)),
+                .style(Style::default().fg(if theme.color {
+                    Color::Magenta
+                } else {
+                    Color::Reset
+                })),
             mem_area,
         );
     }
-    let lines: Vec<Line> = pane.lines.iter().map(pane_line).collect();
+    let lines: Vec<Line> = pane
+        .lines
+        .iter()
+        .map(|line| pane_line(line, theme))
+        .collect();
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(Block::bordered().title(pane.title.as_str())),
         body,
@@ -132,7 +248,11 @@ fn draw_process_pane(frame: &mut Frame, pane: &crate::model::ProcessPaneView, ar
 
 /// Turns graph text into styled lines, reversing and bolding only the selected node's label so
 /// its state colour and the edges around it stay visible.
-fn graph_widget_lines(rendered: &RenderedGraph, selected: Option<&str>) -> Vec<Line<'static>> {
+fn graph_widget_lines(
+    rendered: &RenderedGraph,
+    selected: Option<&str>,
+    theme: Theme,
+) -> Vec<Line<'static>> {
     rendered
         .lines
         .iter()
@@ -160,11 +280,11 @@ fn graph_widget_lines(rendered: &RenderedGraph, selected: Option<&str>) -> Vec<L
                     }
                     let text: String = cells[start..end].iter().collect();
                     let style = if selected_cell {
-                        style_for(segment.tone)
+                        style_for(segment.tone, theme)
                             .add_modifier(Modifier::REVERSED)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        style_for(segment.tone)
+                        style_for(segment.tone, theme)
                     };
                     spans.push(Span::styled(text, style));
                     start = end;
@@ -176,35 +296,78 @@ fn graph_widget_lines(rendered: &RenderedGraph, selected: Option<&str>) -> Vec<L
         .collect()
 }
 
-/// Lays out a view model; all text decisions were made in the model.
+const GAUGE_TITLES: [&str; 4] = ["RUN", "QUE", "BUSY", "PROV"];
+
+fn trend(chart: &crate::model::Chart) -> &'static str {
+    let Some((previous, latest)) = chart
+        .values
+        .len()
+        .checked_sub(2)
+        .and_then(|at| chart.values.get(at).zip(chart.values.last()))
+    else {
+        return "·";
+    };
+    match latest.cmp(previous) {
+        std::cmp::Ordering::Greater => "↑",
+        std::cmp::Ordering::Less => "↓",
+        std::cmp::Ordering::Equal => "→",
+    }
+}
+
+/// A one-row strip: value and direction instead of four flat filled blocks.
+fn draw_gauges(frame: &mut Frame, charts: &[crate::model::Chart], area: Rect, theme: Theme) {
+    if area.height == 0 || area.width == 0 || charts.is_empty() {
+        return;
+    }
+    let separator = Span::styled(
+        " │ ",
+        if theme.color {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        },
+    );
+    let mut spans = Vec::new();
+    for (index, chart) in charts.iter().take(GAUGE_TITLES.len()).enumerate() {
+        if index > 0 {
+            spans.push(separator.clone());
+        }
+        let color = match index {
+            0 => Color::LightGreen,
+            1 => Color::Yellow,
+            2 => Color::Cyan,
+            _ => Color::Magenta,
+        };
+        let style = if theme.color {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(
+            format!("{} {} {}", GAUGE_TITLES[index], chart.latest, trend(chart)),
+            style,
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Lays out a view model with colours taken from the environment.
 pub fn draw(frame: &mut Frame, view: &ViewModel) -> LayoutInfo {
+    draw_with_theme(frame, view, Theme::from_env())
+}
+
+/// Lays out a view model; all text decisions were made in the model.
+pub fn draw_with_theme(frame: &mut Frame, view: &ViewModel, theme: Theme) -> LayoutInfo {
     let area = frame.area();
-    let chart_height = if area.height >= 24 { 5 } else { 0 };
-    let [charts, body, status, footer] = Layout::vertical([
-        Constraint::Length(chart_height),
+    let gauge_height = u16::from(area.height >= 12 && !view.charts.is_empty());
+    let [gauges, body, status, footer] = Layout::vertical([
+        Constraint::Length(gauge_height),
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(area);
-    if chart_height > 0 && !view.charts.is_empty() {
-        let cells = Layout::horizontal(vec![
-            Constraint::Ratio(1, view.charts.len() as u32);
-            view.charts.len()
-        ])
-        .split(charts);
-        for (chart, cell) in view.charts.iter().zip(cells.iter()) {
-            let width = cell.width.saturating_sub(2) as usize;
-            let skip = chart.values.len().saturating_sub(width);
-            let data: Vec<u64> = chart.values[skip..].to_vec();
-            let title = format!("{} {}", chart.title, chart.latest);
-            let sparkline = Sparkline::default()
-                .block(Block::bordered().title(title))
-                .data(&data)
-                .style(Style::default().fg(Color::Cyan));
-            frame.render_widget(sparkline, *cell);
-        }
-    }
+    draw_gauges(frame, &view.charts, gauges, theme);
 
     let process_height = view.process_pane.as_ref().map_or(0, |pane| {
         let spark_h = if body.height >= 10 { 3 } else { 0 };
@@ -248,9 +411,13 @@ pub fn draw(frame: &mut Frame, view: &ViewModel) -> LayoutInfo {
     ])
     .areas(body);
 
-    let focus_border = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
+    let focus_border = if theme.color {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
     let nodes_block =
         Block::bordered()
             .title(view.title.as_str())
@@ -277,17 +444,31 @@ pub fn draw(frame: &mut Frame, view: &ViewModel) -> LayoutInfo {
         .iter()
         .take(node_lines)
         .enumerate()
-        .map(|(index, line)| model_line(line, view.selected_line == Some(index)))
+        .map(|(index, line)| model_line(line, view.selected_line == Some(index), theme))
         .collect();
-    let job_widget: Vec<Line> = view
+    let mut job_widget: Vec<Line> = view
         .lines
         .iter()
         .skip(node_lines)
         .enumerate()
-        .map(|(index, line)| model_line(line, view.selected_line == Some(node_lines + index)))
+        .map(|(index, line)| {
+            model_line(line, view.selected_line == Some(node_lines + index), theme)
+        })
         .collect();
     let nodes = nodes_block.inner(node_area);
     let jobs = jobs_block.inner(jobs_area);
+    // Short lists leave the bottom of the Jobs pane empty; fill it with fleet totals.
+    if job_widget.len() + 2 <= usize::from(jobs.height) {
+        job_widget.push(Line::from(""));
+        job_widget.push(Line::from(Span::styled(
+            view.summary.clone(),
+            if theme.color {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            },
+        )));
+    }
     frame.render_widget(
         Paragraph::new(Text::from(node_widget)).block(nodes_block),
         node_area,
@@ -350,20 +531,24 @@ pub fn draw(frame: &mut Frame, view: &ViewModel) -> LayoutInfo {
                 let width = graph_area.width.saturating_sub(2) as usize;
                 let text: String = detail.text.chars().take(width).collect();
                 block = block.title_bottom(
-                    Line::from(Span::styled(text, style_for(detail.tone)))
+                    Line::from(Span::styled(text, style_for(detail.tone, theme)))
                         .alignment(Alignment::Left),
                 );
             }
             graph_rect = block.inner(graph_area);
-            let lines = graph_widget_lines(&shown_graph, view.selected_job.as_deref());
+            let lines = graph_widget_lines(&shown_graph, view.selected_job.as_deref(), theme);
             frame.render_widget(Paragraph::new(Text::from(lines)).block(block), graph_area);
         }
     }
 
     if let Some(pane) = &view.process_pane {
-        draw_process_pane(frame, pane, bottom_area);
+        draw_process_pane(frame, pane, bottom_area, theme);
     } else if let Some(pane) = &view.cordon_pane {
-        let lines: Vec<Line> = pane.lines.iter().map(pane_line).collect();
+        let lines: Vec<Line> = pane
+            .lines
+            .iter()
+            .map(|line| pane_line(line, theme))
+            .collect();
         frame.render_widget(
             Paragraph::new(Text::from(lines)).block(Block::bordered().title(pane.title.as_str())),
             bottom_area,
@@ -374,14 +559,18 @@ pub fn draw(frame: &mut Frame, view: &ViewModel) -> LayoutInfo {
         } else {
             format!("log {}: {}", log.job_id, log.title)
         };
-        let lines: Vec<Line> = log.lines.iter().map(pane_line).collect();
+        let lines: Vec<Line> = log
+            .lines
+            .iter()
+            .map(|line| pane_line(line, theme))
+            .collect();
         frame.render_widget(
             Paragraph::new(Text::from(lines)).block(Block::bordered().title(title)),
             bottom_area,
         );
     }
 
-    let status_style = style_for(view.status.tone).add_modifier(if view.paused {
+    let status_style = style_for(view.status.tone, theme).add_modifier(if view.paused {
         Modifier::BOLD
     } else {
         Modifier::empty()
@@ -472,6 +661,8 @@ mod tests {
                     title: "do the thing".to_owned(),
                     state: "running".to_owned(),
                     node: Some("peer-a".to_owned()),
+                    repo: "owner/name".to_owned(),
+                    git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 5,
                     model: None,
@@ -569,7 +760,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, &view);
+                draw_with_theme(frame, &view, Theme::truecolor());
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -587,10 +778,13 @@ mod tests {
     }
 
     #[test]
-    fn a_tall_screen_draws_the_charts() {
+    fn a_tall_screen_draws_a_compact_gauge_strip() {
         let text = screen(&dashboard().view(Instant::now()), 100, 30);
-        assert!(text.contains("running jobs 1"), "{text}");
-        assert!(text.contains("providers ok 0"), "{text}");
+        assert!(text.contains("RUN 1"), "{text}");
+        assert!(text.contains("PROV 0"), "{text}");
+        assert!(!text.contains("running jobs"), "{text}");
+        let strip = text.lines().next().unwrap();
+        assert_eq!(strip.lines().count(), 1);
     }
 
     #[test]
@@ -601,6 +795,8 @@ mod tests {
             title: title.to_owned(),
             state: state.to_owned(),
             node: None,
+            repo: "owner/name".to_owned(),
+            git_ref: "main".to_owned(),
             attempt: 1,
             age_secs: 1,
             model: None,
@@ -662,6 +858,8 @@ mod tests {
                     title: "do the thing".to_owned(),
                     state: "running".to_owned(),
                     node: None,
+                    repo: "owner/name".to_owned(),
+                    git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 1,
                     model: None,
@@ -732,6 +930,8 @@ mod tests {
                     title: "do the thing".to_owned(),
                     state: "running".to_owned(),
                     node: Some("peer-a".to_owned()),
+                    repo: "owner/name".to_owned(),
+                    git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 5,
                     model: None,
@@ -779,6 +979,8 @@ mod tests {
             title: "a long task title that must not appear in the graph".to_owned(),
             state: "queued".to_owned(),
             node: None,
+            repo: "owner/name".to_owned(),
+            git_ref: "main".to_owned(),
             attempt: 1,
             age_secs: 1,
             model: None,
@@ -856,6 +1058,8 @@ mod tests {
                 title: "a title much longer than the graph panel can show".to_owned(),
                 state: "running".to_owned(),
                 node: None,
+                repo: "owner/name".to_owned(),
+                git_ref: "main".to_owned(),
                 attempt: 1,
                 age_secs: 1,
                 model: None,
@@ -900,7 +1104,7 @@ mod tests {
         dashboard.toggle_focus();
         dashboard.toggle_focus();
         let view = dashboard.view(Instant::now());
-        let (layout, buffer) = draw_view(&view, 40, 30);
+        let (layout, buffer) = draw_view(&view, 80, 30);
         let text = text_of(&buffer);
         let bottom = text
             .lines()
@@ -909,6 +1113,8 @@ mod tests {
             .to_owned();
         assert!(bottom.contains("01LONGJOBID123"), "{bottom}");
         assert!(bottom.contains("running"), "{bottom}");
+        assert!(bottom.contains("owner/name"), "{bottom}");
+        assert!(bottom.contains("main"), "{bottom}");
         assert!(bottom.contains("a title much"), "{bottom}");
         assert!(!bottom.contains("panel can show"), "{bottom}");
     }
@@ -924,6 +1130,8 @@ mod tests {
                 title: "a fan-out job".to_owned(),
                 state: "running".to_owned(),
                 node: None,
+                repo: "owner/name".to_owned(),
+                git_ref: "main".to_owned(),
                 attempt: 1,
                 age_secs: 1,
                 model: None,
@@ -978,5 +1186,140 @@ mod tests {
                 .all(|node| node.id != "01000"),
             "a selected job outside the window has no graph highlight"
         );
+    }
+
+    fn draw_view_with_theme(
+        view: &ViewModel,
+        width: u16,
+        height: u16,
+        theme: Theme,
+    ) -> (LayoutInfo, Buffer) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut layout = LayoutInfo::default();
+        terminal
+            .draw(|frame| layout = draw_with_theme(frame, view, theme))
+            .unwrap();
+        (layout, terminal.backend().buffer().clone())
+    }
+
+    #[test]
+    fn node_and_job_badges_use_named_truecolor_tokens() {
+        let cases = [
+            (Tone::NodeBusy, badge::ON_LIGHT, Some(badge::AMBER)),
+            (Tone::NodeIdle, Color::Green, None),
+            (Tone::NodeDrained, badge::ON_DARK, Some(badge::BLUE)),
+            (Tone::NodeOffline, badge::ON_DARK, Some(badge::RED)),
+            (Tone::JobRunning, badge::ON_LIGHT, Some(badge::GREEN)),
+            (Tone::JobQueued, badge::AMBER, None),
+            (Tone::Blocked, Color::Rgb(255, 140, 0), None),
+            (Tone::JobFailed, badge::ON_DARK, Some(badge::RED)),
+            (Tone::JobDone, Color::Green, None),
+            (Tone::JobCancelled, Color::DarkGray, None),
+        ];
+        for (tone, fg, bg) in cases {
+            let style = style_for(tone, Theme::truecolor());
+            assert_eq!(style.fg, Some(fg), "{tone:?}");
+            assert_eq!(style.bg, bg, "{tone:?}");
+        }
+    }
+
+    #[test]
+    fn filled_badges_fall_back_to_bold_reverse_without_truecolor() {
+        let filled = [
+            (Tone::NodeBusy, Color::Yellow),
+            (Tone::NodeDrained, Color::Blue),
+            (Tone::NodeOffline, Color::Red),
+            (Tone::JobRunning, Color::Green),
+            (Tone::JobFailed, Color::Red),
+        ];
+        for (tone, fg) in filled {
+            let style = style_for(tone, Theme::standard());
+            assert_eq!(style.fg, Some(fg), "{tone:?}");
+            assert_eq!(style.bg, None, "{tone:?}");
+            assert!(
+                style
+                    .add_modifier
+                    .contains(Modifier::BOLD | Modifier::REVERSED),
+                "{tone:?} {style:?}"
+            );
+        }
+        let text = style_for(Tone::JobQueued, Theme::standard());
+        assert_eq!(text.fg, Some(Color::Yellow));
+        assert_eq!(text.bg, None);
+        assert!(!text.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn no_color_badges_keep_state_distinctions_with_modifiers() {
+        let filled = [
+            Tone::NodeBusy,
+            Tone::NodeDrained,
+            Tone::NodeOffline,
+            Tone::JobRunning,
+            Tone::JobFailed,
+        ];
+        let text = [
+            Tone::NodeIdle,
+            Tone::JobQueued,
+            Tone::Blocked,
+            Tone::JobDone,
+            Tone::JobCancelled,
+        ];
+        for tone in filled {
+            let style = style_for(tone, Theme::plain());
+            assert_eq!(style.fg, None, "{tone:?}");
+            assert_eq!(style.bg, None, "{tone:?}");
+            assert!(
+                style
+                    .add_modifier
+                    .contains(Modifier::BOLD | Modifier::REVERSED),
+                "{tone:?} {style:?}"
+            );
+        }
+        for tone in text {
+            let style = style_for(tone, Theme::plain());
+            assert_eq!(style.fg, None, "{tone:?}");
+            assert_eq!(style.bg, None, "{tone:?}");
+            assert!(style.add_modifier.contains(Modifier::BOLD), "{tone:?}");
+            assert!(!style.add_modifier.contains(Modifier::REVERSED), "{tone:?}");
+        }
+    }
+
+    #[test]
+    fn selection_is_distinct_from_a_16_color_badge() {
+        let t0 = Instant::now();
+        let row = |id: &str, state: &str| JobRow {
+            id: id.to_owned(),
+            state: state.to_owned(),
+            ..job_row(id, &[])
+        };
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(
+            Ok(Snapshot {
+                nodes: Vec::new(),
+                jobs: vec![row("01A", "running"), row("01B", "failed")],
+                controller_version: None,
+                drafts: 0,
+                oldest_draft_secs: 0,
+            }),
+            t0,
+        );
+        assert!(dashboard.select_job_id("01A", Focus::Jobs));
+        let (layout, buffer) =
+            draw_view_with_theme(&dashboard.view(t0), 100, 20, Theme::standard());
+        let state_x = layout.jobs.x + 11;
+        let selected = &buffer[(state_x, layout.jobs.y + 2)];
+        let other = &buffer[(state_x, layout.jobs.y + 3)];
+        assert!(
+            selected.modifier.contains(Modifier::UNDERLINED),
+            "{selected:?}"
+        );
+        assert!(selected.modifier.contains(Modifier::BOLD), "{selected:?}");
+        assert!(
+            selected.modifier.contains(Modifier::REVERSED),
+            "{selected:?}"
+        );
+        assert!(!other.modifier.contains(Modifier::UNDERLINED), "{other:?}");
+        assert!(other.modifier.contains(Modifier::REVERSED), "{other:?}");
     }
 }

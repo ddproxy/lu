@@ -1860,8 +1860,13 @@ fn ansi(tone: Tone) -> Option<&'static str> {
         Tone::Warn => Some("\u{1b}[33m"),
         Tone::Bad => Some("\u{1b}[31m"),
         Tone::Dim => Some("\u{1b}[90m"),
-        Tone::Done => Some("\u{1b}[2;32m"),
+        Tone::Done | Tone::NodeIdle | Tone::JobDone => Some("\u{1b}[2;32m"),
         Tone::Blocked => Some("\u{1b}[38;5;208m"),
+        Tone::NodeBusy | Tone::JobQueued => Some("\u{1b}[33m"),
+        Tone::NodeDrained => Some("\u{1b}[1;34m"),
+        Tone::NodeOffline | Tone::JobFailed => Some("\u{1b}[1;31m"),
+        Tone::JobRunning => Some("\u{1b}[1;92m"),
+        Tone::JobCancelled => Some("\u{1b}[2;90m"),
     }
 }
 

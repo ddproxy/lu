@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lu_client::Client;
 use lu_proto::{JobId, NodeName};
+use lu_tui::model::repo_label;
 use lu_tui::model::{
     CordonCell, Dashboard, JobRow, NodeRow, ProcessJobView, ProcessPaneTarget, ProcessTreeRow,
     ProviderCell, Request, Snapshot, Update,
@@ -151,6 +152,8 @@ async fn snapshot(client: &Client) -> Result<(Snapshot, u64), String> {
                     title: operator::job_title(&job.spec.task),
                     state: operator::state_name(job.state).to_owned(),
                     node: job.node.as_ref().map(ToString::to_string),
+                    repo: repo_label(&job.spec.repo),
+                    git_ref: printable(&job.spec.git_ref),
                     attempt: job.attempt,
                     age_secs: now.saturating_sub(job.created_at),
                     model: job.spec.model.clone(),
