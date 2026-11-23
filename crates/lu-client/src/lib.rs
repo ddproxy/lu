@@ -15,9 +15,9 @@ mod types;
 pub use client::{Client, ClientOptions, Controller};
 pub use error::ApiError;
 pub use types::{
-    CompletionBody, DependencyView, HostStats, JobStats, JobView, ListJobs, ListNodes, ListRepos,
-    LogPage, NodeStats, NodeView, PollReply, PollRequest, ProcessStats, RepoView, StatusView,
-    MAX_JSON_BYTES,
+    AgentSelfView, CompletionBody, DependencyView, HostStats, JobStats, JobView, ListJobs,
+    ListNodes, ListRepos, LogPage, NodeStats, NodeView, PollReply, PollRequest, ProcessStats,
+    RepoView, StatusView, MAX_JSON_BYTES,
 };
 
 /// Canonical paths, exactly as documented in docs/api.md; the client sends each of these and

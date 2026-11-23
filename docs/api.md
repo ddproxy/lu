@@ -29,8 +29,8 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `POST /v1/repos/{name}/sync` | Fetch one configured mirror and return `{"name","heads","synced_at"}`. At most one sync runs at a time and each operator may start 6 per minute; contention or an exhausted budget is `429 rate_limited` with `Retry-After`. An unknown configured name is `404`; a fetch failure is `500` with any credential removed from the message. |
 | `GET /v1/nodes` | Return an array of `NodeView`s. |
 | `GET /v1/nodes/{name}/stats` | Return the latest `NodeStats` from the node's heartbeat. An unknown node is `404`; a known node with no stats returns `{}`. Stats live in memory and are lost on controller restart. |
-| `POST /v1/nodes/{name}/drain` | Stop assigning new jobs to the node. A node that has never heartbeated is `404`. |
-| `POST /v1/nodes/{name}/undrain` | Let the node take new jobs again. A node that has never heartbeated is `404`. |
+| `POST /v1/nodes/{name}/drain` | Stop assigning new jobs to the node. A node that has never heartbeated is `404`. This sets an operator-owned drain; an agent cannot clear it with `/v1/agent/undrain`. |
+| `POST /v1/nodes/{name}/undrain` | Let the node take new jobs again. A node that has never heartbeated is `404`. This clears an operator-owned drain. |
 | `POST /v1/nodes/{name}/workspaces/clean?all=true` or `?job=<job-id>` | Queue a `clean_workspaces` event for the node's agent. Pass exactly one selector; unknown query keys, a malformed id, or both/neither selectors are `400`. A node that has never heartbeated is `404`. Returns `{"queued":1,"refused_running":0,"missing":0}`; `queued: 1` means one request was queued, not one tree deleted, because the agent decides which workspaces are eligible on its next poll. Running workspaces are refused there. |
 | `POST /v1/nodes/{name}/uncordon` body optional `{"provider":"<name>"}` | Clear one provider cordon, or every cordon on the node with an empty body. An unknown node is `404`. Returns `{"removed":["<provider>",…]}` with the providers actually removed. |
 | `PUT /v1/groups/{name}/limit` body `{"max_running":N}` | Set a runtime concurrency cap for the named group. `N` is `1` to `64`; an invalid group or value is `400`, and an unknown body key is `422`. Returns `{"group":"<name>","max_running":N}`. The cap also applies to a group with no `[[controller.groups]]` entry. Caps live in controller memory and return to configured values on restart. |
@@ -210,6 +210,7 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `last_seen` | integer | Unix seconds of the latest heartbeat. |
 | `online` | boolean | Seen within two lease periods; nodes are offline after a controller restart until their next heartbeat. |
 | `draining` | boolean | Whether new assignment is stopped. |
+| `drain_origin` | string or null | `"operator"` or `"agent"` while drained; absent when the node is not drained. Identifies which caller owns the drain. |
 | `harness` | string | Last reported harness state: `idle` or `busy`. |
 | `providers` | array | Provider names and states from the latest heartbeat. |
 | `provider_models` | array | Healthy `{provider, model}` pairs published by the agent for `provider = "any"` jobs. Always present, including `[]` when empty. |
@@ -364,6 +365,9 @@ window narrows the counts by design and is not a monotonic counter source.
 
 | Route | Meaning |
 |---|---|
+| `GET /v1/agent/self` | Return the calling agent's own node in the fixed `AgentSelfView` shape below. The node is bound to the bearer token; no name can be supplied in the path, query or body, and any query string is `400 bad_request`. A node with no heartbeat is `404 not_found`. An operator token or no token is `401 unauthorized`. |
+| `POST /v1/agent/drain` body empty or `{}` | Stop assigning new jobs to the calling agent's node. Idempotent; the running job continues and no new one is assigned. An operator-owned drain is left unchanged. Any body field or query string is `400 bad_request`. Returns `200` with `{}`. |
+| `POST /v1/agent/undrain` body empty or `{}` | Clear a drain this agent started. Idempotent when the node is not drained. An operator-owned drain is refused with `409 conflict` and is not changed. Any body field or query string is `400 bad_request`. Returns `200` with `{}`. |
 | `POST /v1/agent/poll` body `{"heartbeat": Heartbeat, "wait_secs": 0..30}` | Register a heartbeat and ask for work. `wait_secs` above 30 is `400`. Returns `204` when there is no work, or `200` with an array of events: `{"kind":"cancel","job_id":…,"epoch":…}`, `{"kind":"assign","job_id":…,"epoch":…,"spec":JobSpec}` and `{"kind":"clean_workspaces","all":bool,"job":…}`; an `assign` may also carry optional `"provider"` and `"model"` fields, and `job` is omitted unless the clean request named one. An `assign` creates a lease for `lease_secs` and increments the epoch. A heartbeat whose node differs from the token's node is `403`. |
 | `GET /v1/agent/jobs/{id}/base?epoch=N` | Fetch the job's base pack when the spec has `source.base`. Returns `application/x-git-pack` with header `x-lu-base-commit`; the pack holds that commit and its tree without parent history. Missing commit, wrong node, unavailable base or stale epoch gives `403`, `404` or `409` as appropriate; a pack over 256 MiB gives `413 too_large`; four packs may run at once and each agent may start 30 per minute, with `429 rate_limited` on contention. |
 | `POST /v1/agent/jobs/{id}/start` body `{"epoch":N}` | Move a leased job to `running` and return its `JobView`. A wrong node is `403`; a stale epoch is `409 stale_epoch`. The lease is extended. |
@@ -376,6 +380,29 @@ window narrows the counts by design and is not a monotonic counter source.
 | `GET /v1/agent/jobs/{id}/deps/{dep}/artifacts/{name}?epoch=N&tail=M` | Return one fixed dependency artifact: `diff.patch`, `report.json` or `run.log`. Any other name is `404`; a `dep` outside `after` is `403`. `tail=M` returns only the last `M` bytes by seeking to the file end; oversized files are `413 too_large`. Stale epoch is `409 stale_epoch`. |
 | `GET /v1/agent/jobs/{id}/workspace/release?epoch=N` | Ask whether the agent may delete a finished workspace. Returns `{"can_delete":bool,"reason":"<operator-safe text>"}`. The controller requires an empty or stored `diff.patch`, a stored `report.json`, and no active job naming this id in `spec.after`; the stored patch is what dependants use, so stacking and collection do not keep the tree. A stale epoch is `409 stale_epoch`; a wrong node is `403`. Reasons never contain filesystem paths. |
 | `POST /v1/agent/jobs/{id}/complete` body `Completion` | Finish the job and return its `JobView`. A stale epoch is `409 stale_epoch` and the result is discarded. For a provider failure, `retry_after_secs` sets the cordon length on the node, clamped to 5 seconds through 24 hours. Two healthy provider heartbeats clear such a cordon early. A stuck-policy stop may carry `stuck_mode: "cancel"|"retry"`; it is counted in `lu_jobs_stuck_stopped_total` and does not change how the outcome is stored. |
+
+### `AgentSelfView`
+
+`GET /v1/agent/self` returns exactly these six fields, in this order, with no token, config or
+other-node data:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `name` | string | Node name bound to the agent token. |
+| `version` | string or null | Agent version from the latest heartbeat. |
+| `draining` | boolean | Whether new assignment is stopped, from either drain origin. |
+| `current_job` | string or null | Job id the node currently holds. |
+| `last_heartbeat_age_secs` | integer | Whole seconds since the latest heartbeat. |
+| `online` | boolean | Seen within two lease periods. |
+
+```json
+{"name":"node-a","version":"0.5.1","draining":true,"current_job":null,"last_heartbeat_age_secs":2,"online":true}
+```
+
+Every successful self read is audited as `agent_self`, and each drain or undrain as `drain` with
+`source: "agent"` and the node as actor. A refused undrain of an operator drain is audited with
+`result: "conflict"`. These routes use the same auth throttle and error envelope as the other
+agent routes; they add no new rate-limit bucket.
 
 `source.base` is a 40-hex commit id. The mirror pins the resolved commit for a configured source ref and records it on the job. The agent fetches a pack for it unless `base_source` is `clone`. With `controller`, a `404` fails the job; with `auto`, the default, a `404` falls back to cloning `source.repo`.
 

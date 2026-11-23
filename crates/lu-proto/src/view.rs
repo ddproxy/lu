@@ -184,6 +184,10 @@ pub struct NodeView {
     pub online: bool,
     #[serde(default)]
     pub draining: bool,
+    /// `operator` or `agent` while drained; absent when the node is not drained. Older
+    /// controllers omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_origin: Option<String>,
     #[serde(default)]
     pub harness: Option<HarnessState>,
     #[serde(default)]
@@ -231,6 +235,18 @@ pub struct NodeView {
     pub workspaces: Vec<WorkspaceView>,
 }
 
+/// The calling agent's own node view from `GET /v1/agent/self`. The field set is deliberately
+/// fixed: an agent cannot ask for another node, and no field reveals tokens or configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSelfView {
+    pub name: NodeName,
+    pub version: Option<String>,
+    pub draining: bool,
+    pub current_job: Option<JobId>,
+    pub last_heartbeat_age_secs: u64,
+    pub online: bool,
+}
+
 /// One workspace from an agent's `lu node <name> --workspaces` listing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceView {
@@ -268,6 +284,7 @@ impl NodeView {
             last_seen: 0,
             online: false,
             draining,
+            drain_origin: draining.then(|| "operator".to_owned()),
             harness: None,
             providers: Vec::new(),
             provider_models: Vec::new(),

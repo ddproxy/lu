@@ -120,6 +120,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // agent routes with specific body limits
     let agent = Router::new()
         .route("/v1/agent/poll", post(agent::poll).layer(op_json))
+        .route("/v1/agent/self", get(agent::self_view))
+        .route("/v1/agent/drain", post(agent::drain).layer(op_json))
+        .route("/v1/agent/undrain", post(agent::undrain).layer(op_json))
         .route("/v1/agent/jobs/{id}/base", get(agent::job_base))
         .route(
             "/v1/agent/jobs/{id}/start",
@@ -423,6 +426,12 @@ mod tests {
             Err(StoreError::Internal("recovery unavailable".to_owned()))
         }
         fn set_draining(&self, _: &NodeName, _: bool) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn set_agent_drain(&self, _: &NodeName) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn clear_agent_drain(&self, _: &NodeName) -> Result<bool, StoreError> {
             unimplemented!()
         }
         fn nodes(&self, _: Now, _: u64) -> Result<Vec<lu_store::NodeRecord>, StoreError> {

@@ -16,9 +16,9 @@ use serde_json::Value;
 
 use crate::error::{body_excerpt, ApiError};
 use crate::types::{
-    CompletionBody, DependencyView, JobView, ListDrafts, ListJobs, ListNodes, ListRepos, LogPage,
-    NodeStats, NodeView, PollRequest, RepoView, RetryReply, StatusView, WorkspaceCleanResult,
-    WorkspaceRelease, MAX_JSON_BYTES,
+    AgentSelfView, CompletionBody, DependencyView, JobView, ListDrafts, ListJobs, ListNodes,
+    ListRepos, LogPage, NodeStats, NodeView, PollRequest, RepoView, RetryReply, StatusView,
+    WorkspaceCleanResult, WorkspaceRelease, MAX_JSON_BYTES,
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -787,6 +787,49 @@ impl Client {
                 message: format!("could not decode the workspace clean result: {error}"),
             }),
         )
+    }
+
+    /// This agent's own node view. The controller binds the reply to the client's agent token.
+    pub async fn agent_self(&self) -> Result<AgentSelfView> {
+        let reply = self
+            .send(Method::GET, "v1/agent/self", None, &[], &[], true)
+            .await?;
+        let reply = self.success(reply)?;
+        self.scrub(
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode the agent self view: {error}"),
+            }),
+        )
+    }
+
+    /// Drains this agent's node. Idempotent; an operator drain is not replaced.
+    pub async fn agent_drain(&self) -> Result<()> {
+        let reply = self
+            .send(
+                Method::POST,
+                "v1/agent/drain",
+                Some(b"{}".to_vec()),
+                &[],
+                &[],
+                false,
+            )
+            .await?;
+        self.success(reply).map(|_| ())
+    }
+
+    /// Undrains this agent's node. An operator drain is refused with a conflict error.
+    pub async fn agent_undrain(&self) -> Result<()> {
+        let reply = self
+            .send(
+                Method::POST,
+                "v1/agent/undrain",
+                Some(b"{}".to_vec()),
+                &[],
+                &[],
+                false,
+            )
+            .await?;
+        self.success(reply).map(|_| ())
     }
 
     pub async fn set_drain(&self, node: &NodeName, drain: bool) -> Result<NodeView> {

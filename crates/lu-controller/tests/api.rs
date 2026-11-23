@@ -12,7 +12,7 @@ use lu_proto::{
 };
 use lu_serve::{serve, ServeOptions};
 use lu_store::sqlite::SqliteStore;
-use lu_store::{CordonSource, Store};
+use lu_store::{CordonSource, DrainOrigin, Store};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -3472,5 +3472,251 @@ async fn operator_can_set_a_runtime_group_limit() {
     .await;
     assert!(group.starts_with("HTTP/1.1 400"), "{group}");
     assert_eq!(srv.state.group_limits().get("batch"), Some(&2));
+    let _ = srv.shutdown.send(());
+}
+
+async fn agent_call(addr: SocketAddr, token: &str, target: &str, body: &str) -> String {
+    let auth = if token.is_empty() {
+        String::new()
+    } else {
+        format!("Authorization: Bearer {token}\r\n")
+    };
+    let req = format!(
+        "{target} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{auth}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    raw_request(addr, &req).await
+}
+
+#[tokio::test]
+async fn agent_self_is_bound_to_the_token_and_has_a_fixed_shape() {
+    let srv = start_server().await;
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert_eq!(status(&r), 204, "{r}");
+    let r = poll_with(srv.addr, AGENT_B_TOKEN, &heartbeat_json("node-b")).await;
+    assert_eq!(status(&r), 204, "{r}");
+
+    for (token, expected) in [(AGENT_A_TOKEN, "node-a"), (AGENT_B_TOKEN, "node-b")] {
+        let r = agent_call(srv.addr, token, "GET /v1/agent/self", "").await;
+        assert_eq!(status(&r), 200, "{r}");
+        let view: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+        let mut keys: Vec<&String> = view.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "current_job",
+                "draining",
+                "last_heartbeat_age_secs",
+                "name",
+                "online",
+                "version"
+            ]
+        );
+        assert_eq!(view["name"], expected);
+        assert_eq!(view["draining"], false);
+        assert_eq!(view["online"], true);
+        assert!(view["current_job"].is_null());
+        assert!(view["version"].is_null());
+        assert!(view["last_heartbeat_age_secs"].is_u64());
+    }
+
+    // No node can be supplied by the caller, through a query or a body.
+    let r = agent_call(
+        srv.addr,
+        AGENT_A_TOKEN,
+        "GET /v1/agent/self?node=node-b",
+        "",
+    )
+    .await;
+    assert_eq!(status(&r), 400, "{r}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["error"],
+        "bad_request"
+    );
+
+    // Operator and anonymous callers use the ordinary agent-route error shape.
+    for token in [OP_TOKEN, ""] {
+        for target in [
+            "GET /v1/agent/self",
+            "POST /v1/agent/drain",
+            "POST /v1/agent/undrain",
+        ] {
+            let r = agent_call(srv.addr, token, target, "{}").await;
+            assert_eq!(status(&r), 401, "{target} {r}");
+            assert!(r.contains("www-authenticate: Bearer"), "{r}");
+            let err: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+            assert_eq!(err["error"], "unauthorized", "{r}");
+        }
+    }
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn agent_drain_is_idempotent_and_operator_drain_stays_operator_owned() {
+    let srv = start_server().await;
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert_eq!(status(&r), 204, "{r}");
+    let r = poll_with(srv.addr, AGENT_B_TOKEN, &heartbeat_json("node-b")).await;
+    assert_eq!(status(&r), 204, "{r}");
+
+    for body in ["", "{}"] {
+        let r = agent_call(srv.addr, AGENT_A_TOKEN, "POST /v1/agent/drain", body).await;
+        assert_eq!(status(&r), 200, "{r}");
+    }
+    let r = agent_call(srv.addr, AGENT_A_TOKEN, "GET /v1/agent/self", "").await;
+    let view: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(view["draining"], true, "{r}");
+    let nodes = srv.store.nodes(lu_controller::time::now(), 6_000).unwrap();
+    let a = nodes.iter().find(|n| n.name.as_str() == "node-a").unwrap();
+    assert_eq!(a.drain_origin, DrainOrigin::Agent);
+    assert!(a.draining);
+    assert_eq!(
+        srv.store
+            .job_counts(lu_controller::time::now(), 6_000)
+            .unwrap()
+            .nodes_drained,
+        1
+    );
+
+    // An agent cannot name another node, in the query or in the body.
+    let r = agent_call(
+        srv.addr,
+        AGENT_A_TOKEN,
+        "POST /v1/agent/drain?node=node-b",
+        "",
+    )
+    .await;
+    assert_eq!(status(&r), 400, "{r}");
+    let r = agent_call(
+        srv.addr,
+        AGENT_A_TOKEN,
+        "POST /v1/agent/drain",
+        r#"{"node":"node-b"}"#,
+    )
+    .await;
+    assert_eq!(status(&r), 400, "{r}");
+    let r = agent_call(srv.addr, AGENT_B_TOKEN, "POST /v1/agent/drain", "").await;
+    assert_eq!(status(&r), 200, "{r}");
+    let nodes = srv.store.nodes(lu_controller::time::now(), 6_000).unwrap();
+    assert!(
+        nodes
+            .iter()
+            .find(|n| n.name.as_str() == "node-b")
+            .unwrap()
+            .draining
+    );
+
+    for _ in 0..2 {
+        let r = agent_call(srv.addr, AGENT_A_TOKEN, "POST /v1/agent/undrain", "").await;
+        assert_eq!(status(&r), 200, "{r}");
+    }
+    let nodes = srv.store.nodes(lu_controller::time::now(), 6_000).unwrap();
+    let a = nodes.iter().find(|n| n.name.as_str() == "node-a").unwrap();
+    assert_eq!(a.drain_origin, DrainOrigin::None);
+    assert!(!a.draining);
+
+    // An operator drain is not the agent's to clear.
+    let r = raw_request(
+        srv.addr,
+        &format!("POST /v1/nodes/node-a/drain HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    let r = agent_call(srv.addr, AGENT_A_TOKEN, "POST /v1/agent/undrain", "").await;
+    assert_eq!(status(&r), 409, "{r}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["error"],
+        "conflict"
+    );
+    let nodes = srv.store.nodes(lu_controller::time::now(), 6_000).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .find(|n| n.name.as_str() == "node-a")
+            .unwrap()
+            .drain_origin,
+        DrainOrigin::Operator
+    );
+    let r = raw_request(
+        srv.addr,
+        &format!("POST /v1/nodes/node-a/undrain HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    let r = agent_call(srv.addr, AGENT_A_TOKEN, "GET /v1/agent/self", "").await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["draining"],
+        false
+    );
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn agent_drain_keeps_a_running_job_and_stops_new_assignments() {
+    let srv = start_server().await;
+    let (id, _, _) = assign_and_start(&srv).await;
+    let r = agent_call(srv.addr, AGENT_A_TOKEN, "POST /v1/agent/drain", "{}").await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let r = raw_request(
+        srv.addr,
+        &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(job["state"], "running", "{r}");
+
+    let r = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert_eq!(status(&r), 204, "{r}");
+    let r = agent_call(srv.addr, AGENT_A_TOKEN, "GET /v1/agent/self", "").await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["current_job"],
+        id
+    );
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn agent_self_and_drain_calls_are_audited_with_the_agent_as_actor() {
+    let srv = start_server().await;
+    let path = srv._tmp.path().join("agent-audit.jsonl");
+    let (writer, _task) = lu_audit::Writer::open(&path, Arc::clone(&srv.state.audit_write_errors))
+        .await
+        .unwrap();
+    srv.state.set_audit(writer);
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert_eq!(status(&r), 204, "{r}");
+    for target in [
+        "GET /v1/agent/self",
+        "POST /v1/agent/drain",
+        "POST /v1/agent/undrain",
+    ] {
+        let r = agent_call(srv.addr, AGENT_A_TOKEN, target, "{}").await;
+        assert_eq!(status(&r), 200, "{target} {r}");
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(lines.iter().all(|line| line["actor"] == "node-a"), "{text}");
+    let self_calls: Vec<_> = lines
+        .iter()
+        .filter(|line| line["event"] == "agent_self")
+        .collect();
+    assert_eq!(self_calls.len(), 1, "{text}");
+    assert_eq!(self_calls[0]["data"]["source"], "agent");
+    let drains: Vec<_> = lines
+        .iter()
+        .filter(|line| line["event"] == "drain" && line["data"]["source"] == "agent")
+        .collect();
+    assert_eq!(drains.len(), 2, "{text}");
+    assert!(drains.iter().any(|line| line["data"]["state"] == true));
+    assert!(drains.iter().any(|line| line["data"]["state"] == false));
     let _ = srv.shutdown.send(());
 }

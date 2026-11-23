@@ -146,6 +146,26 @@ put `target/release` on `PATH` or run `make install` first.
 A controller listening on a non-loopback address requires a `[tls]` table; plain HTTP is accepted
 only on loopback. See [Tokens and TLS](docs/tokens-and-tls.md).
 
+## Updating a node
+
+A node can take itself out of service with only its own agent token; no operator token or
+controller-side command is needed. Run `ting` on the node being updated:
+
+```sh
+ting drain                                   # no new jobs; the running job finishes
+ting wait-idle --timeout 10m                 # poll until drained and holding no job
+# stop the old service, replace the binary, start the new service
+ting status --json                           # check version and online: true
+ting undrain                                 # allow new assignments again
+```
+
+`ting` reads `/etc/ting/ting.toml` by default; pass `--config <path>` if the file lives elsewhere.
+`wait-idle` exits `0` when drained and idle and `3` on timeout. `status --json` prints the node's
+own fixed-shape view. A drain started by an operator cannot be cleared by `ting undrain`; the
+operator must clear it with `lu undrain <node>`. See [the `ting` reference](docs/ting.md),
+[Updating in operations](docs/operations.md#upgrade) and the
+[agent self-service API](docs/api.md#agent).
+
 ## Commands
 
 Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw controller JSON where the command supports it).
@@ -165,7 +185,7 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu sync <name>` | Fetch one configured repository mirror and print its last sync time and branch heads. `--json` prints the raw response. |
 | `lu serve` | Run the HTTP(S) controller. This is the default when no subcommand is given. |
 | `lu top [--once]` | Live view of the nodes and recent jobs, including the draft count and oldest draft age, refreshed every two seconds, with a compact bordered dependency-graph panel under the job table. The Nodes, Jobs and Graph panes take focus in turn (`Tab` / `Shift+Tab`); the graph shares its selected job with the Jobs table and can be navigated with `h`/`l` (parent/child), `j`/`k` (sibling) and `Home`/`End`. Mouse clicks select rows or nodes, double clicks open a job's log, and the wheel scrolls the focused pane. Mouse capture is released when the TUI exits, so terminal copy and paste keep working. `--once` prints one snapshot as text and exits; global `--json` prints one snapshot as JSON and cannot be combined with `--once`. Only in a build with `--features tui`. |
-| `ting` | Run the node agent loop (separate binary). It needs an `[agent]` config. The `mcp` subcommand serves the scoped harness tools. |
+| `ting` | Run the node agent loop (separate binary). It needs an `[agent]` config. The `mcp` subcommand serves the scoped harness tools; `drain`, `undrain`, `status [--json]` and `wait-idle --timeout` are the node's self-service commands ([reference](docs/ting.md)). |
 | `lu submit` | Submit a job. In single-task mode, `--repo` and `--ref` are required. The task comes from `--task`, `--task-file` or stdin. Flags: `--harness` (default `opencode`), `--provider` (`any` picks a healthy provider published by the node), `--model`, `--timeout` (default `3600`), `--idle-timeout` (1 to 86400 seconds), `--on-stuck` (`none`, `cancel` or `retry`), `--stuck-after` (60 to 86400 seconds), `--after`, `--after-key`, `--collect`, `--on-conflict`, `--include-failed`, `--allow-empty`, `--expect-file`, `--expect-changed`, `--forbid-changed`, `--min-diff-bytes`, `--max-diff-bytes`, `--expect-mode`, `--workspace` (`ephemeral`, `keep_on_failure` or `keep`), `--cache-dir` (repeatable relative build-cache path), `--require`, `--tolerate`, `--fallback`, `--priority` (0 to 9, default 5; higher first), `--group` (1 to 64 letters, digits, `.`, `_` or `-`), `--allow-spawn`, `--spawn-inherit`, repeatable `--spawn-repo`, `--key` and `--wait`. `--allow-spawn` lets the harness submit children through its scoped socket; `--spawn-inherit` lets children submit their own children; `--spawn-repo` names an extra repository a child may use. `--tolerate` is repeatable, at most 8 taints. `--allow-empty` suppresses the `no changes` outcome note. `--fallback provider:model` is repeatable, at most 4; a fallback with only a provider keeps the job's model. `--after` and `--after-key` are repeatable, at most 16 dependencies in total; a key resolves to the newest job submitted with it. `--require` is repeatable, at most 8 labels. `--collect <mode>` selects `none`, `files`, `apply` or `both` (default `apply`, plus documented aliases); `files` and `both` write `.lu/inputs` before the harness starts. `--on-conflict <fail|markers|skip>` handles patches that do not apply; the default is `fail`. `--include-failed` accepts failed or cancelled dependencies as inputs when they stored a diff. `--wait` polls until the job is terminal. |
 | `lu drafts [--limit <n>]` | List unapproved drafts, oldest first; expired drafts are counted in metrics but not listed. `lu show <draft>` shows one draft's spec, origin and context metadata. See [Drafts](docs/drafts.md). |
 | `lu approve <draft> [--edit]` | Approve a draft: it becomes `queued`, or `blocked` if dependencies are unmet. `--edit` edits before approving. |
@@ -309,6 +329,8 @@ MIT. See `LICENSE`.
 ### Reference
 
 - [HTTP API](docs/api.md)
+- [`ting` reference](docs/ting.md)
+- [Agent self-drain notes](NOTES.md)
 - [Client guide](docs/client-guide.md)
 - [MCP server](docs/mcp.md)
 - [FAQ](docs/faq.md)

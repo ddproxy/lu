@@ -2834,13 +2834,84 @@ impl Store for SqliteStore {
             // be a drain for a name that has not appeared yet.
             return Err(StoreError::NotFound);
         }
+        let origin = if draining {
+            crate::DrainOrigin::Operator
+        } else {
+            crate::DrainOrigin::None
+        };
         tx.execute(
             "UPDATE nodes SET draining=?2 WHERE name=?1",
-            params![node.as_str(), if draining { 1i64 } else { 0i64 }],
+            params![node.as_str(), origin.as_raw()],
         )
         .map_err(internal)?;
         tx.commit().map_err(internal)?;
         Ok(())
+    }
+
+    fn set_agent_drain(&self, node: &NodeName) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let raw: Option<i64> = tx
+            .query_row(
+                "SELECT draining FROM nodes WHERE name=?1",
+                params![node.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        if raw.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        // An operator drain is not the agent's to replace. Repeating an agent drain is a no-op.
+        if !matches!(
+            crate::DrainOrigin::from_raw(raw.unwrap_or(0)),
+            crate::DrainOrigin::Operator
+        ) {
+            tx.execute(
+                "UPDATE nodes SET draining=?2 WHERE name=?1",
+                params![node.as_str(), crate::DrainOrigin::Agent.as_raw()],
+            )
+            .map_err(internal)?;
+        }
+        tx.commit().map_err(internal)?;
+        Ok(())
+    }
+
+    fn clear_agent_drain(&self, node: &NodeName) -> Result<bool, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let raw: Option<i64> = tx
+            .query_row(
+                "SELECT draining FROM nodes WHERE name=?1",
+                params![node.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        let raw = match raw {
+            Some(raw) => raw,
+            None => return Err(StoreError::NotFound),
+        };
+        match crate::DrainOrigin::from_raw(raw) {
+            crate::DrainOrigin::None => {
+                tx.commit().map_err(internal)?;
+                Ok(false)
+            }
+            crate::DrainOrigin::Operator => Err(StoreError::Conflict { length: None }),
+            crate::DrainOrigin::Agent => {
+                tx.execute(
+                    "UPDATE nodes SET draining=?2 WHERE name=?1",
+                    params![node.as_str(), crate::DrainOrigin::None.as_raw()],
+                )
+                .map_err(internal)?;
+                tx.commit().map_err(internal)?;
+                Ok(true)
+            }
+        }
     }
 
     fn nodes(&self, now: Now, lease_ms: u64) -> Result<Vec<NodeRecord>, StoreError> {
@@ -2859,8 +2930,9 @@ impl Store for SqliteStore {
             .map_err(internal)?;
         let mut out = Vec::new();
         for r in rows {
-            let (name, hb_json, last_seen_wall, last_seen_mono, draining_i) =
+            let (name, hb_json, last_seen_wall, last_seen_mono, draining_raw) =
                 r.map_err(internal)?;
+            let drain_origin = crate::DrainOrigin::from_raw(draining_raw);
             let heartbeat: Heartbeat = serde_json::from_str(&hb_json).map_err(internal)?;
             let online = last_seen_mono >= 0
                 && now.mono_ms.saturating_sub(last_seen_mono as u64) <= lease_ms.saturating_mul(2);
@@ -2893,7 +2965,8 @@ impl Store for SqliteStore {
                 name: NodeName::parse(&name).map_err(internal)?,
                 last_seen: last_seen_wall,
                 online,
-                draining: draining_i != 0,
+                draining: drain_origin.is_draining(),
+                drain_origin,
                 heartbeat,
                 current_job,
                 cordons,
@@ -3042,7 +3115,7 @@ impl Store for SqliteStore {
             .map_err(internal)?;
         job_counts.nodes_online = online.max(0) as u64;
         let drained = conn
-            .query_row("SELECT COUNT(*) FROM nodes WHERE draining=1", [], |r| {
+            .query_row("SELECT COUNT(*) FROM nodes WHERE draining<>0", [], |r| {
                 r.get::<_, i64>(0)
             })
             .map_err(internal)?;

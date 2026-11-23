@@ -9,10 +9,13 @@ use crate::routes::{
 use crate::state::AppState;
 use crate::time::now;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use lu_audit::{Data, Event, Field};
-use lu_proto::{ArtifactName, Completion, Heartbeat, JobId, JobState, NodeStats, WorkspaceRelease};
+use lu_proto::{
+    AgentSelfView, ArtifactName, Completion, Heartbeat, JobId, JobState, NodeStats,
+    WorkspaceRelease,
+};
 use lu_serve::PeerAddr;
 use lu_staging::{pack_commit_capped, StageError};
 use serde::Deserialize;
@@ -32,6 +35,170 @@ struct PollBody {
 #[serde(deny_unknown_fields)]
 struct EpochBody {
     epoch: u64,
+}
+
+/// The self/drain/undrain routes take no input: the node comes from the agent token alone. An
+/// empty body or `{}` is accepted; any field is refused.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyBody {}
+
+fn reject_query(uri: &Uri) -> Result<(), ApiError> {
+    if uri.query().is_some() {
+        return Err(ApiError::bad_request("unexpected query parameters"));
+    }
+    Ok(())
+}
+
+async fn read_empty_body(req: axum::extract::Request) -> Result<(), ApiError> {
+    let bytes = read_raw_limited(req, MAX_JSON_BODY).await?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(());
+    }
+    serde_json::from_slice::<EmptyBody>(&bytes)
+        .map_err(|_| ApiError::bad_request("invalid request body"))?;
+    Ok(())
+}
+
+/// The agent's own node, bound to the bearer token; no name can be supplied by the caller.
+pub async fn self_view(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let node = match authenticate_agent(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(node) => node,
+        Err(e) => return with_version(e.into_response()),
+    };
+    if let Err(e) = reject_query(&uri) {
+        return with_version(e.into_response());
+    }
+    let at = now();
+    let lease_ms = state.lease_ms;
+    let store = Arc::clone(&state.store);
+    let nodes = match tokio::task::spawn_blocking(move || store.nodes(at, lease_ms)).await {
+        Ok(Ok(nodes)) => nodes,
+        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    };
+    let Some(record) = nodes.into_iter().find(|record| record.name == node) else {
+        return with_version(ApiError::not_found("not found").into_response());
+    };
+    let actor = node.as_str().to_owned();
+    state.record_audit(
+        Event::AgentSelf,
+        None,
+        Some(&actor),
+        &actor,
+        Data::new().text(Field::Source, "agent"),
+    );
+    with_version(json_ok(
+        StatusCode::OK,
+        &AgentSelfView {
+            name: record.name,
+            version: record.heartbeat.version,
+            draining: record.draining,
+            current_job: record.current_job,
+            last_heartbeat_age_secs: u64::try_from(at.wall_unix.saturating_sub(record.last_seen))
+                .unwrap_or(0),
+            online: record.online,
+        },
+    ))
+}
+
+/// Marks this agent's node as drained. Idempotent, and never takes over an operator drain.
+pub async fn drain(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+    req: axum::extract::Request,
+) -> Response {
+    let node = match authenticate_agent(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(node) => node,
+        Err(e) => return with_version(e.into_response()),
+    };
+    if let Err(e) = reject_query(&uri) {
+        return with_version(e.into_response());
+    }
+    if let Err(e) = read_empty_body(req).await {
+        return with_version(e.into_response());
+    }
+    let actor = node.as_str().to_owned();
+    let store = Arc::clone(&state.store);
+    let result = tokio::task::spawn_blocking(move || store.set_agent_drain(&node)).await;
+    match result {
+        Ok(Ok(())) => {
+            state.record_audit(
+                Event::Drain,
+                None,
+                Some(&actor),
+                &actor,
+                Data::new()
+                    .bool(Field::State, true)
+                    .text(Field::Source, "agent"),
+            );
+            state.waiters.notify_work();
+            with_version(json_ok(StatusCode::OK, &json!({})))
+        }
+        Ok(Err(e)) => with_version(store_err(e).into_response()),
+        Err(_) => with_version(ApiError::internal().into_response()),
+    }
+}
+
+/// Clears this agent's own drain. An operator drain is left in place and reported as a conflict.
+pub async fn undrain(
+    State(state): State<Arc<AppState>>,
+    peer: axum::Extension<PeerAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+    req: axum::extract::Request,
+) -> Response {
+    let node = match authenticate_agent(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(node) => node,
+        Err(e) => return with_version(e.into_response()),
+    };
+    if let Err(e) = reject_query(&uri) {
+        return with_version(e.into_response());
+    }
+    if let Err(e) = read_empty_body(req).await {
+        return with_version(e.into_response());
+    }
+    let actor = node.as_str().to_owned();
+    let store = Arc::clone(&state.store);
+    let result = tokio::task::spawn_blocking(move || store.clear_agent_drain(&node)).await;
+    match result {
+        Ok(Ok(_)) => {
+            state.record_audit(
+                Event::Drain,
+                None,
+                Some(&actor),
+                &actor,
+                Data::new()
+                    .bool(Field::State, false)
+                    .text(Field::Source, "agent"),
+            );
+            state.waiters.notify_work();
+            with_version(json_ok(StatusCode::OK, &json!({})))
+        }
+        Ok(Err(e)) => {
+            if matches!(e, lu_store::StoreError::Conflict { .. }) {
+                state.record_audit(
+                    Event::Drain,
+                    None,
+                    Some(&actor),
+                    &actor,
+                    Data::new()
+                        .bool(Field::State, false)
+                        .text(Field::Source, "agent")
+                        .text(Field::Result, "conflict"),
+                );
+            }
+            with_version(store_err(e).into_response())
+        }
+        Err(_) => with_version(ApiError::internal().into_response()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1708,6 +1875,12 @@ mod poll_renewal_tests {
             unimplemented!()
         }
         fn set_draining(&self, _node: &NodeName, _draining: bool) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn set_agent_drain(&self, _node: &NodeName) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn clear_agent_drain(&self, _node: &NodeName) -> Result<bool, StoreError> {
             unimplemented!()
         }
         fn nodes(

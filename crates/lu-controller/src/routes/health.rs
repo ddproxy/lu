@@ -147,6 +147,12 @@ mod tests {
         fn set_draining(&self, _: &NodeName, _: bool) -> Result<(), StoreError> {
             unimplemented!()
         }
+        fn set_agent_drain(&self, _: &NodeName) -> Result<(), StoreError> {
+            unimplemented!()
+        }
+        fn clear_agent_drain(&self, _: &NodeName) -> Result<bool, StoreError> {
+            unimplemented!()
+        }
         fn nodes(&self, _: Now, _: u64) -> Result<Vec<lu_store::NodeRecord>, StoreError> {
             unimplemented!()
         }

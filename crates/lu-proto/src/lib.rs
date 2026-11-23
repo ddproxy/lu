@@ -66,5 +66,6 @@ pub use stats::{
     STATS_BUCKET_LABELS, STATS_GROUPS, TERMINAL_STATES, TOP_REPOSITORIES,
 };
 pub use view::{
-    CordonView, JobView, NodeView, WorkspaceCleanResult, WorkspaceRelease, WorkspaceView,
+    AgentSelfView, CordonView, JobView, NodeView, WorkspaceCleanResult, WorkspaceRelease,
+    WorkspaceView,
 };

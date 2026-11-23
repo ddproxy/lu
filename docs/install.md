@@ -161,6 +161,11 @@ For a foreground check without systemd:
 ting --config /etc/ting/ting.toml
 ```
 
+The command defaults to `/etc/ting/ting.toml` for `ting --config`, matching the unit. The same
+config and token file drive the self-service commands `ting status --json`, `ting drain`,
+`ting undrain` and `ting wait-idle --timeout <duration>`; they need no operator token. See
+[the `ting` reference](ting.md) and [Updating a node](../README.md#updating-a-node).
+
 The scoped MCP server for a harness inside a job is `ting mcp`; see
 [the MCP server](mcp.md#scoped-mcp-ting-mcp).
 
