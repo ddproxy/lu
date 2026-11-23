@@ -265,6 +265,7 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `jobs` | object | Counts for all eleven states (`draft` through `expired`), zero-filled. |
 | `waiting_dependents` | integer | Blocked dependents waiting on a failed or cancelled predecessor, matching `lu_blocked_dependents_total`. |
 | `oldest_queued_secs` | integer | Age of the oldest `queued` or `blocked` job, or `0`. |
+| `providers` | object | Per provider name: `ok`, `cooling` and `other` counts of online nodes, and `soonest_secs` (earliest return of a cooling provider, or `null`). |
 | `drafts` | integer | Number of unapproved drafts. |
 | `oldest_draft_secs` | integer | Age of the oldest unapproved draft, or `0`. The same values are shown by `lu status` and `lu top`. |
 | `nodes` | integer | Registered nodes. |

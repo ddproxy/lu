@@ -53,6 +53,18 @@ pub async fn status(
         .oldest_created_at
         .map(|created| n.wall_unix.saturating_sub(created).max(0) as u64)
         .unwrap_or(0);
+    let node_records = match tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        let lease_ms = state.lease_ms;
+        move || store.nodes(n, lease_ms)
+    })
+    .await
+    {
+        Ok(Ok(nodes)) => nodes,
+        Ok(Err(error)) => return with_version(store_err(error).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    };
+    let providers = provider_summary(&node_records);
     let db_bytes = std::fs::metadata(&state.db_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -69,6 +81,7 @@ pub async fn status(
         "oldest_draft_secs": oldest_draft_secs,
         "nodes": counts.nodes,
         "nodes_online": counts.nodes_online,
+        "providers": providers,
         "lease_secs": state.lease_secs,
         "audit_write_errors": state.audit_write_errors(),
         "scope_enabled": state.scope.enabled,
@@ -77,4 +90,43 @@ pub async fn status(
         "scope_max_descendants_per_root": state.scope.max_descendants_per_root,
     });
     with_version(json_value_ok(StatusCode::OK, body))
+}
+
+/// Per provider: how many online nodes report it ok, cooling or otherwise unusable, and the
+/// soonest time a cooling one returns. Names come from node heartbeats, which the controller
+/// already bounds and validates.
+fn provider_summary(nodes: &[lu_store::NodeRecord]) -> Value {
+    use lu_proto::ProviderState;
+    let mut summary: std::collections::BTreeMap<&str, (u64, u64, u64, Option<u64>)> =
+        std::collections::BTreeMap::new();
+    for node in nodes.iter().filter(|node| node.online) {
+        for provider in &node.heartbeat.providers {
+            let entry = summary.entry(provider.name.as_str()).or_default();
+            match provider.state {
+                ProviderState::Ok => entry.0 += 1,
+                ProviderState::Cooling => {
+                    entry.1 += 1;
+                    if let Some(secs) = provider.soonest_secs {
+                        entry.3 = Some(entry.3.map_or(secs, |best| best.min(secs)));
+                    }
+                }
+                _ => entry.2 += 1,
+            }
+        }
+    }
+    let object: Map<String, Value> = summary
+        .into_iter()
+        .map(|(name, (ok, cooling, other, soonest))| {
+            (
+                name.to_owned(),
+                json!({
+                    "ok": ok,
+                    "cooling": cooling,
+                    "other": other,
+                    "soonest_secs": soonest,
+                }),
+            )
+        })
+        .collect();
+    Value::Object(object)
 }
