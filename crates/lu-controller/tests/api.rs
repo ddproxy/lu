@@ -3698,8 +3698,15 @@ async fn agent_self_and_drain_calls_are_audited_with_the_agent_as_actor() {
         let r = agent_call(srv.addr, AGENT_A_TOKEN, target, "{}").await;
         assert_eq!(status(&r), 200, "{target} {r}");
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let text = std::fs::read_to_string(&path).unwrap();
+    // Audit writes are asynchronous: wait until all three events are on disk.
+    let mut text = String::new();
+    for _ in 0..100 {
+        text = std::fs::read_to_string(&path).unwrap_or_default();
+        if text.lines().count() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let lines: Vec<serde_json::Value> = text
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
