@@ -1,0 +1,95 @@
+name: dev-release
+
+# Dev builds are pre-releases named vX.Y.(Z+1)-dev.<commits since tag>.g<hash>.
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: dev-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    if: >-
+      github.server_url == 'https://github.com' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Work out the dev tag
+        id: next
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -eu
+          git fetch --quiet origin main
+          if [ "$(git rev-parse origin/main)" != "$SHA" ]; then
+            echo "main has moved on; skipping $SHA"
+            exit 0
+          fi
+          base=$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -v -- '-' | head -n1)
+          [ -n "$base" ] || { echo "no stable tag to count from"; exit 0; }
+          count=$(git rev-list --count "$base..$SHA")
+          if [ "$count" -eq 0 ]; then
+            echo "$SHA is $base itself"
+            exit 0
+          fi
+          if ! git diff --name-only "$base..$SHA" | grep -qvE '^(docs/|.*\.md$|LICENSE)'; then
+            echo "only documentation changed since $base; skipping"
+            exit 0
+          fi
+          ver=${base#v}
+          major=${ver%%.*}; rest=${ver#*.}; minor=${rest%%.*}; patch=${rest#*.}
+          tag="v${major}.${minor}.$((patch + 1))-dev.${count}.g$(git rev-parse --short=7 "$SHA")"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists"
+            exit 0
+          fi
+          git config user.name "dev-release"
+          git config user.email "dev-release@users.noreply.github.com"
+          git tag -a "$tag" "$SHA" -m "dev build of $SHA"
+          git push origin "refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: tag
+    if: needs.tag.outputs.tag != ''
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+
+  prune:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Keep the newest ten dev releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.isPrerelease and (.tagName | test("-dev\\.")))] | sort_by(.createdAt) | reverse | .[10:] | .[].tagName' \
+            | while read -r old; do
+                gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+              done
