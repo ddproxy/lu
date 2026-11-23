@@ -151,7 +151,6 @@ impl fmt::Display for WorkspaceState {
 
 /// One provider and its state, as reported by the peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProviderStatus {
     pub name: String,
     pub state: ProviderState,
@@ -161,7 +160,6 @@ pub struct ProviderStatus {
 
 /// A provider and the model the agent would run for it, offered in preference order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProviderModel {
     pub provider: String,
     pub model: String,
@@ -170,7 +168,6 @@ pub struct ProviderModel {
 /// The host numbers sampled from `/proc`. The disk fields are optional because a portable
 /// answer is not available without a platform filesystem call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HostStats {
     pub load1: f64,
     pub load5: f64,
@@ -187,7 +184,6 @@ pub struct HostStats {
 
 /// One process in a job's harness tree, as sampled from `/proc`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProcessStats {
     pub pid: u32,
     pub ppid: u32,
@@ -201,7 +197,6 @@ pub struct ProcessStats {
 
 /// One running job and the processes in its harness process group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct JobStats {
     pub job_id: JobId,
     pub pgid: u32,
@@ -213,7 +208,6 @@ pub struct JobStats {
 
 /// The stats a node reports: its host numbers and its running jobs.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NodeStats {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostStats>,
@@ -243,7 +237,8 @@ pub struct NodeStats {
     pub workspaces: Vec<WorkspaceView>,
 }
 
-/// A periodic message from an agent. `reiki` is the opaque health document, forwarded unchanged.
+/// A periodic message from an agent. Receivers ignore fields they do not know, so an agent may be
+/// newer than its controller; only add optional fields. `reiki` is the opaque health document, forwarded unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Heartbeat {
     pub node: NodeName,
@@ -290,7 +285,8 @@ pub struct Heartbeat {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+// Unknown fields are accepted so an agent from a newer release can talk to this controller;
+// see docs/compatibility.md.
 struct RawHeartbeat {
     pub node: NodeName,
     pub harness: HarnessState,
@@ -1054,12 +1050,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_heartbeat_fields_are_refused() {
-        let json = r#"{"node":"peer-a","harness":"idle","surprise":true}"#;
-        assert!(serde_json::from_str::<Heartbeat>(json).is_err());
-    }
-
-    #[test]
     fn provider_states_round_trip_as_snake_case_strings() {
         for state in [
             ProviderState::Ok,
@@ -1093,5 +1083,23 @@ mod tests {
         }
         assert!("paused".parse::<HarnessState>().is_err());
         assert!("paused".parse::<ProviderState>().is_err());
+    }
+
+    #[test]
+    fn a_heartbeat_from_a_newer_agent_with_extra_fields_is_accepted() {
+        let json = serde_json::json!({
+            "node": "n1",
+            "harness": "idle",
+            "providers": [{"name": "p", "state": "ok", "future_field": 1}],
+            "host": {
+                "load1": 0.1, "load5": 0.1, "load15": 0.1, "mem_total_kb": 1,
+                "mem_available_kb": 1, "swap_used_kb": 0, "disk_free_bytes": 1,
+                "disk_total_bytes": 2, "uptime_secs": 3, "future_host_field": true
+            },
+            "future_top_level": {"a": 1}
+        });
+        let beat: Heartbeat = serde_json::from_value(json).unwrap();
+        assert_eq!(beat.providers.len(), 1);
+        assert!(beat.validate().is_ok());
     }
 }

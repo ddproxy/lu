@@ -3614,7 +3614,7 @@ async fn agent_drain_is_idempotent_and_operator_drain_stays_operator_owned() {
         1
     );
 
-    // An agent cannot name another node, in the query or in the body.
+    // An agent cannot name another node: a query parameter is refused and a body field is ignored.
     let r = agent_call(
         srv.addr,
         AGENT_A_TOKEN,
@@ -3630,7 +3630,17 @@ async fn agent_drain_is_idempotent_and_operator_drain_stays_operator_owned() {
         r#"{"node":"node-b"}"#,
     )
     .await;
-    assert_eq!(status(&r), 400, "{r}");
+    // Unknown body fields are ignored (an agent from a newer release may send more); the node
+    // always comes from the token, so naming another node changes nothing.
+    assert_eq!(status(&r), 200, "{r}");
+    let nodes = srv.store.nodes(lu_controller::time::now(), 6_000).unwrap();
+    assert!(
+        !nodes
+            .iter()
+            .find(|n| n.name.as_str() == "node-b")
+            .unwrap()
+            .draining
+    );
     let r = agent_call(srv.addr, AGENT_B_TOKEN, "POST /v1/agent/drain", "").await;
     assert_eq!(status(&r), 200, "{r}");
     let nodes = srv.store.nodes(lu_controller::time::now(), 6_000).unwrap();

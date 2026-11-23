@@ -329,6 +329,7 @@ MIT. See `LICENSE`.
 ### Reference
 
 - [HTTP API](docs/api.md)
+- [Compatibility between releases](docs/compatibility.md)
 - [`ting` reference](docs/ting.md)
 - [Agent self-drain notes](NOTES.md)
 - [Client guide](docs/client-guide.md)

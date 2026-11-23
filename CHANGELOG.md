@@ -5,6 +5,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Agent-to-controller messages ignore fields they do not know, so an agent may be newer than its controller. `docs/compatibility.md` states the rule and `scripts/compat-test.sh` with a CI job checks it against the previous release in both directions, including the schema migration. A body that names another node on the self-drain routes is now ignored (the node always comes from the token) instead of refused.
+
 ### Added
 
 - Operator tokens accept `role` (`viewer`, `operator`, `admin`), `expires_at` and `restrict_fields`. A viewer is read-only and never receives task text or context; `restrict_fields` refuses job fields that widen what a job may do. Edits, draft edits, group limit changes, workspace cleans and repository syncs are now audited with the operator's role. Viewer and restricted tokens require `[audit]`.
