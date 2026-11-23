@@ -489,6 +489,20 @@ impl Agent {
                 }
             }))
         };
+        // The workspace registry lives in memory, so after a restart every tree an earlier run
+        // staged is unreferenced: nothing would ever delete it, and a retry of the same job id
+        // would be refused because its directory exists. The service manager has already stopped
+        // the earlier run's harness, and only directories this agent staged are touched.
+        {
+            let staging = this.staging.clone();
+            match tokio::task::spawn_blocking(move || staging.clean_all_except(&[])).await {
+                Ok(Ok(())) => info!("cleared workspaces left by an earlier run"),
+                Ok(Err(error)) => {
+                    warn!(%error, "could not clear workspaces left by an earlier run")
+                }
+                Err(error) => warn!(%error, "workspace cleanup did not finish"),
+            }
+        }
         info!(node = %this.node, work_dir = %this.work_dir.display(), "agent started");
         this.housekeep(false);
         loop {

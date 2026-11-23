@@ -2337,6 +2337,31 @@ async fn job_whose_stage_directory_already_exists_completes_node_failure() {
 }
 
 #[tokio::test]
+async fn a_staged_tree_left_by_an_earlier_run_is_cleared_at_start() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    // The registry is in memory, so a restart forgets a tree an earlier run staged; it carries the
+    // staging marker, unlike the plain directory in the test above.
+    let leftover = f.work_dir.join(job_id.as_str());
+    std::fs::create_dir_all(leftover.join(".git")).unwrap();
+    std::fs::write(leftover.join(".git").join("lu-staged"), b"").unwrap();
+    std::fs::write(leftover.join("stale.txt"), b"left behind").unwrap();
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo working; echo added >> README.md"),
+    );
+    let calls = run_job(&controller, agent, has_complete).await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Done, "{done:?}");
+    assert!(calls.iter().any(|c| matches!(c, Call::Start { .. })));
+    assert!(!leftover.join("stale.txt").exists());
+}
+
+#[tokio::test]
 async fn job_missing_repository_completes_execution_failure() {
     let f = fixture();
     let job_id = JobId::new();
