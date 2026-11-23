@@ -7,9 +7,13 @@ use crate::time::now;
 use axum::extract::{Extension, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use lu_proto::StuckPolicy;
+use lu_proto::{
+    FailureClass, NodeName, StatsQuery, StatsReport, StuckPolicy, STATS_BUCKET_LABELS,
+    TERMINAL_STATES,
+};
 use lu_serve::PeerAddr;
 use lu_store::CordonSource;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Escape label value for Prometheus text format.
@@ -46,6 +50,139 @@ fn counter(name: &str, labels: &[(&str, &str)], value: u64) -> String {
     gauge(name, labels, value)
 }
 
+/// Adds the shared store report as node-labelled counters and histograms.
+///
+/// The report is queried with no `since` bound, and its configured-node list is the only source of
+/// `node` labels. Repository text and job content never become labels.
+fn push_node_contribution_metrics(
+    out: &mut String,
+    report: &StatsReport,
+    configured: &BTreeSet<NodeName>,
+) {
+    let mut rows: Vec<_> = report
+        .nodes
+        .iter()
+        .filter(|row| configured.contains(&row.node))
+        .collect();
+    rows.sort_by(|a, b| a.node.as_str().cmp(b.node.as_str()));
+
+    out.push_str("# HELP lu_node_jobs_total Terminal jobs attributed to a configured node\n");
+    out.push_str("# TYPE lu_node_jobs_total counter\n");
+    for row in &rows {
+        let node = escape_label(row.node.as_str());
+        for state in TERMINAL_STATES {
+            let value = row.stats.states.get(state.as_str()).copied().unwrap_or(0);
+            out.push_str(&counter(
+                "lu_node_jobs_total",
+                &[("node", &node), ("state", state.as_str())],
+                value,
+            ));
+            out.push('\n');
+        }
+    }
+
+    out.push_str("# HELP lu_node_failures_total Failed jobs by fixed failure class\n");
+    out.push_str("# TYPE lu_node_failures_total counter\n");
+    for row in &rows {
+        let node = escape_label(row.node.as_str());
+        for class in FailureClass::ALL {
+            let value = row.stats.failures.get(class.as_str()).copied().unwrap_or(0);
+            out.push_str(&counter(
+                "lu_node_failures_total",
+                &[("node", &node), ("class", class.as_str())],
+                value,
+            ));
+            out.push('\n');
+        }
+    }
+
+    out.push_str(
+        "# HELP lu_node_busy_seconds_total Wall-clock job duration on a configured node\n",
+    );
+    out.push_str("# TYPE lu_node_busy_seconds_total counter\n");
+    for row in &rows {
+        let node = escape_label(row.node.as_str());
+        out.push_str(&counter(
+            "lu_node_busy_seconds_total",
+            &[("node", &node)],
+            row.stats.busy_seconds,
+        ));
+        out.push('\n');
+    }
+
+    for (name, help, pick) in [
+        (
+            "lu_node_job_runtime_seconds",
+            "Wall-clock duration from job start to finish",
+            0,
+        ),
+        (
+            "lu_node_queue_wait_seconds",
+            "Wall-clock duration from job creation to start",
+            1,
+        ),
+    ] {
+        out.push_str(&format!("# HELP {name}_bucket {help} (fixed buckets)\n"));
+        out.push_str(&format!("# TYPE {name} histogram\n"));
+        for row in &rows {
+            let node = escape_label(row.node.as_str());
+            let summary = if pick == 0 {
+                &row.stats.runtime
+            } else {
+                &row.stats.queue_wait
+            };
+            for label in STATS_BUCKET_LABELS {
+                let value = summary.buckets.get(label).copied().unwrap_or(0);
+                out.push_str(&counter(
+                    &format!("{name}_bucket"),
+                    &[("node", &node), ("le", label)],
+                    value,
+                ));
+                out.push('\n');
+            }
+            out.push_str(&counter(
+                &format!("{name}_count"),
+                &[("node", &node)],
+                summary.count,
+            ));
+            out.push('\n');
+            out.push_str(&counter(
+                &format!("{name}_sum"),
+                &[("node", &node)],
+                summary.sum_seconds,
+            ));
+            out.push('\n');
+            out.push_str(&gauge(
+                &format!("{name}_median_seconds"),
+                &[("node", &node)],
+                summary.median_seconds.unwrap_or(0),
+            ));
+            out.push('\n');
+            out.push_str(&gauge(
+                &format!("{name}_p90_seconds"),
+                &[("node", &node)],
+                summary.p90_seconds.unwrap_or(0),
+            ));
+            out.push('\n');
+        }
+    }
+
+    out.push_str(
+        "# HELP lu_node_last_job_finished_timestamp_seconds Newest terminal finish time on a node\n",
+    );
+    out.push_str("# TYPE lu_node_last_job_finished_timestamp_seconds gauge\n");
+    for row in &rows {
+        let node = escape_label(row.node.as_str());
+        let value = row.stats.last_finished_at.unwrap_or(0).max(0) as u64;
+        out.push_str(&gauge(
+            "lu_node_last_job_finished_timestamp_seconds",
+            &[("node", &node)],
+            value,
+        ));
+        out.push('\n');
+    }
+}
+
 pub async fn metrics(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -75,6 +212,21 @@ pub async fn metrics(
     .await
     {
         Ok(Ok(c)) => c,
+        _ => return with_version(ApiError::internal().into_response()),
+    };
+
+    let configured_nodes: BTreeSet<NodeName> = state.auth.agents.values().cloned().collect();
+    let stats_query = StatsQuery {
+        nodes: configured_nodes.iter().cloned().collect(),
+        ..StatsQuery::default()
+    };
+    let contributions = match tokio::task::spawn_blocking({
+        let store = Arc::clone(&state.store);
+        move || store.stats(&stats_query)
+    })
+    .await
+    {
+        Ok(Ok(report)) => report,
         _ => return with_version(ApiError::internal().into_response()),
     };
 
@@ -255,6 +407,8 @@ pub async fn metrics(
             out.push('\n');
         }
     }
+
+    push_node_contribution_metrics(&mut out, &contributions, &configured_nodes);
 
     out.push_str("# HELP lu_controller_up Whether the controller is up (1) or down (0)\n");
     out.push_str("# TYPE lu_controller_up gauge\n");

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use lu_proto::{
     valid_group, AgentEvent, ArtifactName, Completion, JobEdit, JobId, JobSpec, JobState, LogChunk,
-    NodeName, ScopeRequest, ScopeResponse, MAX_GROUP_RUNNING,
+    NodeName, ScopeRequest, ScopeResponse, StatsGroup, StatsReport, MAX_GROUP_RUNNING,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
@@ -29,6 +29,22 @@ const CA_LIMIT: u64 = 1024 * 1024;
 fn valid_commit_id(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
+
+fn stats_query(
+    by: StatsGroup,
+    since: Option<&str>,
+    node: Option<&NodeName>,
+) -> Vec<(String, String)> {
+    let mut query = vec![("by".to_owned(), by.as_str().to_owned())];
+    if let Some(since) = since {
+        query.push(("since".to_owned(), since.to_owned()));
+    }
+    if let Some(node) = node {
+        query.push(("node".to_owned(), node.as_str().to_owned()));
+    }
+    query
+}
+
 /// Matches the controller's base-pack cap; kept local so the client needs no git dependency.
 const MAX_BASE_PACK_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -596,6 +612,40 @@ impl Client {
     pub async fn status_raw(&self) -> Result<String> {
         let reply = self
             .send(Method::GET, "v1/status", None, &[], &[], true)
+            .await?;
+        let reply = self.success(reply)?;
+        Ok(raw_body(&reply))
+    }
+
+    /// Shared node contribution report behind `lu stats`.
+    pub async fn stats(
+        &self,
+        by: StatsGroup,
+        since: Option<&str>,
+        node: Option<&NodeName>,
+    ) -> Result<StatsReport> {
+        let query = stats_query(by, since, node);
+        let reply = self
+            .send(Method::GET, "v1/stats", None, &query, &[], true)
+            .await?;
+        let reply = self.success(reply)?;
+        self.scrub(
+            serde_json::from_slice(&reply.body).map_err(|error| ApiError::Decode {
+                message: format!("could not decode the stats report: {error}"),
+            }),
+        )
+    }
+
+    /// The raw stats response, so `lu stats --json` prints exactly what the controller sent.
+    pub async fn stats_raw(
+        &self,
+        by: StatsGroup,
+        since: Option<&str>,
+        node: Option<&NodeName>,
+    ) -> Result<String> {
+        let query = stats_query(by, since, node);
+        let reply = self
+            .send(Method::GET, "v1/stats", None, &query, &[], true)
             .await?;
         let reply = self.success(reply)?;
         Ok(raw_body(&reply))

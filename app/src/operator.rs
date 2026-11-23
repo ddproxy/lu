@@ -12,8 +12,8 @@ use lu_client::{
 use lu_proto::{
     printable, truncate_chars, ArtifactName, CollectMode, ExpectEdit, ExpectMode, ExpectSpec,
     FailureClass, HarnessState, JobEdit, JobId, JobSpec, JobState, NodeName, OnConflict,
-    PublishSpec, StuckPolicy, WorkspacePolicy, DEFAULT_TIMEOUT_SECS, LABEL_SOURCE_PROBED,
-    MAX_STUCK_AFTER_SECS, MAX_TASK_BYTES, MIN_STUCK_AFTER_SECS,
+    PublishSpec, StatsGroup, StatsReport, StuckPolicy, WorkspacePolicy, DEFAULT_TIMEOUT_SECS,
+    LABEL_SOURCE_PROBED, MAX_STUCK_AFTER_SECS, MAX_TASK_BYTES, MIN_STUCK_AFTER_SECS,
 };
 use lu_tui::graph::{self, Graph};
 use lu_tui::model::Tone;
@@ -520,6 +520,19 @@ pub struct NodesArgs {}
 pub struct StatusArgs {}
 
 #[derive(Debug, clap::Args)]
+pub struct StatsArgs {
+    /// Group table rows by node, repository or terminal state.
+    #[arg(long, value_name = "GROUP", default_value = "node")]
+    pub by: StatsGroup,
+    /// Inclusive Unix seconds, UTC date or duration such as `7d`.
+    #[arg(long, value_name = "WHEN")]
+    pub since: Option<String>,
+    /// Restrict the report to one configured node.
+    #[arg(long, value_name = "NAME", value_parser = parse_node)]
+    pub node: Option<NodeName>,
+}
+
+#[derive(Debug, clap::Args)]
 pub struct ReposArgs {}
 
 #[derive(Debug, clap::Args)]
@@ -637,6 +650,10 @@ pub async fn nodes(args: NodesArgs, config: &Path, json: bool) -> ExitCode {
 
 pub async fn status(args: StatusArgs, config: &Path, json: bool) -> ExitCode {
     finish(status_inner(args, config, json).await)
+}
+
+pub async fn stats(args: StatsArgs, config: &Path, json: bool) -> ExitCode {
+    finish(stats_inner(args, config, json).await)
 }
 
 pub async fn repos(args: ReposArgs, config: &Path, json: bool) -> ExitCode {
@@ -1595,6 +1612,25 @@ async fn status_inner(_args: StatusArgs, config: &Path, json: bool) -> Result<Ex
     Ok(ExitCode::SUCCESS)
 }
 
+async fn stats_inner(args: StatsArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let client = connect(config)?;
+    let since = args.since.as_deref();
+    if json {
+        let raw = client
+            .stats_raw(args.by, since, args.node.as_ref())
+            .await
+            .map_err(|error| error.to_string())?;
+        print_raw(&raw);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let report = client
+        .stats(args.by, since, args.node.as_ref())
+        .await
+        .map_err(|error| error.to_string())?;
+    print_stats(&report);
+    Ok(ExitCode::SUCCESS)
+}
+
 async fn repos_inner(_args: ReposArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
     let client = connect(config)?;
     if json {
@@ -2324,6 +2360,90 @@ fn print_status(status: &StatusView) {
         })
         .collect();
     print_table(&["STATE", "COUNT"], rows);
+}
+
+fn stats_value(value: Option<u64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn print_stats_nodes(rows: &[lu_proto::NodeContribution]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|row| {
+            let s = &row.stats;
+            vec![
+                display_field(row.node.as_str()),
+                stats_value(s.states.get(JobState::Done.as_str()).copied()),
+                stats_value(s.states.get(JobState::Failed.as_str()).copied()),
+                stats_value(s.states.get(JobState::Cancelled.as_str()).copied()),
+                stats_value(s.states.get(JobState::Expired.as_str()).copied()),
+                s.retries.to_string(),
+                s.busy_seconds.to_string(),
+                stats_value(s.runtime.median_seconds),
+                stats_value(s.runtime.p90_seconds),
+                stats_value(s.queue_wait.median_seconds),
+                stats_value(s.queue_wait.p90_seconds),
+                s.last_finished_at
+                    .map(|stamp| time(stamp.max(0) as u64))
+                    .unwrap_or_else(|| "-".to_owned()),
+            ]
+        })
+        .collect()
+}
+
+fn print_stats(report: &StatsReport) {
+    match report.by {
+        StatsGroup::Node => print_table(
+            &[
+                "NODE",
+                "DONE",
+                "FAILED",
+                "CANCELLED",
+                "EXPIRED",
+                "RETRIES",
+                "BUSY_S",
+                "RUN_MEDIAN_S",
+                "RUN_P90_S",
+                "WAIT_MEDIAN_S",
+                "WAIT_P90_S",
+                "LAST_FINISHED",
+            ],
+            print_stats_nodes(&report.nodes),
+        ),
+        StatsGroup::Repo => {
+            let rows = report
+                .fleet
+                .top_repositories
+                .iter()
+                .map(|repo| vec![display_field(&repo.repository), repo.jobs.to_string()])
+                .collect();
+            print_table(&["REPOSITORY", "JOBS"], rows);
+        }
+        StatsGroup::State => {
+            let rows = [
+                JobState::Done,
+                JobState::Failed,
+                JobState::Cancelled,
+                JobState::Expired,
+            ]
+            .into_iter()
+            .map(|state| {
+                vec![
+                    state.as_str().to_owned(),
+                    report
+                        .fleet
+                        .states
+                        .get(state.as_str())
+                        .copied()
+                        .unwrap_or(0)
+                        .to_string(),
+                ]
+            })
+            .collect();
+            print_table(&["STATE", "JOBS"], rows);
+        }
+    }
 }
 
 fn print_repos(list: &ListRepos) {

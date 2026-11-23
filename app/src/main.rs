@@ -45,6 +45,8 @@ enum Command {
     Audit(audit::AuditArgs),
     /// Show controller uptime, database size, queue and node counts.
     Status(operator::StatusArgs),
+    /// Report terminal-job contributions by node, repository or state.
+    Stats(operator::StatsArgs),
     /// Serve the Model Context Protocol over stdio (read and write tools).
     Mcp,
     /// List the repositories the controller mirrors.
@@ -115,6 +117,7 @@ async fn main() -> ExitCode {
             Err(error) => fail(&error),
         },
         Command::Status(args) => operator::status(args, &cli.config, json).await,
+        Command::Stats(args) => operator::stats(args, &cli.config, json).await,
         Command::Mcp => mcp::run(&cli.config).await,
         Command::Repos(args) => operator::repos(args, &cli.config, json).await,
         Command::Sync(args) => operator::sync_repo(args, &cli.config, json).await,

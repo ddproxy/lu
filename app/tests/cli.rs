@@ -2949,3 +2949,144 @@ async fn submit_batch_maps_sidecars_external_keys_and_nested_after_hints() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn stats_body(by: &str) -> Value {
+    let empty_buckets = json!({
+        "1": 0, "5": 0, "15": 0, "60": 0,
+        "300": 0, "900": 0, "3600": 0, "21600": 0, "+Inf": 0
+    });
+    let mut runtime_buckets = empty_buckets.clone();
+    runtime_buckets["5"] = json!(1);
+    runtime_buckets["60"] = json!(3);
+    runtime_buckets["+Inf"] = json!(3);
+    let mut queue_buckets = empty_buckets;
+    queue_buckets["15"] = json!(2);
+    queue_buckets["60"] = json!(2);
+    queue_buckets["+Inf"] = json!(2);
+    json!({
+        "by": by,
+        "since": null,
+        "node": null,
+        "fleet": {
+            "states": {"done": 2, "failed": 1, "cancelled": 0, "expired": 1},
+            "failures": {
+                "node": 0, "provider": 1, "execution": 0,
+                "dependency": 0, "conflict": 0
+            },
+            "retries": 3,
+            "busy_seconds": 125,
+            "runtime": {
+                "count": 3, "sum_seconds": 125,
+                "median_seconds": 20, "p90_seconds": 60,
+                "buckets": runtime_buckets
+            },
+            "queue_wait": {
+                "count": 2, "sum_seconds": 30,
+                "median_seconds": 10, "p90_seconds": 20,
+                "buckets": queue_buckets
+            },
+            "top_repositories": [
+                {"repository": "git.example.test/team/app", "jobs": 2}
+            ],
+            "last_finished_at": 1700000000
+        },
+        "nodes": []
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_json_prints_the_raw_body_and_sends_the_filters() {
+    let body = stats_body("repo");
+    let expected = body.to_string();
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("stats-json");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &[
+            "--json", "stats", "--by", "repo", "--since", "7d", "--node", "node-a",
+        ],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{expected}\n"));
+    let records = server.records.lock().unwrap();
+    assert_eq!(records[0].method, "GET");
+    assert_eq!(records[0].path, "/v1/stats");
+    assert_eq!(
+        records[0].query.as_deref(),
+        Some("by=repo&since=7d&node=node-a")
+    );
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_node_table_golden() {
+    let mut body = stats_body("node");
+    let runtime = body["fleet"]["runtime"].clone();
+    let queue_wait = body["fleet"]["queue_wait"].clone();
+    let top_repositories = body["fleet"]["top_repositories"].clone();
+    body["nodes"] = json!([{
+        "node": "node-a",
+        "states": {"done": 2, "failed": 1, "cancelled": 0, "expired": 1},
+        "failures": {
+            "node": 0, "provider": 1, "execution": 0,
+            "dependency": 0, "conflict": 0
+        },
+        "retries": 3,
+        "busy_seconds": 125,
+        "runtime": runtime,
+        "queue_wait": queue_wait,
+        "top_repositories": top_repositories,
+        "last_finished_at": 1700000000
+    }]);
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("stats-node-table");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(&["stats"], &env_for(&server, &token), None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let expected = concat!(
+        "NODE    DONE  FAILED  CANCELLED  EXPIRED  RETRIES  BUSY_S  RUN_MEDIAN_S  ",
+        "RUN_P90_S  WAIT_MEDIAN_S  WAIT_P90_S  LAST_FINISHED\n",
+        "node-a  2     1       0          1        3        125     20            ",
+        "60         10             20          2023-11-14 22:13:20Z\n",
+    );
+    assert_eq!(stdout(&output), expected);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stats_repo_and_state_tables_are_grouped() {
+    let body = stats_body("repo");
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("stats-repo-table");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &["stats", "--by", "repo"],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "REPOSITORY                 JOBS\ngit.example.test/team/app  2\n"
+    );
+
+    let body = stats_body("state");
+    let server = start(move |_| Reply::json(&body)).await;
+    let output = run_with_env(
+        &["stats", "--by", "state"],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "STATE      JOBS\ndone       2\nfailed     1\ncancelled  0\nexpired    1\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

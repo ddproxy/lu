@@ -5,6 +5,7 @@ pub mod intake;
 pub mod metrics;
 pub mod operator;
 pub mod scope;
+pub mod stats;
 pub mod status;
 
 use crate::error::{ApiError, ApiResult};

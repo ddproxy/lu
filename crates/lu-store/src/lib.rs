@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use lu_proto::{
     ArtifactName, Completion, FailureClass, Heartbeat, JobEdit, JobId, JobSpec, JobState, NodeName,
-    ProviderState, PublishRecord,
+    ProviderState, PublishRecord, StatsAggregate, StatsQuery, StatsReport,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,6 +615,21 @@ pub trait Store: Send + Sync + 'static {
     /// Returns counts of jobs per state, including zero for absent states.
     /// Also returns total nodes, online nodes, drained nodes, and completed job counters.
     fn job_counts(&self, now: Now, lease_ms: u64) -> Result<JobCounts, StoreError>;
+
+    /// Aggregates terminal jobs into fleet and per-node contributions. The same report backs the
+    /// operator API, the CLI and `/metrics`, so no view can invent a different number.
+    ///
+    /// There is no job-pruning path: `jobs` is the persistent source. Callers that need monotonic
+    /// counters pass `since: None`, so a rolling window never moves a counter backwards.
+    fn stats(&self, query: &StatsQuery) -> Result<StatsReport, StoreError> {
+        Ok(StatsReport {
+            by: query.by,
+            since: query.since,
+            node: query.node.clone(),
+            fleet: StatsAggregate::empty(),
+            nodes: Vec::new(),
+        })
+    }
 
     /// Installs the configured concurrency caps by group name. Unconfigured groups stay unlimited.
     /// Defaults to no caps for stores that do not manage dispatch.

@@ -16,6 +16,7 @@ pub mod sanitize;
 pub mod scope;
 pub mod spec;
 pub mod state;
+pub mod stats;
 pub mod view;
 
 pub use event::{AgentEvent, Completion, CompletionError, LogChunk, LogChunkError, Outcome};
@@ -59,6 +60,11 @@ pub use spec::{
     WORKSPACE_POLICIES,
 };
 pub use state::{CancelEffect, JobState, ParseJobStateError};
+pub use stats::{
+    normalize_repository, parse_since, DurationSummary, NodeContribution, ParseStatsGroupError,
+    RepoContribution, StatsAggregate, StatsGroup, StatsQuery, StatsReport, STATS_BUCKETS_SECS,
+    STATS_BUCKET_LABELS, STATS_GROUPS, TERMINAL_STATES, TOP_REPOSITORIES,
+};
 pub use view::{
     CordonView, JobView, NodeView, WorkspaceCleanResult, WorkspaceRelease, WorkspaceView,
 };

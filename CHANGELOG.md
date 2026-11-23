@@ -5,6 +5,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Node contribution statistics from one store report. `lu stats [--by node|repo|state] [--since WHEN] [--node NAME]` and `GET /v1/stats?by=&since=&node=` show terminal states, failure classes, retries, wall-clock busy seconds, runtime and queue-wait percentiles, and up to ten normalised `host/owner/name` repositories. `/metrics` adds `lu_node_jobs_total{node,state}`, `lu_node_failures_total{node,class}`, `lu_node_busy_seconds_total{node}`, runtime and queue-wait histograms with fixed buckets, and `lu_node_last_job_finished_timestamp_seconds{node}`. Labels are limited to configured node names and fixed state/class values; repository text is never a label. Stored jobs are not pruned, so all-time counters survive restarts; `since` windows narrow the report by design. See [docs/monitoring.md](docs/monitoring.md#node-contribution-statistics) and [docs/api.md](docs/api.md#statsreport).
+
 ## [0.5.1]
 
 No database change; restart the controller and agents.
