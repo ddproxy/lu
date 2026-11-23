@@ -32,9 +32,19 @@ undrains with `ting undrain`. That needs only the node's own token.
 4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store uses schema version 4. It creates the schema for a new database and migrates schema 1, 2 and 3 databases in place on startup, adding the scrubbing, lineage, publish and stacked-chain columns (`staged_commit`, `blocked_reason`, `blocked_since`). Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly schema version 4, so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
+The store uses schema version 6. It creates the schema for a new database and migrates schema 1 to 5 databases in place on startup, adding the scrubbing, lineage, publish and stacked-chain columns (`staged_commit`, `blocked_reason`, `blocked_since`). Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly schema version 4, so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
+
+## Upgrading the controller
+
+A controller of a newer release starts on the previous release's database and migrates it forward in place; there is no separate migration command. To upgrade:
+
+1. Take a backup with `lu backup --out <file>` (see [Backup and restore](#backup-and-restore)); the rolling-update playbook also keeps a dated copy of the database file.
+2. Stop the controller, replace the binaries, and start it. Agents of the old and the new release can stay connected throughout; see [compatibility](compatibility.md).
+3. Confirm the result with `lu status --json`: `version` is the new release and `schema_version` equals the schema the release notes name (6 for 0.6.0).
+
+The migration only moves forward. To go back to an older release, stop the controller and restore the backup taken in step 1 (or the dated database copy); do not start an older binary on a migrated database, which refuses a schema version it does not know.
 
 ## Backup and restore
 
@@ -121,7 +131,7 @@ systemctl start lu-controller.service
 ```
 
 `lu restore` verifies the snapshot, refuses a file that is not a Lu database (an empty or
-foreign SQLite file would replace your data with nothing), requires exactly schema version 4 and
+foreign SQLite file would replace your data with nothing), requires exactly the current schema version (6) and
 every table that version creates, and refuses when the database is still in use, so stop the
 controller first.
 Only one restore runs at a time. It stages the copy beside the database with the old file's

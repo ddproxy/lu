@@ -168,7 +168,7 @@ codes.
 `lu show` prints `publish_target` (the effective `remote:branch`, with `(source branch)` for a
 source-branch target) and `publish` (the last attempt's detail, remote, branch and target). `lu top`
 adds a `publish:<detail>:<branch>` note to affected rows. The stored `PublishRecord` is part of the
-jobs table's `publish_json` column in the schema 4 baseline; schema 1, 2 and 3 databases gain the
+jobs table's `publish_json` column in the current baseline (schema 4 and later); older databases gain the
 column in place at startup.
 
 `/metrics` exports `lu_publish_total{target,result}` since controller start. `target` is `snapshot`
