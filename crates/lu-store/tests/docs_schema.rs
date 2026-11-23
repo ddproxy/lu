@@ -39,17 +39,21 @@ fn docs_name_the_current_schema_version() {
         }
         let text = std::fs::read_to_string(&path).unwrap();
         for (number, line) in text.lines().enumerate() {
-            let lower = line.to_ascii_lowercase();
-            if HISTORICAL.iter().any(|word| lower.contains(word)) {
-                continue;
-            }
-            for version in mentions(line) {
-                if version != SCHEMA_VERSION {
-                    stale.push(format!(
-                        "{}:{}: says schema version {version}, code is {SCHEMA_VERSION}",
-                        path.file_name().unwrap().to_string_lossy(),
-                        number + 1
-                    ));
+            // Judge each sentence on its own, so a migration remark in one sentence does not
+            // excuse a stale statement of the current schema in the next.
+            for sentence in line.split(". ") {
+                let lower = sentence.to_ascii_lowercase();
+                if HISTORICAL.iter().any(|word| lower.contains(word)) {
+                    continue;
+                }
+                for version in mentions(sentence) {
+                    if version != SCHEMA_VERSION {
+                        stale.push(format!(
+                            "{}:{}: says schema version {version}, code is {SCHEMA_VERSION}",
+                            path.file_name().unwrap().to_string_lossy(),
+                            number + 1
+                        ));
+                    }
                 }
             }
         }
