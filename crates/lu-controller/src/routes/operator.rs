@@ -243,6 +243,44 @@ fn node_view(
     }
 }
 
+/// The first job field that widens what a job may do, for tokens configured with
+/// `restrict_fields`: spawning children, publishing to the source branch, stacking paths.
+fn restricted_field(spec: &JobSpec) -> Option<&'static str> {
+    if spec.allow_spawn {
+        return Some("allow_spawn");
+    }
+    if spec.spawn_inherit {
+        return Some("spawn_inherit");
+    }
+    if !spec.spawn_repos.is_empty() {
+        return Some("spawn_repos");
+    }
+    if !spec.stack_union_paths.is_empty() {
+        return Some("stack_union_paths");
+    }
+    if !spec.stack_base_paths.is_empty() {
+        return Some("stack_base_paths");
+    }
+    if let Some(publish) = &spec.publish {
+        if publish.allow_source_branch {
+            return Some("publish.allow_source_branch");
+        }
+        if publish.target == lu_proto::PublishTarget::SourceBranch {
+            return Some("publish.target");
+        }
+    }
+    None
+}
+
+/// The role an operator's token carries, as a fixed audit code.
+fn role_name(state: &AppState, operator: &str) -> &'static str {
+    match state.auth.profile(operator).map(|p| p.role) {
+        Some(lu_config::OperatorRole::Viewer) => "viewer",
+        Some(lu_config::OperatorRole::Admin) => "admin",
+        _ => "operator",
+    }
+}
+
 pub async fn create_job(
     State(state): State<Arc<AppState>>,
     peer: axum::Extension<PeerAddr>,
@@ -267,6 +305,13 @@ pub async fn create_job(
         Ok(s) => s,
         Err(e) => return with_version(ApiError::unprocessable(e.to_string()).into_response()),
     };
+    if state.auth.restricts_fields(&operator) {
+        if let Some(field) = restricted_field(&spec) {
+            return with_version(
+                ApiError::forbidden(format!("this token may not set {field}")).into_response(),
+            );
+        }
+    }
     if let Some(repo) = state.mirror.repo_for_url(&spec.repo) {
         let name = repo.name.clone();
         let git_ref = spec.git_ref.clone();
@@ -364,9 +409,10 @@ pub async fn set_group_limit(
     Path(group): Path<String>,
     req: axum::extract::Request,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
-    }
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(operator) => operator,
+        Err(_) => return with_version(ApiError::unauthorized().into_response()),
+    };
     if !valid_group(&group) {
         return with_version(ApiError::bad_request("invalid group name").into_response());
     }
@@ -383,6 +429,15 @@ pub async fn set_group_limit(
     if let Err(error) = state.set_group_limit(&group, body.max_running) {
         return with_version(ApiError::bad_request(error).into_response());
     }
+    state.record_audit(
+        Event::GroupLimit,
+        None,
+        None,
+        &operator,
+        Data::new()
+            .text(Field::Source, role_name(&state, &operator))
+            .unsigned(Field::Count, body.max_running as u64),
+    );
     with_version(json_value_ok(
         StatusCode::OK,
         json!({ "group": group, "max_running": body.max_running }),
@@ -735,9 +790,10 @@ pub async fn edit_job(
     Path(id): Path<String>,
     req: axum::extract::Request,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
-    }
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(operator) => operator,
+        Err(_) => return with_version(ApiError::unauthorized().into_response()),
+    };
     let job_id = match JobId::parse(&id) {
         Ok(i) => i,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
@@ -758,6 +814,13 @@ pub async fn edit_job(
     .await;
     match res {
         Ok(Ok(rec)) => {
+            state.record_audit(
+                Event::JobEdited,
+                Some(rec.id.as_str()),
+                None,
+                &operator,
+                Data::new().text(Field::Source, role_name(&state, &operator)),
+            );
             state.waiters.notify_work();
             match job_view_for(&state, &rec).await {
                 Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
@@ -1182,9 +1245,10 @@ pub async fn clean_workspaces(
     Path(name): Path<String>,
     uri: axum::http::Uri,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
-    }
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(operator) => operator,
+        Err(_) => return with_version(ApiError::unauthorized().into_response()),
+    };
     let node = match NodeName::parse(&name) {
         Ok(n) => n,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
@@ -1227,6 +1291,13 @@ pub async fn clean_workspaces(
     if !nodes.iter().any(|record| record.name == node) {
         return with_version(ApiError::not_found("not found").into_response());
     }
+    state.record_audit(
+        Event::WorkspaceClean,
+        None,
+        Some(node.as_str()),
+        &operator,
+        Data::new().text(Field::Source, role_name(&state, &operator)),
+    );
     let mut event = serde_json::json!({ "kind": "clean_workspaces", "all": all });
     if let Some(job) = job {
         event["job"] = serde_json::json!(job.to_string());
@@ -1287,7 +1358,18 @@ pub async fn sync_repo(
     let log_name = name.clone();
     let result = tokio::task::spawn_blocking(move || mirror.sync(&sync_name)).await;
     match result {
-        Ok(Ok(sync)) => with_version(json_ok(StatusCode::OK, &sync)),
+        Ok(Ok(sync)) => {
+            state.record_audit(
+                Event::RepoSync,
+                None,
+                None,
+                &operator,
+                Data::new()
+                    .text(Field::Source, role_name(&state, &operator))
+                    .text(Field::Remote, &log_name),
+            );
+            with_version(json_ok(StatusCode::OK, &sync))
+        }
         Ok(Err(e)) => {
             tracing::error!(repo = %log_name, error = %e, "repository sync failed");
             with_version(ApiError::internal().into_response())

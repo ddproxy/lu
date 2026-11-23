@@ -1953,6 +1953,7 @@ mod poll_renewal_tests {
             operators: vec![ControllerOperator {
                 name: "ops".to_owned(),
                 token_sha256: sha256_hex("unused-operator-token"),
+                ..Default::default()
             }],
             repos: Vec::new(),
             groups: Vec::new(),
@@ -2008,6 +2009,7 @@ mod poll_renewal_tests {
             operators: vec![ControllerOperator {
                 name: "ops".to_owned(),
                 token_sha256: sha256_hex("unused-operator-token"),
+                ..Default::default()
             }],
             repos: Vec::new(),
             groups: Vec::new(),

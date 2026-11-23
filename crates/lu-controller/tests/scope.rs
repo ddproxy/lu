@@ -72,6 +72,7 @@ fn controller_cfg(
         operators: vec![ControllerOperator {
             name: "ops".to_owned(),
             token_sha256: sha256_hex(OP_TOKEN),
+            ..Default::default()
         }],
         repos: Vec::new(),
         groups: Vec::new(),

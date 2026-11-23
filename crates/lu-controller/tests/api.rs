@@ -26,6 +26,9 @@ use tokio::sync::broadcast;
 mod common;
 
 const OP_TOKEN: &str = "op-token-1234567890";
+const VIEW_TOKEN: &str = "view-token-1234567890";
+const RESTRICTED_TOKEN: &str = "restricted-token-1234567890";
+const EXPIRED_TOKEN: &str = "expired-token-1234567890";
 const AGENT_A_TOKEN: &str = "agent-a-token-1234567890";
 const AGENT_B_TOKEN: &str = "agent-b-token-1234567890";
 
@@ -51,10 +54,31 @@ fn controller_cfg(db: &str, artifacts_dir: &str) -> ControllerConfig {
                 token_sha256: sha256_hex(AGENT_B_TOKEN),
             },
         ],
-        operators: vec![ControllerOperator {
-            name: "ops".to_owned(),
-            token_sha256: sha256_hex(OP_TOKEN),
-        }],
+        operators: vec![
+            ControllerOperator {
+                name: "ops".to_owned(),
+                token_sha256: sha256_hex(OP_TOKEN),
+                ..Default::default()
+            },
+            ControllerOperator {
+                name: "viewer".to_owned(),
+                token_sha256: sha256_hex(VIEW_TOKEN),
+                role: lu_config::OperatorRole::Viewer,
+                ..Default::default()
+            },
+            ControllerOperator {
+                name: "restricted".to_owned(),
+                token_sha256: sha256_hex(RESTRICTED_TOKEN),
+                restrict_fields: true,
+                ..Default::default()
+            },
+            ControllerOperator {
+                name: "expired".to_owned(),
+                token_sha256: sha256_hex(EXPIRED_TOKEN),
+                expires_at: Some("2001-01-01T00:00:00Z".to_owned()),
+                ..Default::default()
+            },
+        ],
         repos: Vec::new(),
         groups: Vec::new(),
         blocked_dependent_ttl: "24h".to_owned(),
@@ -3911,5 +3935,83 @@ async fn mirror_failures_return_a_generic_internal_error() {
         !body_str(&submitted).contains("absent-repository"),
         "{submitted}"
     );
+    );
+    let _ = srv.shutdown.send(());
+}
+
+async fn op_request(
+    srv: &TestServer,
+    token: &str,
+    method_path: &str,
+    body: Option<&str>,
+) -> String {
+    let body = body.unwrap_or("");
+    let req = format!(
+        "{method_path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    raw_request(srv.addr, &req).await
+}
+
+#[tokio::test]
+async fn viewer_tokens_read_summaries_without_task_text_and_cannot_mutate() {
+    let srv = start_server().await;
+    let mut spec = sample_spec(Some("view-key"));
+    spec.task = "write the secret plan".to_owned();
+    let body = serde_json::to_string(&spec).unwrap();
+    let r = op_request(&srv, OP_TOKEN, "POST /v1/jobs", Some(&body)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let created: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let full = op_request(&srv, OP_TOKEN, &format!("GET /v1/jobs/{id}"), None).await;
+    assert!(body_str(&full).contains("write the secret plan"), "{full}");
+
+    let seen = op_request(&srv, VIEW_TOKEN, &format!("GET /v1/jobs/{id}"), None).await;
+    assert_eq!(status(&seen), 200, "{seen}");
+    assert!(!body_str(&seen).contains("secret plan"), "{seen}");
+    let list = op_request(&srv, VIEW_TOKEN, "GET /v1/jobs", None).await;
+    assert_eq!(status(&list), 200, "{list}");
+    assert!(!body_str(&list).contains("secret plan"), "{list}");
+    assert_eq!(
+        status(&op_request(&srv, VIEW_TOKEN, "GET /v1/status", None).await),
+        200
+    );
+
+    for target in [
+        format!("GET /v1/jobs/{id}/logs"),
+        format!("GET /v1/jobs/{id}/artifacts/diff.patch"),
+        format!("POST /v1/jobs/{id}/cancel"),
+        "GET /v1/drafts".to_owned(),
+        "POST /v1/nodes/node-a/drain".to_owned(),
+    ] {
+        let r = op_request(&srv, VIEW_TOKEN, &target, Some("{}")).await;
+        assert_eq!(status(&r), 403, "{target}: {r}");
+    }
+    let r = op_request(&srv, VIEW_TOKEN, "POST /v1/jobs", Some(&body)).await;
+    assert_eq!(status(&r), 403, "{r}");
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn restricted_tokens_cannot_widen_job_fields_and_expired_tokens_are_refused() {
+    let srv = start_server().await;
+    let mut spec = sample_spec(Some("restricted-ok"));
+    let ok = serde_json::to_string(&spec).unwrap();
+    let r = op_request(&srv, RESTRICTED_TOKEN, "POST /v1/jobs", Some(&ok)).await;
+    assert_eq!(status(&r), 201, "{r}");
+
+    spec.idempotency_key = Some("restricted-spawn".to_owned());
+    spec.allow_spawn = true;
+    let spawn = serde_json::to_string(&spec).unwrap();
+    let r = op_request(&srv, RESTRICTED_TOKEN, "POST /v1/jobs", Some(&spawn)).await;
+    assert_eq!(status(&r), 403, "{r}");
+    assert!(body_str(&r).contains("allow_spawn"), "{r}");
+    // The same body is fine for an unrestricted operator.
+    let r = op_request(&srv, OP_TOKEN, "POST /v1/jobs", Some(&spawn)).await;
+    assert_eq!(status(&r), 201, "{r}");
+
+    let r = op_request(&srv, EXPIRED_TOKEN, "GET /v1/status", None).await;
+    assert_eq!(status(&r), 401, "{r}");
     let _ = srv.shutdown.send(());
 }

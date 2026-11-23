@@ -760,11 +760,80 @@ pub struct ControllerGroup {
     pub max_running: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ControllerOperator {
     pub name: String,
     pub token_sha256: String,
+    /// What the token may do. Defaults to `operator` so existing configurations keep working.
+    #[serde(default)]
+    pub role: OperatorRole,
+    /// Refuses the token from this UTC instant on, written `YYYY-MM-DDTHH:MM:SSZ`.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Refuses job fields that widen what a job may do (spawning children, publishing to the
+    /// source branch, accepting scrubbed patches) when this token submits or edits a job.
+    #[serde(default)]
+    pub restrict_fields: bool,
+}
+
+/// An operator token's role. `viewer` is read-only and never sees task text, context, logs or
+/// artifacts; `operator` is the full operator API; `admin` is reserved for node-affecting
+/// configuration routes and is currently the same as `operator`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OperatorRole {
+    Viewer,
+    #[default]
+    Operator,
+    Admin,
+}
+
+/// Seconds since the Unix epoch for a strict `YYYY-MM-DDTHH:MM:SSZ` UTC timestamp.
+pub fn parse_utc_timestamp(text: &str) -> Option<i64> {
+    let b = text.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let part = &text[from..to];
+        if part.bytes().all(|c| c.is_ascii_digit()) {
+            part.parse().ok()
+        } else {
+            None
+        }
+    };
+    let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (hour, minute, second) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if leap => 29,
+        _ => 28,
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return None;
+    }
+    // Days from civil (proleptic Gregorian), counted from 1970-01-01.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 /// Where the agent obtains a job's base tree.
@@ -1037,6 +1106,25 @@ impl Config {
     fn validate_audit(&self) -> Result<(), ConfigError> {
         if let Some(audit) = &self.audit {
             validate_abs_no_dotdot("[audit]", "path", &audit.path)?;
+        }
+        // Tokens that exist to be handed to a UI must leave a record of what they did.
+        let audit_off = self.audit.as_ref().is_none_or(|a| a.path.is_empty());
+        if audit_off {
+            if let Some(controller) = &self.controller {
+                if let Some(op) = controller
+                    .operators
+                    .iter()
+                    .find(|op| op.role == OperatorRole::Viewer || op.restrict_fields)
+                {
+                    return invalid(
+                        "[audit]",
+                        format!(
+                            "path is required while operator {} has role viewer or restrict_fields",
+                            op.name
+                        ),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1721,6 +1809,14 @@ impl ControllerConfig {
                 return invalid(&table, "name is used by an earlier operator".to_owned());
             }
             validate_sha256(&table, &op.token_sha256)?;
+            if let Some(expiry) = &op.expires_at {
+                if parse_utc_timestamp(expiry).is_none() {
+                    return invalid(
+                        &table,
+                        "expires_at must be a UTC time like 2030-01-31T12:00:00Z".to_owned(),
+                    );
+                }
+            }
             if ohashes.contains(&op.token_sha256) {
                 return invalid(
                     &table,
@@ -2637,7 +2733,7 @@ mod tests {
         }
     }
 
-    fn controller_only() -> String {
+    pub(super) fn controller_only() -> String {
         format!(
             r#"
 [controller]
@@ -3701,6 +3797,7 @@ heartbeat_secs = 15
 
 #[cfg(test)]
 mod operator_tests {
+    use super::tests::controller_only;
     use super::*;
 
     #[test]
@@ -3726,5 +3823,70 @@ mod operator_tests {
         )
         .unwrap();
         assert!(load_operator(&path).is_err());
+    }
+
+    #[test]
+    fn operator_roles_expiry_and_audit_requirement() {
+        let base = controller_only();
+        // Defaults keep existing configurations valid.
+        assert!(Config::parse(&base).is_ok());
+        let digest = "7f".repeat(32);
+        let with_operator = |extra: &str, audit: bool| {
+            let mut text = base.clone();
+            text.push_str(&format!(
+                "\n[[controller.operators]]\nname = \"ui\"\ntoken_sha256 = \"{digest}\"\n{extra}\n"
+            ));
+            if audit {
+                text.push_str("\n[audit]\npath = \"/var/log/lu/audit.jsonl\"\n");
+            }
+            text
+        };
+        // Viewer and restrict_fields need an audit record.
+        assert!(Config::parse(&with_operator("role = \"viewer\"", false)).is_err());
+        assert!(Config::parse(&with_operator("restrict_fields = true", false)).is_err());
+        let cfg = Config::parse(&with_operator(
+            "role = \"viewer\"\nrestrict_fields = true",
+            true,
+        ))
+        .unwrap();
+        let controller = cfg.controller.unwrap();
+        let op = controller
+            .operators
+            .iter()
+            .find(|o| o.name == "ui")
+            .unwrap();
+        assert_eq!(op.role, OperatorRole::Viewer);
+        assert!(op.restrict_fields);
+        // Expiry is a strict UTC timestamp.
+        assert!(Config::parse(&with_operator(
+            "expires_at = \"2030-01-31T12:00:00Z\"",
+            false
+        ))
+        .is_ok());
+        for bad in [
+            "2030-01-31",
+            "2030-02-30T00:00:00Z",
+            "2030-01-31T12:00:00+01:00",
+        ] {
+            let text = with_operator(&format!("expires_at = \"{bad}\""), false);
+            assert!(Config::parse(&text).is_err(), "{bad}");
+        }
+        assert!(Config::parse(&with_operator("role = \"root\"", true)).is_err());
+    }
+
+    #[test]
+    fn utc_timestamps_parse_to_unix_seconds() {
+        assert_eq!(parse_utc_timestamp("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_utc_timestamp("2000-03-01T00:00:00Z"),
+            Some(951_868_800)
+        );
+        assert_eq!(
+            parse_utc_timestamp("2024-02-29T23:59:59Z"),
+            Some(1_709_251_199)
+        );
+        assert_eq!(parse_utc_timestamp("2023-02-29T00:00:00Z"), None);
+        assert_eq!(parse_utc_timestamp("2030-13-01T00:00:00Z"), None);
+        assert_eq!(parse_utc_timestamp("2030-01-01 00:00:00Z"), None);
     }
 }
