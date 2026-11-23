@@ -65,7 +65,7 @@ fn intake_cfg(secret_file: &str) -> IntakeConfig {
             secret_file: secret_file.to_owned(),
             header: "X-Signature".to_owned(),
             max_body_bytes: 64 * 1024,
-            rate_per_minute: 3,
+            rate_per_minute: 2,
             dedupe_header: Some("X-Delivery".to_owned()),
             dedupe_ttl_secs: 60,
             allow_plain_http: true,
@@ -296,7 +296,8 @@ async fn signed_deliveries_are_drafts_and_failure_modes_are_indistinguishable() 
     .await;
     assert_eq!(status, 204, "{dropped}");
 
-    // The rate limit is third in this sequence: accepted, dropped, then limited.
+    // The rate limit is third in this sequence: accepted, dropped, then limited. The replay above
+    // does not consume a slot.
     let other = body("alice", "delivery-4");
     let other_sig = signature(&other);
     let (status, limited) = request(
@@ -620,5 +621,56 @@ async fn oversized_intake_body_is_rejected_before_hmac() {
         &signed(&payload, "delivery-1", Some("bad"), "alice"),
     )
     .await;
+    // The router caps buffering at the configured source limit, so the oversized body is refused
+    // before the handler can hash it or check the signature.
+    assert_eq!(status, 413, "{text}");
+
+    let small = "{}";
+    let (status, text) = request(server.addr, &signed(small, "delivery-2", None, "alice")).await;
     assert_eq!(status, 401, "{text}");
+}
+
+#[tokio::test]
+async fn retransmitted_deliveries_do_not_burn_rate_capacity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let secret = tmp.path().join("secret");
+    std::fs::write(&secret, SECRET).unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let server = start(intake_cfg(secret.to_str().unwrap())).await;
+
+    let payload = body("alice", "delivery-1");
+    let sig = signature(&payload);
+    let (status, accepted) = request(
+        server.addr,
+        &signed(&payload, "delivery-1", Some(&sig), "alice"),
+    )
+    .await;
+    assert_eq!(status, 202, "{accepted}");
+
+    for _ in 0..3 {
+        let (status, replay) = request(
+            server.addr,
+            &signed(&payload, "delivery-1", Some(&sig), "alice"),
+        )
+        .await;
+        assert_eq!(status, 204, "{replay}");
+    }
+
+    let next = body("alice", "delivery-2");
+    let next_sig = signature(&next);
+    let (status, accepted) = request(
+        server.addr,
+        &signed(&next, "delivery-2", Some(&next_sig), "alice"),
+    )
+    .await;
+    assert_eq!(status, 202, "{accepted}");
+
+    let third = body("alice", "delivery-3");
+    let third_sig = signature(&third);
+    let (status, limited) = request(
+        server.addr,
+        &signed(&third, "delivery-3", Some(&third_sig), "alice"),
+    )
+    .await;
+    assert_eq!(status, 429, "{limited}");
 }

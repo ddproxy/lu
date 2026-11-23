@@ -32,6 +32,8 @@ use crate::state::AppState;
 use crate::time::now;
 
 const NOT_FOUND: &str = "not found";
+/// Audit job id for failures that happen before the lease proves which job the caller owns.
+const UNVERIFIED_JOB: &str = "unknown";
 
 fn not_found() -> ApiError {
     ApiError::not_found(NOT_FOUND)
@@ -433,10 +435,13 @@ async fn child_artifact(
         Err(_) => return Err(ApiError::internal()),
     };
     // Re-scrub at read time as well: the on-disk bytes may predate a scrub rule, and a reader must
-    // never be able to bypass redaction by changing controller configuration after upload.
-    let scrubbed = state
-        .scrubber
-        .scrub(&bytes, file == ArtifactFile::DiffPatch);
+    // never be able to bypass redaction by changing controller configuration after upload. Patches
+    // are scrubbed here even when `scrub_patch` is off, since that option only controls storage.
+    let scrubbed = if file == ArtifactFile::DiffPatch {
+        state.scrubber.scrub_patch_for_read(&bytes)
+    } else {
+        state.scrubber.scrub(&bytes, false)
+    };
     if scrubbed.data.len() > cap {
         return Err(limit("max_artifact_read_bytes"));
     }
@@ -525,6 +530,8 @@ fn result_label(code: ErrorCode) -> &'static str {
     }
 }
 
+/// `job_id` is either the lease-verified job id or `UNVERIFIED_JOB`; a caller-supplied id must
+/// never become an audit principal before `leased_job` has validated it.
 fn audit_scope(
     state: &Arc<AppState>,
     action: ScopeAction,
@@ -594,7 +601,7 @@ pub async fn handle(
             &state,
             action,
             "limit_exceeded",
-            request.job_id.as_str(),
+            UNVERIFIED_JOB,
             node.as_str(),
             request.epoch,
         );
@@ -620,7 +627,7 @@ pub async fn handle(
                 &state,
                 action,
                 "not_found",
-                request.job_id.as_str(),
+                UNVERIFIED_JOB,
                 node.as_str(),
                 epoch,
             );
@@ -633,7 +640,7 @@ pub async fn handle(
                 &state,
                 action,
                 "stale_epoch",
-                request.job_id.as_str(),
+                UNVERIFIED_JOB,
                 node.as_str(),
                 epoch,
             );
@@ -647,7 +654,7 @@ pub async fn handle(
                 &state,
                 action,
                 outcome,
-                request.job_id.as_str(),
+                UNVERIFIED_JOB,
                 node.as_str(),
                 epoch,
             );
@@ -659,7 +666,7 @@ pub async fn handle(
                 &state,
                 action,
                 "internal",
-                request.job_id.as_str(),
+                UNVERIFIED_JOB,
                 node.as_str(),
                 epoch,
             );

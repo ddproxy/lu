@@ -3883,3 +3883,33 @@ async fn status_summarises_provider_states_across_online_nodes() {
     );
     let _ = srv.shutdown.send(());
 }
+
+#[tokio::test]
+async fn mirror_failures_return_a_generic_internal_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("absent-repository");
+    let url = format!("file://{}", missing.display());
+    let srv = start_server_with_repos(vec![repo_entry(&url)]).await;
+
+    let synced = raw_request(srv.addr, &operator_post("/v1/repos/local/sync")).await;
+    assert_eq!(status(&synced), 500, "{synced}");
+    assert!(body_str(&synced).contains("internal error"), "{synced}");
+    assert!(!body_str(&synced).contains("absent-repository"), "{synced}");
+
+    let mut spec = sample_spec(None);
+    spec.repo = url.clone();
+    spec.source.repo = url;
+    spec.git_ref = "main".to_owned();
+    spec.source.git_ref = "main".to_owned();
+    let submitted = post_job(srv.addr, &spec).await;
+    assert_eq!(status(&submitted), 500, "{submitted}");
+    assert!(
+        body_str(&submitted).contains("internal error"),
+        "{submitted}"
+    );
+    assert!(
+        !body_str(&submitted).contains("absent-repository"),
+        "{submitted}"
+    );
+    let _ = srv.shutdown.send(());
+}

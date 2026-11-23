@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 
 pub use throttle::{LoginThrottle, ThrottleSettings};
 
+/// Largest presented bearer value accepted by the controller.
+pub const MAX_BEARER_TOKEN_BYTES: usize = 8 * 1024;
+
 /// Lowercase hex SHA-256 of `input`.
 pub fn sha256_hex(input: &str) -> String {
     Sha256::digest(input.as_bytes())
@@ -27,8 +30,9 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// The token in an `Authorization` value: `Bearer <token>`, with a case-insensitive scheme.
-/// Returns `None` for any other scheme and for a token that is empty or holds anything but
-/// visible ASCII, so a header with control characters or spaces never reaches the hash.
+/// Returns `None` for any other scheme, for a token over [`MAX_BEARER_TOKEN_BYTES`], and for a
+/// token that is empty or holds anything but visible ASCII, so a header with control characters
+/// or spaces never reaches the hash.
 pub fn bearer_token(value: &str) -> Option<&str> {
     let (scheme, rest) = value
         .trim_ascii()
@@ -37,8 +41,10 @@ pub fn bearer_token(value: &str) -> Option<&str> {
         return None;
     }
     let token = rest.trim_ascii();
-    let visible = !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic());
-    visible.then_some(token)
+    let acceptable = !token.is_empty()
+        && token.len() <= MAX_BEARER_TOKEN_BYTES
+        && token.bytes().all(|b| b.is_ascii_graphic());
+    acceptable.then_some(token)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -183,11 +189,14 @@ mod tests {
     }
 
     #[test]
-    fn a_very_long_token_is_hashed_not_rejected() {
-        let long = "a".repeat(64 * 1024);
-        let value = format!("Bearer {long}");
-        assert_eq!(bearer_token(&value).map(str::len), Some(long.len()));
-        assert_eq!(sha256_hex(&long).len(), 64);
+    fn bearer_values_are_capped_at_eight_kibibytes() {
+        let capped = "a".repeat(MAX_BEARER_TOKEN_BYTES);
+        assert_eq!(
+            bearer_token(&format!("Bearer {capped}")).map(str::len),
+            Some(capped.len())
+        );
+        let too_long = "a".repeat(MAX_BEARER_TOKEN_BYTES + 1);
+        assert_eq!(bearer_token(&format!("Bearer {too_long}")), None);
     }
 
     #[test]

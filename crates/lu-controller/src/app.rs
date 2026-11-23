@@ -55,7 +55,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let log_body = DefaultBodyLimit::max(crate::routes::MAX_LOG_CHUNK_BODY);
     let diff_body = DefaultBodyLimit::max(crate::routes::MAX_DIFF_BODY);
     let report_body = DefaultBodyLimit::max(crate::routes::MAX_REPORT_BODY);
-    let intake_body = DefaultBodyLimit::max(16 * 1024 * 1024);
+    // Bound body buffering by the configured intake cap, not a flat 16 MiB: an unsigned caller
+    // cannot make a small-cap source buffer a much larger request before its cap is checked.
+    let intake_body = DefaultBodyLimit::max(
+        state
+            .intake
+            .as_ref()
+            .map_or(0, |intake| intake.max_body_bytes_limit()),
+    );
 
     let operator = Router::new()
         .route(

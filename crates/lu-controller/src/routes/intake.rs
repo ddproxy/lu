@@ -1,5 +1,5 @@
 use crate::error::ApiError;
-use crate::intake::{to_spec, Decision};
+use crate::intake::{to_spec, Decision, INTAKE_KEY_PREFIX};
 use crate::routes::{json_value_ok, store_err};
 use crate::state::AppState;
 use axum::body::Bytes;
@@ -60,7 +60,8 @@ pub async fn intake(
         return outcome(&state, source, Decision::Invalid);
     };
     let delivery_id = crate::intake::body_dedupe_id(&body);
-    match intake.admit(&name, Some(&delivery_id)) {
+    let (decision, ticket) = intake.admit(&name, Some(&delivery_id));
+    match decision {
         Decision::Accepted { .. } => {}
         other => return outcome(&state, source, other),
     }
@@ -71,8 +72,8 @@ pub async fn intake(
     };
     let mut spec = to_spec(&job, source, Some(&delivery_id));
     if spec.idempotency_key.is_none() {
-        let mut key = String::with_capacity("intake-".len() + delivery_id.len());
-        key.push_str("intake-");
+        let mut key = String::with_capacity(INTAKE_KEY_PREFIX.len() + delivery_id.len());
+        key.push_str(INTAKE_KEY_PREFIX);
         key.push_str(&delivery_id);
         spec.idempotency_key = Some(key);
     }
@@ -87,7 +88,7 @@ pub async fn intake(
         let commit = match pinned {
             Ok(Ok(commit)) => commit,
             _ => {
-                intake.rollback(&name, Some(&delivery_id));
+                intake.rollback(&name, ticket, Some(&delivery_id));
                 return outcome(&state, source, Decision::Invalid);
             }
         };
@@ -100,7 +101,7 @@ pub async fn intake(
             field = error.field(),
             "intake rule produced an invalid spec"
         );
-        intake.rollback(&name, Some(&delivery_id));
+        intake.rollback(&name, ticket, Some(&delivery_id));
         return outcome(&state, source, Decision::Invalid);
     }
 
@@ -120,16 +121,16 @@ pub async fn intake(
     let (record, _new) = match created {
         Ok(Ok(result)) => result,
         Ok(Err(lu_store::StoreError::LimitExceeded(limit))) => {
-            intake.rollback(&name, Some(&delivery_id));
+            intake.rollback(&name, ticket, Some(&delivery_id));
             state.record_intake(source, "invalid");
             return ApiError::limit_exceeded(limit).into_response();
         }
         Ok(Err(error)) => {
-            intake.rollback(&name, Some(&delivery_id));
+            intake.rollback(&name, ticket, Some(&delivery_id));
             return store_err(error).into_response();
         }
         Err(_) => {
-            intake.rollback(&name, Some(&delivery_id));
+            intake.rollback(&name, ticket, Some(&delivery_id));
             return ApiError::internal().into_response();
         }
     };
