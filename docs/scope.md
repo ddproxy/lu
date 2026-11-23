@@ -118,7 +118,7 @@ A child starts from its parent's spec with the harness-facing choices clamped by
 ## Lineage and operator views
 
 Jobs carry `parent_job_id`, `root_job_id` and `depth` (top-level jobs are depth 0). These columns
-are part of the schema 4 baseline; schema 1, 2 and 3 databases gain them in place at startup. Operators
+are part of the baseline since schema 4; older databases gain them in place at startup. Operators
 retain full visibility: `lu ls --tree` groups jobs by parent, `lu show` prints parent, root, depth
 and the spawn settings, and `lu top` marks a spawned job with `scope:d<depth>`.
 

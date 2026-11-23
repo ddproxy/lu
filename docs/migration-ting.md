@@ -24,7 +24,7 @@ The controller keeps its own `/etc/lu/lu.toml`, `/etc/lu/operator.token`, `/etc/
 - **Metrics.** Controller `/metrics` series keep their `lu_*` prefixes, including the node views. There were no `lu_agent_*` series to rename.
 - **Config keys.** Unknown keys remain errors; no legacy aliases or compatibility shims were added.
 - **Credentials.** Token files are still private files (`0600` or tighter) owned by the account that reads them. Tokens are never logged or stored in the database.
-- **Store schema.** There is still a single baseline (currently version 4); this rename does not bump a schema version or require a migration of the controller database.
+- **Store schema.** There is still a single baseline (currently version 6); this rename does not bump a schema version or require a migration of the controller database.
 - **Release archives.** Names stay `lu-<tag>-<target>.tar.gz` and now contain both `lu` and `ting`. Repository links moved from `ddproxy/lu` to `ddproxy/tuishou-lu`.
 
 ## Steps

@@ -5,6 +5,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Docs state the current schema (6) and its in-place migration from versions 1 to 5, and `docs/operations.md` gains an "Upgrading the controller" section. A docs test fails when a page names a different schema version as the current one.
+
 ## [0.6.0]
 
 Schema version 6: controllers migrate in place from 5 on first start (an additive `jobs.eligible_since` column). Stop the controller, keep the dated database copy the playbook makes, then start the new binary.

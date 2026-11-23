@@ -1,10 +1,5 @@
 # Notes
 
-- Schema version drift: `lu_store::SCHEMA_VERSION` is `6`, but several docs still describe version
-  `4` as the current baseline (for example the note about `parent_job_id`/`root_job_id`/`depth` in
-  [docs/api.md](docs/api.md)). The code creates new databases at version `6` and migrates versions
-  `1` through `5` in place by adding columns. `docs/monitoring.md` and its `lu status` example were
-  updated to `6`; the remaining prose is left for a separate docs cleanup.
 - Job retention: Lu has no `DELETE FROM jobs` path. Node contribution counters are recomputed from
   the persistent `jobs` table, so they stay monotonic across controller restarts. A `since` window
   narrows the report by design and is not a monotonic counter source. If pruning is added later,
@@ -37,11 +32,7 @@ No database schema change was needed.
   idempotent when not drained, and returns `StoreError::Conflict` for an operator drain, which the
   route maps to `409 conflict`. Both use an immediate transaction and refuse nodes that have never
   heartbeated (`404`).
-- **Schema version.** `crates/lu-store/src/lib.rs` defines `SCHEMA_VERSION = 5`; no migration,
-  column or baseline change was introduced and the version was left at 5. Several existing docs
-  still describe a single schema-4 baseline and schema-4 backup/restore rules (for example
-  `docs/operations.md` and `docs/api.md`); that pre-existing drift is recorded here rather than
-  silently rewritten, because this change does not touch backup or migration policy.
+
 - **Rate limiting and error shape.** The new routes go through the same `authenticate_agent` +
   shared auth throttle as the other agent routes; there is no new per-route quota. Rejections use
   the shared `ApiError` envelope `{"error":"...","message":"..."}` with the same codes and

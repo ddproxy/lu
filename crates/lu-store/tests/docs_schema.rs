@@ -1,0 +1,62 @@
+//! Keeps the prose about the database schema in step with the code: a sentence that names "schema
+//! version N" as the current one must use `SCHEMA_VERSION`.
+
+use lu_store::SCHEMA_VERSION;
+use std::path::Path;
+
+/// Words that mark a sentence as history or migration rather than a statement of the current schema.
+const HISTORICAL: [&str; 6] = ["migrat", "older", "from ", "gain", "previous", "bump"];
+
+fn mentions(line: &str) -> Vec<i64> {
+    let lower = line.to_ascii_lowercase();
+    let mut found = Vec::new();
+    for marker in [
+        "schema version ",
+        "schema_version\": ",
+        "baseline (currently version ",
+    ] {
+        let mut rest = lower.as_str();
+        while let Some(at) = rest.find(marker) {
+            let after = rest[at + marker.len()..].trim_start_matches(['`', '"']);
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(n) = digits.parse() {
+                found.push(n);
+            }
+            rest = &rest[at + marker.len()..];
+        }
+    }
+    found
+}
+
+#[test]
+fn docs_name_the_current_schema_version() {
+    let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+    let mut stale = Vec::new();
+    for entry in std::fs::read_dir(&docs).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "md") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        for (number, line) in text.lines().enumerate() {
+            let lower = line.to_ascii_lowercase();
+            if HISTORICAL.iter().any(|word| lower.contains(word)) {
+                continue;
+            }
+            for version in mentions(line) {
+                if version != SCHEMA_VERSION {
+                    stale.push(format!(
+                        "{}:{}: says schema version {version}, code is {SCHEMA_VERSION}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        number + 1
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "stale schema statements:\n{}",
+        stale.join("\n")
+    );
+}
