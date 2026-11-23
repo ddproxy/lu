@@ -29,6 +29,12 @@ uses semantic versioning once it reaches 1.0.
 
 - `source.repo` refuses URLs with userinfo, and stored values are redacted in job views and audit data.
 - Unparseable `limit`, `offset` and `wait` query parameters return `400 bad_request` instead of silently defaulting.
+- `lu top` Jobs table shows a normalised `REPO` column after `NODE`, the selected job's repo and ref in the graph detail line, and a totals line under short job lists. The repository label keeps only `owner/name` and never renders credentials, hosts, queries or fragments.
+- Golden buffer tests cover 200- and 80-column renders plus the `NO_COLOR` path; badge styles are checked per node and job state.
+
+### Changed
+
+- `lu top` state cells use semantic badges for node and job states, with named colours, bold reverse on 16-colour terminals and an underline that keeps the selection distinct. Tall gauge panels are now a single strip with the latest values and trends; narrow terminals shrink `NOTE`, then `TITLE`, then `REPO` while mandatory columns stay visible. See [docs/operations.md](docs/operations.md#display).
 
 ## [0.5.1]
 

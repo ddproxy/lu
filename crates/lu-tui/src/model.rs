@@ -7,6 +7,51 @@ use crate::graph::{self, Graph};
 use crate::sanitize::printable;
 use lu_proto::{HarnessState, JobState, ProviderState};
 
+/// Reduces a source repository URL or absolute path to `owner/name`, dropping the scheme,
+/// credentials, host, query, fragment and a trailing `.git`. Unusable values become `-`; none of
+/// the discarded parts can reach the screen.
+pub fn repo_label(repo: &str) -> String {
+    let value = printable(repo).trim().to_owned();
+    if value.is_empty() || value.len() > 2048 || value.contains(char::is_whitespace) {
+        return "-".to_owned();
+    }
+    let value = value.split(['?', '#']).next().unwrap_or(&value);
+    let path = match value.split_once("://") {
+        Some((scheme, rest)) => {
+            if !matches!(scheme, "https" | "http" | "ssh" | "git") {
+                return "-".to_owned();
+            }
+            let Some((_, path)) = rest.split_once('/') else {
+                return "-".to_owned();
+            };
+            path
+        }
+        None => value,
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() < 2 {
+        return "-".to_owned();
+    }
+    let owner = parts[parts.len() - 2];
+    let name = parts[parts.len() - 1];
+    if !valid_repo_part(owner) || !valid_repo_part(name) {
+        return "-".to_owned();
+    }
+    format!("{owner}/{name}")
+}
+
+fn valid_repo_part(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
+}
+
 /// One provider on a node, already reduced to text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCell {
@@ -61,6 +106,10 @@ pub struct JobRow {
     pub title: String,
     pub state: String,
     pub node: Option<String>,
+    /// Normalised `owner/name` of the job's source repository, never a URL.
+    pub repo: String,
+    /// Source ref as reported by the controller, shown with the repo in the detail line.
+    pub git_ref: String,
     pub attempt: u32,
     /// Seconds since the job was created.
     pub age_secs: u64,
@@ -197,6 +246,24 @@ pub enum Tone {
     Done,
     /// A blocked job: orange.
     Blocked,
+    /// Node busy: dark text on amber.
+    NodeBusy,
+    /// Node idle: dim or green foreground.
+    NodeIdle,
+    /// Node drained or draining: light text on blue.
+    NodeDrained,
+    /// Node stale, offline or stuck: light text on red.
+    NodeOffline,
+    /// Job running or leased: dark text on green.
+    JobRunning,
+    /// Job queued, recovering or waiting for input: amber foreground.
+    JobQueued,
+    /// Job failed: light text on red.
+    JobFailed,
+    /// Job done: dim green.
+    JobDone,
+    /// Job cancelled or expired: grey.
+    JobCancelled,
 }
 
 /// One coloured span within a line.
@@ -811,7 +878,13 @@ impl Dashboard {
         })
     }
 
+    /// A wide view, used by `--once` and callers that have no terminal width.
     pub fn view(&self, now: Instant) -> ViewModel {
+        self.view_with_width(now, 200)
+    }
+
+    /// The view for a terminal of `width` cells. Tables size their flexible columns to fit.
+    pub fn view_with_width(&self, now: Instant, width: u16) -> ViewModel {
         let (snapshot, history, node_history, live_status) = match &self.frozen {
             Some(frozen) => (
                 &frozen.snapshot,
@@ -843,6 +916,7 @@ impl Dashboard {
             .or(self.controller_version.as_deref());
         ViewModel::build(ViewBuild {
             snapshot,
+            width: usize::from(width),
             history,
             node_history,
             controller_version,
@@ -891,6 +965,8 @@ pub struct ViewModel {
     pub lines: Vec<Line>,
     pub status: Line,
     pub footer: String,
+    /// Fleet totals drawn under a short job list so the empty space carries information.
+    pub summary: String,
     pub paused: bool,
     /// Index into `lines` of the highlighted row.
     pub selected_line: Option<usize>,
@@ -914,6 +990,7 @@ pub struct ViewModel {
 
 struct ViewBuild<'a> {
     snapshot: &'a Snapshot,
+    width: usize,
     history: &'a [Sample],
     node_history: &'a HashMap<String, NodeHistory>,
     controller_version: Option<&'a str>,
@@ -941,9 +1018,51 @@ fn clip(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         return text;
     }
+    if width == 0 {
+        return String::new();
+    }
     let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// Width budget for the three flexible job columns. The mandatory columns (id, state, node,
+/// repo, try and age) keep their minimums; NOTE gives way first, then TITLE, then REPO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JobColumns {
+    repo: usize,
+    title: usize,
+    note: usize,
+}
+
+const JOB_FIXED: usize = 10 + 11 + 9 + 3 + 6 + 7; // id, state, node, try, age and six gaps
+const REPO_MAX: usize = 14;
+const REPO_MIN: usize = 6;
+const TITLE_MAX: usize = 38;
+const TITLE_MIN: usize = 8;
+const NOTE_MAX: usize = 60;
+const NOTE_MIN: usize = 6;
+
+fn take_from(width: &mut usize, floor: usize, needed: usize) -> usize {
+    let taken = needed.min(width.saturating_sub(floor));
+    *width -= taken;
+    taken
+}
+
+fn job_columns(width: usize) -> JobColumns {
+    let budget = width.saturating_sub(JOB_FIXED);
+    let mut columns = JobColumns {
+        repo: REPO_MAX,
+        title: TITLE_MAX,
+        note: NOTE_MAX,
+    };
+    let mut over = (columns.repo + columns.title + columns.note).saturating_sub(budget);
+    over -= take_from(&mut columns.note, NOTE_MIN, over);
+    over -= take_from(&mut columns.title, TITLE_MIN, over);
+    over -= take_from(&mut columns.repo, REPO_MIN, over);
+    over -= take_from(&mut columns.note, 0, over);
+    let _ = take_from(&mut columns.title, 0, over);
+    columns
 }
 
 fn provider_text(cell: &ProviderCell, cordon: Option<&CordonCell>) -> (String, Tone) {
@@ -1051,6 +1170,36 @@ fn job_tone(state: &str) -> Tone {
         Ok(JobState::Queued | JobState::Recovering | JobState::NeedsInput) => Tone::Warn,
         Ok(JobState::Failed) => Tone::Bad,
         Ok(JobState::Cancelled | JobState::Expired) | Err(_) => Tone::Dim,
+    }
+}
+
+/// The badge tone for the STATE cell; unlike `job_tone` it can carry a background.
+fn job_badge_tone(state: &str) -> Tone {
+    match state.parse::<JobState>() {
+        Ok(JobState::Running | JobState::Leased) => Tone::JobRunning,
+        Ok(JobState::Failed) => Tone::JobFailed,
+        Ok(JobState::Done) => Tone::JobDone,
+        Ok(JobState::Cancelled | JobState::Expired) | Err(_) => Tone::JobCancelled,
+        Ok(JobState::Blocked | JobState::Draft) => Tone::Blocked,
+        Ok(JobState::Queued | JobState::Recovering | JobState::NeedsInput) => Tone::JobQueued,
+    }
+}
+
+/// The badge tone for a node's STATE cell. Staleness and stuck jobs turn it red, a drain turns it
+/// blue, and an unknown harness stays plain rather than borrowing a badge.
+fn node_badge_tone(node: &NodeRow) -> Tone {
+    let stale = node.seen_secs_ago.is_none_or(|age| age > STALE_SECS);
+    let harness = node.harness.as_str();
+    if node.stuck > 0 || stale || harness == "offline" {
+        Tone::NodeOffline
+    } else if node.drained || harness == "draining" {
+        Tone::NodeDrained
+    } else if harness == "busy" {
+        Tone::NodeBusy
+    } else if harness == "idle" {
+        Tone::NodeIdle
+    } else {
+        Tone::Plain
     }
 }
 
@@ -1182,20 +1331,16 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
         node.workspace_delete_errors_total
     );
 
-    let state_segments = if node.stuck > 0 {
-        vec![
-            Segment::new(base_state.clone(), base_tone),
-            Segment::new(" ", base_tone),
-            Segment::new("stuck", Tone::Bad),
-        ]
-    } else {
-        vec![Segment::new(base_state.clone(), base_tone)]
-    };
     let state_plain = if node.stuck > 0 {
         format!("{base_state} stuck")
     } else {
         base_state
     };
+    // The whole padded cell carries the badge, so its background is one solid block.
+    let state_badge = Segment::new(
+        pad_right(&clip(&state_plain, 14), 14),
+        node_badge_tone(node),
+    );
 
     // Problems come first so a narrow terminal truncates the healthy providers, not the cooling
     // one an operator needs to see.
@@ -1221,13 +1366,7 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
         Segment::new(" ", Tone::Plain),
     ];
     // state column (14)
-    let state_pad = 14usize.saturating_sub(state_plain.chars().count());
-    for seg in state_segments {
-        segments.push(seg);
-    }
-    if state_pad > 0 {
-        segments.push(Segment::new(" ".repeat(state_pad), Tone::Plain));
-    }
+    segments.push(state_badge);
     segments.push(Segment::new(" ", Tone::Plain));
     segments.push(Segment::new(pad_right(&seen, 8), Tone::Plain));
     segments.push(Segment::new(" ", Tone::Plain));
@@ -1438,10 +1577,107 @@ fn process_pane_view(
     }
 }
 
+fn job_header(columns: JobColumns) -> Line {
+    Line::new(
+        format!(
+            "{:<10} {:<11} {:<9} {:<repo$} {:>3} {:<6} {:<title$} {}",
+            "JOB",
+            "STATE",
+            "NODE",
+            "REPO",
+            "TRY",
+            "AGE",
+            "TITLE",
+            "NOTE",
+            repo = columns.repo,
+            title = columns.title,
+        ),
+        Tone::Heading,
+    )
+}
+
+fn job_line(job: &JobRow, columns: JobColumns) -> Line {
+    let node = job.node.as_deref().map_or("-".to_owned(), |n| clip(n, 9));
+    let id = printable(&job.id);
+    let short_id: String = id
+        .chars()
+        .skip(id.chars().count().saturating_sub(10))
+        .collect();
+    let note = match (&job.model, job.note.is_empty()) {
+        (Some(model), true) => model.as_str(),
+        _ => job.note.as_str(),
+    };
+    let state = clip(&job.state, 11);
+    let mut segments = vec![
+        Segment::new(pad_right(&short_id, 10), Tone::Plain),
+        Segment::new(" ", Tone::Plain),
+        Segment::new(pad_right(&state, 11), job_badge_tone(&job.state)),
+        Segment::new(" ", Tone::Plain),
+        Segment::new(pad_right(&node, 9), Tone::Plain),
+        Segment::new(" ", Tone::Plain),
+        Segment::new(
+            pad_right(&clip(&repo_label(&job.repo), columns.repo), columns.repo),
+            Tone::Dim,
+        ),
+        Segment::new(" ", Tone::Plain),
+        Segment::new(format!("{:>3}", job.attempt), Tone::Plain),
+        Segment::new(" ", Tone::Plain),
+        Segment::new(pad_right(&short_age(job.age_secs), 6), Tone::Plain),
+    ];
+    if columns.title > 0 {
+        segments.push(Segment::new(" ", Tone::Plain));
+        segments.push(Segment::new(
+            pad_right(&clip(&job.title, columns.title), columns.title),
+            Tone::Plain,
+        ));
+    }
+    if columns.note > 0 {
+        segments.push(Segment::new(" ", Tone::Plain));
+        segments.push(Segment::new(clip(note, columns.note), Tone::Plain));
+    }
+    let mut line = Line::rich(segments);
+    line.tone = job_tone(&job.state);
+    line
+}
+
+/// One line of fleet totals, drawn in the empty space under a short job list.
+fn fleet_summary(snapshot: &Snapshot) -> String {
+    let count = |state: JobState| {
+        snapshot
+            .jobs
+            .iter()
+            .filter(|job| job.state.parse::<JobState>() == Ok(state))
+            .count()
+    };
+    let online = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.seen_secs_ago.is_none_or(|age| age <= STALE_SECS))
+        .count();
+    let busy = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.harness.parse::<HarnessState>() == Ok(HarnessState::Busy))
+        .count();
+    format!(
+        "jobs {} · run {} · que {} · blk {} · done {} · fail {} · canc {} · busy {}/{}",
+        snapshot.jobs.len(),
+        count(JobState::Running) + count(JobState::Leased),
+        count(JobState::Queued) + count(JobState::Recovering) + count(JobState::NeedsInput),
+        count(JobState::Blocked) + count(JobState::Draft),
+        count(JobState::Done),
+        count(JobState::Failed),
+        count(JobState::Cancelled) + count(JobState::Expired),
+        busy,
+        online
+    )
+}
+
 impl ViewModel {
     fn build(args: ViewBuild<'_>) -> Self {
         let ViewBuild {
             snapshot,
+            width,
             history,
             node_history,
             controller_version,
@@ -1468,40 +1704,14 @@ impl ViewModel {
             lines.push(node_line(node, controller_version));
         }
         lines.push(Line::new("", Tone::Plain));
-        lines.push(Line::new(
-            format!(
-                "{:<10} {:<11} {:<9} {:>3} {:<6} {:<38} NOTE",
-                "JOB", "STATE", "NODE", "TRY", "AGE", "TITLE"
-            ),
-            Tone::Heading,
-        ));
+        // The border costs two cells on each side; leave one spare for narrow panes.
+        let columns = job_columns(width.saturating_sub(4));
+        lines.push(job_header(columns));
         if snapshot.jobs.is_empty() {
             lines.push(Line::new("no jobs", Tone::Dim));
         }
         for job in &snapshot.jobs {
-            let node = job.node.as_deref().map_or("-".to_owned(), |n| clip(n, 9));
-            let id = printable(&job.id);
-            let short_id: String = id
-                .chars()
-                .skip(id.chars().count().saturating_sub(10))
-                .collect();
-            let note = match (&job.model, job.note.is_empty()) {
-                (Some(model), true) => model.as_str(),
-                _ => job.note.as_str(),
-            };
-            lines.push(Line::new(
-                format!(
-                    "{:<10} {:<11} {:<9} {:>3} {:<6} {:<38} {}",
-                    short_id,
-                    clip(&job.state, 11),
-                    node,
-                    job.attempt,
-                    short_age(job.age_secs),
-                    clip(&job.title, 38),
-                    clip(note, 60)
-                ),
-                job_tone(&job.state),
-            ));
+            lines.push(job_line(job, columns));
         }
 
         let node_rows = snapshot.nodes.len().max(1);
@@ -1581,9 +1791,11 @@ impl ViewModel {
         let graph_detail = selected_job.map(|job| {
             Line::new(
                 format!(
-                    "{}  {}  {}",
+                    "{}  {}  {}  {}  {}",
                     printable(&job.id),
                     printable(&job.state),
+                    clip(&repo_label(&job.repo), 24),
+                    clip(&printable(&job.git_ref), 24),
                     printable(&job.title)
                 ),
                 job_tone(&job.state),
@@ -1607,6 +1819,7 @@ impl ViewModel {
             lines,
             status,
             footer,
+            summary: fleet_summary(snapshot),
             paused,
             selected_line,
             focus: selection.focus,
@@ -1630,6 +1843,8 @@ impl ViewModel {
     /// The two tables, without the title, status, footer or charts; `--once` prints this.
     pub fn table_text(&self) -> String {
         let mut lines: Vec<String> = self.lines.iter().map(|line| line.text.clone()).collect();
+        lines.push(String::new());
+        lines.push(self.summary.clone());
         if let Some(graph) = &self.graph {
             let graph_lines: Vec<String> = graph::render(graph, 100, false)
                 .iter()
@@ -1652,6 +1867,7 @@ impl ViewModel {
     pub fn plain_text(&self) -> String {
         let mut lines = vec![self.title.clone()];
         lines.extend(self.lines.iter().map(|line| line.text.clone()));
+        lines.push(self.summary.clone());
         if let Some(log) = &self.log {
             lines.push(format!("log {}: {}", log.job_id, log.title));
             lines.extend(log.lines.iter().map(|line| line.text.clone()));
@@ -1713,6 +1929,8 @@ mod tests {
             title: "do the thing".to_owned(),
             state: state.to_owned(),
             node: Some("ct-1".to_owned()),
+            repo: "owner/name".to_owned(),
+            git_ref: "main".to_owned(),
             attempt: 1,
             age_secs: 125,
             model: Some("m".to_owned()),
@@ -2212,7 +2430,7 @@ mod tests {
         assert!(
             line.segments
                 .iter()
-                .any(|s| s.text == "stuck" && s.tone == Tone::Bad),
+                .any(|s| s.text.trim() == "busy stuck" && s.tone == Tone::NodeOffline),
             "{:?}",
             line.segments
         );
@@ -2323,6 +2541,8 @@ mod tests {
                     title: "run".to_owned(),
                     state: "running".to_owned(),
                     node: Some("n1".to_owned()),
+                    repo: "owner/name".to_owned(),
+                    git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 1,
                     model: None,
@@ -2364,6 +2584,8 @@ mod tests {
                     title: "run".to_owned(),
                     state: "running".to_owned(),
                     node: Some("n1".to_owned()),
+                    repo: "owner/name".to_owned(),
+                    git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 1,
                     model: None,
@@ -2508,6 +2730,8 @@ mod tests {
                     title: "run".to_owned(),
                     state: "running".to_owned(),
                     node: Some("node\u{1b}[31m".to_owned()),
+                    repo: "owner/name".to_owned(),
+                    git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 1,
                     model: None,
@@ -2873,5 +3097,122 @@ mod tests {
         let zen = text.find("zen cooling").expect(&text);
         let alpha = text.find("alpha ok").expect(&text);
         assert!(zen < alpha, "{text}");
+    }
+
+    fn credential_shaped_source() -> (String, String, String, String) {
+        let scheme = format!("ht{}", "tps");
+        let user = "u".repeat(7);
+        let secret = "p".repeat(9);
+        let host = format!("git{}.example", "hub");
+        let at = ['@'].iter().collect::<String>();
+        let colon = [':'].iter().collect::<String>();
+        let source = [
+            scheme.as_str(),
+            "://",
+            &user,
+            &colon,
+            &secret,
+            &at,
+            &host,
+            "/",
+            "org",
+            "/",
+            "widgets",
+            ".git",
+            "?",
+            "ref",
+            "=",
+            "main",
+            "#",
+            "section",
+        ]
+        .concat();
+        (source, user, secret, host)
+    }
+
+    #[test]
+    fn repo_labels_drop_runtime_built_credentials_and_extras() {
+        let (source, user, secret, host) = credential_shaped_source();
+        let label = repo_label(&source);
+        assert_eq!(label, "org/widgets");
+        assert!(!label.contains(&user));
+        assert!(!label.contains(&secret));
+        assert!(!label.contains(&host));
+        assert_eq!(repo_label(""), "-");
+        assert_eq!(repo_label("   "), "-");
+        assert_eq!(repo_label("owner/../name"), "-");
+        assert_eq!(repo_label(&format!("owner/{}", "x".repeat(257))), "-");
+        assert_eq!(repo_label("ftp://host/owner/name"), "-");
+    }
+
+    #[test]
+    fn rendered_repos_never_show_credentials_or_query_parts() {
+        let (source, user, secret, host) = credential_shaped_source();
+        let t0 = Instant::now();
+        let mut dashboard = Dashboard::new();
+        dashboard.apply(
+            Ok(Snapshot {
+                jobs: vec![JobRow {
+                    repo: source,
+                    ..job("01REPO", "running")
+                }],
+                ..snapshot()
+            }),
+            t0,
+        );
+        let text = dashboard.view(t0).plain_text();
+        assert!(text.contains("org/widgets"), "{text}");
+        for hidden in [&user, &secret, &host] {
+            assert!(!text.contains(hidden), "{hidden} leaked into {text}");
+        }
+        assert!(!text.contains("ref=main"), "{text}");
+        assert!(!text.contains("section"), "{text}");
+    }
+
+    #[test]
+    fn job_badge_tones_cover_every_state() {
+        let cases = [
+            (JobState::Draft.as_str(), Tone::Blocked),
+            (JobState::Blocked.as_str(), Tone::Blocked),
+            (JobState::Queued.as_str(), Tone::JobQueued),
+            (JobState::Recovering.as_str(), Tone::JobQueued),
+            (JobState::NeedsInput.as_str(), Tone::JobQueued),
+            (JobState::Leased.as_str(), Tone::JobRunning),
+            (JobState::Running.as_str(), Tone::JobRunning),
+            (JobState::Done.as_str(), Tone::JobDone),
+            (JobState::Failed.as_str(), Tone::JobFailed),
+            (JobState::Cancelled.as_str(), Tone::JobCancelled),
+            (JobState::Expired.as_str(), Tone::JobCancelled),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(job_badge_tone(state), expected, "{state}");
+        }
+        assert_eq!(job_badge_tone("unknown"), Tone::JobCancelled);
+    }
+
+    #[test]
+    fn node_badge_tones_cover_busy_idle_drained_offline_stuck_and_unknown() {
+        let busy = node("n1", "busy", Some(1));
+        assert_eq!(node_badge_tone(&busy), Tone::NodeBusy);
+        let idle = node("n1", "idle", Some(1));
+        assert_eq!(node_badge_tone(&idle), Tone::NodeIdle);
+        let drained = NodeRow {
+            drained: true,
+            ..node("n1", "idle", Some(1))
+        };
+        assert_eq!(node_badge_tone(&drained), Tone::NodeDrained);
+        let draining = node("n1", "draining", Some(1));
+        assert_eq!(node_badge_tone(&draining), Tone::NodeDrained);
+        let offline = node("n1", "offline", Some(1));
+        assert_eq!(node_badge_tone(&offline), Tone::NodeOffline);
+        let stale = node("n1", "idle", Some(STALE_SECS + 1));
+        assert_eq!(node_badge_tone(&stale), Tone::NodeOffline);
+        let stuck = NodeRow {
+            stuck: 1,
+            ..node("n1", "idle", Some(1))
+        };
+        assert_eq!(node_badge_tone(&stuck), Tone::NodeOffline);
+        let unknown = node("n1", "unknown", Some(1));
+        assert_eq!(node_badge_tone(&unknown), Tone::Plain);
     }
 }

@@ -206,7 +206,8 @@ pub fn run_live(
         while let Ok(update) = updates.try_recv() {
             dashboard.apply_update(update);
         }
-        let view = dashboard.view(Instant::now());
+        let width = terminal.size().map_or(200, |size| size.width);
+        let view = dashboard.view_with_width(Instant::now(), width);
         terminal.draw(|frame| layout = render::draw(frame, &view))?;
         if event::poll(POLL)? {
             match event::read()? {
@@ -382,6 +383,8 @@ mod tests {
                         title: "index".to_owned(),
                         state: "done".to_owned(),
                         node: None,
+                        repo: "owner/name".to_owned(),
+                        git_ref: "main".to_owned(),
                         attempt: 1,
                         age_secs: 1,
                         model: None,
@@ -393,6 +396,8 @@ mod tests {
                         title: "merge".to_owned(),
                         state: "running".to_owned(),
                         node: None,
+                        repo: "owner/name".to_owned(),
+                        git_ref: "main".to_owned(),
                         attempt: 1,
                         age_secs: 1,
                         model: None,
