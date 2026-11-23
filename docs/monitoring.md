@@ -75,6 +75,14 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_node_workspace_delete_errors_total{node}` | counter | Failed workspace deletions since the agent started; failures are retried with backoff. |
 | `lu_scope_requests_total{route,result}` | counter | Scoped job requests by route and `result` (`ok` or a failure code such as `bad_request`, `limit_exceeded` or `internal`), since controller start. |
 | `lu_scope_limit_exceeded_total{limit}` | counter | Scoped requests refused by a named cap, since controller start; the same names appear in `429 limit_exceeded` errors. |
+| `lu_node_jobs_total{node,state}` | counter | Terminal jobs on a configured node; `state` is `done`, `failed` or `cancelled`. |
+| `lu_node_failures_total{node,class}` | counter | Failed jobs on a configured node by fixed `class`: `node`, `provider`, `execution`, `dependency`, `conflict`. |
+| `lu_node_busy_seconds_total{node}` | counter | Wall-clock job duration on a configured node, in seconds; not CPU time. |
+| `lu_node_job_runtime_seconds_bucket{node,le}`, `lu_node_job_runtime_seconds_count{node}`, `lu_node_job_runtime_seconds_sum{node}` | histogram | Terminal job runtime. Fixed `le` values are `1`, `5`, `15`, `60`, `300`, `900`, `3600`, `21600` and `+Inf` seconds. |
+| `lu_node_job_runtime_seconds_median_seconds{node}`, `lu_node_job_runtime_seconds_p90_seconds{node}` | gauge | All-time median and p90 runtime in seconds, from the same stored terminal jobs. |
+| `lu_node_queue_wait_seconds_bucket{node,le}`, `lu_node_queue_wait_seconds_count{node}`, `lu_node_queue_wait_seconds_sum{node}` | histogram | Time from job creation to start. Fixed `le` values match runtime. |
+| `lu_node_queue_wait_seconds_median_seconds{node}`, `lu_node_queue_wait_seconds_p90_seconds{node}` | gauge | All-time median and p90 queue wait in seconds. |
+| `lu_node_last_job_finished_timestamp_seconds{node}` | gauge | Unix timestamp of the newest terminal finish on that node; `0` means no stored finish. |
 
 `lu_drafts{state}` follows the draft inventory; an `expired` count that keeps growing means approved
 review is not keeping up with the `[drafts] ttl` or that draft caps are forcing older drafts out.
@@ -134,6 +142,7 @@ time() - lu_node_last_job_finished_timestamp_seconds > 86400
 
 For a sortable table of the same report, use `lu stats --by node`, `--by repo` or `--by state`;
 all three tables are drawn from the same fields that back the metrics above.
+The per-node contribution series come from one all-time store report. They are monotonic counters derived from stored jobs, so they survive a restart (jobs are not pruned); `node` is only ever a configured node name and `state`/`class` are fixed values. Repository names, job content and operator names are never labels. Busy seconds are wall-clock job duration, not CPU time; queue wait is `started_at - created_at`. The `_median_seconds` and `_p90_seconds` gauges are all-time summaries, while `_bucket` series support rate-based percentiles over a scrape window.
 
 ## `lu status`
 
@@ -168,6 +177,17 @@ lu status --json
 ```
 
 `lu check` validates config values and reports database-level health without Prometheus: `quick_check`, schema version, size, `leased`/`running` jobs without a lease, and orphan dependency rows. Its `checks:` line names what ran; no port is bound.
+
+## Per-node monitoring assets
+
+Two ready-to-use assets live in `contrib/monitoring/`:
+
+- `grafana-lu-nodes.json` — a Grafana dashboard with a `node` variable sourced from `lu_node_jobs_total`. It has panels for utilisation per node (`rate(lu_node_busy_seconds_total[5m])`), failure rate by node and class, busy share of the fleet, p50/p90 runtime and queue wait (`histogram_quantile` over the fixed buckets), and time since the last finished job. Nodes whose finish timestamp is `0` are omitted from the last panel because they have never finished a job.
+- `lu-alerts.yml` — a Prometheus rule file with `LuNodeIdleWhileJobsQueued`, `LuNodeFailureRateHigh` and `LuControllerMetricsMissing`. Load it with `rule_files:` in `prometheus.yml`. The idle rule treats `0` as never finished, the failure rule groups by `node` and `class`, and the controller rule fires when `up{job="lu"}` is down or controller metrics are absent.
+
+Both files use only the series in the table above and only configured node names as label values. They contain no credentials, repository text, job names or operator names. The alert thresholds are starting points: tune the idle window, failure rate and `for` durations against the fleet's `lease_secs`, normal failure rate and expected backlog.
+
+`scripts/check-monitoring.sh` parses both files (JSON and YAML) and checks that the dashboard has panels and the rule file has the three alerts. CI runs it alongside the other repository checks.
 
 ## Alerts
 

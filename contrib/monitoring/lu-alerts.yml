@@ -1,0 +1,40 @@
+groups:
+  - name: lu-nodes
+    rules:
+      - alert: LuNodeIdleWhileJobsQueued
+        expr: |
+          (time() - lu_node_last_job_finished_timestamp_seconds > 86400)
+            and on() (lu_jobs{state="queued"} > 0)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: A configured node has been idle while jobs are queued
+          description: >-
+            Node {{ $labels.node }} has no stored job finish in the last 24 hours
+            while the controller has queued jobs. Check heartbeats, drains,
+            provider cordons and whether the node can accept work.
+      - alert: LuNodeFailureRateHigh
+        expr: |
+          sum by (node, class) (rate(lu_node_failures_total[15m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Failure rate is high on a configured node
+          description: >-
+            Node {{ $labels.node }} has more than three failures per minute
+            in class {{ $labels.class }} over 15 minutes. Correlate with the
+            failure-rate panel in contrib/monitoring/grafana-lu-nodes.json.
+      - alert: LuControllerMetricsMissing
+        expr: |
+          absent(lu_controller_up{job="lu"}) == 1 or up{job="lu"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Lu controller metrics are missing
+          description: >-
+            The Lu scrape target is down or exposes no controller metrics.
+            Check the scrape configuration and the operator token used by
+            Prometheus.
