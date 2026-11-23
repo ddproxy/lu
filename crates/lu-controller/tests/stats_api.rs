@@ -134,6 +134,7 @@ fn spec(repo: &str, key: &str) -> JobSpec {
         idle_timeout_secs: None,
         on_stuck: None,
         stuck_after_secs: None,
+        schedule: None,
         idempotency_key: Some(key.to_owned()),
         after: Vec::new(),
         stack_union_paths: Vec::new(),

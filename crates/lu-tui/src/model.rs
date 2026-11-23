@@ -1169,7 +1169,9 @@ fn job_tone(state: &str) -> Tone {
         Ok(JobState::Blocked | JobState::Draft) => Tone::Blocked,
         Ok(JobState::Queued | JobState::Recovering | JobState::NeedsInput) => Tone::Warn,
         Ok(JobState::Failed) => Tone::Bad,
-        Ok(JobState::Cancelled | JobState::Expired) | Err(_) => Tone::Dim,
+        Ok(JobState::Cancelled | JobState::Expired | JobState::DeadlineMissed) | Err(_) => {
+            Tone::Dim
+        }
     }
 }
 

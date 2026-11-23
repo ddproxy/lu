@@ -5,6 +5,7 @@ members = [
     "crates/lu-serve",
     "crates/lu-tui",
     "crates/lu-proto",
+    "crates/lu-schedule",
     "crates/lu-store",
     "crates/lu-supervise",
     "crates/lu-staging",
@@ -46,6 +47,7 @@ crossterm = "0.29"
 libc = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+lu-schedule = { path = "crates/lu-schedule" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

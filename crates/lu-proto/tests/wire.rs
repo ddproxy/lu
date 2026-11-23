@@ -4,6 +4,8 @@
 
 use std::str::FromStr;
 
+use lu_schedule::{BlockReason, Constraint, JobSchedule, OnDeadline};
+
 use lu_proto::{
     printable, truncate_chars, AgentEvent, ArtifactName, Choice, Completion, CordonView,
     FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobState, JobView, LogChunk, NodeName,
@@ -61,6 +63,7 @@ fn spec() -> JobSpec {
             model: Some("other-model".to_owned()),
         }],
         expect: None,
+        schedule: None,
     }
 }
 
@@ -177,6 +180,7 @@ fn job_and_node_views_match_the_documented_json() {
     let job = JobView {
         id: job_id(),
         state: JobState::Running,
+        schedule: None,
         spec: JobSpec {
             source: lu_proto::SourceSpec {
                 repo: "https://example.net/team/repo.git".to_owned(),
@@ -232,6 +236,7 @@ fn job_and_node_views_match_the_documented_json() {
         root_job_id: None,
         depth: 0,
         waiting_reason: None,
+        waiting_detail: Vec::new(),
         staged_commit: None,
         blocked_reason: None,
         blocked_until: None,
@@ -443,5 +448,93 @@ fn job_view_echoes_the_expect_block() {
             .spec
             .expect,
         view.spec.expect
+    );
+}
+
+#[test]
+fn schedule_field_round_trips_through_specs_and_views() {
+    let schedule = JobSchedule {
+        not_before: Some(1_700_000_000),
+        deadline: Some(1_700_003_600),
+        on_deadline: OnDeadline::Cancel,
+        window: Some("nightly".to_owned()),
+        ..Default::default()
+    };
+    let mut spec = spec();
+    spec.schedule = Some(schedule.clone());
+    spec.validate().unwrap();
+    let json = spec.canonical_json();
+    assert!(json.contains("\"schedule\":"), "{json}");
+    assert_eq!(
+        serde_json::from_str::<JobSpec>(&json).unwrap().schedule,
+        Some(schedule.clone())
+    );
+
+    let mut view = JobView::placeholder(job_id(), JobState::Blocked);
+    view.spec = spec;
+    view.schedule = Some(schedule);
+    view.waiting_detail =
+        vec![BlockReason::new(Constraint::Window, "calendar is closed").until(Some(1_700_003_600))];
+    let value = serde_json::to_value(&view).unwrap();
+    assert_eq!(serde_json::from_value::<JobView>(value).unwrap(), view);
+}
+
+#[test]
+fn older_job_view_json_without_schedule_fields_still_decodes() {
+    let view: JobView = serde_json::from_value(serde_json::json!({
+        "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "state": "queued",
+        "spec": {
+            "source": {"repo": "https://example.net/team/repo.git", "ref": "main"},
+            "task": "add the missing test"
+        }
+    }))
+    .unwrap();
+    assert_eq!(view.schedule, None);
+    assert!(view.waiting_detail.is_empty());
+    let value = serde_json::to_value(&view).unwrap();
+    assert!(value.get("schedule").is_none());
+    assert!(value.get("waiting_detail").is_none());
+}
+
+#[test]
+fn schedule_rejects_unknown_fields_on_the_wire() {
+    let mut value = serde_json::to_value(spec()).unwrap();
+    value["schedule"] = serde_json::json!({"not_before": 1_700_000_000_i64, "surprise": true});
+    let error = serde_json::from_value::<JobSpec>(value)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("unknown field") || error.contains("surprise"),
+        "{error}"
+    );
+}
+
+#[test]
+fn deadline_missed_transitions_are_wired() {
+    assert!(JobState::can_transition(
+        JobState::Queued,
+        JobState::DeadlineMissed
+    ));
+    assert!(JobState::can_transition(
+        JobState::Blocked,
+        JobState::DeadlineMissed
+    ));
+    assert!(!JobState::can_transition(
+        JobState::Running,
+        JobState::DeadlineMissed
+    ));
+    assert!(!JobState::can_transition(
+        JobState::Expired,
+        JobState::DeadlineMissed
+    ));
+    assert!(JobState::DeadlineMissed.is_terminal());
+    assert_eq!(
+        "deadline_missed".parse::<JobState>().unwrap(),
+        JobState::DeadlineMissed
+    );
+    assert_eq!(
+        serde_json::to_string(&JobState::DeadlineMissed).unwrap(),
+        "\"deadline_missed\""
     );
 }

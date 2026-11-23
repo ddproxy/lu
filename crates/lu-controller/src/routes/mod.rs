@@ -4,6 +4,7 @@ pub mod health;
 pub mod intake;
 pub mod metrics;
 pub mod operator;
+pub mod schedule;
 pub mod scope;
 pub mod stats;
 pub mod status;

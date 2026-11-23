@@ -511,6 +511,7 @@ impl<S: Store> Model<S> {
             publish: None,
             fallbacks: Vec::new(),
             expect: None,
+            schedule: None,
         }
     }
 
@@ -1696,7 +1697,11 @@ impl<S: Store> Model<S> {
                         }
                     }
                 }
-                JobState::Done | JobState::Failed | JobState::Cancelled | JobState::Expired => {
+                JobState::Done
+                | JobState::Failed
+                | JobState::Cancelled
+                | JobState::Expired
+                | JobState::DeadlineMissed => {
                     assert!(
                         record.finished_at.is_some(),
                         "terminal job {} has no finished_at",

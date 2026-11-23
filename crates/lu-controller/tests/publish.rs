@@ -325,6 +325,7 @@ fn sample_spec(source_url: &str) -> JobSpec {
         expect: None,
         stack_union_paths: Vec::new(),
         stack_base_paths: Vec::new(),
+        schedule: None,
     }
 }
 

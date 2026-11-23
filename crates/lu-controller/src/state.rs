@@ -13,7 +13,7 @@ use lu_store::Store;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
@@ -175,6 +175,20 @@ pub struct AppState {
     publish_pushes: Mutex<HashMap<String, VecDeque<(Instant, u64)>>>,
     /// Monotonic ticket ids for publish push reservations.
     publish_ticket: AtomicU64,
+    /// Validated scheduling configuration. Swapped atomically by `lu schedule reload`; a failed
+    /// reload never installs a partial set.
+    schedule: RwLock<Option<lu_schedule::Schedule>>,
+    /// Last wall-clock second seen by maintenance, for detecting a backwards clock step.
+    last_wall_tick: Mutex<Option<i64>>,
+    /// Next boundary the wake timer is armed for, in Unix seconds.
+    schedule_wake: Mutex<Option<i64>>,
+    /// `lu_jobs_waiting_schedule{code}` values since process start.
+    schedule_waiting: Mutex<HashMap<String, u64>>,
+    schedule_deadline_expired: AtomicU64,
+    schedule_eval_budget_exceeded: AtomicU64,
+    schedule_reloads: AtomicU64,
+    /// Controller config path, used by `schedule reload` to revalidate the schedule document.
+    config_path: OnceLock<PathBuf>,
 }
 
 impl AppState {
@@ -311,7 +325,112 @@ impl AppState {
             publish_total: Mutex::new(HashMap::new()),
             publish_pushes: Mutex::new(HashMap::new()),
             publish_ticket: AtomicU64::new(0),
+            schedule: RwLock::new(None),
+            last_wall_tick: Mutex::new(None),
+            schedule_wake: Mutex::new(None),
+            schedule_waiting: Mutex::new(HashMap::new()),
+            schedule_deadline_expired: AtomicU64::new(0),
+            schedule_eval_budget_exceeded: AtomicU64::new(0),
+            schedule_reloads: AtomicU64::new(0),
+            config_path: OnceLock::new(),
         })
+    }
+
+    /// Records the controller config path so a reload can revalidate the schedule document.
+    pub fn set_config_path(&self, path: &std::path::Path) {
+        let _ = self.config_path.set(path.to_path_buf());
+    }
+
+    pub fn config_path(&self) -> Option<&std::path::Path> {
+        self.config_path.get().map(PathBuf::as_path)
+    }
+
+    /// Current scheduling configuration, if any. Cloned so dispatch never holds a lock while
+    /// evaluating calendars.
+    pub fn schedule(&self) -> Option<lu_schedule::Schedule> {
+        self.schedule
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Installs a validated schedule. Used at startup and by the reload route after validation.
+    pub fn set_schedule(&self, schedule: Option<lu_schedule::Schedule>) {
+        let mut current = self
+            .schedule
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = schedule;
+        self.schedule_reloads.fetch_add(1, Ordering::Relaxed);
+        *self
+            .schedule_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Records a wall tick. Returns `false` when the clock moved backwards by more than one second,
+    /// which is treated as a clock fault: leases keep using monotonic time, and the wake timer is
+    /// re-armed from the corrected wall time.
+    pub fn note_wall_tick(&self, wall_unix: i64) -> bool {
+        let mut last = self
+            .last_wall_tick
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fault = last.is_some_and(|previous| wall_unix < previous.saturating_sub(1));
+        *last = Some(wall_unix);
+        !fault
+    }
+
+    pub fn set_schedule_wake(&self, at: Option<i64>) {
+        *self
+            .schedule_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = at;
+    }
+
+    pub fn schedule_wake(&self) -> Option<i64> {
+        *self
+            .schedule_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn record_schedule_wait(&self, code: &str) {
+        let mut waits = self
+            .schedule_waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *waits.entry(code.to_owned()).or_insert(0) += 1;
+    }
+
+    pub fn schedule_waits(&self) -> Vec<(String, u64)> {
+        let mut out: Vec<_> = self
+            .schedule_waiting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(code, count)| (code.clone(), *count))
+            .collect();
+        out.sort();
+        out
+    }
+
+    pub fn note_deadline_expired(&self) {
+        self.schedule_deadline_expired
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_eval_budget_exceeded(&self) {
+        self.schedule_eval_budget_exceeded
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn schedule_counts(&self) -> (u64, u64, u64) {
+        (
+            self.schedule_deadline_expired.load(Ordering::Relaxed),
+            self.schedule_eval_budget_exceeded.load(Ordering::Relaxed),
+            self.schedule_reloads.load(Ordering::Relaxed),
+        )
     }
 
     /// A point-in-time copy of the group caps, for views and metrics.

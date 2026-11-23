@@ -13,6 +13,9 @@ pub struct AuthConfig {
     pub operators: HashMap<String, String>, // hash -> operator name
     /// Role, expiry and field policy per operator name. A name with no entry is a plain operator.
     pub profiles: HashMap<String, OperatorProfile>,
+    /// Operator names allowed to set job schedule constraints and reload calendars. The map is
+    /// keyed by name so callers that already hold the authenticated name need no token hash.
+    operator_schedule: HashMap<String, bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,12 @@ impl AuthConfig {
         }
         found
     }
+
+    /// Whether a named operator may set schedule constraints or reload calendars. Default deny:
+    /// an operator absent from the map has no permission.
+    pub fn can_schedule(&self, name: &str) -> bool {
+        self.operator_schedule.get(name).copied().unwrap_or(false)
+    }
 }
 
 fn unix_now() -> i64 {
@@ -64,10 +73,12 @@ impl AuthConfig {
         }
         let mut operators = HashMap::new();
         let mut profiles = HashMap::new();
+        let mut operator_schedule = HashMap::new();
         for o in &cfg.operators {
             if agents.contains_key(&o.token_sha256) || operators.contains_key(&o.token_sha256) {
                 return Err("duplicate token hash across scopes".to_owned());
             }
+            operator_schedule.insert(o.name.clone(), o.schedule);
             operators.insert(o.token_sha256.clone(), o.name.clone());
             let expires_at = match &o.expires_at {
                 Some(text) => Some(
@@ -89,6 +100,7 @@ impl AuthConfig {
             agents,
             operators,
             profiles,
+            operator_schedule,
         })
     }
 }
@@ -218,6 +230,7 @@ mod tests {
             agents: HashMap::new(),
             operators: HashMap::from([(sha256_hex(&token), "ops".to_owned())]),
             profiles: HashMap::new(),
+            operator_schedule: HashMap::new(),
         };
         (auth, token)
     }

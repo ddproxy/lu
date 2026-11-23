@@ -1,10 +1,10 @@
 # Notes
 
-- Schema version drift: `lu_store::SCHEMA_VERSION` is `5`, but several docs still describe version
+- Schema version drift: `lu_store::SCHEMA_VERSION` is `6`, but several docs still describe version
   `4` as the current baseline (for example the note about `parent_job_id`/`root_job_id`/`depth` in
-  [docs/api.md](docs/api.md)). The code creates new databases at version `5` and migrates versions
-  `1` through `4` in place by adding columns. `docs/monitoring.md` and its `lu status` example were
-  updated to `5`; the remaining prose is left for a separate docs cleanup.
+  [docs/api.md](docs/api.md)). The code creates new databases at version `6` and migrates versions
+  `1` through `5` in place by adding columns. `docs/monitoring.md` and its `lu status` example were
+  updated to `6`; the remaining prose is left for a separate docs cleanup.
 - Job retention: Lu has no `DELETE FROM jobs` path. Node contribution counters are recomputed from
   the persistent `jobs` table, so they stay monotonic across controller restarts. A `since` window
   narrows the report by design and is not a monotonic counter source. If pruning is added later,
@@ -156,3 +156,49 @@ None.
 - `cargo test --workspace`
 
 `.git` is root-owned `0700` in this checkout, so changes could not be committed; they remain local and uncommitted.
+
+## Phase 1 scheduling implementation notes
+
+These are the places where the shipped code differs from the design brief. The code was checked
+before each choice; where the design and the repository disagreed, the repository won.
+
+- `lu_store::SCHEMA_VERSION` is **5**, not the 4 in `docs/monitoring.md`. `eligible_since` therefore
+  bumps it to **6**. The migration folds the new column into the baseline and into the additive
+  path for versions 1–5, keeping the existing "refuse higher versions" policy.
+- Cordons are finite: `cordons.until_mono_ms INTEGER NOT NULL`. `recover_on_boot` deletes every
+  cordon, so a restart forgets provider cooldowns. Schedule waits report the stored upper bound,
+  not "unknown".
+- Dispatch order is creation-time `dispatch_seq`, not `eligible_since`. Ordering is now
+  `(starvation class, effective priority, eligible_since, dispatch_seq)`. `eligible_since` is
+  restamped at draft approval and dependency unblock.
+- `submit_child` deliberately keeps `spec.group = None` for cap accounting. Calendar gates for a
+  child are evaluated with the parent's group; `AdmissionRequest.group` carries that value.
+- The task asks for top-level `[[calendar]]` and `[[attach]]`; the design showed nested
+  `[[schedule.calendars]]` and `[schedule.scopes]`. Top-level tables are the wire form; the
+  nested aliases are accepted where practical.
+- `requires_calendar_state(t)` is `open(t)` for `state = "available"` and `!open(t)` for
+  `state = "unavailable"`. The usable interval is `[begin + lead, end - tail)`. The design's
+  "timeout minus tail" example was ambiguous: fit is applied on top of that interval, so a state
+  gate needs `max(tail, timeout_secs + staging + finish)` of real state remaining.
+- The fit rule requires `timeout_secs + staging_secs + finish_secs`; the allowance is configured in
+  `[schedule]` and defaults to 300 s staging plus 60 s finish. `fit = "none"` disables the check.
+- `days` names the local **start day** of a window. `to < from` (including `24:00`) crosses
+  midnight; `from == to` is rejected at validation.
+- Phase 1 has no timezone database, cron rules, DST, cost weights or burst, per v2 item 15.
+  `[[calendar]] offset` accepts `Z`, `UTC`, `+HH:MM`, `-HH:MM`, `+HHMM` or integer minutes.
+- The schedule change permission is `schedule = true` on `[[controller.operators]]` and defaults
+  to `false`. Scoped MCP children cannot set schedule fields at all.
+- Full calendar evaluation happens outside SQLite's `IMMEDIATE` transaction. The store trait gains
+  `next_assignment_scheduled`, which defaults to the old `next_assignment` for test stores;
+  SQLite first collects a read-only snapshot, applies cheap checks, asks the controller's schedule
+  gate, then re-checks and leases in a short write transaction. The per-poll step budget is the
+  configured `step_budget`.
+- The wake timer always recomputes `next_change` after firing and re-arms; a fire before the
+  boundary is a no-op. The last wall tick is stored in memory for the clock-fault check.
+- `on_deadline = "run"` ignores only the job's soft gates (`window`, `requires_calendar_state`
+  and fit). Global, group, node, provider and model attachments and `not_before` stay hard.
+- The deadline ends a job as `deadline_missed`, a new terminal state, rather than reusing
+  `expired`. `expired` remains draft-only.
+- A per-provider start budget is configurable but defaults to zero (unlimited); phase 1's herd
+  bound is one lease per node, with the provider rate-limit consequence documented in
+  `docs/scheduling.md`.

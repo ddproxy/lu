@@ -1138,6 +1138,7 @@ fn build_spec(args: &Value, after: Vec<JobId>) -> Result<JobSpec, ToolError> {
         expect: spec_expect(args)?,
         stack_union_paths: Vec::new(),
         stack_base_paths: Vec::new(),
+        schedule: None,
     };
     validate_spec(&spec)?;
     Ok(spec)

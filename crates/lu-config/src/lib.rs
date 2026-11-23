@@ -2,6 +2,7 @@
 //! names its table, and secret files other users can read are refused.
 
 mod error;
+mod schedule;
 pub mod secret;
 
 use std::collections::{BTreeMap, HashSet};
@@ -12,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 
 pub use error::ConfigError;
+pub use schedule::ScheduleConfig;
 pub use secret::{check_private_file, read_private_file};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +146,18 @@ pub struct Config {
     /// Agent-side policies for conflicts in stacked dependency chains.
     #[serde(default)]
     pub stack: Option<StackConfig>,
+    /// Controller-side time-aware scheduling. Absent means no calendar gating.
+    #[serde(default)]
+    pub schedule: Option<ScheduleConfig>,
+    /// Calendar definitions. The TOML table is `[[calendar]]` (`[[calendars]]` also works).
+    #[serde(default, rename = "calendar", alias = "calendars")]
+    pub calendars: Vec<lu_schedule::Calendar>,
+    /// Calendar attachments. The TOML table is `[[attach]]` (`[[attachments]]` also works).
+    #[serde(default, rename = "attach", alias = "attachments")]
+    pub attachments: Vec<lu_schedule::Attachment>,
+    /// The validated schedule built from the fields above and any referenced file.
+    #[serde(default, skip)]
+    pub schedule_built: Option<lu_schedule::Schedule>,
 }
 
 /// `[stack]` — agent-side, fail-closed policies for known-safe conflicted paths.
@@ -786,6 +800,9 @@ pub struct ControllerOperator {
     /// source branch, accepting scrubbed patches) when this token submits or edits a job.
     #[serde(default)]
     pub restrict_fields: bool,
+    /// Permission to read and change scheduling configuration. Default deny.
+    #[serde(default)]
+    pub schedule: bool,
 }
 
 /// An operator token's role. `viewer` is read-only and never sees task text, context, logs or
@@ -1055,14 +1072,30 @@ impl Default for LogConfig {
 }
 
 impl Config {
-    /// Parses and validates config text. Does not touch the filesystem.
+    /// Parses and validates config text.
+    ///
+    /// The only file this may read is an absolute `schedule.file` reference; all other config
+    /// inputs are the text supplied here.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let config = Self::parse_structure(text)?;
+        let mut config = Self::parse_structure(text)?;
+        config.schedule_built = schedule::build(
+            config.schedule.as_ref(),
+            &config.calendars,
+            &config.attachments,
+        )?;
         config.validate()?;
         Ok(config)
     }
 
+    /// The fully merged and validated schedule, when scheduling is configured.
+    pub fn schedule(&self) -> Option<&lu_schedule::Schedule> {
+        self.schedule_built.as_ref()
+    }
+
     fn parse_structure(text: &str) -> Result<Self, ConfigError> {
+        let value: toml::Value =
+            toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        schedule::validate_document(&value)?;
         toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
@@ -1084,6 +1117,7 @@ impl Config {
         self.validate_intake()?;
         self.validate_mirror()?;
         self.validate_stack()?;
+        self.validate_schedule()?;
         if let Some(c) = &self.controller {
             c.validate(self.tls.is_some())?;
         }
@@ -1658,6 +1692,13 @@ impl Config {
     fn validate_stack(&self) -> Result<(), ConfigError> {
         if let Some(stack) = &self.stack {
             stack.validate()?;
+        }
+        Ok(())
+    }
+
+    fn validate_schedule(&self) -> Result<(), ConfigError> {
+        if let Some(built) = &self.schedule_built {
+            built.validate().map_err(schedule::map_schedule_error)?;
         }
         Ok(())
     }
@@ -2360,7 +2401,11 @@ fn validate_sha256(table: &str, value: &str) -> Result<(), ConfigError> {
     }
 }
 
-fn validate_abs_no_dotdot(table: &str, field: &str, value: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_abs_no_dotdot(
+    table: &str,
+    field: &str,
+    value: &str,
+) -> Result<(), ConfigError> {
     let path = Path::new(value);
     if !path.is_absolute() {
         return invalid(
@@ -2610,7 +2655,7 @@ fn expand_home(value: &str, home: &str) -> String {
     }
 }
 
-fn read_config_text(path: &Path) -> Result<String, ConfigError> {
+pub(crate) fn read_config_text(path: &Path) -> Result<String, ConfigError> {
     let shown = path.display().to_string();
     let file = std::fs::File::open(path).map_err(|source| ConfigError::Io {
         path: shown.clone(),
@@ -2692,7 +2737,13 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 /// Parses a config file without checking values or reading the secret files it names. For
 /// commands that only print a summary and do not use the secrets.
 pub fn load_structure(path: &Path) -> Result<Config, ConfigError> {
-    Config::parse_structure(&read_config_text(path)?)
+    let mut config = Config::parse_structure(&read_config_text(path)?)?;
+    config.schedule_built = schedule::build(
+        config.schedule.as_ref(),
+        &config.calendars,
+        &config.attachments,
+    )?;
+    Ok(config)
 }
 
 /// Reads and validates a config file without opening the secret files it names. This gives

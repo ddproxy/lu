@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+lu-schedule.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Random bytes for job ids. Already in the workspace lock (ring uses 0.2), so no duplicate.

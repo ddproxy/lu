@@ -11,6 +11,7 @@ publish.workspace = true
 serde.workspace = true
 toml.workspace = true
 lu-proto = { path = "../lu-proto" }
+lu-schedule.workspace = true
 libc = "0.2"
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
 

@@ -29,6 +29,9 @@ pub struct JobView {
     pub state: JobState,
     #[serde(default = "empty_job_spec")]
     pub spec: JobSpec,
+    /// Scheduling constraints echoed from the submitted spec, for clients that only read views.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<lu_schedule::JobSchedule>,
     #[serde(default)]
     pub attempt: u32,
     #[serde(default)]
@@ -72,6 +75,9 @@ pub struct JobView {
     pub depth: u32,
     #[serde(default)]
     pub waiting_reason: Option<String>,
+    /// Structured blockers for a job that cannot start yet; empty when no gate is holding it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_detail: Vec<lu_schedule::BlockReason>,
     /// Commit the agent actually staged this job from, recorded before dependency patches are
     /// applied. Dependents inherit it when they have no pinned base of their own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,6 +122,7 @@ impl JobView {
             id,
             state,
             spec: empty_job_spec(),
+            schedule: None,
             attempt: 0,
             node: None,
             assigned_provider: None,
@@ -136,6 +143,7 @@ impl JobView {
             root_job_id: None,
             depth: 0,
             waiting_reason: None,
+            waiting_detail: Vec::new(),
             staged_commit: None,
             blocked_reason: None,
             blocked_until: None,
@@ -351,5 +359,6 @@ pub(crate) fn empty_job_spec() -> JobSpec {
         untrusted_context: false,
         draft: false,
         publish: None,
+        schedule: None,
     }
 }
