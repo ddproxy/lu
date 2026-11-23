@@ -1181,7 +1181,9 @@ fn job_badge_tone(state: &str) -> Tone {
         Ok(JobState::Running | JobState::Leased) => Tone::JobRunning,
         Ok(JobState::Failed) => Tone::JobFailed,
         Ok(JobState::Done) => Tone::JobDone,
-        Ok(JobState::Cancelled | JobState::Expired) | Err(_) => Tone::JobCancelled,
+        Ok(JobState::Cancelled | JobState::Expired | JobState::DeadlineMissed) | Err(_) => {
+            Tone::JobCancelled
+        }
         Ok(JobState::Blocked | JobState::Draft) => Tone::Blocked,
         Ok(JobState::Queued | JobState::Recovering | JobState::NeedsInput) => Tone::JobQueued,
     }
