@@ -1,5 +1,5 @@
-use crate::auth::authenticate_operator;
 use crate::error::ApiError;
+use crate::read_api::authenticate_read;
 use crate::routes::{job_state_str, json_value_ok, store_err, with_version};
 use crate::state::AppState;
 use crate::time::now;
@@ -15,8 +15,8 @@ pub async fn status(
     peer: axum::Extension<PeerAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
+    if let Err(error) = authenticate_read(&headers, peer.0, &state) {
+        return with_version(error.into_response());
     }
     let n = now();
     let counts = match tokio::task::spawn_blocking({

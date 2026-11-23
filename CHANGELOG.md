@@ -11,6 +11,8 @@ uses semantic versioning once it reaches 1.0.
 
 ### Added
 
+- Operator read API for a web UI. `GET /v1/jobs/{id}`, `GET /v1/jobs`, `GET /v1/nodes` and `GET /v1/nodes/{name}/stats` send a strong `ETag` over the response body and answer `If-None-Match` with `304` and no body. `GET /v1/jobs` takes `view=summary` for compact rows (id, state, node, times, `owner/name` repo, provider and model, a title of the first task line, failure class) that never carry task, context or spec. It also takes `state` (repeatable or comma list), `node`, `repo`, `origin` and `updated_since` filters, with `400` for invalid values. Job logs take `max` to bound one response. See [docs/api.md](docs/api.md#reads-validators-summaries-filters-and-budget).
+- `[controller] read_per_minute` (default `1200`) budgets GET requests per operator across the operator read routes and answers `429` with `Retry-After` when exhausted. It is separate from the login throttle and does not apply to writes or `/metrics`.
 - `lu status --json` reports a `providers` object: per provider the number of online nodes that report it ok, cooling or otherwise unusable, and the soonest return. `lu top` names the providers queued jobs are waiting for in its title and lists problem providers first in each node row, so a cooling provider is not truncated off a narrow terminal.
 
 ## [0.5.2]

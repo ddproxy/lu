@@ -1,10 +1,13 @@
 use crate::auth::authenticate_operator;
 use crate::error::ApiError;
 use crate::limits::SYNC_PER_TOKEN;
+use crate::read_api::{
+    authenticate_read, job_summary, json_with_etag, parse_job_filter, scan_jobs, wants_summary,
+    JobsPage,
+};
 use crate::routes::file_body::{file_len, into_response, stream_range};
 use crate::routes::{
-    json_ok, json_value_ok, parse_job_state, parse_query, read_raw_limited, store_err,
-    with_version, MAX_JSON_BODY,
+    json_ok, json_value_ok, parse_query, read_raw_limited, store_err, with_version, MAX_JSON_BODY,
 };
 use crate::state::AppState;
 use crate::time::now;
@@ -45,7 +48,7 @@ pub fn outcome_note(r: &JobRecord) -> Option<&'static str> {
 
 /// Stored timestamps are Unix seconds, which are never negative in practice; the wire views use
 /// unsigned seconds.
-fn seconds(value: i64) -> u64 {
+pub(crate) fn seconds(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
@@ -57,7 +60,10 @@ fn query_flag(query: &HashMap<String, String>, name: &str) -> bool {
 
 /// Reads an unsigned query parameter. An absent parameter uses the caller's default; a present
 /// but unparseable one is a 400 in the standard error shape instead of a silent default.
-fn query_u64(query: &HashMap<String, String>, name: &str) -> Result<Option<u64>, ApiError> {
+pub(crate) fn query_u64(
+    query: &HashMap<String, String>,
+    name: &str,
+) -> Result<Option<u64>, ApiError> {
     match query.get(name) {
         None => Ok(None),
         Some(raw) => raw
@@ -450,10 +456,14 @@ pub async fn list_jobs(
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
+    if let Err(error) = authenticate_read(&headers, peer.0, &state) {
+        return with_version(error.into_response());
     }
     let q = crate::routes::parse_query(&uri);
+    let summary = match wants_summary(&q) {
+        Ok(summary) => summary,
+        Err(error) => return with_version(error.into_response()),
+    };
     // `key` is a different lookup on the same route, not an extra list filter.
     if let Some(key) = q.get("key") {
         if let Err(error) = validate_idempotency_key(key) {
@@ -469,26 +479,13 @@ pub async fn list_jobs(
             Ok(rec) => rec,
             Err(_) => return with_version(ApiError::internal().into_response()),
         };
-        let nodes = match all_nodes(&state, now()).await {
-            Ok(nodes) => nodes,
-            Err(error) => return with_version(error.into_response()),
-        };
-        let counts = match group_counts(&state).await {
-            Ok(counts) => counts,
-            Err(error) => return with_version(error.into_response()),
-        };
         let jobs: Vec<JobRecord> = rec.into_iter().collect();
-        let body = json!({
-            "jobs": job_views(
-                &jobs,
-                &nodes,
-                &counts,
-                &state.group_limits(),
-                state.blocked_dependent_ttl_secs,
-            ),
-            "next": null,
-        });
-        return with_version(json_value_ok(StatusCode::OK, body));
+        return with_version(
+            match render_job_page(&state, &headers, &jobs, summary, None).await {
+                Ok(response) => response,
+                Err(error) => error.into_response(),
+            },
+        );
     }
     let limit = match query_u64(&q, "limit") {
         Ok(value) => usize::try_from(value.unwrap_or(200))
@@ -496,12 +493,9 @@ pub async fn list_jobs(
             .min(200),
         Err(error) => return with_version(error.into_response()),
     };
-    let state_filter = match q.get("state") {
-        Some(s) if !s.is_empty() => match parse_job_state(s) {
-            Some(st) => Some(st),
-            None => return with_version(ApiError::bad_request("invalid state").into_response()),
-        },
-        _ => None,
+    let filter = match parse_job_filter(&q, &uri) {
+        Ok(filter) => filter,
+        Err(error) => return with_version(error.into_response()),
     };
     let after = match q.get("after") {
         Some(a) if !a.is_empty() => match JobId::parse(a) {
@@ -510,36 +504,55 @@ pub async fn list_jobs(
         },
         _ => None,
     };
-    let res = tokio::task::spawn_blocking({
-        let store = Arc::clone(&state.store);
-        move || store.list_jobs(state_filter, limit, after.as_ref())
-    })
-    .await;
-    let jobs = match res {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return with_version(store_err(e).into_response()),
-        Err(_) => return with_version(ApiError::internal().into_response()),
+    // A single state is filtered by the store; several are checked per row by the scan.
+    let store_state = match filter.states.as_slice() {
+        [only] => Some(*only),
+        _ => None,
     };
-    let nodes = match all_nodes(&state, now()).await {
-        Ok(nodes) => nodes,
+    let (jobs, last) = match scan_jobs(&state, store_state, &filter, limit, after).await {
+        Ok(page) => page,
         Err(error) => return with_version(error.into_response()),
     };
-    let counts = match group_counts(&state).await {
-        Ok(counts) => counts,
-        Err(error) => return with_version(error.into_response()),
+    let next = last.map(|j| j.to_string());
+    with_version(
+        match render_job_page(&state, &headers, &jobs, summary, next).await {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        },
+    )
+}
+
+/// Renders a page of jobs in the full or summary shape, with an ETag over the body.
+async fn render_job_page(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    jobs: &[JobRecord],
+    summary: bool,
+    next: Option<String>,
+) -> Result<Response, ApiError> {
+    if summary {
+        let page = JobsPage {
+            jobs: jobs
+                .iter()
+                .map(|job| job_summary(job, &state.scrubber))
+                .collect::<Vec<_>>(),
+            next,
+        };
+        return Ok(json_with_etag(headers, &page));
+    }
+    let nodes = all_nodes(state, now()).await?;
+    let counts = group_counts(state).await?;
+    let page = JobsPage {
+        jobs: job_views(
+            jobs,
+            &nodes,
+            &counts,
+            &state.group_limits(),
+            state.blocked_dependent_ttl_secs,
+        ),
+        next,
     };
-    let next = jobs.last().map(|j| j.id.to_string());
-    let body = json!({
-        "jobs": job_views(
-                &jobs,
-                &nodes,
-                &counts,
-                &state.group_limits(),
-                state.blocked_dependent_ttl_secs,
-            ),
-        "next": next,
-    });
-    with_version(json_value_ok(StatusCode::OK, body))
+    Ok(json_with_etag(headers, &page))
 }
 
 pub async fn get_job(
@@ -548,8 +561,8 @@ pub async fn get_job(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
+    if let Err(error) = authenticate_read(&headers, peer.0, &state) {
+        return with_version(error.into_response());
     }
     let job_id = match JobId::parse(&id) {
         Ok(i) => i,
@@ -562,7 +575,7 @@ pub async fn get_job(
     .await;
     match res {
         Ok(Ok(rec)) => match job_view_for(&state, &rec).await {
-            Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
+            Ok(view) => with_version(json_with_etag(&headers, &view)),
             Err(error) => with_version(error.into_response()),
         },
         Ok(Err(e)) => with_version(store_err(e).into_response()),
@@ -851,8 +864,8 @@ pub async fn list_drafts(
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
+    if let Err(error) = authenticate_read(&headers, peer.0, &state) {
+        return with_version(error.into_response());
     }
     let q = parse_query(&uri);
     let limit = match query_u64(&q, "limit") {
@@ -1039,8 +1052,8 @@ pub async fn get_artifact(
     headers: HeaderMap,
     Path((id, name)): Path<(String, String)>,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
+    if let Err(error) = authenticate_read(&headers, peer.0, &state) {
+        return with_version(error.into_response());
     }
     let job_id = match JobId::parse(&id) {
         Ok(i) => i,
@@ -1077,8 +1090,8 @@ pub async fn get_logs(
     Path(id): Path<String>,
     uri: axum::http::Uri,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
+    if let Err(error) = authenticate_read(&headers, peer.0, &state) {
+        return with_version(error.into_response());
     }
     let job_id = match JobId::parse(&id) {
         Ok(i) => i,
@@ -1087,6 +1100,13 @@ pub async fn get_logs(
     let q = crate::routes::parse_query(&uri);
     let offset = match query_u64(&q, "offset") {
         Ok(value) => value.unwrap_or(0),
+        Err(error) => return with_version(error.into_response()),
+    };
+    // `max` bounds one response. Absent means the log cap; larger values are clamped to it.
+    let max = match query_u64(&q, "max") {
+        Ok(None) => lu_proto::MAX_LOG_BYTES,
+        Ok(Some(0)) => return with_version(ApiError::bad_request("invalid max").into_response()),
+        Ok(Some(value)) => value.min(lu_proto::MAX_LOG_BYTES),
         Err(error) => return with_version(error.into_response()),
     };
     let wait_secs = match query_u64(&q, "wait") {
@@ -1122,7 +1142,7 @@ pub async fn get_logs(
         }
     };
     let path = state.artifacts_dir.join(job_id.to_string()).join("run.log");
-    let requested = rec.log_len.saturating_sub(offset);
+    let requested = rec.log_len.saturating_sub(offset).min(max);
     let (body, len) = if requested == 0 {
         (axum::body::Body::empty(), 0)
     } else {
@@ -1153,8 +1173,8 @@ pub async fn list_nodes(
     peer: axum::Extension<PeerAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
+    if let Err(error) = authenticate_read(&headers, peer.0, &state) {
+        return with_version(error.into_response());
     }
     let n = now();
     let res = tokio::task::spawn_blocking({
@@ -1175,21 +1195,19 @@ pub async fn list_nodes(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             let views = cordon_views(&cordons, n);
-            with_version(json_ok(
-                StatusCode::OK,
-                &nodes
-                    .iter()
-                    .map(|node| {
-                        let details = cordons
-                            .iter()
-                            .zip(views.iter())
-                            .filter(|(cordon, _)| cordon.node == node.name)
-                            .map(|(_, view)| view.clone())
-                            .collect();
-                        node_view(node, stats.get(&node.name), details)
-                    })
-                    .collect::<Vec<_>>(),
-            ))
+            let node_views = nodes
+                .iter()
+                .map(|node| {
+                    let details = cordons
+                        .iter()
+                        .zip(views.iter())
+                        .filter(|(cordon, _)| cordon.node == node.name)
+                        .map(|(_, view)| view.clone())
+                        .collect();
+                    node_view(node, stats.get(&node.name), details)
+                })
+                .collect::<Vec<_>>();
+            with_version(json_with_etag(&headers, &node_views))
         }
         Ok(Err(e)) => with_version(store_err(e).into_response()),
         Err(_) => with_version(ApiError::internal().into_response()),
@@ -1202,8 +1220,8 @@ pub async fn get_node_stats(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
+    if let Err(error) = authenticate_read(&headers, peer.0, &state) {
+        return with_version(error.into_response());
     }
     let node = match NodeName::parse(&name) {
         Ok(n) => n,
@@ -1231,8 +1249,8 @@ pub async fn get_node_stats(
         .get(&node)
         .cloned();
     match stats {
-        Some(stats) => with_version(json_ok(StatusCode::OK, &stats)),
-        None => with_version(json_value_ok(StatusCode::OK, json!({}))),
+        Some(stats) => with_version(json_with_etag(&headers, &stats)),
+        None => with_version(json_with_etag(&headers, &json!({}))),
     }
 }
 
@@ -1324,8 +1342,8 @@ pub async fn list_repos(
     peer: axum::Extension<PeerAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
+    if let Err(error) = authenticate_read(&headers, peer.0, &state) {
+        return with_version(error.into_response());
     }
     let repos = state.mirror.infos();
     with_version(json_value_ok(StatusCode::OK, json!({ "repos": repos })))

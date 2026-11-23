@@ -104,6 +104,9 @@ pub struct AppState {
     pub pack_slots: Arc<Semaphore>,
     pub sync_limiter: Arc<TokenLimiter>,
     pub pack_limiter: Arc<TokenLimiter>,
+    /// Per-operator budget for GET routes, from `[controller] read_per_minute`.
+    pub read_limiter: Arc<TokenLimiter>,
+    pub read_per_minute: usize,
     /// The SQLite file, for size reporting and diagnostics.
     pub db_path: PathBuf,
     pub started: Instant,
@@ -266,6 +269,8 @@ impl AppState {
             pack_slots: Arc::new(Semaphore::new(PACK_CONCURRENCY)),
             sync_limiter: Arc::new(TokenLimiter::new()),
             pack_limiter: Arc::new(TokenLimiter::new()),
+            read_limiter: Arc::new(TokenLimiter::new()),
+            read_per_minute: cfg.read_per_minute,
             db_path: PathBuf::from(&cfg.db),
             started: Instant::now(),
             recovered_on_boot: AtomicU64::new(0),

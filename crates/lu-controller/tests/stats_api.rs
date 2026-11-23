@@ -73,6 +73,7 @@ fn config(db: &Path, artifacts: &Path, token: &str) -> ControllerConfig {
         repos: Vec::new(),
         groups: Vec::new(),
         blocked_dependent_ttl: "24h".to_owned(),
+        read_per_minute: lu_config::DEFAULT_READ_PER_MINUTE,
     }
 }
 

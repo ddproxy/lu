@@ -82,6 +82,7 @@ fn controller_cfg(db: &str, artifacts_dir: &str) -> ControllerConfig {
         repos: Vec::new(),
         groups: Vec::new(),
         blocked_dependent_ttl: "24h".to_owned(),
+        read_per_minute: lu_config::DEFAULT_READ_PER_MINUTE,
     }
 }
 
@@ -113,11 +114,15 @@ async fn start_server_full(
     pack_cap: Option<usize>,
     repos: Vec<ControllerRepo>,
 ) -> TestServer {
-    start_server_inner(roots, pack_cap, repos, None).await
+    start_server_inner(roots, pack_cap, repos, None, None).await
 }
 
 async fn start_server_with_artifacts(artifacts: Option<ArtifactsConfig>) -> TestServer {
-    start_server_inner(Vec::new(), None, Vec::new(), artifacts).await
+    start_server_inner(Vec::new(), None, Vec::new(), artifacts, None).await
+}
+
+async fn start_server_with_read_budget(read_per_minute: usize) -> TestServer {
+    start_server_inner(Vec::new(), None, Vec::new(), None, Some(read_per_minute)).await
 }
 
 async fn start_server_inner(
@@ -125,6 +130,7 @@ async fn start_server_inner(
     pack_cap: Option<usize>,
     repos: Vec<ControllerRepo>,
     artifacts: Option<ArtifactsConfig>,
+    read_per_minute: Option<usize>,
 ) -> TestServer {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("lu.db");
@@ -132,6 +138,9 @@ async fn start_server_inner(
     let mut cfg = controller_cfg(db.to_str().unwrap(), artifacts_dir.to_str().unwrap());
     cfg.local_repo_roots = roots;
     cfg.repos = repos;
+    if let Some(limit) = read_per_minute {
+        cfg.read_per_minute = limit;
+    }
     let store = Arc::new(SqliteStore::open(&db).unwrap());
     let mut state =
         AppState::from_config_with_artifacts(&cfg, store.clone(), artifacts.as_ref()).unwrap();
@@ -4012,5 +4021,402 @@ async fn restricted_tokens_cannot_widen_job_fields_and_expired_tokens_are_refuse
 
     let r = op_request(&srv, EXPIRED_TOKEN, "GET /v1/status", None).await;
     assert_eq!(status(&r), 401, "{r}");
+    let _ = srv.shutdown.send(());
+}
+
+fn with_repo(mut spec: JobSpec, url: &str) -> JobSpec {
+    spec.repo = url.to_owned();
+    spec.source.repo = url.to_owned();
+    spec
+}
+
+fn job_ids(page: &serde_json::Value) -> Vec<String> {
+    page["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+async fn list_page(addr: SocketAddr, query: &str) -> serde_json::Value {
+    let r = raw_request(addr, &operator_get(&format!("/v1/jobs?{query}"))).await;
+    assert_eq!(status(&r), 200, "{query}: {r}");
+    serde_json::from_str(body_str(&r)).unwrap()
+}
+
+#[tokio::test]
+async fn reads_carry_etags_and_answer_not_modified() {
+    let srv = start_server().await;
+    let r = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let paths = [
+        format!("/v1/jobs/{id}"),
+        "/v1/jobs".to_owned(),
+        "/v1/nodes".to_owned(),
+    ];
+    for path in &paths {
+        let first = raw_request(srv.addr, &operator_get(path)).await;
+        assert_eq!(status(&first), 200, "{path}: {first}");
+        let etag = header_value(&first, "etag")
+            .unwrap_or_else(|| panic!("no etag on {path}"))
+            .to_owned();
+        assert!(etag.starts_with('"') && etag.ends_with('"') && !etag.starts_with("W/"));
+        assert_eq!(header_value(&first, "cache-control"), Some("no-store"));
+
+        let same = raw_request(
+            srv.addr,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nIf-None-Match: \"stale\", {etag}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status(&same), 304, "{path}: {same}");
+        assert!(body(&same).is_empty(), "{path}: {same}");
+        assert_eq!(header_value(&same, "etag"), Some(etag.as_str()));
+        assert_eq!(header_value(&same, "cache-control"), Some("no-store"));
+        assert_eq!(
+            header_value(&same, "x-content-type-options"),
+            Some("nosniff")
+        );
+
+        let stale = raw_request(
+            srv.addr,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nIf-None-Match: \"not-it\"\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status(&stale), 200, "{path}: {stale}");
+        assert_eq!(header_value(&stale, "etag"), Some(etag.as_str()));
+    }
+
+    // A new job changes the list body, so the old validator no longer matches.
+    let list = raw_request(srv.addr, &operator_get("/v1/jobs")).await;
+    let old = header_value(&list, "etag").unwrap().to_owned();
+    let r = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let changed = raw_request(
+        srv.addr,
+        &format!("GET /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nIf-None-Match: {old}\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&changed), 200, "{changed}");
+    assert_ne!(header_value(&changed, "etag"), Some(old.as_str()));
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn summary_view_is_compact_and_omits_task_context_and_spec() {
+    let srv = start_server().await;
+    let mut spec = with_repo(sample_spec(None), "https://example.net/team/repo.git");
+    spec.task = "Fix the flaky parser\nsecond line with DETAIL-MARKER".to_owned();
+    spec.context = Some("CONTEXT-MARKER".to_owned());
+    spec.origin = Some("ops-batch".to_owned());
+    let r = submit_spec(srv.addr, &spec).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let r = raw_request(srv.addr, &operator_get("/v1/jobs?view=summary")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let text = body_str(&r);
+    assert!(!text.contains("DETAIL-MARKER"), "{text}");
+    assert!(!text.contains("CONTEXT-MARKER"), "{text}");
+    assert!(!text.contains("\"spec\""), "{text}");
+    let page: serde_json::Value = serde_json::from_str(text).unwrap();
+    let job = &page["jobs"][0];
+    let keys: std::collections::BTreeSet<&str> = job
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected: std::collections::BTreeSet<&str> = [
+        "id",
+        "state",
+        "node",
+        "attempt",
+        "created_at",
+        "updated_at",
+        "started_at",
+        "finished_at",
+        "repo",
+        "origin",
+        "priority",
+        "group",
+        "provider",
+        "model",
+        "title",
+        "failure_class",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(keys, expected, "{text}");
+    assert_eq!(job["id"], id.as_str());
+    assert_eq!(job["state"], "queued");
+    assert_eq!(job["title"], "Fix the flaky parser");
+    assert_eq!(job["repo"], "team/repo");
+    assert_eq!(job["origin"], "ops-batch");
+    assert_eq!(page["next"], id.as_str());
+
+    // The key lookup takes the same view.
+    let key_spec = {
+        let mut keyed = sample_spec(Some("summary-key"));
+        keyed.task = "keyed".to_owned();
+        keyed
+    };
+    assert_eq!(status(&submit_spec(srv.addr, &key_spec).await), 201);
+    let r = raw_request(
+        srv.addr,
+        &operator_get("/v1/jobs?key=summary-key&view=summary"),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["jobs"][0]["title"],
+        "keyed"
+    );
+
+    // Full view is unchanged and still carries the task.
+    let r = raw_request(srv.addr, &operator_get("/v1/jobs")).await;
+    assert!(body_str(&r).contains("DETAIL-MARKER"), "{r}");
+
+    let r = raw_request(srv.addr, &operator_get("/v1/jobs?view=wide")).await;
+    assert_eq!(status(&r), 400, "{r}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["error"],
+        "bad_request"
+    );
+
+    // A credential in the repository is refused at submission and never reaches a summary.
+    // Assembled at runtime so no credential-shaped URL literal lives in the source.
+    let leaky_url = [
+        "https://",
+        "user",
+        ":",
+        "CRED-MARKER",
+        "@example.net/team/repo.git?token=",
+        "CRED-MARKER",
+    ]
+    .concat();
+    let leaky = with_repo(sample_spec(None), &leaky_url);
+    let r = submit_spec(srv.addr, &leaky).await;
+    assert_ne!(status(&r), 201, "{r}");
+    let r = raw_request(srv.addr, &operator_get("/v1/jobs?view=summary")).await;
+    assert!(!body_str(&r).contains("CRED-MARKER"), "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn job_list_filters_combine_and_refuse_bad_values() {
+    let srv = start_server().await;
+    let a = with_repo(sample_spec(None), "https://example.net/team/one.git");
+    let mut a = a;
+    a.origin = Some("alpha".to_owned());
+    let mut b = with_repo(sample_spec(None), "https://example.net/team/two.git");
+    b.origin = Some("beta".to_owned());
+    let r = submit_spec(srv.addr, &a).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let id_a = serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let r = submit_spec(srv.addr, &b).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let id_b = serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let ids = |page: &serde_json::Value| job_ids(page);
+    assert_eq!(
+        ids(&list_page(srv.addr, "origin=alpha").await),
+        vec![id_a.clone()]
+    );
+    assert_eq!(
+        ids(&list_page(srv.addr, "repo=team/two").await),
+        vec![id_b.clone()]
+    );
+    assert_eq!(
+        ids(&list_page(srv.addr, "repo=team/two.git").await),
+        vec![id_b.clone()]
+    );
+    assert_eq!(
+        ids(&list_page(srv.addr, "state=queued,blocked").await),
+        vec![id_b.clone(), id_a.clone()]
+    );
+    assert_eq!(
+        ids(&list_page(srv.addr, "state=blocked&state=queued").await),
+        vec![id_b.clone(), id_a.clone()]
+    );
+    assert!(ids(&list_page(srv.addr, "state=done").await).is_empty());
+    assert!(ids(&list_page(srv.addr, "node=node-a").await).is_empty());
+    assert_eq!(ids(&list_page(srv.addr, "updated_since=0").await).len(), 2);
+    assert!(ids(&list_page(srv.addr, "updated_since=99999999999").await).is_empty());
+    assert_eq!(
+        ids(&list_page(srv.addr, "origin=alpha&repo=team/one").await),
+        vec![id_a.clone()]
+    );
+    assert!(ids(&list_page(srv.addr, "origin=alpha&repo=team/two").await).is_empty());
+    assert_eq!(
+        ids(&list_page(srv.addr, "origin=alpha&limit=1").await),
+        vec![id_a.clone()]
+    );
+
+    for query in [
+        "state=bogus",
+        "state=queued,bogus",
+        "node=bad%20name",
+        "repo=https://example.net/team/one",
+        "repo=team",
+        "repo=team//one",
+        "updated_since=-1",
+        "updated_since=soon",
+    ] {
+        let r = raw_request(srv.addr, &operator_get(&format!("/v1/jobs?{query}"))).await;
+        assert_eq!(status(&r), 400, "{query}: {r}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["error"],
+            "bad_request",
+            "{query}: {r}"
+        );
+    }
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn filtered_pages_resume_from_next_until_empty() {
+    let srv = start_server().await;
+    let mut created = Vec::new();
+    for i in 0..5 {
+        let mut spec = sample_spec(None);
+        spec.origin = Some(if i % 2 == 0 { "alpha" } else { "beta" }.to_owned());
+        let r = submit_spec(srv.addr, &spec).await;
+        assert_eq!(status(&r), 201, "{r}");
+        created.push((
+            spec.origin.clone().unwrap(),
+            serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        ));
+    }
+    let expected: Vec<String> = created
+        .iter()
+        .rev()
+        .filter(|(origin, _)| origin == "alpha")
+        .map(|(_, id)| id.clone())
+        .collect();
+    assert_eq!(expected.len(), 3);
+
+    let mut collected = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..10 {
+        let query = match &after {
+            Some(cursor) => format!("origin=alpha&limit=1&after={cursor}"),
+            None => "origin=alpha&limit=1".to_owned(),
+        };
+        let page = list_page(srv.addr, &query).await;
+        let ids = job_ids(&page);
+        assert!(ids.len() <= 1, "{page}");
+        if ids.is_empty() {
+            break;
+        }
+        collected.extend(ids);
+        after = page["next"].as_str().map(str::to_owned);
+    }
+    assert_eq!(collected, expected);
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn read_budget_answers_429_with_retry_after_and_spares_writes() {
+    let srv = start_server_with_read_budget(3).await;
+    // Unauthenticated probes are refused before the budget is touched.
+    let r = raw_request(
+        srv.addr,
+        "GET /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status(&r), 401, "{r}");
+    for _ in 0..3 {
+        let r = raw_request(srv.addr, &operator_get("/v1/jobs")).await;
+        assert_eq!(status(&r), 200, "{r}");
+    }
+    let r = raw_request(srv.addr, &operator_get("/v1/jobs")).await;
+    assert_eq!(status(&r), 429, "{r}");
+    let retry: u64 = header_value(&r, "retry-after")
+        .expect("retry-after")
+        .parse()
+        .unwrap();
+    assert!((1..=60).contains(&retry), "{retry}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["error"],
+        "rate_limited"
+    );
+    // Writes are not read routes and keep their own behaviour.
+    let r = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn default_read_budget_covers_a_polling_ui() {
+    let srv = start_server().await;
+    // Two requests a second for a minute is 120; the default must not trip at that rate.
+    for _ in 0..125 {
+        let r = raw_request(srv.addr, &operator_get("/v1/jobs?limit=1")).await;
+        assert_eq!(status(&r), 200, "{r}");
+    }
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn log_reads_bound_the_window_with_offset_and_max() {
+    let srv = start_server().await;
+    let (id, _job_id, epoch) = assign_and_start(&srv).await;
+    let req = format!(
+        "POST /v1/agent/jobs/{id}/log?epoch={epoch}&offset=0 HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: 10\r\n\r\n0123456789"
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert!(status(&r) == 200 || status(&r) == 204, "{r}");
+
+    let get = |query: &str| {
+        let path = format!("/v1/jobs/{id}/logs{query}");
+        async move { raw_request(srv.addr, &operator_get(&path)).await }
+    };
+    let r = get("?offset=2&max=3").await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert_eq!(body(&r), "234");
+    assert_eq!(header_value(&r, "content-length"), Some("3"));
+
+    let r = get("?offset=4").await;
+    assert_eq!(body(&r), "456789");
+    let r = get("").await;
+    assert_eq!(body(&r), "0123456789");
+    // Past the end is an empty window, not an error.
+    let r = get("?offset=50").await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert!(body(&r).is_empty());
+    // A larger max is clamped to the cap, so the whole log still comes back.
+    let r = get("?max=18446744073709551615").await;
+    assert_eq!(body(&r), "0123456789");
+    for query in ["?max=0", "?max=-1", "?max=lots", "?offset=-1"] {
+        let r = get(query).await;
+        assert_eq!(status(&r), 400, "{query}: {r}");
+    }
+
     let _ = srv.shutdown.send(());
 }
