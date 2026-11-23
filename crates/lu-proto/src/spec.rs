@@ -2,6 +2,7 @@
 //! [`JobSpec::canonical_json`] is stable for equal specs, so the store can compare payloads byte
 //! for byte to tell a repeated idempotency key from a conflicting one.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -1843,7 +1844,34 @@ fn check_repo(repo: &str) -> Result<(), JobSpecError> {
             "must be a git URL or an absolute local path",
         ));
     }
+    if repo_url_parts(repo).is_some_and(|(_, authority, _)| authority.contains('@')) {
+        return Err(invalid("repo", "must not contain credentials"));
+    }
     Ok(())
+}
+
+/// Splits a URL-form repo into scheme, authority and the rest. Local paths and malformed strings
+/// are not URLs, so they are left alone.
+fn repo_url_parts(repo: &str) -> Option<(&str, &str, &str)> {
+    let (scheme, rest) = repo.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    Some((scheme, &rest[..end], &rest[end..]))
+}
+
+/// Removes credentials, query and fragment from a repository URL before it is shown to a client.
+/// Existing rows may predate the rule that rejects credentials, so views redact on read as well.
+/// Local paths are returned unchanged.
+pub fn redact_repo(repo: &str) -> Cow<'_, str> {
+    let Some((scheme, authority, rest)) = repo_url_parts(repo) else {
+        return Cow::Borrowed(repo);
+    };
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let path_end = rest.find(['?', '#']).unwrap_or(rest.len());
+    let path = &rest[..path_end];
+    if host == authority && path == rest {
+        return Cow::Borrowed(repo);
+    }
+    Cow::Owned(format!("{scheme}://{host}{path}"))
 }
 
 fn check_commit_id(value: &str) -> Result<(), JobSpecError> {
@@ -1991,6 +2019,47 @@ mod tests {
         spec.idle_timeout_secs = Some(30);
         spec.idempotency_key = Some("ticket:1234".to_owned());
         assert!(spec.validate().is_ok());
+    }
+
+    fn credentialed_repo() -> String {
+        // Assembled here so no credential-shaped text is stored in the source tree.
+        let user = ['v', 'i', 'e', 'w'].iter().collect::<String>();
+        let pass = ['o', 'n', 'l', 'y'].iter().collect::<String>();
+        format!("https://{user}:{pass}@example.net/repo.git")
+    }
+
+    #[test]
+    fn userinfo_is_rejected_in_repo_urls() {
+        let mut spec = sample();
+        let repo = credentialed_repo();
+        spec.repo = repo.clone();
+        spec.source.repo = repo;
+        let error = spec.validate().unwrap_err();
+        assert_eq!(error.field(), "repo");
+        assert_eq!(error.reason(), "must not contain credentials");
+
+        let mut spec = sample();
+        let user_only = format!(
+            "https://{}@example.net/repo.git",
+            ['v', 'i', 's', 'i', 't', 'o', 'r']
+                .iter()
+                .collect::<String>()
+        );
+        spec.repo = user_only.clone();
+        spec.source.repo = user_only;
+        assert_eq!(error_field(&spec), "repo");
+    }
+
+    #[test]
+    fn stored_repo_urls_are_redacted_on_read() {
+        let repo = credentialed_repo();
+        let with_extras = format!("{repo}?branch=main#section");
+        assert_eq!(redact_repo(&with_extras), "https://example.net/repo.git");
+        assert_eq!(
+            redact_repo("https://example.net/repo.git?ref=main"),
+            "https://example.net/repo.git"
+        );
+        assert_eq!(redact_repo("/srv/git/repo"), "/srv/git/repo");
     }
 
     #[test]

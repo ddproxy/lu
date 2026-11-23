@@ -7,6 +7,7 @@
 //! The `data` object is an allowlist of small scalar fields. Task text, prompts, artifact
 //! content and tokens have no field they could be written to.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
@@ -154,10 +155,12 @@ impl Data {
     }
 
     /// Adds a short name or code. Values outside the safe character set are dropped rather
-    /// than recorded, so no job text can reach the file through a data field.
+    /// than recorded, so no job text can reach the file through a data field. URL-shaped values
+    /// are stripped of userinfo, query and fragment before the character check.
     pub fn text(mut self, field: Field, value: &str) -> Self {
-        if safe_text(value) {
-            self.put(field, Scalar::Text(value.to_owned()));
+        let value = redact_url(value);
+        if safe_text(value.as_ref()) {
+            self.put(field, Scalar::Text(value.into_owned()));
         }
         self
     }
@@ -178,6 +181,23 @@ impl Data {
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
     }
+}
+
+/// Removes userinfo, query and fragment from a URL-shaped value. Other values are untouched.
+fn redact_url(value: &str) -> Cow<'_, str> {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return Cow::Borrowed(value);
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let tail = &rest[authority_end..];
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    let path = &tail[..path_end];
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host == authority && path == tail {
+        return Cow::Borrowed(value);
+    }
+    Cow::Owned(format!("{scheme}://{host}{path}"))
 }
 
 fn safe_text(value: &str) -> bool {
@@ -688,6 +708,21 @@ mod tests {
         }
         assert!(!text.contains("summary"));
         assert!(!text.contains("token"));
+    }
+
+    #[test]
+    fn url_data_fields_are_redacted() {
+        let user = ['r', 'e', 'a', 'd'].iter().collect::<String>();
+        let pass = ['o', 'n', 'l', 'y'].iter().collect::<String>();
+        let repo = format!("https://{user}:{pass}@example.net/repo.git?ref=main#part");
+        let data = Data::new().text(Field::Source, &repo);
+        let (_, bytes) = line(1, GENESIS_PREV, Event::Submitted, data);
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains("https://example.net/repo.git"));
+        assert!(!text.contains(&user));
+        assert!(!text.contains(&pass));
+        assert!(!text.contains("ref=main"));
+        assert!(!text.contains("part"));
     }
 
     #[test]

@@ -85,3 +85,46 @@ No database schema change was needed.
 
 The checkout's `.git` directory is not writable, so no commit could be created. Commit messages
 were kept terse as requested; report this limitation rather than claiming a commit exists.
+# Verification notes
+
+The referenced report was readable through the worklog vault. Claims relevant to this work were
+checked against the tree before editing; the results follow.
+
+## Confirmed in code
+
+- `check_repo` only checked length, control characters and the URL/path shape; it accepted
+  userinfo in the authority. `parse_http_url` in `lu-config` already rejects `@`, `?` and `#`.
+- `job_view_with` copied `JobRecord.spec` into every `JobView`, so a stored repo was shown verbatim.
+- No response set `Cache-Control` or `X-Content-Type-Options`. Artifact responses had no
+  `Content-Disposition`; log responses had no `Content-Disposition` either.
+- `limit` on jobs and drafts, and `offset` and `wait` on logs, silently defaulted when unparseable.
+- Both operator and agent auth counted a missing token in the same `(peer IP, scope)` bucket as a
+  wrong token, and the block check ran before the token was read.
+- `docs/api.md` omitted retry, staged-commit and merge-base, and described `repo` as an https URL
+  or configured local path. It did not document strict query parsing.
+- Retry takes a full `JobSpec` body and returns `job`, `retried` pairs and `waiting_dependents`.
+- Staged-commit and merge-base are agent routes fenced by the lease epoch.
+
+## Where the code disagreed with the report
+
+- The report said the security doc's fixed throttle numbers might be config-driven and unverified.
+  They are hardcoded in `AppState::from_config` (`max_failures: 10`, `window: 60s`) and matched the
+  doc. The new tokenless bucket is also hardcoded (100 in the same window) and is documented.
+- The report said the code accepts any absolute path for `repo`. It also accepts any string with
+  `://`, not just https URLs; the docs now say "a git URL with a scheme, or an absolute local path".
+- The report described config mirror validation as rejecting userinfo only. It also rejects query
+  and fragment. `source.repo` now rejects userinfo to align with that rule, while query and
+  fragment are allowed on submit and stripped from stored values on read as requested.
+
+## Scope decisions
+
+- Redaction is applied where `JobView` values are built, so lists, single reads, retry replies and
+  agent JobView replies all use the cleaned repo. The agent assignment event and scope job context
+  keep the stored repo because an agent needs it for its fetch; new submissions cannot contain
+  userinfo, and those paths are not job views.
+- Audit records did not contain a repo URL before this change. `Data::text` now strips URL
+  userinfo, query and fragment centrally, so a future field cannot leak one.
+- Security headers are set both in the router middleware and `with_version`; the latter keeps
+  direct handler calls and their tests consistent with served responses.
+- The status route collapses every auth failure to 401. The integration check observes the
+  wrong-token block through `POST /v1/jobs`, which surfaces the throttle error as 429.

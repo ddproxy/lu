@@ -51,8 +51,8 @@ pub use scope::{
     SCOPE_ROUTES, SCOPE_SOURCE,
 };
 pub use spec::{
-    effective_stuck, valid_group, validate_idempotency_key, validate_stack_paths, Choice,
-    CollectMode, CollectModeError, ExpectEdit, ExpectMode, ExpectModeError, ExpectSpec,
+    effective_stuck, redact_repo, valid_group, validate_idempotency_key, validate_stack_paths,
+    Choice, CollectMode, CollectModeError, ExpectEdit, ExpectMode, ExpectModeError, ExpectSpec,
     GateFailureMode, GateFailureModeError, JobEdit, JobSpec, JobSpecError, OnConflict,
     OnConflictError, PublishSpec, PublishTarget, SourceSpec, StuckPolicy, StuckPolicyError,
     WorkspacePolicy, WorkspacePolicyError, ANY_PROVIDER, COLLECT_ALIASES, COLLECT_MODES,

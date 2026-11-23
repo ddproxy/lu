@@ -13,8 +13,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lu_audit::{Data, Event, Field};
 use lu_proto::{
-    valid_group, validate_idempotency_key, ArtifactName, CordonView, JobEdit, JobId, JobSpec,
-    JobView, NodeName, NodeView, WorkspaceCleanResult,
+    redact_repo, valid_group, validate_idempotency_key, ArtifactName, CordonView, JobEdit, JobId,
+    JobSpec, JobView, NodeName, NodeView, WorkspaceCleanResult,
 };
 use lu_serve::PeerAddr;
 use lu_store::{
@@ -55,6 +55,18 @@ fn query_flag(query: &HashMap<String, String>, name: &str) -> bool {
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
 }
 
+/// Reads an unsigned query parameter. An absent parameter uses the caller's default; a present
+/// but unparseable one is a 400 in the standard error shape instead of a silent default.
+fn query_u64(query: &HashMap<String, String>, name: &str) -> Result<Option<u64>, ApiError> {
+    match query.get(name) {
+        None => Ok(None),
+        Some(raw) => raw
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| ApiError::bad_request(format!("invalid {name}"))),
+    }
+}
+
 pub fn job_view(r: &JobRecord) -> JobView {
     job_view_with(r, None, lu_config::DEFAULT_BLOCKED_DEPENDENT_TTL_SECS)
 }
@@ -65,10 +77,16 @@ pub fn job_view_with_ttl(r: &JobRecord, ttl_secs: u64) -> JobView {
 }
 
 fn job_view_with(r: &JobRecord, reason: Option<String>, ttl_secs: u64) -> JobView {
+    // Older rows can hold a repo with credentials, query or fragment. Redact on every view,
+    // including single-job reads, lists, retries and agent replies, without changing the stored
+    // spec the agent still needs for its fetch.
+    let mut spec = r.spec.clone();
+    spec.repo = redact_repo(&spec.repo).into_owned();
+    spec.source.repo = redact_repo(&spec.source.repo).into_owned();
     JobView {
         id: r.id.clone(),
         state: r.state,
-        spec: r.spec.clone(),
+        spec,
         attempt: r.attempt,
         node: r.node.clone(),
         assigned_provider: r.assigned_provider.clone(),
@@ -422,11 +440,12 @@ pub async fn list_jobs(
         });
         return with_version(json_value_ok(StatusCode::OK, body));
     }
-    let limit = q
-        .get("limit")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(200)
-        .min(200);
+    let limit = match query_u64(&q, "limit") {
+        Ok(value) => usize::try_from(value.unwrap_or(200))
+            .unwrap_or(usize::MAX)
+            .min(200),
+        Err(error) => return with_version(error.into_response()),
+    };
     let state_filter = match q.get("state") {
         Some(s) if !s.is_empty() => match parse_job_state(s) {
             Some(st) => Some(st),
@@ -778,11 +797,12 @@ pub async fn list_drafts(
         return with_version(ApiError::unauthorized().into_response());
     }
     let q = parse_query(&uri);
-    let limit = q
-        .get("limit")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(200)
-        .min(1000);
+    let limit = match query_u64(&q, "limit") {
+        Ok(value) => usize::try_from(value.unwrap_or(200))
+            .unwrap_or(usize::MAX)
+            .min(1000),
+        Err(error) => return with_version(error.into_response()),
+    };
     let store = Arc::clone(&state.store);
     let drafts = match tokio::task::spawn_blocking(move || store.list_drafts(limit)).await {
         Ok(Ok(jobs)) => jobs,
@@ -987,7 +1007,7 @@ pub async fn get_artifact(
     }
     .await;
     match result {
-        Ok(file) => with_version(into_response(file, ct)),
+        Ok(file) => with_version(into_response(file, ct, art.file_name())),
         Err(error) => with_version(error.into_response()),
     }
 }
@@ -1007,15 +1027,14 @@ pub async fn get_logs(
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
     };
     let q = crate::routes::parse_query(&uri);
-    let offset = q
-        .get("offset")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    let wait_secs = q
-        .get("wait")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0)
-        .min(25);
+    let offset = match query_u64(&q, "offset") {
+        Ok(value) => value.unwrap_or(0),
+        Err(error) => return with_version(error.into_response()),
+    };
+    let wait_secs = match query_u64(&q, "wait") {
+        Ok(value) => value.unwrap_or(0).min(25),
+        Err(error) => return with_version(error.into_response()),
+    };
     let job_id_s = job_id.to_string();
     // verify job exists
     let rec0 = {
@@ -1058,6 +1077,12 @@ pub async fn get_logs(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/plain")
         .header(header::CONTENT_LENGTH, len.to_string())
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"run.log\"",
+        )
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "no-store")
         .header("x-lu-log-length", rec.log_len.to_string())
         .header("x-lu-state", rec.state.as_str())
         .body(body)
@@ -1507,6 +1532,23 @@ mod tests {
 
     fn diff() -> Vec<ArtifactName> {
         vec![ArtifactName::DiffPatch]
+    }
+
+    #[test]
+    fn a_stored_repo_with_userinfo_is_redacted_in_views() {
+        let mut r = record(JobState::Queued, false, None, Vec::new());
+        let user = ['v', 'i', 'e', 'w'].iter().collect::<String>();
+        let pass = ['o', 'n', 'l', 'y'].iter().collect::<String>();
+        let raw = format!("https://{user}:{pass}@example.net/repo.git?ref=main#part");
+        r.spec.repo = raw.clone();
+        r.spec.source.repo = raw;
+        let view = job_view(&r);
+        assert_eq!(view.spec.source.repo, "https://example.net/repo.git");
+        assert_eq!(view.spec.repo, "https://example.net/repo.git");
+        let wire = serde_json::to_string(&view).expect("serialize view");
+        assert!(!wire.contains(&user));
+        assert!(!wire.contains(&pass));
+        assert!(!wire.contains("ref=main"));
     }
 
     #[test]
