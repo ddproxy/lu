@@ -1960,7 +1960,7 @@ mod poll_renewal_tests {
                 name: "ops".to_owned(),
                 token_sha256: sha256_hex("unused-operator-token"),
                 schedule: false,
-                ..Default::default(),
+                ..Default::default()
             }],
             repos: Vec::new(),
             groups: Vec::new(),
@@ -2018,7 +2018,7 @@ mod poll_renewal_tests {
                 name: "ops".to_owned(),
                 token_sha256: sha256_hex("unused-operator-token"),
                 schedule: false,
-                ..Default::default(),
+                ..Default::default()
             }],
             repos: Vec::new(),
             groups: Vec::new(),
