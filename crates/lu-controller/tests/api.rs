@@ -2374,6 +2374,75 @@ async fn stale_epoch_artifact_upload_leaves_the_file_alone() {
 }
 
 #[tokio::test]
+async fn completed_job_artifact_upload_is_rejected_and_file_preserved() {
+    let srv = start_server().await;
+    let spec = sample_spec(None);
+    let body = serde_json::to_string(&spec).unwrap();
+    let req = format!(
+        "POST /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(), body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 201, "{r}");
+    let j: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let id = j["id"].as_str().unwrap().to_string();
+
+    let poll_body = json!({"heartbeat": heartbeat_json("node-a"), "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let assign = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign")
+        .unwrap()
+        .clone();
+    let epoch = assign["epoch"].as_u64().unwrap();
+
+    let start = json!({"epoch": epoch}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", start.len(), start);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let original = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n";
+    let req = format!("PUT /v1/agent/jobs/{id}/artifacts/diff.patch?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n", original.len());
+    let mut packet = req.into_bytes();
+    packet.extend_from_slice(original);
+    let r = raw_request_bytes(srv.addr, &packet).await;
+    let rs = String::from_utf8_lossy(&r).into_owned();
+    assert_eq!(status(&rs), 200, "{rs}");
+
+    let path = srv._artifacts_dir.join(&id).join("diff.patch");
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+
+    let comp = json!({"job_id": id, "epoch": epoch, "outcome": "done"}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/complete HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", comp.len(), comp);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+
+    let replacement = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+evil\n";
+    let req = format!("PUT /v1/agent/jobs/{id}/artifacts/diff.patch?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: {}\r\n\r\n", replacement.len());
+    let mut packet = req.into_bytes();
+    packet.extend_from_slice(replacement);
+    let r = raw_request_bytes(srv.addr, &packet).await;
+    let rs = String::from_utf8_lossy(&r).into_owned();
+    assert_eq!(status(&rs), 409, "{rs}");
+    let jb: serde_json::Value = serde_json::from_str(body_str(&rs)).unwrap();
+    assert_eq!(jb["error"], "conflict", "{rs}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original,
+        "completed job artifact must not be replaced"
+    );
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
 async fn log_append_100_bytes_below_the_cap_keeps_the_marker() {
     let srv = start_server().await;
     let spec = sample_spec(None);

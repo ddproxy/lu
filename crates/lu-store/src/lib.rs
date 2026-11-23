@@ -296,6 +296,48 @@ pub struct DraftCounts {
 pub trait Store: Send + Sync + 'static {
     /// Creates a job, or returns the existing one for the same key and spec (`false`).
     fn create_job(&self, spec: &JobSpec, now: Now) -> Result<(JobRecord, bool), StoreError>;
+    /// Creates a draft job while enforcing draft capacity atomically. Evicts oldest drafts as
+    /// needed (same origin for per-source overflow, global for total overflow). Returns
+    /// `LimitExceeded("max_drafts")` when capacity cannot be freed.
+    fn create_draft_job(
+        &self,
+        spec: &JobSpec,
+        now: Now,
+        max_total: u64,
+        max_per_source: u64,
+    ) -> Result<(JobRecord, bool), StoreError> {
+        if !spec.draft {
+            return self.create_job(spec, now);
+        }
+        let origin = spec.origin.clone().unwrap_or_default();
+        let counts = self.draft_counts()?;
+        let per_source = counts
+            .by_origin
+            .iter()
+            .find(|(label, _)| label == &origin)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        let per_source_overflow = per_source.saturating_add(1).saturating_sub(max_per_source);
+        if per_source_overflow > 0 {
+            self.expire_oldest_drafts(per_source_overflow, now, Some(&origin))?;
+        }
+        let counts = self.draft_counts()?;
+        let total_overflow = counts.total.saturating_add(1).saturating_sub(max_total);
+        if total_overflow > 0 {
+            self.expire_oldest_drafts(total_overflow, now, None)?;
+        }
+        let counts = self.draft_counts()?;
+        let per_source = counts
+            .by_origin
+            .iter()
+            .find(|(label, _)| label == &origin)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        if counts.total >= max_total || per_source >= max_per_source {
+            return Err(StoreError::LimitExceeded("max_drafts"));
+        }
+        self.create_job(spec, now)
+    }
     /// Creates a child job with explicit lineage. The store owns the lineage write so a child is
     /// never recorded without its parent and root. Stores that do not implement scope return an
     /// error rather than silently dropping the right.
@@ -449,9 +491,15 @@ pub trait Store: Send + Sync + 'static {
         Ok(0)
     }
     /// Expires up to `count` oldest drafts to make room under a capacity limit. Returns the
-    /// number moved to terminal `expired`. Drafts are never deleted silently.
-    fn expire_oldest_drafts(&self, count: u64, now: Now) -> Result<u64, StoreError> {
-        let _ = (count, now);
+    /// number moved to terminal `expired`. Drafts are never deleted silently. When `origin` is
+    /// set, only drafts with that origin label are considered.
+    fn expire_oldest_drafts(
+        &self,
+        count: u64,
+        now: Now,
+        origin: Option<&str>,
+    ) -> Result<u64, StoreError> {
+        let _ = (count, now, origin);
         Ok(0)
     }
 

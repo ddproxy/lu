@@ -13,10 +13,10 @@ pub struct ThrottleSettings {
     pub window: Duration,
 }
 
-/// Counts failed token checks per address. A blocked address gets the time left in its window.
+/// Counts failed token checks per address and scope. A blocked key gets the time left in its window.
 pub struct LoginThrottle {
     settings: ThrottleSettings,
-    seen: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    seen: Mutex<HashMap<(IpAddr, String), (u32, Instant)>>,
 }
 
 /// An IPv4 address is its own key. An IPv6 address is keyed by its /64, so a host that rotates
@@ -43,11 +43,11 @@ impl LoginThrottle {
         }
     }
 
-    /// How long `ip` must wait, or `None` when it may try.
-    pub fn blocked(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
-        let ip = throttle_key(ip);
+    /// How long `ip` must wait in `scope`, or `None` when it may try.
+    pub fn blocked(&self, ip: IpAddr, scope: &str, now: Instant) -> Option<Duration> {
+        let key = (throttle_key(ip), scope.to_owned());
         let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        let (count, since) = seen.get(&ip)?;
+        let (count, since) = seen.get(&key)?;
         let elapsed = now.saturating_duration_since(*since);
         if elapsed >= self.settings.window {
             return None;
@@ -55,13 +55,13 @@ impl LoginThrottle {
         (*count >= self.settings.max_failures).then(|| self.settings.window - elapsed)
     }
 
-    /// Records a failure and returns how many the address has inside the current window.
-    pub fn fail(&self, ip: IpAddr, now: Instant) -> u32 {
-        let ip = throttle_key(ip);
+    /// Records a failure and returns how many the address has inside the current window for `scope`.
+    pub fn fail(&self, ip: IpAddr, scope: &str, now: Instant) -> u32 {
+        let key = (throttle_key(ip), scope.to_owned());
         let window = self.settings.window;
         let max = self.settings.max_failures;
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        if seen.len() >= MAX_TRACKED && !seen.contains_key(&ip) {
+        if seen.len() >= MAX_TRACKED && !seen.contains_key(&key) {
             // Evict the least harmful entry: expired first, then unblocked, then least failed.
             let victim = seen
                 .iter()
@@ -69,12 +69,12 @@ impl LoginThrottle {
                     let expired = now.saturating_duration_since(*since) >= window;
                     (!expired, *count >= max, *count, *since)
                 })
-                .map(|(addr, _)| *addr);
+                .map(|(entry_key, _)| entry_key.clone());
             if let Some(victim) = victim {
                 seen.remove(&victim);
             }
         }
-        let entry = seen.entry(ip).or_insert((0, now));
+        let entry = seen.entry(key).or_insert((0, now));
         if now.saturating_duration_since(entry.1) >= window {
             *entry = (0, now);
         }
@@ -105,15 +105,15 @@ mod tests {
         let throttle = throttle();
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let t0 = Instant::now();
-        assert_eq!(throttle.fail(ip, t0), 1);
-        assert_eq!(throttle.fail(ip, t0), 2);
+        assert_eq!(throttle.fail(ip, "operator", t0), 1);
+        assert_eq!(throttle.fail(ip, "operator", t0), 2);
         assert!(
-            throttle.blocked(ip, t0).is_none(),
+            throttle.blocked(ip, "operator", t0).is_none(),
             "two failures are allowed"
         );
-        assert_eq!(throttle.fail(ip, t0), 3);
+        assert_eq!(throttle.fail(ip, "operator", t0), 3);
         let wait = throttle
-            .blocked(ip, t0 + Duration::from_secs(20))
+            .blocked(ip, "operator", t0 + Duration::from_secs(20))
             .expect("blocked");
         assert_eq!(wait, Duration::from_secs(40));
     }
@@ -124,11 +124,13 @@ mod tests {
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let t0 = Instant::now();
         for _ in 0..3 {
-            throttle.fail(ip, t0);
+            throttle.fail(ip, "operator", t0);
         }
-        assert!(throttle.blocked(ip, t0 + Duration::from_secs(60)).is_none());
+        assert!(throttle
+            .blocked(ip, "operator", t0 + Duration::from_secs(60))
+            .is_none());
         assert_eq!(
-            throttle.fail(ip, t0 + Duration::from_secs(61)),
+            throttle.fail(ip, "operator", t0 + Duration::from_secs(61)),
             1,
             "the count restarts"
         );
@@ -142,11 +144,15 @@ mod tests {
         let ip: IpAddr = "192.0.2.7".parse().unwrap();
         let t0 = Instant::now();
         for _ in 0..10 {
-            throttle.fail(ip, t0);
+            throttle.fail(ip, "operator", t0);
         }
-        assert!(throttle.blocked(ip, t0).is_some());
-        assert!(throttle.blocked(ip, t0 + Duration::from_secs(30)).is_some());
-        assert!(throttle.blocked(ip, t0 + Duration::from_secs(61)).is_none());
+        assert!(throttle.blocked(ip, "operator", t0).is_some());
+        assert!(throttle
+            .blocked(ip, "operator", t0 + Duration::from_secs(30))
+            .is_some());
+        assert!(throttle
+            .blocked(ip, "operator", t0 + Duration::from_secs(61))
+            .is_none());
     }
 
     #[test]
@@ -154,8 +160,12 @@ mod tests {
         let throttle = throttle();
         let ip: IpAddr = "192.0.2.8".parse().unwrap();
         let t0 = Instant::now();
-        throttle.seen.lock().unwrap().insert(ip, (u32::MAX, t0));
-        assert_eq!(throttle.fail(ip, t0), u32::MAX);
+        throttle
+            .seen
+            .lock()
+            .unwrap()
+            .insert((ip, "operator".to_owned()), (u32::MAX, t0));
+        assert_eq!(throttle.fail(ip, "operator", t0), u32::MAX);
     }
 
     #[test]
@@ -166,14 +176,14 @@ mod tests {
         let same_prefix: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
         let other: IpAddr = "192.0.2.1".parse().unwrap();
         for _ in 0..2 {
-            throttle.fail(a, t0);
+            throttle.fail(a, "operator", t0);
         }
-        throttle.fail(same_prefix, t0);
+        throttle.fail(same_prefix, "operator", t0);
         assert!(
-            throttle.blocked(a, t0).is_some(),
+            throttle.blocked(a, "operator", t0).is_some(),
             "the /64 shares one count"
         );
-        assert!(throttle.blocked(other, t0).is_none());
+        assert!(throttle.blocked(other, "operator", t0).is_none());
     }
 
     #[test]
@@ -182,8 +192,20 @@ mod tests {
         let t0 = Instant::now();
         for i in 0..(MAX_TRACKED as u32 + 500) {
             let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
-            throttle.fail(ip, t0);
+            throttle.fail(ip, "operator", t0);
         }
         assert_eq!(throttle.tracked(), MAX_TRACKED);
+    }
+
+    #[test]
+    fn scopes_are_throttled_independently() {
+        let throttle = throttle();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            throttle.fail(ip, "agent", t0);
+        }
+        assert!(throttle.blocked(ip, "agent", t0).is_some());
+        assert!(throttle.blocked(ip, "operator", t0).is_none());
     }
 }

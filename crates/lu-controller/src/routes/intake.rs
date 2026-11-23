@@ -44,28 +44,23 @@ pub async fn intake(
         return ApiError::not_found("not found").into_response();
     }
     let source = intake.source_label(&name);
+    if body.len() > intake.max_body_bytes(&name) {
+        return outcome(&state, source, Decision::BadSignature);
+    }
     let signature = intake
         .signature_header(&name)
         .and_then(|header| headers.get(header))
         .and_then(|value| value.to_str().ok());
-    // Verify the raw bytes before even checking the size or parsing JSON. Bad and missing
-    // signatures are indistinguishable to the caller.
+    // Verify the raw bytes before parsing JSON. Bad, missing, and oversized signed payloads are
+    // indistinguishable to the caller.
     if !intake.verify(&name, signature, &body) {
         return outcome(&state, source, Decision::BadSignature);
-    }
-    if body.len() > intake.max_body_bytes(&name) {
-        return outcome(&state, source, Decision::Invalid);
     }
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
         return outcome(&state, source, Decision::Invalid);
     };
-    let delivery_id = intake
-        .dedupe_header(&name)
-        .and_then(|header| headers.get(header))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    match intake.admit(&name, delivery_id) {
+    let delivery_id = crate::intake::body_dedupe_id(&body);
+    match intake.admit(&name, Some(&delivery_id)) {
         Decision::Accepted { .. } => {}
         other => return outcome(&state, source, other),
     }
@@ -74,7 +69,13 @@ pub async fn intake(
         Ok(None) => return outcome(&state, source, Decision::Dropped),
         Err(_) => return outcome(&state, source, Decision::Invalid),
     };
-    let mut spec = to_spec(&job, source, delivery_id);
+    let mut spec = to_spec(&job, source, Some(&delivery_id));
+    if spec.idempotency_key.is_none() {
+        let mut key = String::with_capacity("intake-".len() + delivery_id.len());
+        key.push_str("intake-");
+        key.push_str(&delivery_id);
+        spec.idempotency_key = Some(key);
+    }
     // The controller resolves the named ref (including PR refs) and pins the commit itself, so
     // a node never needs forge access and cannot reinterpret a mutable branch name.
     if let Some(repo) = state.mirror.repo_for_url(&spec.source.repo) {
@@ -86,7 +87,7 @@ pub async fn intake(
         let commit = match pinned {
             Ok(Ok(commit)) => commit,
             _ => {
-                intake.rollback(&name, delivery_id);
+                intake.rollback(&name, Some(&delivery_id));
                 return outcome(&state, source, Decision::Invalid);
             }
         };
@@ -99,28 +100,36 @@ pub async fn intake(
             field = error.field(),
             "intake rule produced an invalid spec"
         );
-        intake.rollback(&name, delivery_id);
+        intake.rollback(&name, Some(&delivery_id));
         return outcome(&state, source, Decision::Invalid);
-    }
-
-    if let Err(error) = crate::routes::enforce_draft_capacity(&state, &spec).await {
-        intake.rollback(&name, delivery_id);
-        state.record_intake(source, "invalid");
-        return error.into_response();
     }
 
     let is_draft = spec.draft;
     let store = Arc::clone(&state.store);
-    let created =
-        tokio::task::spawn_blocking(move || store.create_job(&spec, crate::time::now())).await;
+    let max_total = state.drafts.max_total;
+    let max_per_source = state.drafts.max_per_source;
+    let created = tokio::task::spawn_blocking(move || {
+        let now = crate::time::now();
+        if is_draft {
+            store.create_draft_job(&spec, now, max_total, max_per_source)
+        } else {
+            store.create_job(&spec, now)
+        }
+    })
+    .await;
     let (record, _new) = match created {
         Ok(Ok(result)) => result,
+        Ok(Err(lu_store::StoreError::LimitExceeded(limit))) => {
+            intake.rollback(&name, Some(&delivery_id));
+            state.record_intake(source, "invalid");
+            return ApiError::limit_exceeded(limit).into_response();
+        }
         Ok(Err(error)) => {
-            intake.rollback(&name, delivery_id);
+            intake.rollback(&name, Some(&delivery_id));
             return store_err(error).into_response();
         }
         Err(_) => {
-            intake.rollback(&name, delivery_id);
+            intake.rollback(&name, Some(&delivery_id));
             return ApiError::internal().into_response();
         }
     };

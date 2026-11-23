@@ -167,8 +167,7 @@ impl Intake {
         names
     }
 
-    /// Verifies the signature with a constant-time comparison. Returns the hex digest so it can
-    /// seed an idempotency key when the operator did not configure `key_template`.
+    /// Verifies the signature with a constant-time comparison.
     pub fn verify(&self, name: &str, header_value: Option<&str>, body: &[u8]) -> bool {
         let Some(source) = self.sources.get(name) else {
             return false;
@@ -387,6 +386,21 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, ()> {
         out.push(((hi << 4) | lo) as u8);
     }
     Ok(out)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Stable dedupe key derived from signed body content.
+pub fn body_dedupe_id(body: &[u8]) -> String {
+    hex_encode(&Sha256::digest(body))
 }
 
 /// RFC 6901 pointer lookup. Array indices are decimal; `-` and malformed escapes do not match.

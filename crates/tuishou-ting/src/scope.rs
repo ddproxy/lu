@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::io;
 #[cfg(unix)]
-use std::os::unix::fs::{chown, MetadataExt};
+use std::os::unix::fs::{chown, DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -68,18 +68,57 @@ impl JobSocket {
             .unwrap_or(0);
         let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
         let scope_root = work_dir.join("scope");
-        std::fs::create_dir_all(&scope_root)
-            .map_err(|error| format!("cannot create job socket root: {error}"))?;
-        set_mode(&scope_root, 0o700)?;
+        match std::fs::symlink_metadata(&scope_root) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked scope root: {}",
+                    scope_root.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(unix)]
+                {
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&scope_root)
+                        .map_err(|error| format!("cannot create job socket root: {error}"))?;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::create_dir_all(&scope_root)
+                        .map_err(|error| format!("cannot create job socket root: {error}"))?;
+                }
+            }
+            Err(error) => return Err(format!("cannot stat job socket root: {error}")),
+        }
+        ensure_private_dir(&scope_root)?;
         if let Some((uid, gid)) = owner {
             set_owner(&scope_root, uid, gid)?;
+            ensure_private_dir(&scope_root)?;
         }
         let dir = scope_root.join(format!("{job_id}-{epoch}-{nanos}-{nonce}"));
-        std::fs::create_dir_all(&dir)
-            .map_err(|error| format!("cannot create job socket dir: {error}"))?;
-        set_mode(&dir, 0o700)?;
+        match std::fs::symlink_metadata(&dir) {
+            Ok(_) => return Err(format!("job socket dir already exists: {}", dir.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot stat job socket dir: {error}")),
+        }
+        #[cfg(unix)]
+        {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|error| format!("cannot create job socket dir: {error}"))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(&dir)
+                .map_err(|error| format!("cannot create job socket dir: {error}"))?;
+        }
+        ensure_private_dir(&dir)?;
         if let Some((uid, gid)) = owner {
             set_owner(&dir, uid, gid)?;
+            ensure_private_dir(&dir)?;
         }
         let path = dir.join("job.sock");
         let listener = UnixListener::bind(&path)
@@ -123,6 +162,30 @@ impl JobSocket {
 }
 
 #[cfg(unix)]
+fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot stat {}: {error}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("refusing symlinked scope path: {}", path.display()));
+    }
+    if !meta.is_dir() {
+        return Err(format!("scope path is not a directory: {}", path.display()));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot set permissions on {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_dir(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -137,7 +200,18 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<(), String> {
 #[cfg(unix)]
 fn set_owner(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
     chown(path, Some(uid), Some(gid))
-        .map_err(|error| format!("cannot chown {}: {error}", path.display()))
+        .map_err(|error| format!("cannot chown {}: {error}", path.display()))?;
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot stat {}: {error}", path.display()))?;
+    if meta.uid() != uid || meta.gid() != gid {
+        return Err(format!(
+            "unexpected owner on {}: {}:{}",
+            path.display(),
+            meta.uid(),
+            meta.gid()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -552,6 +626,24 @@ mod tests {
         });
         assert!(read_bounded_line(&mut server).await.is_err());
         writer.await.unwrap();
+    }
+
+    #[test]
+    fn symlinked_scope_root_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scope_root = tmp.path().join("scope");
+        let target = tmp.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &scope_root).unwrap();
+        let err = JobSocket::start(
+            Arc::new(FakeController::new()),
+            &JobId::new(),
+            1,
+            tmp.path(),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("symlinked scope root"), "{err}");
     }
 
     #[test]

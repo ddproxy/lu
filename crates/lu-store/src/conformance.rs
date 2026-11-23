@@ -234,7 +234,7 @@ fn draft_lifecycle<S: Store>(make: impl Fn() -> S) {
     // Capacity enforcement expires the oldest drafts before refusing a new one.
     let (first, _) = s.create_job(&sp, n).unwrap();
     let (second, _) = s.create_job(&sp, n).unwrap();
-    let evicted = s.expire_oldest_drafts(1, now(2000, 21)).unwrap();
+    let evicted = s.expire_oldest_drafts(1, now(2000, 21), None).unwrap();
     assert_eq!(evicted, 1);
     assert_eq!(s.get_job(&first.id).unwrap().state, JobState::Expired);
     assert_eq!(s.get_job(&second.id).unwrap().state, JobState::Draft);
