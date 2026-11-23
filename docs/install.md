@@ -35,9 +35,9 @@ and `contrib/`. The workflow builds with Rust 1.99, runs `cargo build --release 
 Worked example:
 
 ```sh
-sha256sum -c lu-v0.6.0-x86_64-unknown-linux-musl.tar.gz.sha256
-tar -xzf lu-v0.6.0-x86_64-unknown-linux-musl.tar.gz
-cd lu-v0.6.0-x86_64-unknown-linux-musl
+sha256sum -c lu-v0.6.1-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf lu-v0.6.1-x86_64-unknown-linux-musl.tar.gz
+cd lu-v0.6.1-x86_64-unknown-linux-musl
 ./lu --version
 ./ting --version
 install -m 0755 lu /usr/local/bin/lu
