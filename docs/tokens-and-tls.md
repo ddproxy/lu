@@ -39,6 +39,29 @@ name = "ops"
 token_sha256 = "<sha256 of operator.token>"
 ```
 
+Operator entries accept three optional settings, all safe to omit:
+
+```toml
+[[controller.operators]]
+name = "dashboard"
+token_sha256 = "<sha256 of dashboard.token>"
+role = "viewer"                    # viewer, operator (default) or admin (reserved)
+expires_at = "2030-01-31T12:00:00Z" # UTC, strict form; the token is refused from this instant
+restrict_fields = true             # refuse job fields that widen what a job may do
+```
+
+- `viewer` is read-only. It may read `/v1/status`, `/v1/stats`, `/v1/jobs`, `/v1/jobs/{id}`,
+  `/v1/nodes`, `/v1/nodes/{name}/stats`, `/v1/repos`, `/v1/health` and `/metrics`. Task text
+  and context are removed from every JSON response it receives. Logs, artifacts, drafts, scope
+  routes and every mutation return `403`.
+- `expires_at` makes the token fail exactly like an unknown one (`401`) once the time passes. Lu
+  does not reload tokens at runtime, so rotate by editing the file and restarting the controller.
+- `restrict_fields` makes job creation refuse `allow_spawn`, `spawn_inherit`, `spawn_repos`,
+  `stack_union_paths`, `stack_base_paths`, `publish.allow_source_branch` and
+  `publish.target = "source_branch"` with `403`.
+- A viewer or `restrict_fields` token requires an `[audit]` path: the controller refuses to start
+  without one, so changes made through a UI leave a record.
+
 Hashes must be unique across all agents and operators, so one token cannot hold both scopes. Agent
 names are also node identities. Config validation rejects malformed hashes, duplicate names and
 duplicate hashes.

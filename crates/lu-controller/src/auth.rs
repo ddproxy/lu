@@ -11,6 +11,46 @@ use std::time::Instant;
 pub struct AuthConfig {
     pub agents: HashMap<String, NodeName>,  // hash -> node name
     pub operators: HashMap<String, String>, // hash -> operator name
+    /// Role, expiry and field policy per operator name. A name with no entry is a plain operator.
+    pub profiles: HashMap<String, OperatorProfile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorProfile {
+    pub role: lu_config::OperatorRole,
+    /// Unix seconds from which the token is refused.
+    pub expires_at: Option<i64>,
+    pub restrict_fields: bool,
+}
+
+impl AuthConfig {
+    pub fn profile(&self, name: &str) -> Option<&OperatorProfile> {
+        self.profiles.get(name)
+    }
+
+    /// True when this operator's submissions must not widen what a job may do.
+    pub fn restricts_fields(&self, name: &str) -> bool {
+        self.profile(name).is_some_and(|p| p.restrict_fields)
+    }
+
+    /// The operator a presented bearer token belongs to, whether or not it has expired.
+    pub fn operator_for_token(&self, token: &str) -> Option<&str> {
+        let presented = sha256_hex(token);
+        let mut found = None;
+        for (hash, name) in &self.operators {
+            if constant_time_eq(presented.as_bytes(), hash.as_bytes()) && found.is_none() {
+                found = Some(name.as_str());
+            }
+        }
+        found
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl AuthConfig {
@@ -23,13 +63,33 @@ impl AuthConfig {
             }
         }
         let mut operators = HashMap::new();
+        let mut profiles = HashMap::new();
         for o in &cfg.operators {
             if agents.contains_key(&o.token_sha256) || operators.contains_key(&o.token_sha256) {
                 return Err("duplicate token hash across scopes".to_owned());
             }
             operators.insert(o.token_sha256.clone(), o.name.clone());
+            let expires_at = match &o.expires_at {
+                Some(text) => Some(
+                    lu_config::parse_utc_timestamp(text)
+                        .ok_or_else(|| format!("operator {}: invalid expires_at", o.name))?,
+                ),
+                None => None,
+            };
+            profiles.insert(
+                o.name.clone(),
+                OperatorProfile {
+                    role: o.role,
+                    expires_at,
+                    restrict_fields: o.restrict_fields,
+                },
+            );
         }
-        Ok(Self { agents, operators })
+        Ok(Self {
+            agents,
+            operators,
+            profiles,
+        })
     }
 }
 
@@ -95,6 +155,12 @@ pub fn authenticate_operator(
             found = Some(name.clone());
         }
     }
+    // An expired token is refused exactly like an unknown one.
+    let found = found.filter(|name| {
+        auth.profile(name)
+            .and_then(|p| p.expires_at)
+            .is_none_or(|expiry| unix_now() < expiry)
+    });
     match found {
         Some(name) => Ok(name),
         None => {
@@ -151,6 +217,7 @@ mod tests {
         let auth = AuthConfig {
             agents: HashMap::new(),
             operators: HashMap::from([(sha256_hex(&token), "ops".to_owned())]),
+            profiles: HashMap::new(),
         };
         (auth, token)
     }

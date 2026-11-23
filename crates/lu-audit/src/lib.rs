@@ -59,6 +59,14 @@ pub enum Event {
     /// High-confidence secret patterns found in added patch lines. `data.count` is the number of
     /// hits and `data.rules` names the rules; no matched secret text is recorded.
     PatchSecretDetected,
+    /// A job or draft edit. `data.source` is the operator's role.
+    JobEdited,
+    /// A runtime group limit change. `data.count` is the new maximum, `data.source` the role.
+    GroupLimit,
+    /// A workspace clean request for a node. `data.source` is the operator's role.
+    WorkspaceClean,
+    /// A repository mirror sync. `data.remote` is the configured repository name.
+    RepoSync,
 }
 
 impl Event {
@@ -83,6 +91,10 @@ impl Event {
             Self::AgentSelf => "agent_self",
             Self::Publish => "publish",
             Self::PatchSecretDetected => "patch_secret_detected",
+            Self::JobEdited => "job_edited",
+            Self::GroupLimit => "group_limit",
+            Self::WorkspaceClean => "workspace_clean",
+            Self::RepoSync => "repo_sync",
         }
     }
 }

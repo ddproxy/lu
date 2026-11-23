@@ -203,7 +203,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(crate::routes::intake::intake).layer(intake_body),
         ));
     }
-    let app = app.with_state(state).layer(middleware::from_fn(version_mw));
+    let app = app
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::role::role_guard,
+        ))
+        .with_state(state)
+        .layer(middleware::from_fn(version_mw));
 
     with_request_ids(app)
 }

@@ -8,6 +8,7 @@ pub mod limits;
 pub mod mirror;
 pub mod publish;
 pub mod repo;
+pub mod role;
 pub mod routes;
 pub mod scrub;
 pub mod state;

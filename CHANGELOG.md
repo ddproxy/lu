@@ -7,6 +7,10 @@ uses semantic versioning once it reaches 1.0.
 
 ### Added
 
+- Operator tokens accept `role` (`viewer`, `operator`, `admin`), `expires_at` and `restrict_fields`. A viewer is read-only and never receives task text or context; `restrict_fields` refuses job fields that widen what a job may do. Edits, draft edits, group limit changes, workspace cleans and repository syncs are now audited with the operator's role. Viewer and restricted tokens require `[audit]`.
+
+### Added
+
 - `lu status --json` reports a `providers` object: per provider the number of online nodes that report it ok, cooling or otherwise unusable, and the soonest return. `lu top` names the providers queued jobs are waiting for in its title and lists problem providers first in each node row, so a cooling provider is not truncated off a narrow terminal.
 
 ## [0.5.2]

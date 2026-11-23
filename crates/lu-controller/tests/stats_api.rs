@@ -68,6 +68,7 @@ fn config(db: &Path, artifacts: &Path, token: &str) -> ControllerConfig {
         operators: vec![ControllerOperator {
             name: "ops".to_owned(),
             token_sha256: sha256_hex(token),
+            ..Default::default()
         }],
         repos: Vec::new(),
         groups: Vec::new(),
