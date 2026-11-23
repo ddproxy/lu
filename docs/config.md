@@ -24,6 +24,7 @@ At least one of `[controller]` and `[agent]` must be present. A file may contain
 | `provider_cooldown_secs` | no | `1800` | Integer `60` to `86400`. How long a `(node, provider)` pair is cordoned after a retryable provider failure without `retry_after_secs`. |
 | `recovery_grace_secs` | no | `30` | Integer `0` to `600`. How long a job stays `recovering` before it is requeued or failed. |
 | `blocked_dependent_ttl` | no | `24h` | Duration `1s` to `365d`. How long a dependent blocked by a failed or cancelled predecessor waits for a retry before failing with `failure_class: "dependency"`. |
+| `read_per_minute` | no | `1200` | Integer `1` to `100000`. GET requests each operator may make per 60-second window across the operator read routes. A polling UI at 2 requests a second uses 120. Exceeding it is `429 rate_limited` with `Retry-After`. See [api.md](api.md#reads-validators-summaries-filters-and-budget). |
 | `max_connections` | no | `256` | Integer greater than `0`. Global concurrent connection cap. |
 | `max_connections_per_addr` | no | `64` | Integer `1` to `max_connections`. Concurrent connection cap per remote IP. |
 | `local_repo_roots` | no | `[]` | Absolute local paths, without `..`, that the controller may read job bases from. Each must exist as a directory at startup. With no roots, only configured repository mirrors can serve `GET /v1/agent/jobs/{id}/base`. |

@@ -11,9 +11,9 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | Route | Meaning |
 |---|---|
 | `POST /v1/jobs` body `JobSpec` | Create a job. `201` with a `JobView` and a `warnings` array. `spec.after` holds at most 16 job ids; an unknown, failed, cancelled or duplicate dependency or any other invalid spec is `422 unprocessable` and names the fault. A failed or cancelled dependency is accepted only when `spec.include_failed` is true. `spec.collect` selects dependency-input collection (`none`, `files`, `apply`, `both`; default `apply`); file collection with known stored diffs over 64 MiB is rejected. `spec.on_conflict` selects `fail`, `markers` or `skip` for input patches that do not apply. `spec.stack_union_paths` and `spec.stack_base_paths` may only narrow the agent's `[stack]` policy lists; a path outside that configuration is refused. `spec.requires` holds at most 8 labels; an unknown label is accepted with a warning in the reply. A repeated `idempotency_key` with the same spec returns the existing job with `200`; the same key with a different spec is `409 conflict`. |
-| `GET /v1/jobs?state=&limit=&after=` | List jobs, newest first. `limit` defaults to 200 and is capped at 200; an unparseable `limit` is `400 bad_request`. `after` is a `JobId` cursor; an invalid value is `400 bad_request`. Returns `{"jobs":[JobView],"next":"<id>|null"}`. |
+| `GET /v1/jobs?view=&state=&node=&repo=&origin=&updated_since=&limit=&after=` | List jobs, newest first. `limit` defaults to 200 and is capped at 200; an unparseable `limit` is `400 bad_request`. `after` is a `JobId` cursor; an invalid value is `400 bad_request`. Returns `{"jobs":[JobView],"next":"<id>|null"}`. The filters and `view` are described under [Reads](#reads-validators-summaries-filters-and-budget). |
 | `GET /v1/jobs?key=<key>` | Look up an idempotency key. Returns the same envelope with zero or one job and `next: null`; other filters are ignored. An empty, over-long or malformed key is `400 bad_request`. |
-| `GET /v1/jobs/{id}` | Return a `JobView`. An unknown id is `404 not_found`. |
+| `GET /v1/jobs/{id}` | Return a `JobView` with an `ETag`; see [Reads](#reads-validators-summaries-filters-and-budget). An unknown id is `404 not_found`. |
 | `POST /v1/jobs/{id}/cancel` with optional `?keep_children=1` and `?keep_dependents=1` | `draft`, `blocked`, `queued` and `recovering` jobs become `cancelled` at once; `leased`, `running` and `needs_input` jobs get `cancel_requested = true` and the agent is told on its next poll. Descendants are cancelled too unless `keep_children=1` is set, and blocked dependents waiting on this predecessor (`blocked_reason: "predecessor failed"`) are cancelled too unless `keep_dependents=1` is set; terminal dependents and descendants are left as they are. A terminal target job is `409 conflict`. Returns a `JobView`. The CLI spells these flags `--keep-children` and `--keep-dependents`. |
 | `POST /v1/jobs/{id}/edit` body `JobEdit` | Change a `queued` or `blocked` job's provider, model, fallbacks, requirements, tolerations, dependencies, collect mode, conflict policy or failed-input opt-in in place. Absent fields stay unchanged; an empty array clears a list. The job keeps its id and dependents. Returns a `JobView`. Another state is `409 conflict`; a dependency cycle is `400 bad_request`; an invalid spec or an unknown, failed or cancelled dependency is `422 unprocessable`, naming the fault. `include_failed` also permits an already dead dependency. Edited dependencies move the job between `blocked` and `queued` and respect the 16-dependency limit. |
 | `POST /v1/jobs/{id}/retry?chain=1` body `JobSpec` | Recreate a finished job from the supplied spec and return `{"job":JobView,"retried":[{"old","new"}],"waiting_dependents":N}`. A nonterminal job is `409 conflict`; an invalid spec is `422 unprocessable`. Without `chain`, blocked dependents waiting on the old job are reattached to the new one; with it, they are cloned too and the `retried` array lists every old/new pair. |
@@ -22,14 +22,14 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `PUT /v1/drafts/{id}` | Edit a draft's task text, provider, model, priority, source ref and publish settings. Absent fields stay unchanged. |
 | `POST /v1/drafts/{id}/approve` | Move a draft to `queued`, or to `blocked` if dependencies are unmet. An optional `{"edit": JobEdit}` body applies an edit first; an empty body is allowed. |
 | `POST /v1/drafts/{id}/reject` | Move a draft to `cancelled`. An optional `{"reason":"..."}` body is mapped to the safe audit codes `duplicate`, `spam`, `unsafe` or `rejected`; free text is not stored on the job. |
-| `GET /v1/jobs/{id}/logs?offset=N&wait=25` | Return raw log bytes from `offset` with `Content-Type: text/plain`, `X-Lu-Log-Length`, `X-Lu-State`, `Content-Disposition: attachment` and the hardening headers above. The bytes are streamed up to the stored 50 MiB log cap; an oversized file is `413 too_large`. `wait` holds the request for at most 25 seconds while no new bytes arrive. Unparseable `offset` or `wait` is `400 bad_request`; an unknown id is `404`. |
+| `GET /v1/jobs/{id}/logs?offset=N&max=N&wait=25` | Return raw log bytes from `offset` with `Content-Type: text/plain`, `X-Lu-Log-Length`, `X-Lu-State`, `Content-Disposition: attachment` and the hardening headers above. `max` caps the bytes in one response (default and hard cap: the 50 MiB log cap; a larger value is clamped to it; `0` is `400`). The bytes are streamed up to the stored 50 MiB log cap; an oversized file is `413 too_large`. `wait` holds the request for at most 25 seconds while no new bytes arrive. Unparseable `offset`, `max` or `wait` is `400 bad_request`; an offset past the end is `200` with an empty body; an unknown id is `404`. |
 | `GET /v1/jobs/{id}/artifacts/{name}` | Return one fixed artifact name: `diff.patch`, `run.log` or `report.json` from any job that stored it, including a `failed` job with a partial diff. The file is streamed under its stored cap with `Content-Disposition: attachment` and the hardening headers above; an oversized file is `413 too_large`. An unknown name or an artifact that is not stored is `404`. |
 | `GET /v1/status` | Return a `StatusView`. |
 | `GET /v1/stats?by=&since=&node=` | Return a `StatsReport` aggregating terminal jobs per configured node and for the fleet. Needs the same operator token and login throttle as the other operator reads. `by` is `node` (default), `repo` or `state` and only selects the CLI's table grouping; the JSON report always contains every group. `since` accepts Unix seconds, a `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SSZ` UTC timestamp, or a duration such as `30m`, `1h30m` or `7d` relative to the controller clock; it filters on `finished_at` inclusively. `node` restricts the report to one configured node. A bad `by`, `since` or `node` is `400 bad_request`; an unknown node yields zero-valued rows, not `404`. See [monitoring.md](monitoring.md#node-contribution-statistics) for semantics. |
 | `GET /v1/repos` | Return `{"repos":[{"name","url","synced_at","heads"}]}`. `synced_at` is null before the first sync; `heads` maps up to 20 branch names to commit ids. |
 | `POST /v1/repos/{name}/sync` | Fetch one configured mirror and return `{"name","heads","synced_at"}`. At most one sync runs at a time and each operator may start 6 per minute; contention or an exhausted budget is `429 rate_limited` with `Retry-After`. An unknown configured name is `404`; a fetch failure is `500` with any credential removed from the message. |
-| `GET /v1/nodes` | Return an array of `NodeView`s. |
-| `GET /v1/nodes/{name}/stats` | Return the latest `NodeStats` from the node's heartbeat. An unknown node is `404`; a known node with no stats returns `{}`. Stats live in memory and are lost on controller restart. |
+| `GET /v1/nodes` | Return an array of `NodeView`s with an `ETag`; see [Reads](#reads-validators-summaries-filters-and-budget). |
+| `GET /v1/nodes/{name}/stats` | Return the latest `NodeStats` from the node's heartbeat, with an `ETag`. An unknown node is `404`; a known node with no stats returns `{}`. Stats live in memory and are lost on controller restart. |
 | `POST /v1/nodes/{name}/drain` | Stop assigning new jobs to the node. A node that has never heartbeated is `404`. This sets an operator-owned drain; an agent cannot clear it with `/v1/agent/undrain`. |
 | `POST /v1/nodes/{name}/undrain` | Let the node take new jobs again. A node that has never heartbeated is `404`. This clears an operator-owned drain. |
 | `POST /v1/nodes/{name}/workspaces/clean?all=true` or `?job=<job-id>` | Queue a `clean_workspaces` event for the node's agent. Pass exactly one selector; unknown query keys, a malformed id, or both/neither selectors are `400`. A node that has never heartbeated is `404`. Returns `{"queued":1,"refused_running":0,"missing":0}`; `queued: 1` means one request was queued, not one tree deleted, because the agent decides which workspaces are eligible on its next poll. Running workspaces are refused there. |
@@ -37,6 +37,41 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `PUT /v1/groups/{name}/limit` body `{"max_running":N}` | Set a runtime concurrency cap for the named group. `N` is `1` to `64`; an invalid group or value is `400`, and an unknown body key is `422`. Returns `{"group":"<name>","max_running":N}`. The cap also applies to a group with no `[[controller.groups]]` entry. Caps live in controller memory and return to configured values on restart. |
 | `GET /metrics` | Return Prometheus text with `Content-Type: text/plain; version=0.0.4; charset=utf-8`. It needs an operator token. Series are listed in [monitoring.md](monitoring.md#series). |
 | `GET /v1/health` | Return `{"ok":true,"version":"…","db":"ok"}` without authentication. The DB probe behind `db` is single-flight and cached for up to 5 seconds, including failures; a failed probe returns `500 internal` until a later probe succeeds. |
+
+### Reads: validators, summaries, filters and budget
+
+These apply to the operator GET routes: `/v1/jobs` (list and `key`), `/v1/jobs/{id}`, `/v1/jobs/{id}/logs`, `/v1/jobs/{id}/artifacts/{name}`, `/v1/drafts`, `/v1/repos`, `/v1/nodes`, `/v1/nodes/{name}/stats`, `/v1/status` and `/v1/stats`. Write routes and `/metrics` are not affected.
+
+**Budget.** Each operator may make `[controller] read_per_minute` GET requests per 60-second window (default `1200`). The budget is counted per operator name, after the token is checked, so unauthenticated or wrong-token requests do not use it. It is separate from the login failure throttle. An exhausted budget is `429 rate_limited` with `Retry-After` in whole seconds. Writes do not use this budget.
+
+**Validators.** JSON reads of a single job, the job list, node views and node stats send a strong `ETag`: the first 128 bits of the SHA-256 of the exact response body, quoted. Send it back as `If-None-Match` (a list, a weak `W/` form and `*` are accepted). A match returns `304 Not Modified` with the same `ETag`, no body, and the usual `Cache-Control: no-store`. A mismatch returns `200` with the new body and `ETag`. Any change to the body, including a job moving state, changes the tag.
+
+```
+GET /v1/jobs/{id}                       -> 200  ETag: "3f9c…"
+GET /v1/jobs/{id}  If-None-Match: "3f9c…" -> 304  (no body)
+```
+
+**Summary view.** `GET /v1/jobs?view=summary` (and `view=summary` with `key=`) returns compact rows instead of `JobView`s. Each row holds exactly these keys and no others: `id`, `state`, `node`, `attempt`, `created_at`, `updated_at`, `started_at`, `finished_at`, `repo`, `origin`, `priority`, `group`, `provider`, `model`, `title`, `failure_class`. Times are Unix seconds, and `started_at`, `finished_at`, `node`, `provider`, `model`, `group`, `origin` and `failure_class` are `null` when unset. `repo` is `owner/name` taken from the normalised repository: the host, credentials, query, fragment and `.git` suffix are dropped, and `null` when the repository cannot be normalised. `provider` and `model` are the values that ran (`assigned_provider` and `assigned_model`). `title` is the first line of the task, scrubbed by the artifact scrub rules, without control characters and cut to 80 characters. Task text, context and the rest of the spec are never included. Use the full view, or `GET /v1/jobs/{id}`, for those. `view` accepts `full` (default) or `summary`; any other value is `400 bad_request`.
+
+**Filters.** All of these combine with each other and with `limit` and `after`:
+
+| Parameter | Meaning |
+|---|---|
+| `state` | A job state. Repeat it or pass a comma list (`state=queued,blocked`). Unknown states are `400 bad_request`. |
+| `node` | Jobs whose assigned node is this name. An invalid name is `400`. |
+| `repo` | Normalised `owner/name` (any number of `/` segments, so a `.git` suffix is accepted). A host, credentials, a query or any other character is `400 bad_request`. |
+| `origin` | Exact match on the job's origin label. |
+| `updated_since` | Unix seconds. Jobs with `updated_at` at or after this time. A non-integer is `400 bad_request`. |
+
+A filter that the store cannot apply alone (several states, or any of `node`, `repo`, `origin`, `updated_since`) is checked per row. The scan examines at most 10,000 rows per request, so a filtered page can hold fewer than `limit` jobs. Its `next` cursor is the last row examined, so continue from `next` until `jobs` is empty. This works for unfiltered lists too. A `next` that is non-null does not promise another job.
+
+```
+GET /v1/jobs?origin=ci&state=queued,blocked&limit=50
+GET /v1/jobs?repo=team/app&updated_since=1767225600&view=summary
+GET /v1/jobs?view=summary&limit=1&after=<next>      # resume a walk
+```
+
+**Rejected values** return `400` with the standard error body, for example `{"error":"bad_request","message":"invalid repo"}`.
 
 Approval and rejection require a job in `draft`; a job in another state, including `expired`, gets
 `409 conflict`. `PUT /v1/drafts/{id}` uses the shared edit handler and accepts `draft`, `queued` or

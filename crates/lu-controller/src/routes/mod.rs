@@ -272,10 +272,6 @@ pub fn failure_class_str(class: lu_proto::FailureClass) -> &'static str {
     }
 }
 
-pub fn parse_job_state(s: &str) -> Option<lu_proto::JobState> {
-    s.parse().ok()
-}
-
 pub fn version_header() -> HeaderValue {
     HeaderValue::from_static(concat!("lu/", env!("CARGO_PKG_VERSION")))
 }
@@ -290,6 +286,18 @@ pub fn with_version(mut res: Response) -> Response {
         HeaderValue::from_static("nosniff"),
     );
     res
+}
+
+/// Every value of a repeated query parameter, in order, percent-decoded. Empty pairs are skipped.
+pub fn query_values(uri: &Uri, name: &str) -> Vec<String> {
+    uri.query()
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (key == name).then(|| percent_decode(value))
+        })
+        .collect()
 }
 
 pub fn parse_query(uri: &Uri) -> HashMap<String, String> {

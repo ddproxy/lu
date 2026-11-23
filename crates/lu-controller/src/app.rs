@@ -504,6 +504,7 @@ mod tests {
             repos: Vec::new(),
             groups: Vec::new(),
             blocked_dependent_ttl: "24h".to_owned(),
+            read_per_minute: lu_config::DEFAULT_READ_PER_MINUTE,
         };
         let state = Arc::new(AppState::from_config(&cfg, Arc::new(FailingRecoveryStore)).unwrap());
         let error = recover_on_boot(&state).await.unwrap_err();

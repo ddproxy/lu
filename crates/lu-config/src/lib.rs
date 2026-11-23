@@ -720,6 +720,17 @@ pub struct ControllerConfig {
     /// How long dependents of a failed or cancelled job stay blocked before failing.
     #[serde(default = "default_blocked_dependent_ttl")]
     pub blocked_dependent_ttl: String,
+    /// Operator GET requests allowed per principal in a 60-second window, across all read routes.
+    /// Separate from the login failure throttle; exceeding it returns 429 with Retry-After.
+    #[serde(default = "default_read_per_minute")]
+    pub read_per_minute: usize,
+}
+
+/// Well above a polling UI's roughly 120 requests a minute per operator.
+pub const DEFAULT_READ_PER_MINUTE: usize = 1200;
+
+fn default_read_per_minute() -> usize {
+    DEFAULT_READ_PER_MINUTE
 }
 
 fn default_blocked_dependent_ttl() -> String {
@@ -1728,6 +1739,15 @@ impl ControllerConfig {
                     "blocked_dependent_ttl must be a duration from 1s to 365d".to_owned(),
                 )
             }
+        }
+        if !(1..=100_000).contains(&self.read_per_minute) {
+            return invalid(
+                "[controller]",
+                format!(
+                    "read_per_minute must be 1 to 100000 (got {})",
+                    self.read_per_minute
+                ),
+            );
         }
         validate_abs_no_dotdot("[controller]", "db", &self.db)?;
         validate_abs_no_dotdot("[controller]", "artifacts_dir", &self.artifacts_dir)?;

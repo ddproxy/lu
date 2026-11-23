@@ -1958,6 +1958,7 @@ mod poll_renewal_tests {
             repos: Vec::new(),
             groups: Vec::new(),
             blocked_dependent_ttl: "24h".to_owned(),
+            read_per_minute: lu_config::DEFAULT_READ_PER_MINUTE,
         };
         let state = Arc::new(AppState::from_config(&cfg, store.clone()).unwrap());
         let body = json!({"heartbeat": {"node": "node-a", "harness": "idle", "providers": []}, "wait_secs": 0}).to_string();
@@ -2014,6 +2015,7 @@ mod poll_renewal_tests {
             repos: Vec::new(),
             groups: Vec::new(),
             blocked_dependent_ttl: "24h".to_owned(),
+            read_per_minute: lu_config::DEFAULT_READ_PER_MINUTE,
         };
         let state = Arc::new(AppState::from_config(&cfg, store).unwrap());
         let dir = tmp.path().join("artifacts").join(job_id.to_string());
