@@ -128,3 +128,31 @@ checked against the tree before editing; the results follow.
   direct handler calls and their tests consistent with served responses.
 - The status route collapses every auth failure to 401. The integration check observes the
   wrong-token block through `POST /v1/jobs`, which surfaces the throttle error as 429.
+# Second-round security review notes
+
+All ten findings were verified against the current source and docs. None were rejected.
+
+| # | Verdict | Disposition |
+|---|---------|-------------|
+| 1 | Confirmed | With default `scrub_patch = false`, the scope read path returned the raw patch while claiming `scrubbed: true`, despite the documented read-time re-scrub guarantee. Kept raw storage under the default option, but scrub `diff.patch` explicitly on scope read so the flag stays truthful. Added a regression test. |
+| 2 | Confirmed | Pre-lease scope audit calls trusted the caller-supplied job id. They now use the `unknown` placeholder until lease verification succeeds. Added a regression test. |
+| 3 | Confirmed | Context values are byte-capped and truncation stops on a character boundary. Added unit tests. |
+| 4 | Confirmed | Derived idempotency keys reserve prefix bytes and truncate on a character boundary. Added a unit test. |
+| 5 | Confirmed | Rollback now releases the exact admitted slot via an opaque ticket instead of popping the newest entry. Added a concurrency regression test. |
+| 6 | Confirmed | The intake router body limit is set to the largest configured per-source cap; the handler still enforces each source's own cap. Updated the body-limit test. |
+| 7 | Confirmed | Dedupe is checked before a rate slot is consumed, so retransmissions no longer burn rate capacity. Added a regression test. |
+| 8 | Confirmed | The rate cutoff uses a guarded subtraction that cannot underflow. Added a unit test. |
+| 9 | Confirmed | Presented bearer values are capped at 8 KiB; docs now reconcile that with the larger agent token-file limit. Added a unit test and updated the docs. |
+| 10 | Confirmed | Mirror and sync failures return the generic internal error to clients while detailed errors are logged server-side. Added an API regression test. |
+
+## Rejects
+
+None.
+
+## Validation
+
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+
+`.git` is root-owned `0700` in this checkout, so changes could not be committed; they remain local and uncommitted.

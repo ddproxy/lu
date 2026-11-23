@@ -83,9 +83,9 @@ fuzz_target!(|data: &[u8]| {
     let _ = intake.verify("fuzz", None, data);
     let _ = intake.verify("missing", Some(&header), data);
 
-    let _ = intake.admit("fuzz", Some(&delivery_id));
+    let (_, ticket) = intake.admit("fuzz", Some(&delivery_id));
     intake.remember("fuzz", Some(&delivery_id));
-    intake.rollback("fuzz", Some(&delivery_id));
+    intake.rollback("fuzz", ticket, Some(&delivery_id));
 
     let signed = delivery(data);
     match intake.map("fuzz", &signed) {

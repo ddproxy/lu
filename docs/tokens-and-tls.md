@@ -45,11 +45,12 @@ duplicate hashes.
 
 A token file is opened once with `O_NOFOLLOW | O_NONBLOCK` and must be a regular file owned by the
 effective user, with no group or other permission bits (`0600` or tighter). Symlinks, FIFOs and
-directories are refused. Agent token files are capped at 64 KiB. Repository credential files and
-Reiki token files are capped at 64 KiB when the configuration loads, then at 8 KiB and 4 KiB
-respectively when read for use. Operator token files and the bearer value itself are capped at
-8 KiB.
-The bearer value must be visible ASCII with no spaces or control characters.
+directories are refused. Agent token files are capped at 64 KiB at configuration load. Repository
+credential files and Reiki token files are capped at 64 KiB when the configuration loads, then at
+8 KiB and 4 KiB respectively when read for use. Operator token files are capped at 8 KiB.
+The presented bearer value is capped at 8 KiB on every request, so an agent token longer than that
+is refused even though its file passes the 64 KiB load-time check. The bearer value must be visible
+ASCII with no spaces or control characters.
 
 ## Authentication in practice
 

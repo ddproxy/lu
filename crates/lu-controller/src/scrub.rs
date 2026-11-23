@@ -138,6 +138,20 @@ impl Scrubber {
         self.enabled && self.scrub_patch
     }
 
+    /// Scrubs a stored patch for display. `[artifacts] scrub_patch` controls whether uploads are
+    /// changed on disk; a reader still gets patch-safe redaction so the `scrubbed` flag is honest.
+    pub fn scrub_patch_for_read(&self, input: &[u8]) -> ScrubOutcome {
+        if !self.enabled {
+            return ScrubOutcome {
+                data: input.to_vec(),
+                hits: 0,
+                patch_scrubbed: false,
+                patch_secret_hits: PatchSecretHits::default(),
+            };
+        }
+        self.scrub_patch(input)
+    }
+
     /// Built-in rules only, with scrubbing enabled and patch scrubbing off (default).
     fn builtins() -> Self {
         let patterns = vec![

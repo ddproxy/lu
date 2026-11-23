@@ -1,5 +1,5 @@
 use crate::auth::authenticate_operator;
-use crate::error::{ApiError, ErrorCode};
+use crate::error::ApiError;
 use crate::limits::SYNC_PER_TOKEN;
 use crate::routes::file_body::{file_len, into_response, stream_range};
 use crate::routes::{
@@ -282,13 +282,8 @@ pub async fn create_job(
                 return with_version(ApiError::unprocessable(e.to_string()).into_response())
             }
             Ok(Err(e)) => {
-                return with_version(
-                    ApiError::new(
-                        ErrorCode::Internal,
-                        format!("could not mirror {}: {e}", spec.repo),
-                    )
-                    .into_response(),
-                )
+                tracing::error!(repo = %spec.repo, error = %e, "could not mirror repository");
+                return with_version(ApiError::internal().into_response());
             }
             Err(_) => return with_version(ApiError::internal().into_response()),
         }
@@ -1288,13 +1283,15 @@ pub async fn sync_repo(
         return with_version(ApiError::rate_limited(retry_after).into_response());
     }
     let mirror = Arc::clone(&state.mirror);
-    let result = tokio::task::spawn_blocking(move || mirror.sync(&name)).await;
+    let sync_name = name.clone();
+    let log_name = name.clone();
+    let result = tokio::task::spawn_blocking(move || mirror.sync(&sync_name)).await;
     match result {
         Ok(Ok(sync)) => with_version(json_ok(StatusCode::OK, &sync)),
-        Ok(Err(e)) => with_version(
-            ApiError::new(ErrorCode::Internal, format!("repository sync failed: {e}"))
-                .into_response(),
-        ),
+        Ok(Err(e)) => {
+            tracing::error!(repo = %log_name, error = %e, "repository sync failed");
+            with_version(ApiError::internal().into_response())
+        }
         Err(_) => with_version(ApiError::internal().into_response()),
     }
 }

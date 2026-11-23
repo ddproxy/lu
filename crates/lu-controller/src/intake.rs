@@ -26,6 +26,8 @@ const MAX_SIGNATURE_BYTES: usize = 256;
 const MAX_DEDUP_KEYS: usize = 100_000;
 const MAX_TEMPLATE_VAR_BYTES: usize = 256;
 const CONTEXT_TRUNCATION_MARKER: &str = "\n[context truncated]\n";
+/// Prefix applied to every intake-derived idempotency key.
+pub const INTAKE_KEY_PREFIX: &str = "intake-";
 
 /// Result of mapping one signed delivery. `Dropped` is a deliberate operator rule decision; the
 /// other non-accepted outcomes are counted separately in `lu_intake_total`.
@@ -89,6 +91,24 @@ struct CompiledRule {
     allow: Vec<CompiledCondition>,
 }
 
+struct RateQueue {
+    entries: VecDeque<(u64, Instant)>,
+    next: u64,
+}
+
+impl RateQueue {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            next: 0,
+        }
+    }
+}
+
+/// Opaque handle for one admitted rate slot. Rollback releases this slot, never the newest one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateTicket(u64);
+
 struct SourceRuntime {
     name: String,
     secret: Vec<u8>,
@@ -98,8 +118,13 @@ struct SourceRuntime {
     dedupe_header: Option<String>,
     dedupe_ttl: Duration,
     rules: Vec<CompiledRule>,
-    rate: Mutex<VecDeque<Instant>>,
+    rate: Mutex<RateQueue>,
     seen: Mutex<HashMap<String, Instant>>,
+}
+
+/// Sliding-window cutoff that cannot underflow during the first seconds after boot.
+fn recent_cutoff(now: Instant, window: Duration) -> Instant {
+    now.checked_sub(window).unwrap_or(now)
 }
 
 /// All configured intake sources. Constructed once at startup; secrets never leave this object.
@@ -145,7 +170,7 @@ impl Intake {
                         dedupe_header: source.dedupe_header.clone(),
                         dedupe_ttl: Duration::from_secs(source.dedupe_ttl_secs),
                         rules,
-                        rate: Mutex::new(VecDeque::new()),
+                        rate: Mutex::new(RateQueue::new()),
                         seen: Mutex::new(HashMap::new()),
                     },
                 )
@@ -215,38 +240,35 @@ impl Intake {
             .unwrap_or(0)
     }
 
-    /// Applies the rate window and delivery-id de-duplication. One successful slot is consumed
-    /// only after the signature has been checked and the JSON parsed.
-    pub fn admit(&self, name: &str, delivery_id: Option<&str>) -> Decision {
+    /// Largest per-source body cap. The router uses this to bound buffering before a source name
+    /// can be checked; the handler still enforces each source's own cap.
+    pub fn max_body_bytes_limit(&self) -> usize {
+        self.sources
+            .values()
+            .map(|s| s.max_body_bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Applies delivery-id de-duplication before consuming a rate slot, so a retransmission never
+    /// burns capacity. Returns the exact slot to release if a later step fails.
+    pub fn admit(&self, name: &str, delivery_id: Option<&str>) -> (Decision, Option<RateTicket>) {
         let Some(source) = self.sources.get(name) else {
-            return Decision::Invalid;
+            return (Decision::Invalid, None);
         };
-        {
-            let mut rate = source
-                .rate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let cutoff = Instant::now() - Duration::from_secs(60);
-            while rate.front().is_some_and(|at| *at <= cutoff) {
-                rate.pop_front();
-            }
-            if rate.len() as u64 >= source.rate_per_minute {
-                return Decision::RateLimited;
-            }
-            rate.push_back(Instant::now());
-        }
+        let now = Instant::now();
         if let Some(id) = delivery_id {
             if id.is_empty() || id.len() > MAX_ORIGIN_REF_BYTES {
-                return Decision::Invalid;
+                return (Decision::Invalid, None);
             }
             let mut seen = source
                 .seen
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let cutoff = Instant::now().checked_sub(source.dedupe_ttl);
+            let cutoff = now.checked_sub(source.dedupe_ttl);
             seen.retain(|_, at| cutoff.is_none_or(|cut| *at > cut));
             if seen.contains_key(id) {
-                return Decision::Duplicate;
+                return (Decision::Duplicate, None);
             }
             if seen.len() >= MAX_DEDUP_KEYS {
                 let oldest = seen
@@ -257,9 +279,32 @@ impl Intake {
                     seen.remove(&key);
                 }
             }
-            seen.insert(id.to_owned(), Instant::now());
+            seen.insert(id.to_owned(), now);
         }
-        Decision::Accepted { draft: false }
+        let mut rate = source
+            .rate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cutoff = recent_cutoff(now, Duration::from_secs(60));
+        while rate.entries.front().is_some_and(|(_, at)| *at <= cutoff) {
+            rate.entries.pop_front();
+        }
+        if rate.entries.len() as u64 >= source.rate_per_minute {
+            drop(rate);
+            // The id was claimed above; do not let a rate-limited delivery block a retry.
+            if let Some(id) = delivery_id {
+                let mut seen = source
+                    .seen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                seen.remove(id);
+            }
+            return (Decision::RateLimited, None);
+        }
+        let ticket = RateTicket(rate.next);
+        rate.next = rate.next.wrapping_add(1);
+        rate.entries.push_back((ticket.0, now));
+        (Decision::Accepted { draft: false }, Some(ticket))
     }
 
     /// Applies the first matching rule. `None` means the operator did not intend a job for this
@@ -305,15 +350,16 @@ impl Intake {
         }
     }
 
-    /// Releases a rate slot and delivery id when the store refused the job.
-    pub fn rollback(&self, name: &str, delivery_id: Option<&str>) {
+    /// Releases the slot admitted for one delivery and its id when a later step failed.
+    pub fn rollback(&self, name: &str, ticket: Option<RateTicket>, delivery_id: Option<&str>) {
         if let Some(source) = self.sources.get(name) {
-            let mut rate = source
-                .rate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            rate.pop_back();
-            drop(rate);
+            if let Some(ticket) = ticket {
+                let mut rate = source
+                    .rate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                rate.entries.retain(|(id, _)| *id != ticket.0);
+            }
             if let Some(id) = delivery_id {
                 let mut seen = source
                     .seen
@@ -464,11 +510,24 @@ fn resolve(value: &IntakeValue, body: &Value) -> Option<String> {
     }
 }
 
+/// Largest index at or before `limit` that lands on a UTF-8 character boundary.
+fn char_boundary(text: &str, limit: usize) -> usize {
+    let mut end = limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 fn sanitize(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_TEMPLATE_VAR_BYTES)
-        .collect()
+    let mut out = String::with_capacity(text.len().min(MAX_TEMPLATE_VAR_BYTES));
+    for c in text.chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > MAX_TEMPLATE_VAR_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn substitute(template: &str, body: &Value) -> String {
@@ -525,7 +584,10 @@ fn build_job(rule: &CompiledRule, body: &Value) -> Result<IntakeJob, String> {
         }
     }
     if context.len() > MAX_CONTEXT_BYTES {
-        context.truncate(MAX_CONTEXT_BYTES - CONTEXT_TRUNCATION_MARKER.len());
+        context.truncate(char_boundary(
+            &context,
+            MAX_CONTEXT_BYTES - CONTEXT_TRUNCATION_MARKER.len(),
+        ));
         context.push_str(CONTEXT_TRUNCATION_MARKER);
     }
     let origin_ref = rule
@@ -534,10 +596,9 @@ fn build_job(rule: &CompiledRule, body: &Value) -> Result<IntakeJob, String> {
         .map(|template| substitute(template, body))
         .filter(|key| !(key.is_empty() || key.len() > MAX_ORIGIN_REF_BYTES));
     let key = origin_ref.as_ref().map(|key| {
-        let mut capped: String = key.chars().take(MAX_IDEMPOTENCY_KEY_BYTES).collect();
-        capped.insert_str(0, "intake-");
-        capped.truncate(MAX_IDEMPOTENCY_KEY_BYTES);
-        capped
+        let budget = MAX_IDEMPOTENCY_KEY_BYTES - INTAKE_KEY_PREFIX.len();
+        let end = char_boundary(key, budget);
+        format!("{INTAKE_KEY_PREFIX}{}", &key[..end])
     });
     Ok(IntakeJob {
         source,
@@ -680,5 +741,104 @@ mod tests {
             &body,
             "https://example.net/org/r.git"
         ));
+    }
+
+    fn intake_with_rate(rate_per_minute: u64) -> Intake {
+        let runtime = SourceRuntime {
+            name: "s".to_owned(),
+            secret: b"key".to_vec(),
+            header: "X-Signature".to_owned(),
+            max_body_bytes: 1024,
+            rate_per_minute,
+            dedupe_header: None,
+            dedupe_ttl: Duration::from_secs(60),
+            rules: Vec::new(),
+            rate: Mutex::new(RateQueue::new()),
+            seen: Mutex::new(HashMap::new()),
+        };
+        Intake {
+            sources: HashMap::from([("s".to_owned(), runtime)]),
+        }
+    }
+
+    #[test]
+    fn retransmissions_do_not_consume_rate_slots() {
+        let intake = intake_with_rate(2);
+        assert_eq!(
+            intake.admit("s", Some("one")).0,
+            Decision::Accepted { draft: false }
+        );
+        assert_eq!(intake.admit("s", Some("one")).0, Decision::Duplicate);
+        assert_eq!(
+            intake.admit("s", Some("two")).0,
+            Decision::Accepted { draft: false }
+        );
+        assert_eq!(intake.admit("s", Some("three")).0, Decision::RateLimited);
+        assert_eq!(intake.admit("s", Some("")).0, Decision::Invalid);
+    }
+
+    #[test]
+    fn rollback_releases_only_the_admitted_slot() {
+        let intake = intake_with_rate(2);
+        let (_, first) = intake.admit("s", Some("one"));
+        let (_, second) = intake.admit("s", Some("two"));
+        assert_ne!(first, second);
+        intake.rollback("s", first, Some("one"));
+        assert_eq!(
+            intake.admit("s", Some("one")).0,
+            Decision::Accepted { draft: false }
+        );
+        assert_eq!(intake.admit("s", Some("three")).0, Decision::RateLimited);
+    }
+
+    #[test]
+    fn rate_cutoff_never_moves_after_now() {
+        let now = Instant::now();
+        assert_eq!(recent_cutoff(now, Duration::MAX), now);
+        assert!(recent_cutoff(now, Duration::from_secs(60)) <= now);
+    }
+
+    #[test]
+    fn multibyte_values_are_truncated_on_character_boundaries() {
+        let value = "😀".repeat(64);
+        assert_eq!(sanitize(&value).len(), MAX_TEMPLATE_VAR_BYTES);
+        let end = char_boundary(&value, 5);
+        assert!(value.is_char_boundary(end));
+        assert!(end < 5);
+
+        let mut compiled = rule();
+        compiled.rule.context_from = (0..130).map(|i| format!("/v{i}")).collect();
+        let mut body = json!({
+            "action": "opened",
+            "actor": {"login": "alice"},
+            "repository": {"url": "https://example.net/r.git"},
+            "pull_request": {"ref": "refs/pull/7/head"},
+            "delivery": {"id": "d-1"}
+        });
+        let fields = body.as_object_mut().unwrap();
+        for i in 0..130 {
+            fields.insert(format!("v{i}"), json!(value.clone()));
+        }
+        let context = build_job(&compiled, &body).unwrap().context.unwrap();
+        assert!(context.len() <= MAX_CONTEXT_BYTES);
+        assert!(context.ends_with(CONTEXT_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn derived_keys_are_byte_bounded_without_splitting_characters() {
+        let mut compiled = rule();
+        compiled.rule.key_template = Some("{{/value}}".to_owned());
+        let body = json!({
+            "action": "opened",
+            "actor": {"login": "alice"},
+            "repository": {"url": "https://example.net/r.git"},
+            "pull_request": {"ref": "refs/pull/7/head"},
+            "delivery": {"id": "d-1"},
+            "value": "x".to_owned() + &"😀".repeat(127)
+        });
+        let key = build_job(&compiled, &body).unwrap().key.unwrap();
+        assert!(key.starts_with(INTAKE_KEY_PREFIX));
+        assert_eq!(key.len(), MAX_IDEMPOTENCY_KEY_BYTES);
+        assert!(!key.contains('\u{fffd}'));
     }
 }

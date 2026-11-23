@@ -1063,10 +1063,33 @@ async fn child_artifact_reads_are_hardened() {
     let dir = srv.artifact_dir.join(child_id.as_str());
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("report.json"), format!("value={TOKEN}")).unwrap();
+    let request = ScopeRequest::new(parent.clone(), epoch, ScopeAction::GetChildArtifact)
+        .with_payload(ScopePayload {
+            child: Some(child_id.clone()),
+            artifact: Some("report.json".to_owned()),
+            ..ScopePayload::default()
+        });
+    let resp = call_scope(&srv, "get_child_artifact", Some(AGENT_A_TOKEN), &request).await;
+    assert_eq!(status(&resp), 200, "{resp}");
+    let value = json_body(&resp)["result"]["artifact"].clone();
+    assert_eq!(value["scrubbed"], true, "{resp}");
+    let content = value["content"].as_str().unwrap();
+    assert!(content.contains("[scrubbed:token_prefix]"), "{content}");
+    assert!(!content.contains(TOKEN), "{content}");
+
+    // A patch stored raw under the default `scrub_patch = false` must still be scrubbed on read.
+    srv.store
+        .record_artifact(&child_id, child_epoch, ArtifactName::DiffPatch, 4)
+        .unwrap();
+    std::fs::write(
+        dir.join("diff.patch"),
+        format!("@@ -1 +1 @@\n+value={TOKEN}\n"),
+    )
+    .unwrap();
     let request = ScopeRequest::new(parent, epoch, ScopeAction::GetChildArtifact).with_payload(
         ScopePayload {
             child: Some(child_id),
-            artifact: Some("report.json".to_owned()),
+            artifact: Some("diff.patch".to_owned()),
             ..ScopePayload::default()
         },
     );
@@ -1245,7 +1268,12 @@ async fn audit_and_metrics_record_scope_actions_without_task_text() {
     spec.task = secret.to_owned();
     let (_, parent, epoch) = lease_spec(&srv, &spec).await;
 
-    // Pre-lease failures are metered but never attributed to a job in the audit log.
+    // Pre-lease failures are metered but never attributed to a caller-chosen job in the audit log.
+    let forged = lu_proto::JobId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+    let spoof = ScopeRequest::new(forged.clone(), epoch, ScopeAction::JobContext);
+    let missing = call_scope(&srv, "job_context", Some(AGENT_A_TOKEN), &spoof).await;
+    assert_eq!(status(&missing), 409, "{missing}");
+
     let context = ScopeRequest::new(parent.clone(), epoch, ScopeAction::JobContext);
     let unauthorized = call_scope(&srv, "job_context", Some("wrong-token"), &context).await;
     assert_eq!(status(&unauthorized), 401, "{unauthorized}");
@@ -1299,6 +1327,14 @@ async fn audit_and_metrics_record_scope_actions_without_task_text() {
     assert!(audit.contains("\"mode\":\"job_context\""), "{audit}");
     assert!(audit.contains("\"mode\":\"submit_child\""), "{audit}");
     assert!(audit.contains("\"outcome\":\"limit_exceeded\""), "{audit}");
+    assert!(
+        audit.contains("\"actor\":\"job:unknown\""),
+        "unverified job id was audited: {audit}"
+    );
+    assert!(
+        !audit.contains(forged.as_str()),
+        "caller-chosen job id was audited: {audit}"
+    );
     assert!(!audit.contains(secret), "task text in audit: {audit}");
     assert_eq!(srv.state.audit_write_errors(), 0);
 
@@ -1323,6 +1359,10 @@ async fn audit_and_metrics_record_scope_actions_without_task_text() {
     assert!(
         metrics
             .contains("lu_scope_requests_total{route=\"job_context\",result=\"unauthorized\"} 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("lu_scope_requests_total{route=\"job_context\",result=\"stale_epoch\"} 1"),
         "{metrics}"
     );
     assert!(
