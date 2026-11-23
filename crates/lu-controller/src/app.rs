@@ -2,7 +2,7 @@ use crate::routes::{agent, health, metrics, operator, scope, stats, status};
 use crate::state::AppState;
 use crate::time::{background_interval_secs, now};
 use axum::extract::DefaultBodyLimit;
-use axum::http::Request;
+use axum::http::{HeaderValue, Request};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post, put};
@@ -35,8 +35,18 @@ impl ControllerRuntime {
 
 async fn version_mw(req: Request<axum::body::Body>, next: Next) -> Response {
     let mut res = next.run(req).await;
-    res.headers_mut()
-        .insert("x-lu-version", crate::routes::version_header());
+    let headers = res.headers_mut();
+    headers.insert("x-lu-version", crate::routes::version_header());
+    // Applies to every route, including the fallback and unauthenticated health check. Raw
+    // artifact and log responses set Content-Disposition themselves.
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     res
 }
 

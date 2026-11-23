@@ -226,6 +226,7 @@ impl AppState {
         let auth = AuthConfig::from_controller(cfg)?;
         let throttle = LoginThrottle::new(ThrottleSettings {
             max_failures: 10,
+            missing_token_max_failures: 100,
             window: Duration::from_secs(60),
         });
         // Ensure artifacts root exists? config validation requires absolute paths; runtime may need dir.

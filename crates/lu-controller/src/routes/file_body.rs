@@ -88,11 +88,17 @@ pub async fn stream_range(
     })
 }
 
-pub fn into_response(file: FileBody, content_type: &'static str) -> Response {
+pub fn into_response(file: FileBody, content_type: &'static str, filename: &str) -> Response {
+    let disposition =
+        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .expect("fixed artifact filename");
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, file.len.to_string())
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::CACHE_CONTROL, "no-store")
         .body(file.body)
         .expect("valid artifact response headers")
 }

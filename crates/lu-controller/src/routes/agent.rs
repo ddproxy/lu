@@ -1391,7 +1391,11 @@ pub async fn get_dep_diff(
     }
     .await;
     match result {
-        Ok(file) => with_version(into_response(file, "application/octet-stream")),
+        Ok(file) => with_version(into_response(
+            file,
+            "application/octet-stream",
+            ArtifactName::DiffPatch.file_name(),
+        )),
         Err(error) => with_version(error.into_response()),
     }
 }
@@ -1458,7 +1462,11 @@ pub async fn get_dep_artifact(
     }
     .await;
     match result {
-        Ok(file) => with_version(into_response(file, "application/octet-stream")),
+        Ok(file) => with_version(into_response(
+            file,
+            "application/octet-stream",
+            artifact.file_name(),
+        )),
         Err(error) => with_version(error.into_response()),
     }
 }

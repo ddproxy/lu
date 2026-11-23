@@ -11,6 +11,20 @@ uses semantic versioning once it reaches 1.0.
 
 - Node contribution statistics from one store report. `lu stats [--by node|repo|state] [--since WHEN] [--node NAME]` and `GET /v1/stats?by=&since=&node=` show terminal states, failure classes, retries, wall-clock busy seconds, runtime and queue-wait percentiles, and up to ten normalised `host/owner/name` repositories. `/metrics` adds `lu_node_jobs_total{node,state}`, `lu_node_failures_total{node,class}`, `lu_node_busy_seconds_total{node}`, runtime and queue-wait histograms with fixed buckets, and `lu_node_last_job_finished_timestamp_seconds{node}`. Labels are limited to configured node names and fixed state/class values; repository text is never a label. Stored jobs are not pruned, so all-time counters survive restarts; `since` windows narrow the report by design. See [docs/monitoring.md](docs/monitoring.md#node-contribution-statistics) and [docs/api.md](docs/api.md#statsreport).
 - Agent self-drain. A node can drain itself, wait for its running job to finish, update and undrain using only its own agent token. `POST /v1/agent/drain`, `POST /v1/agent/undrain` and `GET /v1/agent/self` are agent-only, bound to the calling node, idempotent where applicable, audited, and refuse caller-supplied node names. Drain ownership is recorded in the existing `nodes.draining` integer (`1` operator, `2` agent), so an agent cannot clear an operator drain and no schema change is needed. `ting drain`, `ting undrain`, `ting status --json` and `ting wait-idle --timeout <duration>` expose the flow; the CLI config default is `/etc/ting/ting.toml`. See [docs/ting.md](docs/ting.md), [docs/api.md](docs/api.md#agent) and [Updating a node](README.md#updating-a-node).
+### Added
+
+- Audit text fields strip userinfo, query and fragment from URL-shaped values before writing them.
+
+### Changed
+
+- Requests with no token use a separate, more generous throttle bucket so a polling client cannot lock out other clients sharing its address. Wrong-token throttling is unchanged.
+- All controller responses send `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`; log and artifact downloads also send `Content-Disposition: attachment`.
+- API docs cover retry, staged-commit, merge-base, accepted repository forms and strict query parsing.
+
+### Fixed
+
+- `source.repo` refuses URLs with userinfo, and stored values are redacted in job views and audit data.
+- Unparseable `limit`, `offset` and `wait` query parameters return `400 bad_request` instead of silently defaulting.
 
 ## [0.5.1]
 

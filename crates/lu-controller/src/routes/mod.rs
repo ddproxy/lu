@@ -281,7 +281,14 @@ pub fn version_header() -> HeaderValue {
 }
 
 pub fn with_version(mut res: Response) -> Response {
-    res.headers_mut().insert("x-lu-version", version_header());
+    let headers = res.headers_mut();
+    headers.insert("x-lu-version", version_header());
+    // Also applied by the router middleware; keeping it here covers direct handler use and tests.
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     res
 }
 

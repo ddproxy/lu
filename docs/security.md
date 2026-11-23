@@ -70,10 +70,17 @@ job, is `403 forbidden`.
 Token hashes must be unique across agents and operators, so one token can never hold both
 scopes. An agent name is also the node identity; two agents cannot share a name or a token hash.
 
-Failed token checks are throttled per source address: ten failures in sixty seconds block that
-address for the rest of the window and return `429 rate_limited` with `Retry-After`. IPv6
-addresses are counted by `/64`, and an IPv4-mapped IPv6 address is counted as IPv4. A
-successful request does not reset the count.
+### Throttling
+
+Failed token checks are throttled per source address and scope. Ten wrong-token failures in
+sixty seconds block that address for the rest of the window and return `429 rate_limited`
+with `Retry-After`; the block is checked before the token, so it also refuses otherwise valid
+requests from that address. Requests with no token are counted in a separate bucket with a
+limit of 100 in the same window. They never consume the wrong-token budget, so a polling
+client that lost its token cannot lock out other clients sharing the address; a full
+tokenless bucket throttles only further tokenless requests. IPv6 addresses are counted by
+`/64`, and an IPv4-mapped IPv6 address is counted as IPv4. A successful request does not reset
+either count.
 
 For token generation, hash configuration, private-file rules and rotation, see
 [Tokens and TLS](tokens-and-tls.md#token-files-and-hashes). The controller stores only SHA-256
@@ -140,6 +147,8 @@ under `<artifacts_dir>/../mirrors`, mode `0700`; fetching uses `https` (`file://
 no system or global config, no hooks and no inherited askpass or ssh command, with a 5-minute
 timeout and a size cap. A repository credential is read at fetch time, passed through a
 short-lived private askpass helper, and scrubbed from any stderr before it becomes an error. A restart clears helpers left by a crash.
+
+Job submissions cannot put userinfo in `source.repo`: the validator refuses it with the same fixed error used for mirror URLs. Rows written before that rule still exist, so every job view strips userinfo, query and fragment from the repo before encoding it; the stored value itself is unchanged for the agent's fetch. Audit data fields apply the same stripping to URL-shaped text, and no credential text is accepted into an audit field.
 
 Every staging `git` invocation, including three-way applies, runs with prompts disabled, a
 restricted transport allowlist (`file`, `https`, `ssh`), system and global config skipped, hooks
@@ -277,7 +286,9 @@ A task, repository file, command line, model response or harness log can contain
 that text is stored in `run.log`, `diff.patch`, `report.json` or SQLite. Logs and artifacts are
 mode `0600`, directories `0700`, and the database is created `0600`, but backups and downloads
 inherit their sensitivity. Treat job storage and backups as sensitive as the repositories and
-credentials of the jobs that ran there.
+credentials of the jobs that ran there. Controller responses send `Cache-Control: no-store` and
+`X-Content-Type-Options: nosniff`; log and artifact downloads also send
+`Content-Disposition: attachment` so a browser saves them instead of embedding them in a page.
 
 ## Artifact scrubbing
 

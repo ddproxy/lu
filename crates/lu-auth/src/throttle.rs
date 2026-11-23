@@ -9,14 +9,30 @@ const MAX_TRACKED: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThrottleSettings {
+    /// Wrong-token failures allowed in one window.
     pub max_failures: u32,
+    /// Requests with no token at all allowed in one window. Deliberately more generous: a client
+    /// that loses a session keeps polling without a token, and must not lock out other clients
+    /// that share its source address.
+    pub missing_token_max_failures: u32,
     pub window: Duration,
 }
 
-/// Counts failed token checks per address and scope. A blocked key gets the time left in its window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Bucket {
+    /// A token was presented but did not match.
+    Token,
+    /// No token was presented.
+    MissingToken,
+}
+
+type Seen = HashMap<(IpAddr, String, Bucket), (u32, Instant)>;
+
+/// Counts failed token checks per address, scope and failure kind. A blocked key gets the time
+/// left in its window. Tokenless requests never fill the wrong-token bucket.
 pub struct LoginThrottle {
     settings: ThrottleSettings,
-    seen: Mutex<HashMap<(IpAddr, String), (u32, Instant)>>,
+    seen: Mutex<Seen>,
 }
 
 /// An IPv4 address is its own key. An IPv6 address is keyed by its /64, so a host that rotates
@@ -43,31 +59,46 @@ impl LoginThrottle {
         }
     }
 
-    /// How long `ip` must wait in `scope`, or `None` when it may try.
-    pub fn blocked(&self, ip: IpAddr, scope: &str, now: Instant) -> Option<Duration> {
-        let key = (throttle_key(ip), scope.to_owned());
+    fn max_failures(&self, bucket: Bucket) -> u32 {
+        match bucket {
+            Bucket::Token => self.settings.max_failures,
+            Bucket::MissingToken => self.settings.missing_token_max_failures,
+        }
+    }
+
+    fn check(&self, ip: IpAddr, scope: &str, now: Instant, bucket: Bucket) -> Option<Duration> {
+        let key = (throttle_key(ip), scope.to_owned(), bucket);
         let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         let (count, since) = seen.get(&key)?;
         let elapsed = now.saturating_duration_since(*since);
         if elapsed >= self.settings.window {
             return None;
         }
-        (*count >= self.settings.max_failures).then(|| self.settings.window - elapsed)
+        (*count >= self.max_failures(bucket)).then(|| self.settings.window - elapsed)
     }
 
-    /// Records a failure and returns how many the address has inside the current window for `scope`.
-    pub fn fail(&self, ip: IpAddr, scope: &str, now: Instant) -> u32 {
-        let key = (throttle_key(ip), scope.to_owned());
+    /// How long a wrong token from `ip` must wait in `scope`, or `None` when it may try.
+    pub fn blocked(&self, ip: IpAddr, scope: &str, now: Instant) -> Option<Duration> {
+        self.check(ip, scope, now, Bucket::Token)
+    }
+
+    /// How long a tokenless request from `ip` must wait in `scope`.
+    pub fn blocked_missing(&self, ip: IpAddr, scope: &str, now: Instant) -> Option<Duration> {
+        self.check(ip, scope, now, Bucket::MissingToken)
+    }
+
+    fn record(&self, ip: IpAddr, scope: &str, now: Instant, bucket: Bucket) -> u32 {
+        let key = (throttle_key(ip), scope.to_owned(), bucket);
         let window = self.settings.window;
-        let max = self.settings.max_failures;
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         if seen.len() >= MAX_TRACKED && !seen.contains_key(&key) {
             // Evict the least harmful entry: expired first, then unblocked, then least failed.
             let victim = seen
                 .iter()
-                .min_by_key(|(_, (count, since))| {
+                .min_by_key(|((_, _, entry_bucket), (count, since))| {
                     let expired = now.saturating_duration_since(*since) >= window;
-                    (!expired, *count >= max, *count, *since)
+                    let entry_max = self.max_failures(*entry_bucket);
+                    (!expired, *count >= entry_max, *count, *since)
                 })
                 .map(|(entry_key, _)| entry_key.clone());
             if let Some(victim) = victim {
@@ -80,6 +111,16 @@ impl LoginThrottle {
         }
         entry.0 = entry.0.saturating_add(1);
         entry.0
+    }
+
+    /// Records a wrong-token failure and returns how many the address has in the current window.
+    pub fn fail(&self, ip: IpAddr, scope: &str, now: Instant) -> u32 {
+        self.record(ip, scope, now, Bucket::Token)
+    }
+
+    /// Records a tokenless request in the separate, more generous bucket.
+    pub fn fail_missing(&self, ip: IpAddr, scope: &str, now: Instant) -> u32 {
+        self.record(ip, scope, now, Bucket::MissingToken)
     }
 
     // There is deliberately no success reset: see the test of the same intent below.
@@ -96,6 +137,7 @@ mod tests {
     fn throttle() -> LoginThrottle {
         LoginThrottle::new(ThrottleSettings {
             max_failures: 3,
+            missing_token_max_failures: 6,
             window: Duration::from_secs(60),
         })
     }
@@ -164,7 +206,7 @@ mod tests {
             .seen
             .lock()
             .unwrap()
-            .insert((ip, "operator".to_owned()), (u32::MAX, t0));
+            .insert((ip, "operator".to_owned(), Bucket::Token), (u32::MAX, t0));
         assert_eq!(throttle.fail(ip, "operator", t0), u32::MAX);
     }
 
@@ -207,5 +249,29 @@ mod tests {
         }
         assert!(throttle.blocked(ip, "agent", t0).is_some());
         assert!(throttle.blocked(ip, "operator", t0).is_none());
+    }
+
+    #[test]
+    fn tokenless_requests_use_a_separate_generous_bucket() {
+        let throttle = throttle();
+        let ip: IpAddr = "192.0.2.9".parse().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            throttle.fail(ip, "operator", t0);
+        }
+        assert!(throttle.blocked(ip, "operator", t0).is_some());
+        assert!(throttle.blocked_missing(ip, "operator", t0).is_none());
+
+        let other: IpAddr = "192.0.2.10".parse().unwrap();
+        for _ in 0..5 {
+            throttle.fail_missing(other, "operator", t0);
+        }
+        assert!(throttle.blocked_missing(other, "operator", t0).is_none());
+        assert_eq!(throttle.fail_missing(other, "operator", t0), 6);
+        assert!(throttle.blocked_missing(other, "operator", t0).is_some());
+        assert!(
+            throttle.blocked(other, "operator", t0).is_none(),
+            "tokenless traffic never fills the wrong-token bucket"
+        );
     }
 }

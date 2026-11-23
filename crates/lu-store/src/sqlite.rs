@@ -97,10 +97,21 @@ fn decode_artifacts(s: &str) -> Result<Vec<ArtifactName>, StoreError> {
 }
 
 fn decode_spec(s: &str) -> Result<JobSpec, StoreError> {
-    let spec: JobSpec =
-        serde_json::from_str(s).map_err(|e| internal(format!("invalid stored spec: {e}")))?;
-    spec.validate()
-        .map_err(|e| internal(format!("invalid stored spec: {e}")))?;
+    let bad = |e: &dyn std::fmt::Display| internal(format!("invalid stored spec: {e}"));
+    let mut value: serde_json::Value = serde_json::from_str(s).map_err(|e| bad(&e))?;
+    // Rows stored before credentials were refused in repo URLs must stay readable, without the
+    // credentials: redact before the typed parse, which validates.
+    for path in [&["repo"][..], &["source", "repo"][..]] {
+        let mut slot = Some(&mut value);
+        for key in path {
+            slot = slot.and_then(|v| v.get_mut(*key));
+        }
+        if let Some(serde_json::Value::String(repo)) = slot {
+            *repo = lu_proto::redact_repo(repo).into_owned();
+        }
+    }
+    let spec: JobSpec = serde_json::from_value(value).map_err(|e| bad(&e))?;
+    spec.validate().map_err(|e| bad(&e))?;
     Ok(spec)
 }
 
@@ -418,7 +429,7 @@ fn load_waiting(conn: &Connection, id: &str) -> Result<Vec<JobId>, StoreError> {
             r.get(0)
         })
         .map_err(internal)?;
-    let spec: JobSpec = serde_json::from_str(&spec_json).map_err(internal)?;
+    let spec: JobSpec = decode_spec(&spec_json)?;
     let mut stmt = conn
         .prepare(
             "SELECT d.dep,j.state FROM job_deps d JOIN jobs j ON j.id=d.dep
@@ -466,7 +477,7 @@ fn blocked_dependents_tx(
     let mut out = Vec::new();
     for row in rows {
         let (id, json) = row.map_err(internal)?;
-        let spec: JobSpec = serde_json::from_str(&json).map_err(internal)?;
+        let spec: JobSpec = decode_spec(&json)?;
         out.push((id, spec));
     }
     Ok(out)
@@ -3480,7 +3491,16 @@ mod tests {
             started,
             finished,
         } = row;
-        let spec = crate::conformance::spec(repo, Some(key));
+        // New specs may not carry credentials, but stored rows from before that rule can: create
+        // the job with a clean URL, then put the original text back to exercise normalisation.
+        let clean_repo = match repo.split_once("://").and_then(|(scheme, rest)| {
+            rest.split_once('@')
+                .map(|(_, host)| format!("{scheme}://{host}"))
+        }) {
+            Some(clean) => clean,
+            None => repo.to_string(),
+        };
+        let spec = crate::conformance::spec(&clean_repo, Some(key));
         let (job, _) = store
             .create_job(
                 &spec,
@@ -3490,6 +3510,17 @@ mod tests {
                 },
             )
             .unwrap();
+        if clean_repo != repo {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs SET spec_json=replace(spec_json, ?2, ?3) WHERE id=?1",
+                    params![job.id.as_str(), clean_repo, repo],
+                )
+                .unwrap();
+        }
         store
             .conn
             .lock()
@@ -4178,5 +4209,39 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM cordons", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn stored_specs_with_credentials_stay_readable_and_redacted() {
+        let store = SqliteStore::open(temp_db("legacy-repo.sqlite")).unwrap();
+        let spec = crate::conformance::spec("https://git.example.test/team/app.git", Some("k1"));
+        let (job, _) = store
+            .create_job(
+                &spec,
+                Now {
+                    wall_unix: 10,
+                    mono_ms: 10,
+                },
+            )
+            .unwrap();
+        let credential = ["pw", "legacy", "value"].join("-");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET spec_json=replace(spec_json, 'https://git.example.test/', ?2) WHERE id=?1",
+                params![
+                    job.id.as_str(),
+                    format!("https://user:{credential}@git.example.test/")
+                ],
+            )
+            .unwrap();
+        let record = store.get_job(&job.id).unwrap();
+        assert_eq!(record.spec.repo, "https://git.example.test/team/app.git");
+        assert_eq!(
+            record.spec.source.repo,
+            "https://git.example.test/team/app.git"
+        );
     }
 }
