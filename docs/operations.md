@@ -32,7 +32,7 @@ undrains with `ting undrain`. That needs only the node's own token.
 4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store uses schema version 6. It creates the schema for a new database and migrates schema 1 to 5 databases in place on startup, adding the scrubbing, lineage, publish and stacked-chain columns (`staged_commit`, `blocked_reason`, `blocked_since`). Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly schema version 4, so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
+The store uses schema version 6. It creates the schema for a new database and migrates schema 1 to 5 databases in place on startup, adding the scrubbing, lineage, publish and stacked-chain columns (`staged_commit`, `blocked_reason`, `blocked_since`, `eligible_since`). Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly the current schema version (6), so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
 
