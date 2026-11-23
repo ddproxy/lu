@@ -3163,7 +3163,10 @@ mod tests {
         let text = dashboard.view(t0).plain_text();
         assert!(text.contains("org/widgets"), "{text}");
         for hidden in [&user, &secret, &host] {
-            assert!(!text.contains(hidden), "{hidden} leaked into {text}");
+            assert!(
+                !text.contains(hidden),
+                "credential text leaked into the render"
+            );
         }
         assert!(!text.contains("ref=main"), "{text}");
         assert!(!text.contains("section"), "{text}");
