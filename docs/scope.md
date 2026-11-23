@@ -35,7 +35,7 @@ When a job with `allow_spawn = true` starts, the agent creates a Unix domain soc
 a private directory under `<work_dir>/scope`: directory mode `0700`, socket mode `0600`. Set
 `[agent] harness_uid` (and optionally `harness_gid`) when the harness runs as a different account;
 the agent then chowns the socket root and each per-job directory/socket to that account and checks
-`SO_PEERCRED` against its uid. Without `harness_uid`, the harness must share the agent's uid. The
+`SO_PEERCRED` against its uid. Without `harness_uid` the agent refuses a job with `allow_spawn` (failure class `conflict`), because a harness that shares the agent's uid can read the agent's token and files; set `[agent] allow_shared_uid_scope = true` to accept that on a trusted node. The
 harness sees only `LU_JOB_SOCKET=<path>`; there is no token, controller URL or config path to read.
 A peer from another uid is refused even if it can reach the path.
 
