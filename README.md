@@ -256,7 +256,7 @@ workflows, where their findings appear, and the release verification steps are i
 Download the archive, its `.sha256` file and the CycloneDX SBOM from the release, then:
 
 ```sh
-tag=v0.5.2
+tag=v0.6.0
 target=x86_64-unknown-linux-musl
 asset="lu-${tag}-${target}.tar.gz"
 
