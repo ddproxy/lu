@@ -3935,7 +3935,6 @@ async fn mirror_failures_return_a_generic_internal_error() {
         !body_str(&submitted).contains("absent-repository"),
         "{submitted}"
     );
-    );
     let _ = srv.shutdown.send(());
 }
 
