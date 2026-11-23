@@ -5,6 +5,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.5.1]
+
+No database change; restart the controller and agents.
+
 ### Added
 
 - One base per dependency chain. The agent records the commit it staged in `JobView.staged_commit`, also exposed on entries from `GET /v1/agent/jobs/{id}/deps`. A dependent with no pinned `source.base` inherits the `staged_commit` of its dependencies; all must agree, and disagreeing commits stage their newest common ancestor; if a patch then fails to apply, a conflict summary names every contested commit. A dependent's `diff.patch` is relative to the inherited base, and the operator merges the final patch onto the moved branch afterwards. See [docs/dependencies.md](docs/dependencies.md#one-base-per-chain).

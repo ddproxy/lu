@@ -119,9 +119,9 @@ done
 Expected health response and node row; times and version vary:
 
 ```text
-{"db":"ok","ok":true,"version":"0.5.0"}
+{"db":"ok","ok":true,"version":"0.5.1"}
 NAME    VERSION  HARNESS  LABELS  CORDONS  LAST_SEEN             DRAINED
-node-a  0.5.0    idle     -       -        2026-11-21 14:22:00Z  no
+node-a  0.5.1    idle     -       -        2026-11-21 14:22:00Z  no
 ```
 
 If the node row does not appear, read `$DEMO/agent.log` and `$DEMO/controller.log`.
