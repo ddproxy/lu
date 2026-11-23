@@ -25,14 +25,14 @@ use std::sync::Arc;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+// Unknown fields are accepted: an agent from a newer release may send more (docs/compatibility.md).
 struct PollBody {
     heartbeat: Heartbeat,
     wait_secs: u64,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+// Unknown fields are accepted: an agent from a newer release may send more (docs/compatibility.md).
 struct EpochBody {
     epoch: u64,
 }
@@ -40,7 +40,7 @@ struct EpochBody {
 /// The self/drain/undrain routes take no input: the node comes from the agent token alone. An
 /// empty body or `{}` is accepted; any field is refused.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+// Unknown fields are accepted: an agent from a newer release may send more (docs/compatibility.md).
 struct EmptyBody {}
 
 fn reject_query(uri: &Uri) -> Result<(), ApiError> {
@@ -202,7 +202,7 @@ pub async fn undrain(
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+// Unknown fields are accepted: an agent from a newer release may send more (docs/compatibility.md).
 struct StagedCommitBody {
     /// Full 40-character hex object id of the commit the agent staged from.
     commit: String,
@@ -211,7 +211,7 @@ struct StagedCommitBody {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+// Unknown fields are accepted: an agent from a newer release may send more (docs/compatibility.md).
 struct MergeBaseBody {
     /// Two or more full 40-character hex object ids.
     commits: Vec<String>,

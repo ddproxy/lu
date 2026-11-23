@@ -124,7 +124,7 @@ pub struct LogChunk {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+// Unknown fields are accepted: an agent from a newer release may send more (docs/compatibility.md).
 struct RawLogChunk {
     pub job_id: JobId,
     pub epoch: u64,
@@ -226,7 +226,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+// Unknown fields are accepted: an agent from a newer release may send more (docs/compatibility.md).
 struct RawCompletion {
     pub job_id: JobId,
     pub epoch: u64,
@@ -511,12 +511,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_completion_fields_are_refused() {
+    fn unknown_completion_fields_from_a_newer_agent_are_ignored() {
         let json = format!(
             r#"{{"job_id":"{}","epoch":1,"outcome":"done","extra":true}}"#,
             job_id()
         );
-        assert!(serde_json::from_str::<Completion>(&json).is_err());
+        assert!(serde_json::from_str::<Completion>(&json).is_ok());
     }
 
     #[test]
