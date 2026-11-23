@@ -3,8 +3,18 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # The dev-release workflow builds an automatic dev tag through here.
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to build and publish
+        required: true
+        type: string
 
 permissions: {}
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   create:
@@ -17,8 +27,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag --draft
+          # A pre-release tag (v0.6.2-dev.7.g1a2b3c4) is a dev build and never "latest".
+          case "$TAG" in
+            *-*)
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --title "$TAG" --generate-notes --verify-tag --draft --prerelease --latest=false ;;
+            *)
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --title "$TAG" --generate-notes --verify-tag --draft ;;
+          esac
 
   build:
     needs: create
@@ -35,7 +52,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ env.TAG }}
           persist-credentials: false
+      - name: Set the build version from the tag
+        run: python3 scripts/set-release-version.py "$TAG"
       - name: Install musl toolchain
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -67,7 +87,7 @@ jobs:
           "target/${{ matrix.target }}/release/ting" --version
       - name: Package
         run: |
-          name="lu-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="lu-${TAG}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/lu" "target/${{ matrix.target }}/release/ting" LICENSE README.md CHANGELOG.md SECURITY.md "$name/"
           cp -R docs contrib "$name/"
@@ -79,8 +99,8 @@ jobs:
         with:
           name: lu-${{ matrix.target }}
           path: |
-            lu-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-            lu-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+            lu-${{ env.TAG }}-${{ matrix.target }}.tar.gz
+            lu-${{ env.TAG }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
   sbom:
@@ -91,7 +111,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ env.TAG }}
           persist-credentials: false
+      - name: Set the build version from the tag
+        run: python3 scripts/set-release-version.py "$TAG"
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: '1.99'
@@ -102,8 +125,8 @@ jobs:
         run: |
           cargo cyclonedx --manifest-path app/Cargo.toml --format json \
             --features tui --spec-version 1.5 \
-            --override-filename "lu-${GITHUB_REF_NAME}-sbom"
-          mv "app/lu-${GITHUB_REF_NAME}-sbom.json" .
+            --override-filename "lu-${TAG}-sbom"
+          mv "app/lu-${TAG}-sbom.json" .
       - name: Upload SBOM
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -128,7 +151,7 @@ jobs:
       - name: Upload assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" dist/*
+        run: gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" dist/*
       - name: Attest release archives
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -136,4 +159,4 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

@@ -75,6 +75,10 @@ fn check_pinned_uses(name: &str, text: &str, problems: &mut Vec<String>) {
         let mut fields = rest.splitn(2, '#');
         let action = fields.next().unwrap_or_default().trim();
         let version = fields.next().map(str::trim);
+        // A reusable workflow in this repository has no version to pin.
+        if action.starts_with("./.github/workflows/") {
+            continue;
+        }
 
         let pinned = action.rsplit_once('@').is_some_and(|(repo, sha)| {
             repo.split_once('/').is_some_and(|(owner, name)| {
@@ -143,7 +147,13 @@ fn check_job_permissions(name: &str, doc: &Value, problems: &mut Vec<String>) {
 fn expected_permissions(workflow: &str, job: &str) -> Option<Permissions> {
     const READ: Permissions = &[("contents", "read")];
     Some(match (workflow, job) {
-        ("ci.yml", "test" | "musl") => READ,
+        ("ci.yml", "test" | "musl" | "compat") => READ,
+        ("dev-release.yml", "tag" | "prune") => &[("contents", "write")],
+        ("dev-release.yml", "release") => &[
+            ("attestations", "write"),
+            ("contents", "write"),
+            ("id-token", "write"),
+        ],
         ("pages.yml", "build") => READ,
         ("pages.yml", "deploy") => &[("pages", "write"), ("id-token", "write")],
         ("codeql.yml", "analyze") => &[

@@ -5,6 +5,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Automatic dev builds: after CI passes on `main`, `dev-release` tags `vX.Y.(Z+1)-dev.<N>.g<hash>` (N = commits since the last stable tag) and builds it as a GitHub pre-release with attestation. The release workflow also refuses a stable tag that differs from the `Cargo.toml` version, and sets the dev version inside the build.
+
 ## [0.6.1]
 
 ### Fixed

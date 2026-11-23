@@ -32,6 +32,19 @@ and `contrib/`. The workflow builds with Rust 1.99, runs `cargo build --release 
 --features tui --target <target>` and `cargo build --release --locked -p tuishou-ting --target
 <target>`, smoke-runs both binaries, and verifies the tag before publishing.
 
+A stable tag must equal the `Cargo.toml` workspace version; the release workflow refuses a tag that
+does not, so a binary cannot report a version other than its tag.
+
+### Dev builds
+
+After CI passes on `main`, the `dev-release` workflow tags the commit `vX.Y.(Z+1)-dev.<N>.g<hash>`
+and builds it through the same release workflow. X.Y.Z is the latest stable tag and N is the number
+of commits since it, so dev builds order by N and rank below the stable release of the same
+version. They are GitHub pre-releases (never "latest"), carry the same attestation, report their
+dev version from `lu --version`, and only the newest ten are kept. Documentation-only changes do
+not produce one. A canary node can follow them with tuishou's `channel = "dev"`; controllers
+should stay on stable releases, because schema migrations only move forward.
+
 Worked example:
 
 ```sh
