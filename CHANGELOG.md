@@ -5,6 +5,10 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.6.0]
+
+Schema version 6: controllers migrate in place from 5 on first start (an additive `jobs.eligible_since` column). Stop the controller, keep the dated database copy the playbook makes, then start the new binary.
+
 ### Changed
 
 - Agent-to-controller messages ignore fields they do not know, so an agent may be newer than its controller. `docs/compatibility.md` states the rule and `scripts/compat-test.sh` with a CI job checks it against the previous release in both directions, including the schema migration. A body that names another node on the self-drain routes is now ignored (the node always comes from the token) instead of refused.
