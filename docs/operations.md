@@ -17,9 +17,14 @@ systemd units are in [install.md](install.md); the agent's isolation model is in
 | Provider and label dispatch | [dispatch.md](dispatch.md) |
 | MCP tools | [mcp.md](mcp.md) |
 | HTTP routes and limits | [api.md](api.md) |
+| Node self-service commands | [ting.md](ting.md) |
 | Configuration keys | [config.md](config.md) |
 
 ## Upgrade
+
+For the agent-host half of an upgrade, see [Updating a node](../README.md#updating-a-node): the node
+drains itself with `ting drain`, waits with `ting wait-idle`, is updated and health-checked, then
+undrains with `ting undrain`. That needs only the node's own token.
 
 1. Read `CHANGELOG.md` and back up the database and artifacts ([below](#backup-and-restore)).
 2. Stop the controller: `systemctl stop lu-controller.service`.
@@ -219,7 +224,7 @@ The controller counts successful stuck completions in
 
 These are separate mechanisms:
 
-- **Drain** stops a node taking any new job. It is set by `POST /v1/nodes/{name}/drain` and cleared by `/undrain`, and is stored in the `nodes` table. It survives a controller restart. A node must have sent a heartbeat at least once to exist; draining an unknown node returns `404 not_found`.
+- **Drain** stops a node taking any new job. It is set by `POST /v1/nodes/{name}/drain` and cleared by `/undrain`, and is stored in the `nodes` table. It survives a controller restart. A node must have sent a heartbeat at least once to exist; draining an unknown node returns `404 not_found`. An operator drain is operator-owned: the agent's `POST /v1/agent/undrain` refuses it with `409 conflict` and the node view reports `drain_origin: "operator"`. A node can instead drain itself with `POST /v1/agent/drain` and clear that drain with `POST /v1/agent/undrain`, reported as `drain_origin: "agent"`. See [Updating a node](../README.md#updating-a-node) for the self-service update sequence and [the `ting` reference](ting.md) for the CLI.
 - **Cordon** stops a node taking jobs whose chosen provider is cordoned. It is created when a retryable provider failure completes, keyed by the pair actually assigned rather than necessarily the primary. A completion with `retry_after_secs` creates a Reiki-derived cordon that lifts after two consecutive healthy provider heartbeats; any other provider failure uses `provider_cooldown_secs` and a fixed expiry. A job with no provider is not blocked by a cordon.
 
 Cordon expiry is stored as monotonic milliseconds internally so dispatch behaviour is unchanged,
@@ -250,7 +255,8 @@ node-a  0.4.0   idle     !homelab,gpu,php8.3,region=eu   !zen,!mistral 2026-11-2
 
 There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full controller view:
 `online` (seen within two lease periods; nodes are offline after a controller restart until their
-next heartbeat), `draining`, `providers`, `provider_models`, `labels`, `label_sources`, `taints`,
+next heartbeat), `draining`, `drain_origin` (`"operator"` or `"agent"` while drained, absent otherwise),
+`providers`, `provider_models`, `labels`, `label_sources`, `taints`,
 `current_job`, `cordon_details`, `version` and the opaque `reiki` document. `label_sources` maps a
 probed label to `probed`; other labels have no entry. Each `cordon_details` entry carries its
 provider, source, reason, set time, expiry or healthy-lift count.

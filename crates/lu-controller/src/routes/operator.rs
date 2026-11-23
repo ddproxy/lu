@@ -202,6 +202,7 @@ fn node_view(
         last_seen: seconds(n.last_seen),
         online: n.online,
         draining: n.draining,
+        drain_origin: n.draining.then(|| n.drain_origin.as_str().to_owned()),
         harness: Some(n.heartbeat.harness),
         providers: n.heartbeat.providers.clone(),
         provider_models: n.heartbeat.provider_models.clone(),

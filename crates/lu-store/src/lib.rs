@@ -53,6 +53,46 @@ impl CordonSource {
     }
 }
 
+/// Who a node's drain belongs to. Stored in the existing `nodes.draining` integer so no schema
+/// change is needed: 0 is undrained, 1 is an operator drain and 2 is an agent's own drain.
+/// Only an agent drain can be cleared by that agent's token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOrigin {
+    None,
+    Operator,
+    Agent,
+}
+
+impl DrainOrigin {
+    pub fn from_raw(raw: i64) -> Self {
+        match raw {
+            1 => Self::Operator,
+            2 => Self::Agent,
+            _ => Self::None,
+        }
+    }
+
+    pub fn as_raw(self) -> i64 {
+        match self {
+            Self::None => 0,
+            Self::Operator => 1,
+            Self::Agent => 2,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Operator => "operator",
+            Self::Agent => "agent",
+        }
+    }
+
+    pub fn is_draining(self) -> bool {
+        self != Self::None
+    }
+}
+
 /// A provider cordon with the detail needed to explain it to an operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cordon {
@@ -139,6 +179,8 @@ pub struct NodeRecord {
     /// Seen within two lease periods of the `now` given to the query.
     pub online: bool,
     pub draining: bool,
+    /// Who requested the drain; `None` when the node is not drained.
+    pub drain_origin: DrainOrigin,
     pub heartbeat: Heartbeat,
     pub current_job: Option<JobId>,
     /// Providers with an unexpired `(node, provider)` cordon.
@@ -591,9 +633,15 @@ pub trait Store: Send + Sync + 'static {
     /// At controller start: every `leased` or `running` job becomes `recovering`.
     fn recover_on_boot(&self, now: Now) -> Result<u64, StoreError>;
 
-    /// Drains or undrains a node. `Err(StoreError::NotFound)` for a node that has never
-    /// heartbeated.
+    /// Drains or undrains a node as an operator. `Err(StoreError::NotFound)` for a node that has
+    /// never heartbeated. An operator undrain clears a drain from either origin.
     fn set_draining(&self, node: &NodeName, draining: bool) -> Result<(), StoreError>;
+    /// Drains a node on behalf of its own agent. Idempotent; an existing operator drain is left
+    /// untouched so the agent cannot take ownership of it.
+    fn set_agent_drain(&self, node: &NodeName) -> Result<(), StoreError>;
+    /// Clears a drain the agent started. Returns whether the drain was actually removed. An
+    /// operator drain yields `StoreError::Conflict` and stays in place.
+    fn clear_agent_drain(&self, node: &NodeName) -> Result<bool, StoreError>;
     fn nodes(&self, now: Now, lease_ms: u64) -> Result<Vec<NodeRecord>, StoreError>;
 
     /// All cordons, or just one node's when `node` is `Some`.

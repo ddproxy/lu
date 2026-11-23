@@ -296,6 +296,7 @@ fn job_and_node_views_match_the_documented_json() {
         last_seen: 1_700_000_030,
         online: true,
         draining: false,
+        drain_origin: None,
         harness: Some(HarnessState::Idle),
         providers: vec![ProviderStatus {
             name: "peer-b".to_owned(),

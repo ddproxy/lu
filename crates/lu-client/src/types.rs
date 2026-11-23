@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use lu_proto::{
-    HostStats, JobStats, JobView, NodeStats, NodeView, ProcessStats, WorkspaceCleanResult,
-    WorkspaceRelease,
+    AgentSelfView, HostStats, JobStats, JobView, NodeStats, NodeView, ProcessStats,
+    WorkspaceCleanResult, WorkspaceRelease,
 };
 
 /// Largest JSON response the client will read. Artifacts have their own per-file cap.

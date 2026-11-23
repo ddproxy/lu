@@ -50,6 +50,8 @@ pub enum Event {
     DraftApproved,
     DraftRejected,
     DraftExpired,
+    /// An agent read its own node view. `data.source` is always `agent`.
+    AgentSelf,
     /// One controller-side publish attempt. `data.target` is `snapshot` or `source_branch`,
     /// `data.result` is a fixed outcome code and `data.remote` is a configured remote name.
     Publish,
@@ -77,6 +79,7 @@ impl Event {
             Self::DraftApproved => "draft_approved",
             Self::DraftRejected => "draft_rejected",
             Self::DraftExpired => "draft_expired",
+            Self::AgentSelf => "agent_self",
             Self::Publish => "publish",
             Self::PatchSecretDetected => "patch_secret_detected",
         }

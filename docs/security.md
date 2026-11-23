@@ -57,7 +57,10 @@ There are two scopes:
   and drain or undrain any node. An operator token is not bound to a node.
 - **Agent**: bound to exactly one node name at config time. Its heartbeat must name the same
   node, and agent writes are accepted only for jobs currently assigned to that node and for the
-  current epoch. It cannot use operator routes.
+  current epoch. It cannot use operator routes. It can read its own node state and drain or
+  undrain only that node through the agent self-service routes; no node name is accepted from the
+  caller. There is no separate controller-role token: the controller service has no agent token, so
+  an operator token or an anonymous caller is `401` on those routes.
 
 Missing, malformed and unknown tokens are `401 unauthorized` with `WWW-Authenticate: Bearer`.
 A valid token used on the other scope's route is also `401`, so a probe cannot distinguish scope
@@ -97,6 +100,14 @@ duplicated or delayed agent from finishing a job that has since been reassigned.
 An agent token is bound to one node, and the controller checks that the job's `node` is that
 node before accepting a write. A token from node-a therefore cannot complete, log or upload for
 a job on node-b, even if it guesses the job id and epoch.
+
+The same binding applies to the self-service routes: `GET /v1/agent/self`, `POST /v1/agent/drain`
+and `POST /v1/agent/undrain` all derive the node from the bearer token alone. Query strings and
+body fields are refused, so agent-a cannot read or change agent-b's drain state. Drain ownership
+is explicit: `nodes.draining` distinguishes operator and agent drains, `agent/undrain` returns
+`409 conflict` for an operator drain and never clears it, and an agent drain never replaces an
+operator drain. Only operator routes can clear an operator drain. These calls are audited with the
+agent node as actor (`agent_self`, and `drain` with `source: "agent"`).
 
 Lease expiry is a safety mechanism governed by the lease epoch and node binding. If an agent is
 slow, paused or partitioned for `lease_secs`, the job becomes `recovering`; after
@@ -304,8 +315,10 @@ drains for a fixed 10 seconds on shutdown. The unauthenticated health check shar
 single-flight DB probe instead of querying SQLite on every request. Mirror syncs are limited to one
 at a time and six per operator per minute; base packs to four at a time and thirty per agent per
 minute. Both return `429 rate_limited` on contention. Artifact and log downloads are streamed under
-the same per-file caps instead of being read whole into memory. `lu-supervise` enforces its own run,
-idle and output limits on the harness.
+the same per-file caps instead of being read whole into memory. The agent self-service routes
+(`/v1/agent/self`, `/v1/agent/drain`, `/v1/agent/undrain`) add no new quota: they use the same
+auth throttle, shared JSON/body caps and error envelope as every other agent route. `lu-supervise`
+enforces its own run, idle and output limits on the harness.
 
 Intake adds per-source body caps, rolling-minute rate limits, a bounded dedupe window and `[drafts]`
 caps; every drop is counted and payload text is not logged, so an unsigned or abusive sender cannot
