@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.6.1]
+
 ### Fixed
 
 - `ting` clears workspaces an earlier run staged when it starts. The workspace registry is in memory, so after a restart (an update, a crash) those trees were never deleted and a retry of the same job id was refused with `staging failed: directory already exists`. Only directories the agent itself staged are removed; a directory without the staging marker still makes staging refuse.
