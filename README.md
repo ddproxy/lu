@@ -125,7 +125,9 @@ put `target/release` on `PATH` or run `make install` first.
    still advertises its partial diff. `lu logs --follow` streams stored output and stops when the job
    reaches a terminal state.
    `lu fetch` prints one `saved <path>` line per file: `results/diff.patch`, `results/run.log` and
-   `results/report.json`. It also fetches artifacts of failed jobs.
+   `results/report.json`. It also fetches artifacts of failed jobs. `lu stats` prints terminal-job
+   counts, retries, busy seconds and duration percentiles per node; `--by repo` and `--by state`
+   switch the table, and `--since 7d` narrows the window. See [Monitoring](docs/monitoring.md#node-contribution-statistics).
 
 7. To chain work, use idempotency keys instead of copying ids:
 
@@ -157,6 +159,7 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu audit tail <path> [-n <lines>]` | Print the last audit records. |
 | `lu audit head <path>` | Print the current head hash (and record count with `--json`) so it can be anchored elsewhere. |
 | `lu status` | Show controller version, uptime, schema version, database size, recovered jobs, job counts by state (including drafts), oldest queued age and node counts. `--json` prints the raw response. |
+| `lu stats [--by node|repo|state] [--since WHEN] [--node NAME]` | Show terminal-job counts, failures, retries, busy seconds and duration percentiles from the controller store. `--by` selects the table grouping (`node` by default), `--since` accepts Unix seconds, a UTC date or a duration such as `7d`, and `--node` restricts the report to one configured node. `--json` prints the full report with per-node and fleet aggregates. See [Monitoring](docs/monitoring.md#node-contribution-statistics). |
 | `lu mcp` | Serve Lu tools over stdio using newline-delimited JSON-RPC 2.0. See [Use Lu from an agent](#use-lu-from-an-agent). |
 | `lu repos` | List the configured repository mirrors with their last sync time and branch heads. `--json` prints the raw response. |
 | `lu sync <name>` | Fetch one configured repository mirror and print its last sync time and branch heads. `--json` prints the raw response. |

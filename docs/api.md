@@ -24,6 +24,7 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `GET /v1/jobs/{id}/logs?offset=N&wait=25` | Return raw log bytes from `offset` with `Content-Type: text/plain`, `X-Lu-Log-Length` and `X-Lu-State`. The bytes are streamed up to the stored 50 MiB log cap; an oversized file is `413 too_large`. `wait` holds the request for up to 25 seconds while no new bytes arrive. An unknown id is `404`. |
 | `GET /v1/jobs/{id}/artifacts/{name}` | Return one fixed artifact name: `diff.patch`, `run.log` or `report.json` from any job that stored it, including a `failed` job with a partial diff. The file is streamed under its stored cap; an oversized file is `413 too_large`. An unknown name or an artifact that is not stored is `404`. |
 | `GET /v1/status` | Return a `StatusView`. |
+| `GET /v1/stats?by=&since=&node=` | Return a `StatsReport` aggregating terminal jobs per configured node and for the fleet. Needs the same operator token and login throttle as the other operator reads. `by` is `node` (default), `repo` or `state` and only selects the CLI's table grouping; the JSON report always contains every group. `since` accepts Unix seconds, a `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SSZ` UTC timestamp, or a duration such as `30m`, `1h30m` or `7d` relative to the controller clock; it filters on `finished_at` inclusively. `node` restricts the report to one configured node. A bad `by`, `since` or `node` is `400 bad_request`; an unknown node yields zero-valued rows, not `404`. See [monitoring.md](monitoring.md#node-contribution-statistics) for semantics. |
 | `GET /v1/repos` | Return `{"repos":[{"name","url","synced_at","heads"}]}`. `synced_at` is null before the first sync; `heads` maps up to 20 branch names to commit ids. |
 | `POST /v1/repos/{name}/sync` | Fetch one configured mirror and return `{"name","heads","synced_at"}`. At most one sync runs at a time and each operator may start 6 per minute; contention or an exhausted budget is `429 rate_limited` with `Retry-After`. An unknown configured name is `404`; a fetch failure is `500` with any credential removed from the message. |
 | `GET /v1/nodes` | Return an array of `NodeView`s. |
@@ -272,6 +273,72 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `scope_max_depth` | integer | Configured maximum lineage depth. |
 | `scope_max_children_per_job` | integer | Configured direct-child cap. |
 | `scope_max_descendants_per_root` | integer | Configured per-root descendant cap. |
+
+### StatsReport
+
+`GET /v1/stats` and `lu stats --json` return the same object. Only terminal jobs (`done`, `failed`,
+`cancelled`, `expired`) contribute, filtered by `finished_at` when `since` is present.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `by` | string | `node`, `repo` or `state`, echoed from the request; the JSON body always carries every group. |
+| `since` | integer or null | Inclusive lower bound in Unix seconds; `null` means all retained jobs. |
+| `node` | string or null | Node filter from the request, if any. |
+| `fleet` | `StatsAggregate` | Sum over all contributing jobs. |
+| `nodes` | array of `NodeContribution` | One zero-filled row per configured node, ordered by name. |
+
+A `NodeContribution` is a `stats` aggregate plus a `node` string from `[controller.agents]`. A
+`StatsAggregate` has these fields, with every fixed key and bucket present even when zero:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `states` | object | Counts keyed by `done`, `failed`, `cancelled`, `expired`. |
+| `failures` | object | Counts keyed by `node`, `provider`, `execution`, `dependency`, `conflict`, for `failed` jobs only. |
+| `retries` | integer | Sum of `attempt - 1` over counted terminal jobs. |
+| `busy_seconds` | integer | Sum of wall-clock job durations in whole seconds, not CPU time. Uses `finished_at - started_at`, falling back to `finished_at - created_at`; jobs without `finished_at` add no duration sample. |
+| `runtime` | `DurationSummary` | Wall-clock run durations. |
+| `queue_wait` | `DurationSummary` | `started_at - created_at` durations. |
+| `top_repositories` | array of `RepoContribution` | At most 10 entries, `{repository,jobs}`, sorted by count then name. `repository` is `host/owner/name`; raw URLs, credentials and local paths are not reported. |
+| `last_finished_at` | integer or null | Newest terminal `finished_at` in the scope. |
+
+A `DurationSummary` has `count` (samples with both timestamps), `sum_seconds`, `median_seconds`
+and `p90_seconds` (nearest-rank percentiles, `null` when there are no samples) and `buckets`, a map
+from the fixed `le` labels `1`, `5`, `15`, `60`, `300`, `900`, `3600`, `21600`, `+Inf` to cumulative
+sample counts. The same bounds back the histograms in [monitoring.md](monitoring.md#node-contribution-statistics).
+
+```json
+{
+  "by": "node",
+  "since": 1700000000,
+  "node": null,
+  "fleet": {
+    "states": {"cancelled": 1, "done": 3, "expired": 0, "failed": 1},
+    "failures": {"conflict": 0, "dependency": 0, "execution": 1, "node": 0, "provider": 0},
+    "retries": 2,
+    "busy_seconds": 42,
+    "runtime": {
+      "count": 4,
+      "sum_seconds": 42,
+      "median_seconds": 8,
+      "p90_seconds": 20,
+      "buckets": {"+Inf": 4, "1": 0, "15": 3, "21600": 4, "300": 4, "3600": 4, "5": 1, "60": 4, "900": 4}
+    },
+    "queue_wait": {
+      "count": 4,
+      "sum_seconds": 6,
+      "median_seconds": 1,
+      "p90_seconds": 3,
+      "buckets": {"+Inf": 4, "1": 2, "15": 4, "21600": 4, "300": 4, "3600": 4, "5": 4, "60": 4, "900": 4}
+    },
+    "top_repositories": [{"repository": "git.example.test/team/app", "jobs": 4}],
+    "last_finished_at": 1700000123
+  },
+  "nodes": []
+}
+```
+
+Lu does not prune stored jobs, so these all-time values are stable across restarts. A `since`
+window narrows the counts by design and is not a monotonic counter source.
 
 ### Repository shapes
 

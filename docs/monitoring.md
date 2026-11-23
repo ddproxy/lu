@@ -1,11 +1,11 @@
 # Monitoring
 
-The controller exposes Prometheus text at `GET /metrics` and a one-shot JSON summary at `GET /v1/status`. Both need an operator token. This page lists the emitted series, a scrape setup and alert examples.
+The controller exposes Prometheus text at `GET /metrics`, a one-shot JSON summary at `GET /v1/status` and a node-contribution report at `GET /v1/stats`. All three need an operator token. This page lists the emitted series, a scrape setup and alert examples.
 
 ```mermaid
 flowchart LR
     Prometheus -->|"Bearer operator token<br/>GET /metrics"| Controller
-    Operator -->|"lu status"| Controller
+    Operator -->|"lu status / lu stats"| Controller
     Controller --> Store[("SQLite<br/>+ in-memory heartbeats")]
     NodeExporter -->|"host disk and filesystem"| Prometheus
 ```
@@ -36,7 +36,7 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_build_info{version}` | gauge | Always `1`; controller build version. |
 | `lu_uptime_seconds` | gauge | Seconds since the controller process started. |
 | `lu_db_bytes` | gauge | SQLite file size, excluding `-wal` and `-shm`. |
-| `lu_schema_version` | gauge | Schema version the binary expects; currently `4`. |
+| `lu_schema_version` | gauge | Schema version the binary expects; currently `5`. |
 | `lu_recovered_on_boot` | gauge | Jobs moved to `recovering` by this process's boot recovery. |
 | `lu_queue_oldest_seconds` | gauge | Age of the oldest `queued` or `blocked` job, or `0` when none. |
 | `lu_jobs{state}` | gauge | Jobs in each of eleven zero-filled states: `draft`, `blocked`, `queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`, `expired`. |
@@ -52,6 +52,13 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_repo_last_sync_seconds{repo}` | gauge | Seconds since that configured mirror synced; `0` before its first sync. |
 | `lu_jobs_stuck_stopped_total{mode}` | counter | Jobs stopped by the agent's stuck policy, by `mode` (`cancel` or `retry`), since this controller process started. |
 | `lu_jobs_completed_total{outcome}` | counter | Terminal jobs by `outcome`: `done`, `failed`, `cancelled`; derived from stored jobs and kept across restarts. |
+| `lu_node_jobs_total{node,state}` | counter | Terminal jobs for a configured node and fixed `state`: `done`, `failed`, `cancelled`, `expired`; derived from all retained jobs. |
+| `lu_node_failures_total{node,class}` | counter | Failed jobs for a configured node and one of five fixed `class` values: `node`, `provider`, `execution`, `dependency`, `conflict`. |
+| `lu_node_busy_seconds_total{node}` | counter | Sum of wall-clock job durations on a configured node; not CPU time. |
+| `lu_node_job_runtime_seconds_{bucket,count,sum}{node[,le]}` | histogram | Wall-clock `finished_at - started_at` (or creation time when start is missing), with fixed `le` bounds. |
+| `lu_node_queue_wait_seconds_{bucket,count,sum}{node[,le]}` | histogram | Wall-clock `started_at - created_at`, with the same fixed `le` bounds. |
+| `lu_node_job_runtime_seconds_{median,p90}_seconds{node}`, `lu_node_queue_wait_seconds_{median,p90}_seconds{node}` | gauge | Nearest-rank percentiles in whole seconds; `0` when there are no samples. |
+| `lu_node_last_job_finished_timestamp_seconds{node}` | gauge | Newest terminal `finished_at` on a configured node; `0` when that node has no finished job. |
 | `lu_jobs_no_changes_total` | counter | `done` jobs whose stored diff was empty and `allow_empty` was false, summed since this controller process started. |
 | `lu_jobs_expect_failed_total` | counter | `done` jobs whose suspect expectations failed, summed since this controller process started. |
 | `lu_publish_total{target,result}` | counter | Publish attempts by `target` (`snapshot` or `source_branch`) and fixed `result` code, since this controller process started. Results include `published`, `published_snapshot_fallback`, `gates_failed`, `hold`, `no_snapshot_prefix`, `failed`, `denied`, `invalid`, `state`, `git` and `rate_limited`. |
@@ -84,6 +91,50 @@ the dependents as well); otherwise those jobs fail with class `dependency` when 
 
 Node label, provider, disk and last-seen series come from the controller store's persisted latest heartbeat and survive a restart; `lu_node_last_seen_seconds` keeps growing until a new heartbeat arrives. Workspace series come from the same heartbeat but are kept only in controller memory, so they return to zero on a controller restart and their cumulative agent counters restart with the agent. `lu_nodes_online` uses a monotonic timestamp reset at boot, so it becomes `0` on restart until agents report again. Provider and label series appear only for nodes that report them. Cordon series come from the store; boot clears cordons, so they reappear only when a new failure or Reiki reading sets one. Group series appear for named `[[controller.groups]]` entries and for groups given a runtime cap through `PUT /v1/groups/{name}/limit`. A job in an uncapped group has no group series. Runtime caps return to configured values on restart.
 
+## Node contribution statistics
+
+`GET /v1/stats`, `lu stats` and the node series in `/metrics` all read one report computed by the
+controller store from stored jobs. Only terminal jobs (`done`, `failed`, `cancelled`, `expired`) with
+a `finished_at` within the requested window contribute. `since` is inclusive on `finished_at`;
+without it the report covers all retained history. The CLI accepts `--since <unix-seconds|UTC-date|duration>`
+(`30m`, `1h30m`, `7d`), and the API accepts the same syntax in `?since=`. See
+[api.md](api.md#statsreport) for the JSON shape.
+
+- **Retention.** Lu does not prune jobs: there is no job-delete path, so the persistent `jobs` table
+  is the source of truth. Counters derived from it do not fall when old jobs age out and survive a
+  controller restart. `/metrics` queries the report without `since` for this reason; a `since`
+  window changes the report's counts by design and must not be used as a monotonic counter series.
+- **Busy time.** `busy_seconds` and the runtime histogram use wall-clock job duration
+  (`finished_at - started_at`, falling back to `finished_at - created_at` for older rows), not CPU
+  time. Queue wait uses `started_at - created_at`. Jobs with no `finished_at` still count in states,
+  retries and repositories, but contribute no duration sample. Negative gaps are clamped to zero.
+- **Bounded labels.** `node` label values come only from configured `[[controller.agents]]` names,
+  with zero-valued rows for nodes that have not finished a job. `state` and `class` are fixed names.
+  Repository text is never a metric label: the report exposes at most ten `host/owner/name` values
+  in `top_repositories` for the JSON and CLI views only.
+- **Buckets and retries.** Duration buckets are cumulative with fixed `le` bounds of `1`, `5`,
+  `15`, `60`, `300`, `900`, `3600`, `21600` seconds plus `+Inf`. `retries` sums `attempt - 1` over
+  counted terminal jobs. A failed job with no stored class is counted as `node`.
+
+PromQL examples using only emitted series:
+
+```promql
+# Failed jobs in the last hour per node (counters are all-time, so use a range).
+sum by (node) (increase(lu_node_jobs_total{state="failed"}[1h]))
+
+# Wall-clock busy fraction per node over five minutes.
+sum by (node) (rate(lu_node_busy_seconds_total[5m]))
+
+# Slowest decile of job runtime over the last hour.
+histogram_quantile(0.9, sum by (le) (rate(lu_node_job_runtime_seconds_bucket[1h])))
+
+# Nodes with no terminal job in the last day.
+time() - lu_node_last_job_finished_timestamp_seconds > 86400
+```
+
+For a sortable table of the same report, use `lu stats --by node`, `--by repo` or `--by state`;
+all three tables are drawn from the same fields that back the metrics above.
+
 ## `lu status`
 
 `GET /v1/status` and `lu status` return the same fields: `version`, `uptime_secs`, `schema_version`, `db_bytes`, `recovered_on_boot`, `jobs` (eleven zero-filled counts, including `draft` and `expired`), `waiting_dependents`, `oldest_queued_secs`, `drafts`, `oldest_draft_secs`, `nodes`, `nodes_online`, `lease_secs`, `audit_write_errors`, `scope_enabled`, `scope_max_depth`, `scope_max_children_per_job` and `scope_max_descendants_per_root`. `audit_write_errors` is the same counter as `lu_audit_write_errors_total`; `lu show <id>` also prints it in the job view. Draft counts and the oldest draft age are visible in `lu top`; see [drafts.md](drafts.md#observing-drafts).
@@ -98,7 +149,7 @@ lu status --json
 {
   "version": "0.5.1",
   "uptime_secs": 3600,
-  "schema_version": 4,
+  "schema_version": 5,
   "db_bytes": 81920,
   "recovered_on_boot": 2,
   "jobs": {"draft": 3, "blocked": 0, "queued": 1, "leased": 1, "running": 2, "recovering": 0, "needs_input": 0, "done": 12, "failed": 1, "cancelled": 0, "expired": 1},
@@ -152,6 +203,9 @@ groups:
         for: 30m
       - alert: LuIntakeBadSignatures
         expr: increase(lu_intake_total{result="bad_signature"}[15m]) > 0
+        for: 5m
+      - alert: LuNodeFailuresSpike
+        expr: increase(lu_node_jobs_total{state="failed"}[15m]) > 5
         for: 5m
 ```
 

@@ -9,8 +9,10 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use lu_proto::{
-    ArtifactName, CancelEffect, Completion, FailureClass, Heartbeat, JobEdit, JobId, JobSpec,
-    JobState, NodeName, Outcome, MAX_COLLECT_BYTES, MAX_LOG_BYTES,
+    normalize_repository, ArtifactName, CancelEffect, Completion, DurationSummary, FailureClass,
+    Heartbeat, JobEdit, JobId, JobSpec, JobState, NodeContribution, NodeName, Outcome,
+    RepoContribution, StatsAggregate, StatsQuery, StatsReport, MAX_COLLECT_BYTES, MAX_LOG_BYTES,
+    STATS_BUCKETS_SECS, STATS_BUCKET_LABELS, TOP_REPOSITORIES,
 };
 
 use crate::{
@@ -1266,6 +1268,144 @@ impl SqliteStore {
         tx.commit().map_err(internal)?;
         Ok((rec, true))
     }
+}
+
+/// In-memory builder for one [`StatsAggregate`]. Durations are kept as samples until the report is
+/// finalised so medians, p90s and cumulative buckets all come from one pass over the same rows.
+struct StatsAccumulator {
+    aggregate: StatsAggregate,
+    runtime_samples: Vec<u64>,
+    queue_samples: Vec<u64>,
+    repositories: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Copy)]
+struct StatsJob<'a> {
+    state: JobState,
+    failure: Option<FailureClass>,
+    attempt: u32,
+    created_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+    repository: Option<&'a str>,
+}
+
+impl StatsAccumulator {
+    fn new() -> Self {
+        Self {
+            aggregate: StatsAggregate::empty(),
+            runtime_samples: Vec::new(),
+            queue_samples: Vec::new(),
+            repositories: BTreeMap::new(),
+        }
+    }
+
+    fn add_job(&mut self, job: StatsJob<'_>) {
+        let StatsJob {
+            state,
+            failure,
+            attempt,
+            created_at,
+            started_at,
+            finished_at,
+            repository,
+        } = job;
+        *self
+            .aggregate
+            .states
+            .entry(state.as_str().to_owned())
+            .or_insert(0) += 1;
+        self.aggregate.retries = self
+            .aggregate
+            .retries
+            .saturating_add(attempt.saturating_sub(1) as u64);
+        if state == JobState::Failed {
+            // Failed jobs written before failure classes existed still need a fixed label.
+            let class = failure.unwrap_or(FailureClass::Node);
+            *self
+                .aggregate
+                .failures
+                .entry(class.as_str().to_owned())
+                .or_insert(0) += 1;
+        }
+        if let Some(finished) = finished_at {
+            self.aggregate.last_finished_at = Some(
+                self.aggregate
+                    .last_finished_at
+                    .map_or(finished, |latest| latest.max(finished)),
+            );
+            // Busy time is wall-clock job duration, not CPU time. `started_at` is the best basis;
+            // older rows without it fall back to creation time. Missing `finished_at` means no
+            // duration sample, but the job still contributes to counts, retries and repositories.
+            let began = started_at.unwrap_or(created_at);
+            self.runtime_samples
+                .push(finished.saturating_sub(began).max(0) as u64);
+        }
+        if let Some(started) = started_at {
+            self.queue_samples
+                .push(started.saturating_sub(created_at).max(0) as u64);
+        }
+        if let Some(repository) = repository {
+            *self.repositories.entry(repository.to_owned()).or_insert(0) += 1;
+        }
+    }
+
+    fn finish(mut self) -> StatsAggregate {
+        let runtime = summarize(std::mem::take(&mut self.runtime_samples));
+        let queue_wait = summarize(std::mem::take(&mut self.queue_samples));
+        self.aggregate.busy_seconds = runtime.sum_seconds;
+        self.aggregate.runtime = runtime;
+        self.aggregate.queue_wait = queue_wait;
+        let mut repos: Vec<RepoContribution> = self
+            .repositories
+            .into_iter()
+            .map(|(repository, jobs)| RepoContribution { repository, jobs })
+            .collect();
+        repos.sort_by(|a, b| {
+            b.jobs
+                .cmp(&a.jobs)
+                .then_with(|| a.repository.cmp(&b.repository))
+        });
+        repos.truncate(TOP_REPOSITORIES);
+        self.aggregate.top_repositories = repos;
+        self.aggregate
+    }
+}
+
+fn summarize(samples: Vec<u64>) -> DurationSummary {
+    let mut samples = samples;
+    samples.sort_unstable();
+    let count = samples.len() as u64;
+    let sum_seconds = samples
+        .iter()
+        .fold(0u64, |total, value| total.saturating_add(*value));
+    let mut buckets: BTreeMap<String, u64> = STATS_BUCKET_LABELS
+        .iter()
+        .map(|label| ((*label).to_owned(), 0))
+        .collect();
+    for sample in &samples {
+        for (label, bound) in STATS_BUCKET_LABELS.iter().zip(STATS_BUCKETS_SECS.iter()) {
+            if *sample <= *bound {
+                *buckets.entry((*label).to_owned()).or_insert(0) += 1;
+            }
+        }
+        *buckets.entry("+Inf".to_owned()).or_insert(0) += 1;
+    }
+    DurationSummary {
+        count,
+        sum_seconds,
+        median_seconds: nearest_rank(&samples, 50),
+        p90_seconds: nearest_rank(&samples, 90),
+        buckets,
+    }
+}
+
+fn nearest_rank(sorted: &[u64], percentile: usize) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = percentile.saturating_mul(sorted.len()).div_ceil(100).max(1);
+    sorted.get(rank - 1).copied()
 }
 
 impl Store for SqliteStore {
@@ -2951,6 +3091,104 @@ impl Store for SqliteStore {
         Ok(job_counts)
     }
 
+    fn stats(&self, query: &StatsQuery) -> Result<StatsReport, StoreError> {
+        let conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT state, spec_json, attempt, node, created_at, started_at, finished_at,
+                        failure_class
+                 FROM jobs
+                 WHERE state IN ('done','failed','cancelled','expired')
+                   AND (?1 IS NULL OR finished_at >= ?1)
+                   AND (?2 IS NULL OR node = ?2)",
+            )
+            .map_err(internal)?;
+        let node_filter = query.node.as_ref().map(NodeName::as_str);
+        let rows = stmt
+            .query_map(params![query.since, node_filter], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(internal)?;
+
+        let mut fleet = StatsAccumulator::new();
+        let mut per_node: BTreeMap<NodeName, StatsAccumulator> = BTreeMap::new();
+        let mut observed_nodes = BTreeSet::new();
+        for row in rows {
+            let (
+                state_text,
+                spec_json,
+                attempt,
+                node_text,
+                created_at,
+                started_at,
+                finished_at,
+                failure_text,
+            ) = row.map_err(internal)?;
+            let state = parse_state(&state_text)?;
+            let node = node_text
+                .as_deref()
+                .map(NodeName::parse)
+                .transpose()
+                .map_err(internal)?;
+            let failure = failure_text.as_deref().map(parse_failure).transpose()?;
+            let repo = normalize_repository(&decode_spec(&spec_json)?.repo);
+            let job = StatsJob {
+                state,
+                failure,
+                attempt: attempt.max(0) as u32,
+                created_at,
+                started_at,
+                finished_at,
+                repository: repo.as_deref(),
+            };
+            fleet.add_job(job);
+            if let Some(node) = &node {
+                observed_nodes.insert(node.clone());
+                per_node
+                    .entry(node.clone())
+                    .or_insert_with(StatsAccumulator::new)
+                    .add_job(job);
+            }
+        }
+
+        let mut node_names: BTreeSet<NodeName> = if query.nodes.is_empty() {
+            observed_nodes
+        } else {
+            query.nodes.iter().cloned().collect()
+        };
+        if let Some(node) = &query.node {
+            node_names.retain(|name| name == node);
+            node_names.insert(node.clone());
+        }
+        let nodes = node_names
+            .into_iter()
+            .map(|node| {
+                let stats = per_node
+                    .remove(&node)
+                    .unwrap_or_else(StatsAccumulator::new)
+                    .finish();
+                NodeContribution { node, stats }
+            })
+            .collect();
+
+        Ok(StatsReport {
+            by: query.by,
+            since: query.since,
+            node: query.node.clone(),
+            fleet: fleet.finish(),
+            nodes,
+        })
+    }
+
     fn set_group_limits(&self, limits: HashMap<String, usize>) -> Result<(), StoreError> {
         let mut current = self
             .group_limits
@@ -3126,6 +3364,7 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
 mod tests {
     use super::SqliteStore;
     use crate::{Now, Store};
+    use lu_proto::{FailureClass, JobState, NodeName, StatsQuery};
     use rusqlite::params;
     use std::fs;
     use std::path::PathBuf;
@@ -3144,12 +3383,380 @@ mod tests {
         dir.join(name)
     }
 
+    struct TerminalRow<'a> {
+        key: &'a str,
+        repo: &'a str,
+        node: &'a str,
+        state: JobState,
+        failure: Option<FailureClass>,
+        attempt: u32,
+        created: i64,
+        started: Option<i64>,
+        finished: Option<i64>,
+    }
+
+    fn insert_terminal(store: &SqliteStore, row: TerminalRow<'_>) {
+        let TerminalRow {
+            key,
+            repo,
+            node,
+            state,
+            failure,
+            attempt,
+            created,
+            started,
+            finished,
+        } = row;
+        let spec = crate::conformance::spec(repo, Some(key));
+        let (job, _) = store
+            .create_job(
+                &spec,
+                Now {
+                    wall_unix: created,
+                    mono_ms: created.max(0) as u64,
+                },
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET state=?2,node=?3,attempt=?4,started_at=?5,finished_at=?6,
+                               failure_class=?7 WHERE id=?1",
+                params![
+                    job.id.as_str(),
+                    state.as_str(),
+                    node,
+                    attempt as i64,
+                    started,
+                    finished,
+                    failure.map(FailureClass::as_str),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn configured_nodes() -> Vec<NodeName> {
+        ["node-a", "node-b", "node-c"]
+            .into_iter()
+            .map(|name| name.parse().unwrap())
+            .collect()
+    }
+
     #[test]
     fn conformance() {
         crate::conformance::run_all(|| {
             let p = temp_db("db.sqlite");
             SqliteStore::open(&p).unwrap()
         });
+    }
+
+    #[test]
+    fn stats_windows_nodes_retries_and_missing_times() {
+        let store = SqliteStore::open(temp_db("stats.sqlite")).unwrap();
+        insert_terminal(
+            &store,
+            TerminalRow {
+                key: "old",
+                repo: "https://git.example.test/team/old.git",
+                node: "node-a",
+                state: JobState::Done,
+                failure: None,
+                attempt: 1,
+                created: 0,
+                started: Some(0),
+                finished: Some(50),
+            },
+        );
+        let credential = ["cr", "ed"].join("");
+        let credentialed_repo = format!("https://user:{credential}@git.example.test/team/app.git");
+        insert_terminal(
+            &store,
+            TerminalRow {
+                key: "done",
+                repo: &credentialed_repo,
+                node: "node-a",
+                state: JobState::Done,
+                failure: None,
+                attempt: 2,
+                created: 100,
+                started: Some(110),
+                finished: Some(130),
+            },
+        );
+        insert_terminal(
+            &store,
+            TerminalRow {
+                key: "failed",
+                repo: "https://git.example.test/team/app",
+                node: "node-a",
+                state: JobState::Failed,
+                failure: Some(FailureClass::Provider),
+                attempt: 1,
+                created: 200,
+                started: Some(210),
+                finished: Some(270),
+            },
+        );
+        insert_terminal(
+            &store,
+            TerminalRow {
+                key: "cancelled",
+                repo: "https://git.example.test/other/lib.git",
+                node: "node-b",
+                state: JobState::Cancelled,
+                failure: None,
+                attempt: 1,
+                created: 300,
+                started: Some(320),
+                finished: Some(325),
+            },
+        );
+        insert_terminal(
+            &store,
+            TerminalRow {
+                key: "expired",
+                repo: "https://git.example.test/other/lib",
+                node: "node-b",
+                state: JobState::Expired,
+                failure: None,
+                attempt: 1,
+                created: 400,
+                started: None,
+                finished: Some(460),
+            },
+        );
+        insert_terminal(
+            &store,
+            TerminalRow {
+                key: "unfinished",
+                repo: "https://git.example.test/other/lib",
+                node: "node-b",
+                state: JobState::Cancelled,
+                failure: None,
+                attempt: 1,
+                created: 500,
+                started: Some(510),
+                finished: None,
+            },
+        );
+        let (queued, _) = store
+            .create_job(
+                &crate::conformance::spec(
+                    "https://git.example.test/team/queued.git",
+                    Some("queued"),
+                ),
+                Now {
+                    wall_unix: 600,
+                    mono_ms: 600,
+                },
+            )
+            .unwrap();
+        assert_eq!(queued.state, JobState::Queued);
+
+        let window = store
+            .stats(&StatsQuery {
+                since: Some(100),
+                nodes: configured_nodes(),
+                ..StatsQuery::default()
+            })
+            .unwrap();
+        assert_eq!(window.since, Some(100));
+        assert_eq!(window.fleet.states["done"], 1);
+        assert_eq!(window.fleet.states["failed"], 1);
+        assert_eq!(window.fleet.states["cancelled"], 1);
+        assert_eq!(window.fleet.states["expired"], 1);
+        assert_eq!(window.fleet.failures["provider"], 1);
+        assert_eq!(window.fleet.retries, 1);
+        assert_eq!(window.fleet.busy_seconds, 145);
+        assert_eq!(window.fleet.last_finished_at, Some(460));
+        assert_eq!(window.fleet.runtime.count, 4);
+        assert_eq!(window.fleet.runtime.sum_seconds, 145);
+        assert_eq!(window.fleet.runtime.median_seconds, Some(20));
+        assert_eq!(window.fleet.runtime.p90_seconds, Some(60));
+        assert_eq!(window.fleet.runtime.buckets["5"], 1);
+        assert_eq!(window.fleet.runtime.buckets["60"], 4);
+        assert_eq!(window.fleet.runtime.buckets["+Inf"], 4);
+        assert_eq!(window.fleet.queue_wait.count, 3);
+        assert_eq!(window.fleet.queue_wait.median_seconds, Some(10));
+        assert_eq!(window.fleet.queue_wait.p90_seconds, Some(20));
+        assert_eq!(
+            window.fleet.top_repositories,
+            vec![
+                lu_proto::RepoContribution {
+                    repository: "git.example.test/other/lib".to_owned(),
+                    jobs: 2,
+                },
+                lu_proto::RepoContribution {
+                    repository: "git.example.test/team/app".to_owned(),
+                    jobs: 2,
+                },
+            ]
+        );
+
+        assert_eq!(window.nodes.len(), 3);
+        let node_a = window
+            .nodes
+            .iter()
+            .find(|row| row.node.as_str() == "node-a")
+            .unwrap();
+        assert_eq!(node_a.stats.states["done"], 1);
+        assert_eq!(node_a.stats.failures["provider"], 1);
+        assert_eq!(node_a.stats.retries, 1);
+        assert_eq!(node_a.stats.busy_seconds, 80);
+        let node_b = window
+            .nodes
+            .iter()
+            .find(|row| row.node.as_str() == "node-b")
+            .unwrap();
+        assert_eq!(node_b.stats.states["cancelled"], 1);
+        assert_eq!(node_b.stats.states["expired"], 1);
+        assert_eq!(node_b.stats.busy_seconds, 65);
+        let node_c = window
+            .nodes
+            .iter()
+            .find(|row| row.node.as_str() == "node-c")
+            .unwrap();
+        assert_eq!(node_c.stats.busy_seconds, 0);
+        assert_eq!(node_c.stats.runtime.count, 0);
+        assert_eq!(node_c.stats.last_finished_at, None);
+
+        let all = store
+            .stats(&StatsQuery {
+                nodes: configured_nodes(),
+                ..StatsQuery::default()
+            })
+            .unwrap();
+        assert_eq!(all.fleet.states["done"], 2);
+        assert_eq!(all.fleet.states["cancelled"], 2);
+        assert_eq!(all.fleet.busy_seconds, 195);
+        assert_eq!(all.fleet.runtime.count, 5);
+        assert_eq!(all.fleet.queue_wait.count, 5);
+        assert_eq!(all.fleet.last_finished_at, Some(460));
+
+        let only_b = store
+            .stats(&StatsQuery {
+                node: Some("node-b".parse().unwrap()),
+                nodes: configured_nodes(),
+                ..StatsQuery::default()
+            })
+            .unwrap();
+        assert_eq!(only_b.node.as_ref().map(NodeName::as_str), Some("node-b"));
+        assert_eq!(only_b.nodes.len(), 1);
+        assert_eq!(only_b.fleet.states["cancelled"], 2);
+        assert_eq!(only_b.fleet.states["done"], 0);
+        assert_eq!(only_b.fleet.busy_seconds, 65);
+    }
+
+    #[test]
+    fn stats_top_repositories_are_capped_and_normalised() {
+        let store = SqliteStore::open(temp_db("stats-top.sqlite")).unwrap();
+        for index in 0..12 {
+            let repo = format!("https://git.example.test/owner/repo{index}.git");
+            insert_terminal(
+                &store,
+                TerminalRow {
+                    key: &format!("repo-{index}"),
+                    repo: &repo,
+                    node: "node-a",
+                    state: JobState::Done,
+                    failure: None,
+                    attempt: 1,
+                    created: index * 10,
+                    started: Some(index * 10),
+                    finished: Some(index * 10 + 5),
+                },
+            );
+        }
+        let report = store
+            .stats(&StatsQuery {
+                nodes: configured_nodes(),
+                ..StatsQuery::default()
+            })
+            .unwrap();
+        assert_eq!(report.fleet.top_repositories.len(), 10);
+        assert_eq!(
+            report.fleet.top_repositories[0].repository,
+            "git.example.test/owner/repo0"
+        );
+        assert_eq!(
+            report.fleet.top_repositories[9].repository,
+            "git.example.test/owner/repo7"
+        );
+        assert!(report
+            .fleet
+            .top_repositories
+            .iter()
+            .all(|row| !row.repository.contains("://") && !row.repository.ends_with(".git")));
+    }
+
+    #[test]
+    fn stats_survive_restart_and_windows_never_raise_all_time_counters() {
+        let path = temp_db("stats-restart.sqlite");
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            insert_terminal(
+                &store,
+                TerminalRow {
+                    key: "old",
+                    repo: "https://git.example.test/team/old.git",
+                    node: "node-a",
+                    state: JobState::Done,
+                    failure: None,
+                    attempt: 1,
+                    created: 0,
+                    started: Some(0),
+                    finished: Some(20),
+                },
+            );
+            insert_terminal(
+                &store,
+                TerminalRow {
+                    key: "new",
+                    repo: "https://git.example.test/team/new.git",
+                    node: "node-a",
+                    state: JobState::Failed,
+                    failure: Some(FailureClass::Execution),
+                    attempt: 3,
+                    created: 100,
+                    started: Some(110),
+                    finished: Some(170),
+                },
+            );
+        }
+        let reopened = SqliteStore::open(&path).unwrap();
+        let all_time = reopened
+            .stats(&StatsQuery {
+                nodes: configured_nodes(),
+                ..StatsQuery::default()
+            })
+            .unwrap();
+        assert_eq!(all_time.fleet.states["done"], 1);
+        assert_eq!(all_time.fleet.states["failed"], 1);
+        assert_eq!(all_time.fleet.retries, 2);
+        assert_eq!(all_time.fleet.busy_seconds, 80);
+
+        let window = reopened
+            .stats(&StatsQuery {
+                since: Some(100),
+                nodes: configured_nodes(),
+                ..StatsQuery::default()
+            })
+            .unwrap();
+        assert_eq!(window.fleet.states["done"], 0);
+        assert_eq!(window.fleet.states["failed"], 1);
+        assert!(all_time.fleet.busy_seconds >= window.fleet.busy_seconds);
+
+        // Re-reading the same persistent source after another open gives the same counters.
+        let second_open = SqliteStore::open(&path).unwrap();
+        let again = second_open
+            .stats(&StatsQuery {
+                nodes: configured_nodes(),
+                ..StatsQuery::default()
+            })
+            .unwrap();
+        assert_eq!(again, all_time);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::routes::{agent, health, metrics, operator, scope, status};
+use crate::routes::{agent, health, metrics, operator, scope, stats, status};
 use crate::state::AppState;
 use crate::time::{background_interval_secs, now};
 use axum::extract::DefaultBodyLimit;
@@ -91,6 +91,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(operator::reject_draft).layer(op_json),
         )
         .route("/v1/status", get(status::status))
+        .route("/v1/stats", get(stats::stats))
         .route("/v1/repos", get(operator::list_repos))
         .route(
             "/v1/repos/{name}/sync",
