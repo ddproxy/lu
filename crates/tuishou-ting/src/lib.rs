@@ -249,6 +249,7 @@ pub struct Agent {
     harness_ok: Arc<AtomicBool>,
     harness: String,
     harness_wrapper: Vec<String>,
+    allow_shared_uid_scope: bool,
     builder: Arc<CommandBuilder>,
     housekeeper: Option<housekeeping::Housekeeper>,
     /// Owns every workspace tree and its retention counters. Deletions run on the sweeper, never
@@ -373,6 +374,7 @@ impl Agent {
             harness_ok: Arc::new(AtomicBool::new(true)),
             harness: config.harness,
             harness_wrapper: config.harness_wrapper,
+            allow_shared_uid_scope: config.allow_shared_uid_scope,
             builder: Arc::new(|task_file, model, server, message| {
                 lu_supervise::opencode_command(task_file, model, server, message)
                     .map_err(|error| error.to_string())
@@ -1094,6 +1096,15 @@ impl Agent {
         // Only an operator-granted capability gets a socket. The guard is dropped on every return
         // below, including cancellation, stale leases and the stuck watcher.
         let job_socket = if spec.allow_spawn {
+            if self.harness_owner.is_none() && !self.allow_shared_uid_scope {
+                let summary =
+                    "allow_spawn needs [agent] harness_uid so the harness runs as another \
+                    account; set it, or set allow_shared_uid_scope = true to accept a shared uid"
+                        .to_owned();
+                self.complete_failure(&job_id, epoch, &summary, FailureClass::Conflict, &workspace)
+                    .await?;
+                return Ok(JobEnd::Finished);
+            }
             match scope::JobSocket::start(
                 Arc::clone(&self.controller),
                 &job_id,

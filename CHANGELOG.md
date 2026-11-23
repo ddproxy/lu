@@ -8,6 +8,9 @@ uses semantic versioning once it reaches 1.0.
 ### Added
 
 - Automatic dev builds: after CI passes on `main`, `dev-release` tags `vX.Y.(Z+1)-dev.<N>.g<hash>` (N = commits since the last stable tag) and builds it as a GitHub pre-release with attestation. The release workflow also refuses a stable tag that differs from the `Cargo.toml` version, and sets the dev version inside the build.
+### Security
+
+- A job with `allow_spawn` is refused (`conflict`) when `[agent] harness_uid` is unset, because a harness sharing the agent's uid can read everything the agent can and the scope socket then identifies nothing. Set `harness_uid`, or opt in with `[agent] allow_shared_uid_scope = true`.
 
 ## [0.6.1]
 

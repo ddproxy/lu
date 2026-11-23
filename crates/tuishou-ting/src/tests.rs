@@ -498,6 +498,7 @@ fn make_agent(
         provider_models: Arc::new(Vec::new()),
         harness: "opencode".to_owned(),
         harness_wrapper: Vec::new(),
+        allow_shared_uid_scope: true,
         builder: Arc::new(move |task_file, _model, _server, _message| {
             Ok(harness_script(task_file))
         }),
@@ -2359,6 +2360,25 @@ async fn a_staged_tree_left_by_an_earlier_run_is_cleared_at_start() {
     assert_eq!(done[0].outcome, Outcome::Done, "{done:?}");
     assert!(calls.iter().any(|c| matches!(c, Call::Start { .. })));
     assert!(!leftover.join("stale.txt").exists());
+}
+
+#[tokio::test]
+async fn a_spawning_job_is_refused_when_the_harness_shares_the_agent_uid() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.allow_spawn = true;
+    let controller = assigned_controller(&job_id, spec);
+    let mut agent = fast_agent(&f.work_dir, controller.clone(), sh("echo should not run"));
+    agent.allow_shared_uid_scope = false;
+    let calls = run_job(&controller, agent, has_complete).await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Conflict));
+    let summary = done[0].summary.clone().unwrap_or_default();
+    assert!(summary.contains("harness_uid"), "{summary}");
+    assert!(!log_text(&calls).contains("should not run"));
 }
 
 #[tokio::test]

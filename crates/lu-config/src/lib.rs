@@ -934,6 +934,11 @@ pub struct AgentConfig {
     /// `harness_uid`. Requires `harness_uid`.
     #[serde(default)]
     pub harness_gid: Option<u32>,
+    /// Lets a job with `allow_spawn` get its scope socket while the harness shares the agent's uid
+    /// (no `harness_uid`). Such a harness can read everything the agent can, so the socket proves
+    /// nothing about who is on the other end; by default the agent refuses the job instead.
+    #[serde(default)]
+    pub allow_shared_uid_scope: bool,
     /// A private file holding the opencode server's password, passed to the harness as
     /// `OPENCODE_SERVER_PASSWORD`. The same rules as `token_file`: a regular file owned by the
     /// agent's account with no group or other access.

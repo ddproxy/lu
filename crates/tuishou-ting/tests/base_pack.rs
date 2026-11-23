@@ -215,6 +215,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         workspace_group: None,
         harness_uid: None,
         harness_gid: None,
+        allow_shared_uid_scope: false,
         opencode_password_file: None,
         harness_wrapper: Vec::new(),
         heartbeat_secs: 3,
