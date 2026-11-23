@@ -590,6 +590,12 @@ async fn put_artifact_impl(
     if rec_check.node.as_ref() != Some(&node) {
         return with_version(ApiError::forbidden("forbidden").into_response());
     }
+    if !matches!(
+        rec_check.state,
+        JobState::Leased | JobState::Running | JobState::Recovering
+    ) {
+        return with_version(ApiError::conflict("job is not active").into_response());
+    }
     let cap = art.max_bytes();
     let body_limit = match art {
         ArtifactName::DiffPatch => MAX_DIFF_BODY,

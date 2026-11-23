@@ -12,7 +12,7 @@
 //! The pure helpers in this module are unit-tested; the git work is exercised against a local
 //! bare repository in `tests/publish.rs`.
 
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
 
 use git2::build::CheckoutBuilder;
@@ -486,6 +486,66 @@ struct Prepared {
     commit: Oid,
 }
 
+fn reject_unsafe_publish_patch(repo: &Repository, diff: &Diff<'_>) -> Result<(), PublishError> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| PublishError::State("publish checkout has no worktree".to_owned()))?;
+    for delta in diff.deltas() {
+        for file in [delta.old_file(), delta.new_file()] {
+            if matches!(file.mode(), git2::FileMode::Link | git2::FileMode::Commit) {
+                return Err(PublishError::State(
+                    "patch contains symlink or gitlink entry".to_owned(),
+                ));
+            }
+            let Some(path) = file.path() else {
+                continue;
+            };
+            let relative = Path::new(path);
+            if relative.as_os_str().is_empty()
+                || relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir | Component::RootDir))
+                || relative.components().any(|part| {
+                    matches!(part, Component::Normal(name) if name == std::ffi::OsStr::new(".lu"))
+                })
+            {
+                return Err(PublishError::State(format!(
+                    "unsafe patch path {:?}",
+                    path.display()
+                )));
+            }
+            let mut current = workdir.to_path_buf();
+            for part in relative.components() {
+                let Component::Normal(_) = part else {
+                    return Err(PublishError::State(format!(
+                        "unsafe patch path {:?}",
+                        path.display()
+                    )));
+                };
+                current.push(part);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(PublishError::State(format!(
+                            "unsafe patch path {:?}: symlinked component",
+                            path.display()
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(PublishError::State(format!(
+                            "cannot inspect patch path {:?}: {error}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn prepare_tree(
     mirror_path: &Path,
     base_commit: &str,
@@ -508,6 +568,7 @@ fn prepare_tree(
         .map_err(|e| PublishError::Git(format!("cannot check out source commit: {e}")))?;
     let diff = Diff::from_buffer(patch)
         .map_err(|e| PublishError::State(format!("stored diff is not a git patch: {e}")))?;
+    reject_unsafe_publish_patch(&repo, &diff)?;
     repo.apply(&diff, ApplyLocation::Both, None)
         .map_err(|e| PublishError::State(format!("stored diff does not apply: {e}")))?;
     let mut index = repo

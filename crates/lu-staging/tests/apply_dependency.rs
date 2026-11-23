@@ -742,3 +742,75 @@ fn stack_summary_names_every_file_and_hunk() {
     );
     assert_eq!(unmerged_entries(&inputs.consumer), "");
 }
+
+#[test]
+fn symlink_patch_entry_is_rejected_before_workdir_apply() {
+    if !git_available() {
+        eprintln!("skipping: git not installed");
+        return;
+    }
+    let tmp = TestDir::new("symlink-patch");
+    let repo = base_repo(&tmp, "base\n");
+    let staging = Staging::new(&tmp.0).unwrap();
+    let consumer = stage(&staging, &repo, "consumer");
+    let producer = stage(&staging, &repo, "producer");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/tmp/outside-target", producer.path().join("cache")).unwrap();
+    #[cfg(not(unix))]
+    {
+        eprintln!("skipping: symlink test requires unix");
+        return;
+    }
+    git(producer.path(), &["add", "-A"]);
+    let out = Command::new("git")
+        .args(["diff", "--cached", "--binary"])
+        .current_dir(producer.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let patch = out.stdout;
+    assert!(!patch.is_empty());
+
+    let error = Staging::apply_input_diff(&consumer, &patch, "dep", ConflictPolicy::Fail)
+        .expect_err("symlink patch should be rejected");
+    let msg = error.to_string();
+    assert!(msg.contains("symlink") || msg.contains("unsafe"), "{msg}");
+    assert!(
+        !consumer.path().join("cache").exists(),
+        "rejected patch must not create worktree entry"
+    );
+}
+
+#[test]
+fn patch_through_existing_symlink_ancestor_is_rejected() {
+    if !git_available() {
+        eprintln!("skipping: git not installed");
+        return;
+    }
+    let tmp = TestDir::new("symlink-ancestor");
+    let repo = base_repo(&tmp, "base\n");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/tmp/outside-target", repo.join("cache")).unwrap();
+    #[cfg(not(unix))]
+    {
+        eprintln!("skipping: symlink test requires unix");
+        return;
+    }
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "add symlink"]);
+
+    let staging = Staging::new(&tmp.0).unwrap();
+    let consumer = stage(&staging, &repo, "consumer");
+    // replace symlink in producer with a directory layout via patch? easier: create a normal
+    // patch that adds cache/pwned as a file - git won't produce this from a symlink parent, so
+    // build a minimal patch manually.
+    let patch = b"diff --git a/cache/pwned b/cache/pwned\nnew file mode 100644\nindex 0000000..9daeafb\n--- /dev/null\n+++ b/cache/pwned\n@@ -0,0 +1 @@\n+test\n";
+    let error = Staging::apply_input_diff(&consumer, patch, "dep", ConflictPolicy::Fail)
+        .expect_err("patch through symlink ancestor should be rejected");
+    let msg = error.to_string();
+    assert!(
+        msg.contains("symlinked component") || msg.contains("unsafe"),
+        "{msg}"
+    );
+}

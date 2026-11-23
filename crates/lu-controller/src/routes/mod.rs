@@ -48,7 +48,8 @@ pub async fn read_raw_limited(req: Request, limit: usize) -> ApiResult<axum::bod
 }
 
 /// Applies `[drafts]` capacity to a new draft, expiring the oldest drafts first. The caller must
-/// call this before writing; a full store returns a typed `limit_exceeded` error.
+/// call this before writing; a full store returns a typed `limit_exceeded` error. Per-source cap
+/// overflow only evicts drafts from that origin; global overflow evicts oldest drafts overall.
 pub async fn enforce_draft_capacity(
     state: &std::sync::Arc<crate::state::AppState>,
     spec: &lu_proto::JobSpec,
@@ -63,53 +64,78 @@ pub async fn enforce_draft_capacity(
         move || store.draft_counts()
     })
     .await;
-    let counts = match counts {
+    let mut counts = match counts {
         Ok(Ok(counts)) => counts,
         _ => return Err(ApiError::internal()),
     };
-    let per_source = counts
+    let mut per_source = counts
         .by_origin
         .iter()
         .find(|(label, _)| label == &origin)
         .map(|(_, count)| *count)
         .unwrap_or(0);
-    let overflow = counts
-        .total
+    let per_source_overflow = per_source
         .saturating_add(1)
-        .saturating_sub(policy.max_total)
-        .max(
-            per_source
-                .saturating_add(1)
-                .saturating_sub(policy.max_per_source),
-        );
-    if overflow > 0 {
+        .saturating_sub(policy.max_per_source);
+    if per_source_overflow > 0 {
         let expired = tokio::task::spawn_blocking({
             let store = Arc::clone(&state.store);
             let now = crate::time::now();
-            move || store.expire_oldest_drafts(overflow, now)
+            let origin = origin.clone();
+            move || store.expire_oldest_drafts(per_source_overflow, now, Some(&origin))
         })
         .await;
         if !matches!(expired, Ok(Ok(_))) {
             return Err(ApiError::internal());
         }
-        let counts = tokio::task::spawn_blocking({
+        counts = match tokio::task::spawn_blocking({
             let store = Arc::clone(&state.store);
             move || store.draft_counts()
         })
-        .await;
-        let counts = match counts {
+        .await
+        {
             Ok(Ok(counts)) => counts,
             _ => return Err(ApiError::internal()),
         };
-        let per_source = counts
+        per_source = counts
             .by_origin
             .iter()
             .find(|(label, _)| label == &origin)
             .map(|(_, count)| *count)
             .unwrap_or(0);
-        if counts.total >= policy.max_total || per_source >= policy.max_per_source {
-            return Err(ApiError::limit_exceeded("max_drafts"));
+    }
+    let total_overflow = counts
+        .total
+        .saturating_add(1)
+        .saturating_sub(policy.max_total);
+    if total_overflow > 0 {
+        let expired = tokio::task::spawn_blocking({
+            let store = Arc::clone(&state.store);
+            let now = crate::time::now();
+            move || store.expire_oldest_drafts(total_overflow, now, None)
+        })
+        .await;
+        if !matches!(expired, Ok(Ok(_))) {
+            return Err(ApiError::internal());
         }
+        counts = match tokio::task::spawn_blocking({
+            let store = Arc::clone(&state.store);
+            move || store.draft_counts()
+        })
+        .await
+        {
+            Ok(Ok(counts)) => counts,
+            _ => return Err(ApiError::internal()),
+        };
+        per_source = counts
+            .by_origin
+            .iter()
+            .find(|(label, _)| label == &origin)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+    }
+    if counts.total >= policy.max_total || per_source >= policy.max_per_source {
+        return Err(ApiError::limit_exceeded("max_drafts"));
     }
     Ok(())
 }

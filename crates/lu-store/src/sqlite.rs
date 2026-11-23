@@ -1022,6 +1022,50 @@ fn refresh_reiki_cordons(tx: &rusqlite::Transaction<'_>, hb: &Heartbeat) -> Resu
 
 /// Inserts a fresh job and its dependency edges. Callers own the idempotency write so a retry can
 /// point an existing key at the new row instead of resurrecting the old one.
+fn expire_drafts_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    count: u64,
+    now: Now,
+    origin: Option<&str>,
+) -> Result<u64, StoreError> {
+    if count == 0 {
+        return Ok(0);
+    }
+    let ids: Vec<String> = {
+        let limit = count.min(i64::MAX as u64) as i64;
+        if let Some(origin) = origin {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM jobs WHERE state='draft' AND COALESCE(json_extract(spec_json, '$.origin'), '') = ?2 ORDER BY created_at, rowid LIMIT ?1",
+                )
+                .map_err(internal)?;
+            let rows = stmt
+                .query_map(params![limit, origin], |r| r.get::<_, String>(0))
+                .map_err(internal)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(internal)?
+        } else {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM jobs WHERE state='draft' ORDER BY created_at, rowid LIMIT ?1",
+                )
+                .map_err(internal)?;
+            let rows = stmt
+                .query_map(params![limit], |r| r.get::<_, String>(0))
+                .map_err(internal)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(internal)?
+        }
+    };
+    for id in &ids {
+        let (mut rec, lease, recov) = get_job_tx(tx, id)?;
+        check_transition(rec.state, JobState::Expired)?;
+        rec.state = JobState::Expired;
+        rec.updated_at = now.wall_unix;
+        rec.finished_at = Some(now.wall_unix);
+        update_job_tx(tx, &rec, lease, recov)?;
+    }
+    Ok(ids.len() as u64)
+}
+
 fn insert_job_tx(
     tx: &rusqlite::Transaction<'_>,
     spec: &JobSpec,
@@ -1227,6 +1271,94 @@ impl SqliteStore {
 impl Store for SqliteStore {
     fn create_job(&self, spec: &JobSpec, now: Now) -> Result<(JobRecord, bool), StoreError> {
         self.create_job_inner(spec, now, None, 0, 0)
+    }
+
+    fn create_draft_job(
+        &self,
+        spec: &JobSpec,
+        now: Now,
+        max_total: u64,
+        max_per_source: u64,
+    ) -> Result<(JobRecord, bool), StoreError> {
+        if !spec.draft {
+            return self.create_job(spec, now);
+        }
+        spec.validate()
+            .map_err(|e| StoreError::InvalidSpec(e.to_string()))?;
+        let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let canonical = spec.canonical_json();
+        if let Some(key) = &spec.idempotency_key {
+            let existing: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT spec_hash, job_id FROM idempotency WHERE key=?1",
+                    params![key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(internal)?;
+            if let Some((hash, job_id)) = existing {
+                if hash == canonical {
+                    let (rec, _, _) = get_job_tx(&tx, &job_id)?;
+                    tx.commit().map_err(internal)?;
+                    return Ok((rec, false));
+                } else {
+                    return Err(StoreError::Conflict { length: None });
+                }
+            }
+        }
+        let origin = spec.origin.clone().unwrap_or_default();
+        let per_source: u64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state='draft' AND COALESCE(json_extract(spec_json, '$.origin'), '') = ?1",
+                params![origin],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c.max(0) as u64)
+            .map_err(internal)?;
+        let per_source_overflow = per_source.saturating_add(1).saturating_sub(max_per_source);
+        if per_source_overflow > 0 {
+            expire_drafts_in_tx(&tx, per_source_overflow, now, Some(&origin))?;
+        }
+        let total: u64 = tx
+            .query_row("SELECT COUNT(*) FROM jobs WHERE state='draft'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|c| c.max(0) as u64)
+            .map_err(internal)?;
+        let total_overflow = total.saturating_add(1).saturating_sub(max_total);
+        if total_overflow > 0 {
+            expire_drafts_in_tx(&tx, total_overflow, now, None)?;
+        }
+        let per_source: u64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state='draft' AND COALESCE(json_extract(spec_json, '$.origin'), '') = ?1",
+                params![origin],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c.max(0) as u64)
+            .map_err(internal)?;
+        let total: u64 = tx
+            .query_row("SELECT COUNT(*) FROM jobs WHERE state='draft'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|c| c.max(0) as u64)
+            .map_err(internal)?;
+        if total >= max_total || per_source >= max_per_source {
+            return Err(StoreError::LimitExceeded("max_drafts"));
+        }
+        let rec = insert_job_tx(&tx, spec, now, None)?;
+        if let Some(key) = &spec.idempotency_key {
+            tx.execute(
+                "INSERT INTO idempotency(key,spec_hash,job_id) VALUES (?1,?2,?3)",
+                params![key, canonical, rec.id.as_str()],
+            )
+            .map_err(internal)?;
+        }
+        tx.commit().map_err(internal)?;
+        Ok((rec, true))
     }
 
     fn create_scoped_job(
@@ -1791,7 +1923,12 @@ impl Store for SqliteStore {
         Ok(ids.len() as u64)
     }
 
-    fn expire_oldest_drafts(&self, count: u64, now: Now) -> Result<u64, StoreError> {
+    fn expire_oldest_drafts(
+        &self,
+        count: u64,
+        now: Now,
+        origin: Option<&str>,
+    ) -> Result<u64, StoreError> {
         if count == 0 {
             return Ok(0);
         }
@@ -1800,21 +1937,28 @@ impl Store for SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
         let ids: Vec<String> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT id FROM jobs WHERE state='draft' ORDER BY created_at, rowid LIMIT ?1",
-                )
-                .map_err(internal)?;
-            let rows = stmt
-                .query_map(params![count.min(i64::MAX as u64) as i64], |r| {
-                    r.get::<_, String>(0)
-                })
-                .map_err(internal)?;
-            let mut ids = Vec::new();
-            for row in rows {
-                ids.push(row.map_err(internal)?);
+            let limit = count.min(i64::MAX as u64) as i64;
+            if let Some(origin) = origin {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id FROM jobs WHERE state='draft' AND COALESCE(json_extract(spec_json, '$.origin'), '') = ?2 ORDER BY created_at, rowid LIMIT ?1",
+                    )
+                    .map_err(internal)?;
+                let rows = stmt
+                    .query_map(params![limit, origin], |r| r.get::<_, String>(0))
+                    .map_err(internal)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(internal)?
+            } else {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id FROM jobs WHERE state='draft' ORDER BY created_at, rowid LIMIT ?1",
+                    )
+                    .map_err(internal)?;
+                let rows = stmt
+                    .query_map(params![limit], |r| r.get::<_, String>(0))
+                    .map_err(internal)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(internal)?
             }
-            ids
         };
         for id in &ids {
             let (mut rec, lease, recov) = get_job_tx(&tx, id)?;
@@ -2217,6 +2361,12 @@ impl Store for SqliteStore {
         if rec.epoch != epoch {
             return Err(StoreError::StaleEpoch);
         }
+        if !matches!(
+            rec.state,
+            JobState::Leased | JobState::Running | JobState::Recovering
+        ) {
+            return Err(StoreError::Conflict { length: None });
+        }
         if !rec.artifacts.contains(&name) {
             rec.artifacts.push(name);
         }
@@ -2242,6 +2392,12 @@ impl Store for SqliteStore {
         let (mut rec, lease, recov) = get_job_tx(&tx, id.as_str())?;
         if rec.epoch != epoch {
             return Err(StoreError::StaleEpoch);
+        }
+        if !matches!(
+            rec.state,
+            JobState::Leased | JobState::Running | JobState::Recovering
+        ) {
+            return Err(StoreError::Conflict { length: None });
         }
         rec.scrubbed_hits = rec.scrubbed_hits.saturating_add(hits);
         rec.patch_scrubbed |= patch;
@@ -3220,7 +3376,28 @@ mod tests {
         assert_eq!(jobs[0].staged_commit, None);
         assert_eq!(jobs[0].blocked_reason, None);
         assert_eq!(jobs[0].blocked_since, None);
-        s.record_scrub(&jobs[0].id, jobs[0].epoch, 3, true).unwrap();
+        let n = crate::conformance::node("test-node");
+        s.heartbeat(
+            &crate::conformance::hb("test-node", lu_proto::HarnessState::Idle, vec![]),
+            Now {
+                wall_unix: 2,
+                mono_ms: 2,
+            },
+        )
+        .unwrap();
+        let a = s
+            .next_assignment(
+                &n,
+                Now {
+                    wall_unix: 2,
+                    mono_ms: 3,
+                },
+                60_000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.job_id, jobs[0].id);
+        s.record_scrub(&jobs[0].id, a.epoch, 3, true).unwrap();
         let job = s.get_job(&jobs[0].id).unwrap();
         assert_eq!(job.scrubbed_hits, 3);
         assert!(job.patch_scrubbed);

@@ -909,6 +909,72 @@ pub fn check_patch_inflate(patch: &[u8], cap: u64) -> Result<(), ApplyError> {
     Ok(())
 }
 
+fn reject_unsafe_workdir_patch(
+    repo: &git2::Repository,
+    diff: &git2::Diff<'_>,
+) -> Result<(), ApplyError> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| ApplyError::Git("staged checkout has no worktree".to_owned()))?;
+    for delta in diff.deltas() {
+        for file in [delta.old_file(), delta.new_file()] {
+            if matches!(file.mode(), git2::FileMode::Link | git2::FileMode::Commit) {
+                return Err(ApplyError::Git(
+                    "patch contains symlink or gitlink entry".to_owned(),
+                ));
+            }
+            let Some(path) = file.path() else {
+                continue;
+            };
+            let relative = Path::new(path);
+            if relative.as_os_str().is_empty()
+                || relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir | Component::RootDir))
+                || is_lu_path(relative)
+            {
+                return Err(ApplyError::Git(format!(
+                    "unsafe patch path {:?}",
+                    path.display()
+                )));
+            }
+            reject_symlink_ancestors(workdir, relative)?;
+        }
+    }
+    Ok(())
+}
+
+fn reject_symlink_ancestors(workdir: &Path, relative: &Path) -> Result<(), ApplyError> {
+    let mut current = workdir.to_path_buf();
+    for part in relative.components() {
+        let Component::Normal(_) = part else {
+            return Err(ApplyError::Git(format!(
+                "unsafe patch path {:?}",
+                relative.display()
+            )));
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(ApplyError::Git(format!(
+                    "unsafe patch path {:?}: symlinked component",
+                    relative.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ApplyError::Git(format!(
+                    "cannot inspect patch path {:?}: {error}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Staging {
     /// Apply one collected input's diff under `policy`. `name` labels conflict markers.
     ///
@@ -954,6 +1020,7 @@ impl Staging {
             }
         };
         let hunk = hunk_detail(patch);
+        reject_unsafe_workdir_patch(&repo, &diff)?;
 
         let mut check = git2::ApplyOptions::new();
         check.check(true);

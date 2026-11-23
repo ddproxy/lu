@@ -42,9 +42,10 @@ pub enum Principal {
 pub fn check_rate_limit(
     throttle: &LoginThrottle,
     ip: IpAddr,
+    scope: &str,
     now: Instant,
 ) -> Result<(), ApiError> {
-    if let Some(wait) = throttle.blocked(ip, now) {
+    if let Some(wait) = throttle.blocked(ip, scope, now) {
         return Err(ApiError::rate_limited(wait.as_secs().max(1)));
     }
     Ok(())
@@ -64,9 +65,9 @@ pub fn authenticate_operator(
     throttle: &LoginThrottle,
 ) -> Result<String, ApiError> {
     let now = Instant::now();
-    check_rate_limit(throttle, peer.0.ip(), now)?;
+    check_rate_limit(throttle, peer.0.ip(), "operator", now)?;
     let token = presented_token(headers).ok_or_else(|| {
-        throttle.fail(peer.0.ip(), now);
+        throttle.fail(peer.0.ip(), "operator", now);
         ApiError::unauthorized()
     })?;
     let presented = sha256_hex(token);
@@ -79,7 +80,7 @@ pub fn authenticate_operator(
     match found {
         Some(name) => Ok(name),
         None => {
-            throttle.fail(peer.0.ip(), now);
+            throttle.fail(peer.0.ip(), "operator", now);
             Err(ApiError::unauthorized())
         }
     }
@@ -92,9 +93,9 @@ pub fn authenticate_agent(
     throttle: &LoginThrottle,
 ) -> Result<NodeName, ApiError> {
     let now = Instant::now();
-    check_rate_limit(throttle, peer.0.ip(), now)?;
+    check_rate_limit(throttle, peer.0.ip(), "agent", now)?;
     let token = presented_token(headers).ok_or_else(|| {
-        throttle.fail(peer.0.ip(), now);
+        throttle.fail(peer.0.ip(), "agent", now);
         ApiError::unauthorized()
     })?;
     let presented = sha256_hex(token);
@@ -107,7 +108,7 @@ pub fn authenticate_agent(
     match found {
         Some(node) => Ok(node),
         None => {
-            throttle.fail(peer.0.ip(), now);
+            throttle.fail(peer.0.ip(), "agent", now);
             Err(ApiError::unauthorized())
         }
     }

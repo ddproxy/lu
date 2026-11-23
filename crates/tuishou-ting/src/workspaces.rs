@@ -219,17 +219,47 @@ impl Registry {
                     return Err(format!("unsafe cache directory {dir:?}"));
                 }
                 path.push(part);
-            }
-            if !path.starts_with(&base) {
-                return Err(format!("cache directory {dir:?} escapes the workspace"));
-            }
-            if let Ok(meta) = fs::symlink_metadata(&path) {
-                if meta.file_type().is_symlink() {
-                    return Err(format!("cache directory {dir:?} is a symlink"));
+                if !path.starts_with(&base) {
+                    return Err(format!("cache directory {dir:?} escapes the workspace"));
+                }
+                match fs::symlink_metadata(&path) {
+                    Ok(meta) => {
+                        if meta.file_type().is_symlink() {
+                            return Err(format!("cache directory {dir:?} is a symlink"));
+                        }
+                        if !meta.is_dir() {
+                            return Err(format!("cache directory {dir:?} is not a directory"));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::DirBuilderExt;
+                            std::fs::DirBuilder::new()
+                                .mode(0o700)
+                                .create(&path)
+                                .map_err(|error| {
+                                    format!("cannot create cache directory {dir:?}: {error}")
+                                })?;
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            fs::create_dir(&path).map_err(|error| {
+                                format!("cannot create cache directory {dir:?}: {error}")
+                            })?;
+                        }
+                        let meta = fs::symlink_metadata(&path).map_err(|error| {
+                            format!("cannot stat cache directory {dir:?}: {error}")
+                        })?;
+                        if meta.file_type().is_symlink() || !meta.is_dir() {
+                            return Err(format!("cache directory {dir:?} is unsafe"));
+                        }
+                    }
+                    Err(error) => {
+                        return Err(format!("cannot stat cache directory {dir:?}: {error}"));
+                    }
                 }
             }
-            fs::create_dir_all(&path)
-                .map_err(|error| format!("cannot create cache directory {dir:?}: {error}"))?;
         }
         Ok(())
     }
@@ -882,6 +912,23 @@ mod tests {
             fs::read_to_string(outside.join("keep.txt")).unwrap(),
             "keep"
         );
+    }
+
+    #[test]
+    fn cache_dirs_reject_symlink_escape() {
+        let f = Fixture::new();
+        let r = f.registry();
+        let job = id(90);
+        let base = r.path_for(&job);
+        fs::create_dir_all(&base).unwrap();
+        let outside = f.dir.path().join("outside-cache");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("escape")).unwrap();
+        let err = r
+            .create_cache_dirs(&job, &["escape/subdir".to_owned()])
+            .unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(!outside.join("subdir").exists());
     }
 
     #[test]

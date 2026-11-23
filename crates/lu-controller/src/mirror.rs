@@ -738,7 +738,8 @@ fn init_mirror_dir(path: &Path, name: &str) -> Result<(), MirrorError> {
 
 fn request_allowed(repo: &ControllerRepo, requested: &RequestedRef) -> bool {
     match requested {
-        RequestedRef::Commit(_) => true,
+        // Raw commit OIDs bypass ref-name allow-lists; only permit them when the repo allows all refs.
+        RequestedRef::Commit(_) => repo.refs.iter().any(|pattern| pattern == "*"),
         RequestedRef::BranchOrTag { allow, .. } => ref_allowed(repo, allow),
         RequestedRef::Pull(pull) => ref_allowed(repo, &pull.full_ref()),
     }
@@ -1294,6 +1295,18 @@ mod tests {
         mirror.sync("local").unwrap();
         assert_eq!(mirror.resolve("local", "main"), None);
         assert!(mirror.ensure_resolved("local", "main").is_err());
+    }
+
+    #[test]
+    fn raw_commit_oid_is_rejected_when_allow_list_is_restricted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (url, first, _) = local_repo(tmp.path());
+        let mut config = repo_config(&url);
+        config.refs = vec!["refs/heads/main".to_owned()];
+        let (_dir, mirror) = mirror(vec![config]);
+        mirror.sync("local").unwrap();
+        assert_eq!(mirror.resolve("local", &first), None);
+        assert!(mirror.ensure_resolved("local", &first).is_err());
     }
 
     #[test]

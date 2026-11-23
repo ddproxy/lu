@@ -274,18 +274,24 @@ pub async fn create_job(
             Err(_) => return with_version(ApiError::internal().into_response()),
         }
     }
-    if let Err(error) = crate::routes::enforce_draft_capacity(&state, &spec).await {
-        return with_version(error.into_response());
-    }
     let submit_data = Data::new()
         .text(Field::Provider, spec.provider.as_deref().unwrap_or("any"))
         .text(Field::Model, spec.model.as_deref().unwrap_or(""));
     let collect_applies = spec.collect.applies_diffs();
     let collect_mode = spec.collect.as_str();
+    let is_draft = spec.draft;
+    let max_total = state.drafts.max_total;
+    let max_per_source = state.drafts.max_per_source;
     let now = now();
     let res = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
-        move || store.create_job(&spec, now)
+        move || {
+            if is_draft {
+                store.create_draft_job(&spec, now, max_total, max_per_source)
+            } else {
+                store.create_job(&spec, now)
+            }
+        }
     })
     .await;
     let (rec, created) = match res {
