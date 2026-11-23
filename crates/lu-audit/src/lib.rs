@@ -67,6 +67,10 @@ pub enum Event {
     WorkspaceClean,
     /// A repository mirror sync. `data.remote` is the configured repository name.
     RepoSync,
+    /// A queued or blocked job reached its start deadline and was ended.
+    DeadlineMissed,
+    /// A validated schedule was installed from the controller config.
+    ScheduleReload,
 }
 
 impl Event {
@@ -95,6 +99,8 @@ impl Event {
             Self::GroupLimit => "group_limit",
             Self::WorkspaceClean => "workspace_clean",
             Self::RepoSync => "repo_sync",
+            Self::DeadlineMissed => "deadline_missed",
+            Self::ScheduleReload => "schedule_reload",
         }
     }
 }

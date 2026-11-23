@@ -447,6 +447,7 @@ fn test_spec(repo: &str) -> JobSpec {
         publish: None,
         fallbacks: Vec::new(),
         expect: None,
+        schedule: None,
     }
 }
 

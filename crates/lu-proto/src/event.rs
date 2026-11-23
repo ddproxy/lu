@@ -354,6 +354,7 @@ mod tests {
             tolerates: Vec::new(),
             fallbacks: Vec::new(),
             expect: None,
+            schedule: None,
         }
     }
 

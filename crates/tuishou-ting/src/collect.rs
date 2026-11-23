@@ -287,6 +287,7 @@ fn state_name(state: JobState) -> &'static str {
         JobState::Failed => "failed",
         JobState::Cancelled => "cancelled",
         JobState::Expired => "expired",
+        JobState::DeadlineMissed => "deadline_missed",
     }
 }
 

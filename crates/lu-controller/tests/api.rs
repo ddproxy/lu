@@ -274,6 +274,7 @@ fn sample_spec(key: Option<&str>) -> JobSpec {
         expect: None,
         stack_union_paths: Vec::new(),
         stack_base_paths: Vec::new(),
+        schedule: None,
     }
 }
 
@@ -648,6 +649,7 @@ async fn post_edit_changes_a_queued_job_and_rejects_bad_states() {
         publish: None,
         source_ref: None,
         task: None,
+        schedule: None,
     };
     let r = edit_job(srv.addr, &id, &edit).await;
     assert_eq!(status(&r), 200, "{r}");

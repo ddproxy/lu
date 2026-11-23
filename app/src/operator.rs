@@ -749,6 +749,7 @@ async fn submit_inner(args: SubmitArgs, config: &Path, json: bool) -> Result<Exi
         expect: expect.spec(),
         stack_union_paths: Vec::new(),
         stack_base_paths: Vec::new(),
+        schedule: None,
     };
     spec.validate().map_err(|error| error.to_string())?;
 
@@ -932,6 +933,7 @@ async fn collect_inner(args: CollectArgs, config: &Path, json: bool) -> Result<E
         expect: None,
         stack_union_paths: Vec::new(),
         stack_base_paths: Vec::new(),
+        schedule: None,
     };
     spec.validate().map_err(|error| error.to_string())?;
     submit_and_report(&client, &spec, json, args.wait).await
@@ -1174,6 +1176,7 @@ async fn edit_inner(args: EditArgs, config: &Path, json: bool) -> Result<ExitCod
         } else {
             None
         },
+        schedule: None,
     };
     let (view, raw) = client
         .edit_with_raw(&args.id, &edit)

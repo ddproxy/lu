@@ -9,7 +9,7 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 #[cfg(test)]
 pub mod conformance;
@@ -119,6 +119,9 @@ pub struct JobRecord {
     pub epoch: u64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// When this job became eligible for dispatch: submission, approval or unblock, whichever is
+    /// last. Stored so queue aging and deferral survive a restart.
+    pub eligible_since: i64,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub failure_class: Option<FailureClass>,
@@ -557,6 +560,28 @@ pub trait Store: Send + Sync + 'static {
         now: Now,
         lease_ms: u64,
     ) -> Result<Option<Assignment>, StoreError>;
+    /// Like [`Store::next_assignment`], but evaluates the time-aware gates in `schedule` before
+    /// leasing. Stores without schedule support fall back to the plain path.
+    fn next_assignment_scheduled(
+        &self,
+        node: &NodeName,
+        now: Now,
+        lease_ms: u64,
+        schedule: &lu_schedule::Schedule,
+    ) -> Result<Option<Assignment>, StoreError> {
+        let _ = schedule;
+        self.next_assignment(node, now, lease_ms)
+    }
+    /// Ends queued or blocked jobs whose start deadline has passed and whose `on_deadline` asks
+    /// for termination. Returns each id with the configured action so the caller can audit it.
+    fn expire_deadlines(
+        &self,
+        now: Now,
+        schedule: &lu_schedule::Schedule,
+    ) -> Result<Vec<(JobId, lu_schedule::OnDeadline)>, StoreError> {
+        let _ = (now, schedule);
+        Ok(Vec::new())
+    }
     /// Jobs held by `node` whose cancel was requested, with the epoch to name.
     fn pending_cancels(&self, node: &NodeName) -> Result<Vec<(JobId, u64)>, StoreError>;
     /// Jobs currently held by `node` (leased, running or recovering), with the epoch to name.

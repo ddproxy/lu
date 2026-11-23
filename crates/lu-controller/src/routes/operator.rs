@@ -131,6 +131,35 @@ fn job_view_with(r: &JobRecord, reason: Option<String>, ttl_secs: u64) -> JobVie
         audit_write_errors: None,
         publish: r.publish.clone(),
         publish_target: None,
+        schedule: r.spec.schedule.clone(),
+        waiting_detail: Vec::new(),
+    }
+}
+
+/// Structured reasons from the same admission evaluator dispatch uses. A job without a schedule
+/// block, or a controller without scheduling configured, has no schedule detail.
+fn schedule_waiting_detail(state: &AppState, rec: &JobRecord) -> Vec<lu_schedule::BlockReason> {
+    let (Some(schedule), Some(job)) = (state.schedule(), rec.spec.schedule.clone()) else {
+        return Vec::new();
+    };
+    let request = lu_schedule::AdmissionRequest {
+        now: now().wall_unix,
+        eligible_since: rec.eligible_since,
+        timeout_secs: rec.spec.timeout_secs as i64,
+        job,
+        node: rec.node.as_ref().map(|node| node.as_str().to_owned()),
+        group: rec.spec.group.clone(),
+        provider: rec.assigned_provider.clone(),
+        model: rec.assigned_model.clone(),
+    };
+    match schedule.admit(&request) {
+        Ok(lu_schedule::Admission::Blocked(blocked)) => {
+            for reason in &blocked.reasons {
+                state.record_schedule_wait(reason.constraint.as_str());
+            }
+            blocked.reasons
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -158,6 +187,7 @@ async fn job_view_for(state: &Arc<AppState>, rec: &JobRecord) -> Result<JobView,
     let counts = group_counts(state).await?;
     let reason = waiting_reason_with_groups(rec, &nodes, &counts, &state.group_limits());
     let mut view = job_view_with(rec, reason, state.blocked_dependent_ttl_secs);
+    view.waiting_detail = schedule_waiting_detail(state, rec);
     view.audit_write_errors = Some(state.audit_write_errors());
     view.publish_target = crate::publish::target_text(state, rec);
     Ok(view)
@@ -1595,6 +1625,7 @@ mod tests {
                 expect: None,
                 stack_union_paths: Vec::new(),
                 stack_base_paths: Vec::new(),
+                schedule: None,
             },
             attempt: 1,
             node: None,
@@ -1603,6 +1634,7 @@ mod tests {
             epoch: 1,
             created_at: 1,
             updated_at: 2,
+            eligible_since: 1,
             started_at: None,
             finished_at: None,
             failure_class: None,

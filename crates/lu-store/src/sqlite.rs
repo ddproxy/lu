@@ -23,7 +23,7 @@ use crate::{
 const CURRENT_SCHEMA_VERSION: i64 = crate::SCHEMA_VERSION;
 
 /// Columns shared by the list/get queries that build a `JobRecord` from positional rows.
-const JOB_SELECT_COLUMNS: &str = "id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since";
+const JOB_SELECT_COLUMNS: &str = "id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since,eligible_since";
 
 fn internal<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Internal(e.to_string())
@@ -246,7 +246,7 @@ impl SqliteStore {
             // Schemas 1 through 4 add additive job columns. Fill them with zero/false/NULL so
             // older jobs keep their history and views stay compatible. Each column is checked
             // because a database briefly opened by a newer binary may already have some of them.
-            Some(1) | Some(2) | Some(3) | Some(4) => {
+            Some(1) | Some(2) | Some(3) | Some(4) | Some(5) => {
                 for (name, ddl) in [
                     (
                         "scrubbed_hits",
@@ -282,11 +282,20 @@ impl SqliteStore {
                         "blocked_since",
                         "ALTER TABLE jobs ADD COLUMN blocked_since INTEGER",
                     ),
+                    (
+                        "eligible_since",
+                        "ALTER TABLE jobs ADD COLUMN eligible_since INTEGER NOT NULL DEFAULT 0",
+                    ),
                 ] {
                     if !job_column_exists(&tx, name)? {
                         tx.execute(ddl, []).map_err(internal)?;
                     }
                 }
+                tx.execute(
+                    "UPDATE jobs SET eligible_since=created_at WHERE eligible_since=0",
+                    [],
+                )
+                .map_err(internal)?;
                 tx.execute(
                     "UPDATE schema_version SET version = ?1",
                     params![CURRENT_SCHEMA_VERSION],
@@ -360,7 +369,8 @@ fn apply_baseline(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
             publish_json TEXT,
             staged_commit TEXT,
             blocked_reason TEXT,
-            blocked_since INTEGER
+            blocked_since INTEGER,
+            eligible_since INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE nodes (
             name TEXT PRIMARY KEY,
@@ -519,9 +529,10 @@ fn release_blocked_job(
     if deps_satisfied(tx, id, include_failed)? {
         tx.execute(
             "UPDATE jobs SET state='queued',updated_at=?2,failure_class=NULL,
-             summary=NULL,finished_at=NULL,blocked_reason=NULL,blocked_since=NULL
+             summary=NULL,finished_at=NULL,blocked_reason=NULL,blocked_since=NULL,
+             eligible_since=?3
              WHERE id=?1 AND state='blocked'",
-            params![id, now.wall_unix],
+            params![id, now.wall_unix, now.wall_unix],
         )
         .map_err(internal)?;
     }
@@ -807,7 +818,7 @@ fn get_job_tx(
     id: &str,
 ) -> Result<(JobRecord, Option<u64>, Option<u64>), StoreError> {
     let mut stmt = tx
-        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since FROM jobs WHERE id=?1")
+        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since,eligible_since FROM jobs WHERE id=?1")
         .map_err(internal)?;
     let row = stmt
         .query_row(params![id], |r| {
@@ -844,6 +855,7 @@ fn get_job_tx(
                 r.get::<_, Option<String>>("staged_commit")?,
                 r.get::<_, Option<String>>("blocked_reason")?,
                 r.get::<_, Option<i64>>("blocked_since")?,
+                r.get::<_, i64>("eligible_since")?,
             ))
         })
         .optional()
@@ -883,6 +895,7 @@ fn get_job_tx(
         staged_commit,
         blocked_reason,
         blocked_since,
+        eligible_since,
     ) = row;
     let idp = JobId::parse(&id_s).map_err(internal)?;
     let state = parse_state(&state_s)?;
@@ -907,6 +920,7 @@ fn get_job_tx(
         epoch: epoch_i as u64,
         created_at,
         updated_at,
+        eligible_since,
         started_at,
         finished_at,
         failure_class,
@@ -950,7 +964,7 @@ fn update_job_tx(
         .map_err(internal)?;
     let patch_secret_hits_json = serde_json::to_string(&rec.patch_secret_hits).map_err(internal)?;
     tx.execute(
-        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20,diff_bytes=?21,expect_failed=?22,scrubbed_hits=?23,patch_scrubbed=?24,parent_job_id=?25,root_job_id=?26,depth=?27,publish_json=?28,staged_commit=?29,blocked_reason=?30,blocked_since=?31,patch_secret_hits_json=?32 WHERE id=?1",
+        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20,diff_bytes=?21,expect_failed=?22,scrubbed_hits=?23,patch_scrubbed=?24,parent_job_id=?25,root_job_id=?26,depth=?27,publish_json=?28,staged_commit=?29,blocked_reason=?30,blocked_since=?31,patch_secret_hits_json=?32,eligible_since=?33 WHERE id=?1",
         params![
             rec.id.as_str(),
             state_str(rec.state),
@@ -984,6 +998,7 @@ fn update_job_tx(
             rec.blocked_reason,
             rec.blocked_since,
             patch_secret_hits_json,
+            rec.eligible_since,
         ],
     ).map_err(internal)?;
     Ok(())
@@ -1149,6 +1164,7 @@ fn insert_job_tx(
         epoch: 0,
         created_at: now.wall_unix,
         updated_at: now.wall_unix,
+        eligible_since: now.wall_unix,
         started_at: None,
         finished_at: None,
         failure_class: None,
@@ -1172,8 +1188,8 @@ fn insert_job_tx(
         publish: None,
     };
     tx.execute(
-        "INSERT INTO jobs(id,dispatch_seq,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,lease_until_mono_ms,recovering_since_mono_ms,parent_job_id,root_job_id,depth)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+        "INSERT INTO jobs(id,dispatch_seq,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,lease_until_mono_ms,recovering_since_mono_ms,parent_job_id,root_job_id,depth,eligible_since)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
         params![
             rec.id.as_str(), dispatch_seq, state_str(rec.state), canonical, 1i64, Option::<String>::None, 0i64,
             rec.created_at, rec.updated_at, Option::<i64>::None, Option::<i64>::None,
@@ -1182,6 +1198,7 @@ fn insert_job_tx(
             rec.parent_job_id.as_ref().map(|id| id.as_str()),
             rec.root_job_id.as_ref().map(|id| id.as_str()),
             rec.depth as i64,
+            rec.eligible_since,
         ],
     ).map_err(internal)?;
     for (ord, dep) in spec.after.iter().enumerate() {
@@ -1417,6 +1434,391 @@ fn nearest_rank(sorted: &[u64], percentile: usize) -> Option<u64> {
     }
     let rank = percentile.saturating_mul(sorted.len()).div_ceil(100).max(1);
     sorted.get(rank - 1).copied()
+}
+
+/// A queued job as seen by one dispatch poll. Provider choices are computed with the heartbeat and
+/// cordons from the same short transaction, so the expensive calendar work has all its inputs
+/// without holding the write lock.
+#[derive(Debug)]
+struct DispatchCandidate {
+    id: String,
+    dispatch_seq: i64,
+    spec: JobSpec,
+    /// The parent's group for a scoped child, whose own `spec.group` is reset to `None`.
+    group: Option<String>,
+    eligible_since: i64,
+    choices: Vec<ProviderChoice>,
+}
+
+#[derive(Debug)]
+struct DispatchSnapshot {
+    limits: HashMap<String, usize>,
+    candidates: Vec<DispatchCandidate>,
+}
+
+/// Node checks that must be atomic with the lease. Returns `None` when this node cannot take work.
+fn dispatch_node(
+    tx: &rusqlite::Transaction<'_>,
+    node: &NodeName,
+) -> Result<Option<Heartbeat>, StoreError> {
+    let row: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT heartbeat_json, draining FROM nodes WHERE name=?1",
+            params![node.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+    let Some((json, draining)) = row else {
+        return Ok(None);
+    };
+    if draining != 0 {
+        return Ok(None);
+    }
+    let hb: Heartbeat = serde_json::from_str(&json).map_err(internal)?;
+    if !matches!(hb.harness, lu_proto::HarnessState::Idle) {
+        return Ok(None);
+    }
+    let held: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM jobs WHERE node=?1 AND state IN ('leased','running','recovering') LIMIT 1",
+            params![node.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(internal)?;
+    if held.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(hb))
+}
+
+fn active_group_counts(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<HashMap<String, usize>, StoreError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT json_extract(spec_json, '$.group') FROM jobs
+             WHERE state IN ('leased','running','recovering','needs_input')
+               AND json_extract(spec_json, '$.group') IS NOT NULL",
+        )
+        .map_err(internal)?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(internal)?;
+    let mut counts = HashMap::new();
+    for row in rows {
+        *counts.entry(row.map_err(internal)?).or_insert(0) += 1;
+    }
+    Ok(counts)
+}
+
+/// One provider/model pair a job may run on; `(None, None)` means run without an assignment.
+type ProviderChoice = (Option<String>, Option<String>);
+
+/// Provider choices in preference order. An `any` job uses the healthy pairs the heartbeat
+/// published; a named provider uses its primary then its fallbacks. A job with no provider at all
+/// returns one empty choice, which means "run without an assignment".
+fn provider_choices(
+    tx: &rusqlite::Transaction<'_>,
+    node: &NodeName,
+    hb: &Heartbeat,
+    spec: &JobSpec,
+    now: Now,
+) -> Result<Vec<ProviderChoice>, StoreError> {
+    let choices: Vec<(String, Option<String>)> = if spec.is_any_provider() {
+        hb.provider_models
+            .iter()
+            .filter(|pair| node_offers_provider(hb, &pair.provider))
+            .map(|pair| (pair.provider.clone(), Some(pair.model.clone())))
+            .collect()
+    } else {
+        match &spec.provider {
+            Some(primary) => std::iter::once((primary.clone(), spec.model.clone()))
+                .chain(spec.fallbacks.iter().map(|choice| {
+                    (
+                        choice.provider.clone(),
+                        choice.model.clone().or_else(|| spec.model.clone()),
+                    )
+                }))
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    if choices.is_empty() {
+        return Ok(if spec.provider.is_none() {
+            vec![(None, None)]
+        } else {
+            Vec::new()
+        });
+    }
+    let mut usable = Vec::new();
+    for (provider, model) in choices {
+        let cordoned: Option<i64> = tx
+            .query_row(
+                "SELECT until_mono_ms FROM cordons WHERE node=?1 AND provider=?2",
+                params![node.as_str(), provider],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        if cordoned.is_some_and(|until| (until as u64) > now.mono_ms) {
+            continue;
+        }
+        if node_offers_provider(hb, &provider) {
+            usable.push((Some(provider), model));
+        }
+    }
+    Ok(usable)
+}
+
+/// Calendar gates use the parent's group even though `submit_child` resets the child's own group.
+/// The root's group is the fallback for grandchildren, whose immediate parent is also ungrouped.
+fn inherited_group(
+    tx: &rusqlite::Transaction<'_>,
+    parent: Option<String>,
+    root: Option<String>,
+) -> Result<Option<String>, StoreError> {
+    let mut stmt = tx
+        .prepare("SELECT spec_json FROM jobs WHERE id=?1")
+        .map_err(internal)?;
+    for id in [parent, root].into_iter().flatten() {
+        let spec: Option<String> = stmt
+            .query_row(params![id], |row| row.get(0))
+            .optional()
+            .map_err(internal)?;
+        if let Some(spec) = spec {
+            let spec = decode_spec(&spec)?;
+            if spec.group.is_some() {
+                return Ok(spec.group);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn dispatch_snapshot(
+    store: &SqliteStore,
+    node: &NodeName,
+    now: Now,
+    schedule: &lu_schedule::Schedule,
+) -> Result<Option<DispatchSnapshot>, StoreError> {
+    let mut conn = store.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(internal)?;
+    let hb = match dispatch_node(&tx, node)? {
+        Some(hb) => hb,
+        None => {
+            tx.commit().map_err(internal)?;
+            return Ok(None);
+        }
+    };
+    let limits = store
+        .group_limits
+        .lock()
+        .map_err(|_| internal("mutex poisoned"))?
+        .clone();
+    let active = active_group_counts(&tx)?;
+    let mut candidates = Vec::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id,dispatch_seq,spec_json,eligible_since,parent_job_id,root_job_id \
+                 FROM jobs WHERE state='queued'",
+            )
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(internal)?;
+        let mut raw = Vec::new();
+        for row in rows {
+            raw.push(row.map_err(internal)?);
+        }
+        for (id, dispatch_seq, spec_json, eligible_since, parent, root) in raw {
+            let spec = decode_spec(&spec_json)?;
+            let group = match &spec.group {
+                Some(group) => Some(group.clone()),
+                None => inherited_group(&tx, parent.clone(), root.clone())?,
+            };
+            if let Some(group) = &spec.group {
+                if let Some(&limit) = limits.get(group) {
+                    if active.get(group).copied().unwrap_or(0) >= limit {
+                        continue;
+                    }
+                }
+            }
+            if !crate::labels_satisfied(&spec.requires, &hb.labels)
+                || !crate::taints_tolerated(&hb.taints, &spec.tolerates)
+            {
+                continue;
+            }
+            let choices = provider_choices(&tx, node, &hb, &spec, now)?;
+            if choices.is_empty() {
+                continue;
+            }
+            candidates.push(DispatchCandidate {
+                id,
+                dispatch_seq,
+                spec,
+                group,
+                eligible_since,
+                choices,
+            });
+        }
+    }
+    tx.commit().map_err(internal)?;
+    candidates.sort_by(|a, b| {
+        let ka = lu_schedule::queue_key(
+            now.wall_unix,
+            a.eligible_since,
+            a.spec.priority,
+            a.dispatch_seq.max(0) as u64,
+            schedule.defaults.starvation_secs,
+        );
+        let kb = lu_schedule::queue_key(
+            now.wall_unix,
+            b.eligible_since,
+            b.spec.priority,
+            b.dispatch_seq.max(0) as u64,
+            schedule.defaults.starvation_secs,
+        );
+        // Starvation class and effective priority sort high to low; ties keep the oldest
+        // eligibility and submission order so the queue stays total and restart-stable.
+        kb.0.cmp(&ka.0)
+            .then_with(|| kb.1.cmp(&ka.1))
+            .then_with(|| ka.3.cmp(&kb.3))
+            .then_with(|| ka.2.cmp(&kb.2))
+    });
+    // A per-poll budget keeps an enormous queue bounded even when all its jobs fail the same
+    // calendar gate. The default is deliberately far above normal queue sizes.
+    candidates.truncate(schedule.defaults.step_budget.min(candidates.len()));
+    Ok(Some(DispatchSnapshot { limits, candidates }))
+}
+
+/// Inputs one dispatch poll shares between evaluation and the final short transaction.
+#[derive(Clone, Copy)]
+struct DispatchPoll<'a> {
+    node: &'a NodeName,
+    now: Now,
+    lease_ms: u64,
+    schedule: &'a lu_schedule::Schedule,
+    snapshot: &'a DispatchSnapshot,
+}
+
+/// Final short transaction: re-check everything that can race with the evaluation, then lease.
+fn commit_dispatch(
+    store: &SqliteStore,
+    poll: DispatchPoll<'_>,
+    candidate: &DispatchCandidate,
+    choice: &ProviderChoice,
+) -> Result<Option<Assignment>, StoreError> {
+    let DispatchPoll {
+        node,
+        now,
+        lease_ms,
+        schedule,
+        snapshot,
+    } = poll;
+    let (provider, model) = choice;
+    let mut conn = store.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(internal)?;
+    if dispatch_node(&tx, node)?.is_none() {
+        tx.commit().map_err(internal)?;
+        return Ok(None);
+    }
+    let (mut rec, _, _) = match get_job_tx(&tx, &candidate.id) {
+        Ok(value) => value,
+        Err(StoreError::NotFound) => {
+            tx.commit().map_err(internal)?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if rec.state != JobState::Queued {
+        tx.commit().map_err(internal)?;
+        return Ok(None);
+    }
+    if let Some(group) = &rec.spec.group {
+        if let Some(&limit) = snapshot.limits.get(group) {
+            let active = active_group_counts(&tx)?;
+            if active.get(group).copied().unwrap_or(0) >= limit {
+                tx.commit().map_err(internal)?;
+                return Ok(None);
+            }
+        }
+    }
+    // Provider cordons are wall-clock independent; a heartbeat between the two transactions
+    // may have cordoned the chosen pair, so check it once more.
+    if let Some(provider) = provider {
+        let cordoned: Option<i64> = tx
+            .query_row(
+                "SELECT until_mono_ms FROM cordons WHERE node=?1 AND provider=?2",
+                params![node.as_str(), provider],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        if cordoned.is_some_and(|until| (until as u64) > now.mono_ms) {
+            tx.commit().map_err(internal)?;
+            return Ok(None);
+        }
+    }
+    // The snapshot was evaluated without the write lock. Re-check the same admission decision
+    // here so a boundary crossed while other polls held the writer cannot lease a gated job.
+    let job_schedule = rec
+        .spec
+        .schedule
+        .clone()
+        .unwrap_or_else(lu_schedule::JobSchedule::default);
+    let request = lu_schedule::AdmissionRequest {
+        now: now.wall_unix,
+        eligible_since: rec.eligible_since,
+        timeout_secs: rec.spec.timeout_secs as i64,
+        job: job_schedule,
+        node: Some(node.as_str().to_owned()),
+        group: candidate.group.clone(),
+        provider: provider.clone(),
+        model: model.clone(),
+    };
+    match schedule.admit(&request) {
+        Ok(lu_schedule::Admission::Admitted(_)) => {}
+        Ok(lu_schedule::Admission::Blocked(_)) | Err(_) => {
+            tx.commit().map_err(internal)?;
+            return Ok(None);
+        }
+    }
+    check_transition(rec.state, JobState::Leased)?;
+    rec.state = JobState::Leased;
+    rec.node = Some(node.clone());
+    rec.assigned_provider = provider.clone();
+    rec.assigned_model = model.clone();
+    rec.epoch = rec.epoch.saturating_add(1);
+    rec.updated_at = now.wall_unix;
+    rec.failure_class = None;
+    rec.summary = None;
+    rec.exit_code = None;
+    rec.finished_at = None;
+    update_job_tx(&tx, &rec, Some(now.mono_ms.saturating_add(lease_ms)), None)?;
+    tx.commit().map_err(internal)?;
+    Ok(Some(Assignment {
+        job_id: rec.id,
+        epoch: rec.epoch,
+        provider: rec.assigned_provider.clone(),
+        model: rec.assigned_model.clone(),
+        spec: rec.spec,
+    }))
 }
 
 impl Store for SqliteStore {
@@ -2038,6 +2440,8 @@ impl Store for SqliteStore {
         check_transition(rec.state, target)?;
         rec.state = target;
         rec.updated_at = now.wall_unix;
+        // Clocks on a draft do not start until approval; this is the eligibility stamp.
+        rec.eligible_since = now.wall_unix;
         rec.waiting_on = load_waiting(&tx, rec.id.as_str())?;
         update_job_tx(&tx, &rec, lease, recov)?;
         tx.commit().map_err(internal)?;
@@ -2155,182 +2559,120 @@ impl Store for SqliteStore {
         now: Now,
         lease_ms: u64,
     ) -> Result<Option<Assignment>, StoreError> {
+        self.next_assignment_scheduled(node, now, lease_ms, &lu_schedule::Schedule::default())
+    }
+
+    fn next_assignment_scheduled(
+        &self,
+        node: &NodeName,
+        now: Now,
+        lease_ms: u64,
+        schedule: &lu_schedule::Schedule,
+    ) -> Result<Option<Assignment>, StoreError> {
+        // Phase 1: a short read/write transaction collects the cheap checks and a snapshot of
+        // candidates. Calendar evaluation happens with no write lock held. A second short
+        // transaction re-checks the node and the chosen job before the lease is written, so a
+        // concurrent poll cannot take the same job or the last group slot.
+        let snapshot = match dispatch_snapshot(self, node, now, schedule)? {
+            Some(snapshot) => snapshot,
+            None => return Ok(None),
+        };
+        let poll = DispatchPoll {
+            node,
+            now,
+            lease_ms,
+            schedule,
+            snapshot: &snapshot,
+        };
+        for candidate in &snapshot.candidates {
+            let job_schedule = candidate
+                .spec
+                .schedule
+                .clone()
+                .unwrap_or_else(lu_schedule::JobSchedule::default);
+            for choice in &candidate.choices {
+                let (provider, model) = choice;
+                let request = lu_schedule::AdmissionRequest {
+                    now: now.wall_unix,
+                    eligible_since: candidate.eligible_since,
+                    timeout_secs: candidate.spec.timeout_secs as i64,
+                    job: job_schedule.clone(),
+                    node: Some(node.as_str().to_owned()),
+                    group: candidate.group.clone(),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                };
+                match schedule.admit(&request) {
+                    Ok(lu_schedule::Admission::Admitted(_)) => {
+                        if let Some(assignment) = commit_dispatch(self, poll, candidate, choice)? {
+                            return Ok(Some(assignment));
+                        }
+                        // The job or the node changed underneath us; this poll is done.
+                        return Ok(None);
+                    }
+                    Ok(lu_schedule::Admission::Blocked(_)) => continue,
+                    Err(error) => {
+                        // A malformed job block must never lease the job. The submit path rejects
+                        // these, but a hand-edited database must fail closed too.
+                        let _ = error;
+                        continue;
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Ends jobs that missed a start deadline with `on_deadline = expire|cancel`.
+    fn expire_deadlines(
+        &self,
+        now: Now,
+        _schedule: &lu_schedule::Schedule,
+    ) -> Result<Vec<(JobId, lu_schedule::OnDeadline)>, StoreError> {
+        use lu_schedule::OnDeadline;
+
         let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
-        // node state
-        let node_row: Option<(String, i64)> = tx
-            .query_row(
-                "SELECT heartbeat_json, draining FROM nodes WHERE name=?1",
-                params![node.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(internal)?;
-        let (hb_json, draining_i) = match node_row {
-            Some(x) => x,
-            None => return Ok(None),
-        };
-        if draining_i != 0 {
-            return Ok(None);
-        }
-        let hb: Heartbeat = serde_json::from_str(&hb_json).map_err(internal)?;
-        if !matches!(hb.harness, lu_proto::HarnessState::Idle) {
-            return Ok(None);
-        }
-        // A recovering job still belongs to its node: the agent may come back for it, so the
-        // node must not take a second job in the meantime.
-        let held: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM jobs WHERE node=?1 AND state IN ('leased','running','recovering') LIMIT 1",
-                params![node.as_str()],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(internal)?;
-        if held.is_some() {
-            return Ok(None);
-        }
-        // Group caps are counted inside this write transaction, so two concurrent polls cannot
-        // both take the last slot of a group.
-        let limits = self
-            .group_limits
-            .lock()
-            .map_err(|_| internal("mutex poisoned"))?;
-        let mut active: HashMap<String, usize> = {
+        let due = {
             let mut stmt = tx
-                .prepare(
-                    "SELECT json_extract(spec_json, '$.group') FROM jobs
-                     WHERE state IN ('leased','running','recovering','needs_input')
-                       AND json_extract(spec_json, '$.group') IS NOT NULL",
-                )
+                .prepare("SELECT id,spec_json FROM jobs WHERE state IN ('queued','blocked')")
                 .map_err(internal)?;
             let rows = stmt
-                .query_map([], |r| r.get::<_, String>(0))
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                 .map_err(internal)?;
-            let mut counts = HashMap::new();
+            let mut due = Vec::new();
             for row in rows {
-                *counts.entry(row.map_err(internal)?).or_insert(0) += 1;
+                let (id, spec_json) = row.map_err(internal)?;
+                let spec: JobSpec = serde_json::from_str(&spec_json).map_err(internal)?;
+                let Some(job) = &spec.schedule else { continue };
+                let Some(deadline) = job.deadline else {
+                    continue;
+                };
+                if now.wall_unix <= deadline || job.on_deadline == OnDeadline::Run {
+                    continue;
+                }
+                due.push((id, job.on_deadline));
             }
-            counts
+            due
         };
-        // Higher priority first, then submission order. `dispatch_seq` is persisted so wall
-        // clock steps and same-millisecond ids cannot reorder the queue. A spec from before the
-        // priority field existed has no JSON value and sorts as the default priority.
-        let candidates: Vec<String> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT id FROM jobs WHERE state='queued'
-                     ORDER BY COALESCE(json_extract(spec_json, '$.priority'), 5) DESC,
-                              dispatch_seq ASC",
-                )
-                .map_err(internal)?;
-            let ids = stmt
-                .query_map([], |r| r.get::<_, String>(0))
-                .map_err(internal)?;
-            let mut v = Vec::new();
-            for id in ids {
-                v.push(id.map_err(internal)?);
-            }
-            v
-        };
-        for jid in candidates {
-            let (mut rec, _, _) = get_job_tx(&tx, &jid)?;
-            if let Some(group) = &rec.spec.group {
-                if let Some(&limit) = limits.get(group) {
-                    if active.get(group).copied().unwrap_or(0) >= limit {
-                        continue;
-                    }
-                }
-            }
-            if !crate::labels_satisfied(&rec.spec.requires, &hb.labels) {
+        let mut moved = Vec::new();
+        for (id, action) in due {
+            let (mut rec, lease, recov) = get_job_tx(&tx, &id)?;
+            if !matches!(rec.state, JobState::Queued | JobState::Blocked) {
                 continue;
             }
-            if !crate::taints_tolerated(&hb.taints, &rec.spec.tolerates) {
-                continue;
-            }
-            // A job that names no provider runs anywhere, as before. `provider = "any"` takes
-            // the healthy pairs the agent published, in preference order. Otherwise the primary
-            // is tried first, then the fallbacks; a fallback without a model keeps the primary
-            // model. Every choice still needs this node to serve it.
-            let choices: Vec<(String, Option<String>)> = if rec.spec.is_any_provider() {
-                hb.provider_models
-                    .iter()
-                    .filter(|pair| node_offers_provider(&hb, &pair.provider))
-                    .map(|pair| (pair.provider.clone(), Some(pair.model.clone())))
-                    .collect()
-            } else {
-                match &rec.spec.provider {
-                    Some(primary) => std::iter::once((primary.clone(), rec.spec.model.clone()))
-                        .chain(rec.spec.fallbacks.iter().map(|choice| {
-                            (
-                                choice.provider.clone(),
-                                choice.model.clone().or_else(|| rec.spec.model.clone()),
-                            )
-                        }))
-                        .collect(),
-                    None => Vec::new(),
-                }
-            };
-            // Only a job with no provider at all may run without an assignment. An `any` job with
-            // no healthy pair waits for a node that has one.
-            let mut chosen = if choices.is_empty() && rec.spec.provider.is_none() {
-                Some((None, None))
-            } else {
-                None
-            };
-            for (provider, model) in &choices {
-                let cordoned: Option<i64> = tx
-                    .query_row(
-                        "SELECT until_mono_ms FROM cordons WHERE node=?1 AND provider=?2",
-                        params![node.as_str(), provider],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(internal)?;
-                if let Some(until) = cordoned {
-                    if (until as u64) > now.mono_ms {
-                        continue;
-                    }
-                }
-                if node_offers_provider(&hb, provider) {
-                    chosen = Some((Some(provider.clone()), model.clone()));
-                    break;
-                }
-            }
-            let Some((assigned_provider, assigned_model)) = chosen else {
-                continue;
-            };
-            check_transition(rec.state, JobState::Leased)?;
-            rec.state = JobState::Leased;
-            rec.node = Some(node.clone());
-            rec.assigned_provider = assigned_provider;
-            rec.assigned_model = assigned_model;
-            rec.epoch = rec.epoch.saturating_add(1);
+            check_transition(rec.state, JobState::DeadlineMissed)?;
+            rec.state = JobState::DeadlineMissed;
+            rec.finished_at = Some(now.wall_unix);
             rec.updated_at = now.wall_unix;
-            rec.failure_class = None;
-            rec.summary = None;
-            rec.exit_code = None;
-            rec.finished_at = None;
-            let lease_until = Some(now.mono_ms.saturating_add(lease_ms));
-            update_job_tx(&tx, &rec, lease_until, None)?;
-            if let Some(group) = &rec.spec.group {
-                if limits.contains_key(group) {
-                    *active.entry(group.clone()).or_insert(0) += 1;
-                }
-            }
-            tx.commit().map_err(internal)?;
-            return Ok(Some(Assignment {
-                job_id: rec.id,
-                epoch: rec.epoch,
-                provider: rec.assigned_provider.clone(),
-                model: rec.assigned_model.clone(),
-                spec: rec.spec,
-            }));
+            rec.summary = Some("deadline missed".to_owned());
+            update_job_tx(&tx, &rec, lease, recov)?;
+            moved.push((rec.id, action));
         }
         tx.commit().map_err(internal)?;
-        Ok(None)
+        Ok(moved)
     }
 
     fn pending_cancels(&self, node: &NodeName) -> Result<Vec<(JobId, u64)>, StoreError> {
@@ -3333,6 +3675,7 @@ type JobTuple = (
     Option<String>,
     Option<String>,
     Option<i64>,
+    i64,
 );
 
 fn row_to_job_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobTuple> {
@@ -3367,6 +3710,7 @@ fn row_to_job_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobTuple> {
         row.get(27)?,
         row.get(28)?,
         row.get(29)?,
+        row.get(30)?,
     ))
 }
 
@@ -3402,6 +3746,7 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         staged_commit,
         blocked_reason,
         blocked_since,
+        eligible_since,
     ) = t;
     Ok(JobRecord {
         id: JobId::parse(&id_s).map_err(internal)?,
@@ -3417,6 +3762,7 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         epoch: epoch_i as u64,
         created_at,
         updated_at,
+        eligible_since,
         started_at,
         finished_at,
         failure_class: match failure_s {
@@ -3917,6 +4263,7 @@ mod tests {
             tolerates: Vec::new(),
             fallbacks: Vec::new(),
             expect: None,
+            schedule: None,
         };
         let now = Now {
             wall_unix: 1,
@@ -3977,7 +4324,7 @@ mod tests {
         {
             let _s = SqliteStore::open(&p).unwrap();
         }
-        for version in [0i64, 6, 9, 999] {
+        for version in [0i64, 7, 9, 999] {
             let conn = rusqlite::Connection::open(&p).unwrap();
             conn.execute("UPDATE schema_version SET version = ?1", params![version])
                 .unwrap();
@@ -4040,6 +4387,7 @@ mod tests {
                 tolerates: Vec::new(),
                 fallbacks: Vec::new(),
                 expect: None,
+                schedule: None,
             };
             s.create_job(
                 &spec,
@@ -4074,7 +4422,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let jobs = s.list_jobs(None, 10, None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].scrubbed_hits, 0);
@@ -4147,7 +4495,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let jobs = s.list_jobs(None, 10, None).unwrap();
         assert_eq!(jobs.len(), 2);
         for job in &jobs {
@@ -4243,5 +4591,33 @@ mod tests {
             record.spec.source.repo,
             "https://git.example.test/team/app.git"
         );
+    }
+
+    #[test]
+    fn schema_five_database_gains_eligible_since_in_place() {
+        let path = temp_db("v5.sqlite");
+        drop(SqliteStore::open(&path).unwrap());
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE jobs DROP COLUMN eligible_since;
+                 UPDATE schema_version SET version = 5;",
+            )
+            .unwrap();
+        }
+        drop(SqliteStore::open(&path).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, crate::SCHEMA_VERSION);
+        let has_column: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name = 'eligible_since'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1);
     }
 }

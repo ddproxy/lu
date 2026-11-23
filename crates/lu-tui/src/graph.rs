@@ -35,7 +35,7 @@ impl StateStyle for State {
             Self::Queued | Self::Recovering | Self::NeedsInput => '○',
             Self::Draft => '▧',
             Self::Failed => '✗',
-            Self::Cancelled | Self::Expired => '–',
+            Self::Cancelled | Self::Expired | Self::DeadlineMissed => '–',
         }
     }
 
@@ -46,7 +46,7 @@ impl StateStyle for State {
             Self::Blocked | Self::Draft => Tone::Blocked,
             Self::Queued | Self::Recovering | Self::NeedsInput => Tone::Warn,
             Self::Failed => Tone::Bad,
-            Self::Cancelled | Self::Expired => Tone::Dim,
+            Self::Cancelled | Self::Expired | Self::DeadlineMissed => Tone::Dim,
         }
     }
 

@@ -1148,6 +1148,7 @@ version = "0.5.2"
 dependencies = [
  "libc",
  "lu-proto",
+ "lu-schedule",
  "rustix",
  "serde",
  "tempfile",
@@ -1166,6 +1167,7 @@ dependencies = [
  "lu-auth",
  "lu-config",
  "lu-proto",
+ "lu-schedule",
  "lu-serve",
  "lu-staging",
  "lu-store",
@@ -1185,6 +1187,15 @@ name = "lu-proto"
 version = "0.5.2"
 dependencies = [
  "getrandom 0.4.3",
+ "lu-schedule",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lu-schedule"
+version = "0.5.2"
+dependencies = [
  "serde",
  "serde_json",
 ]
@@ -1218,6 +1229,7 @@ name = "lu-store"
 version = "0.5.2"
 dependencies = [
  "lu-proto",
+ "lu-schedule",
  "rusqlite",
  "serde_json",
 ]

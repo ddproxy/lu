@@ -38,6 +38,9 @@ pub enum JobState {
     Cancelled,
     /// A draft that was never approved before its TTL elapsed.
     Expired,
+    /// A job whose start deadline passed before it could be dispatched. Distinct from `expired`,
+    /// which only applies to drafts that aged out.
+    DeadlineMissed,
 }
 
 /// What cancelling a job in a given state does. One rule for every store.
@@ -66,6 +69,7 @@ impl JobState {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::Expired => "expired",
+            Self::DeadlineMissed => "deadline_missed",
         }
     }
 
@@ -83,6 +87,7 @@ impl JobState {
             "failed" => Self::Failed,
             "cancelled" => Self::Cancelled,
             "expired" => Self::Expired,
+            "deadline_missed" => Self::DeadlineMissed,
             _ => return Err(ParseJobStateError),
         })
     }
@@ -92,12 +97,14 @@ impl JobState {
         match self {
             Self::Draft | Self::Blocked | Self::Queued | Self::Recovering => CancelEffect::Now,
             Self::Leased | Self::Running | Self::NeedsInput => CancelEffect::Request,
-            Self::Done | Self::Failed | Self::Cancelled | Self::Expired => CancelEffect::Refuse,
+            Self::Done | Self::Failed | Self::Cancelled | Self::Expired | Self::DeadlineMissed => {
+                CancelEffect::Refuse
+            }
         }
     }
 
     /// Every state, in declaration order.
-    pub const ALL: [JobState; 11] = [
+    pub const ALL: [JobState; 12] = [
         Self::Draft,
         Self::Blocked,
         Self::Queued,
@@ -109,13 +116,14 @@ impl JobState {
         Self::Failed,
         Self::Cancelled,
         Self::Expired,
+        Self::DeadlineMissed,
     ];
 
     /// A terminal state has no outgoing edges.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Done | Self::Failed | Self::Cancelled | Self::Expired
+            Self::Done | Self::Failed | Self::Cancelled | Self::Expired | Self::DeadlineMissed
         )
     }
 
@@ -126,8 +134,8 @@ impl JobState {
     /// controller restart, resuming or finishing.
     pub fn can_transition(from: Self, to: Self) -> bool {
         use JobState::{
-            Blocked, Cancelled, Done, Draft, Expired, Failed, Leased, NeedsInput, Queued,
-            Recovering, Running,
+            Blocked, Cancelled, DeadlineMissed, Done, Draft, Expired, Failed, Leased, NeedsInput,
+            Queued, Recovering, Running,
         };
         matches!(
             (from, to),
@@ -138,8 +146,10 @@ impl JobState {
                 | (Blocked, Queued)
                 | (Blocked, Cancelled)
                 | (Blocked, Failed)
+                | (Blocked, DeadlineMissed)
                 | (Queued, Leased)
                 | (Queued, Cancelled)
+                | (Queued, DeadlineMissed)
                 | (Leased, Running)
                 | (Leased, Queued)
                 | (Leased, Recovering)
@@ -192,8 +202,10 @@ mod tests {
             (Blocked, Queued),
             (Blocked, Cancelled),
             (Blocked, Failed),
+            (Blocked, DeadlineMissed),
             (Queued, Leased),
             (Queued, Cancelled),
+            (Queued, DeadlineMissed),
             (Leased, Running),
             (Leased, Queued),
             (Leased, Recovering),
@@ -242,10 +254,40 @@ mod tests {
         for state in JobState::ALL {
             assert_eq!(
                 state.is_terminal(),
-                matches!(state, Done | Failed | Cancelled | Expired),
+                matches!(state, Done | Failed | Cancelled | Expired | DeadlineMissed),
                 "{state:?}"
             );
         }
+    }
+
+    #[test]
+    fn deadline_missed_is_terminal_and_only_reached_from_queued_or_blocked() {
+        assert!(JobState::can_transition(Queued, DeadlineMissed));
+        assert!(JobState::can_transition(Blocked, DeadlineMissed));
+        for from in JobState::ALL {
+            if from != Queued && from != Blocked {
+                assert!(
+                    !JobState::can_transition(from, DeadlineMissed),
+                    "{from:?} -> DeadlineMissed"
+                );
+            }
+        }
+        assert!(DeadlineMissed.is_terminal());
+        for to in JobState::ALL {
+            assert!(
+                !JobState::can_transition(DeadlineMissed, to),
+                "DeadlineMissed -> {to:?}"
+            );
+        }
+        assert_eq!(DeadlineMissed.as_str(), "deadline_missed");
+        assert_eq!(
+            "deadline_missed".parse::<JobState>().unwrap(),
+            DeadlineMissed
+        );
+        assert_eq!(
+            serde_json::to_string(&DeadlineMissed).unwrap(),
+            "\"deadline_missed\""
+        );
     }
 
     #[test]
@@ -279,7 +321,7 @@ mod tests {
     #[test]
     fn job_state_strings_match_docs_api_md() {
         // docs/api.md, "JobView": one of `draft`, `blocked`, `queued`, `leased`, `running`,
-        // `recovering`, `needs_input`, `done`, `failed`, `cancelled`, `expired`.
+        // `recovering`, `needs_input`, `done`, `failed`, `cancelled`, `expired`, `deadline_missed`.
         let documented = [
             "draft",
             "blocked",
@@ -292,6 +334,7 @@ mod tests {
             "failed",
             "cancelled",
             "expired",
+            "deadline_missed",
         ];
         let actual: Vec<&str> = JobState::ALL.iter().map(|state| state.as_str()).collect();
         assert_eq!(actual, documented);

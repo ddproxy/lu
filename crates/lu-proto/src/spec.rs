@@ -1060,6 +1060,10 @@ pub struct JobSpec {
     /// Optional publish step, run only by an explicit `lu publish` after this job finishes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<PublishSpec>,
+    /// Time and gate constraints that decide when this job may start. Absent means unconstrained.
+    /// Kept last so the canonical JSON of existing specs never moves its other fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<lu_schedule::JobSchedule>,
 }
 
 #[derive(Deserialize)]
@@ -1136,6 +1140,8 @@ struct RawJobSpec {
     cache_dirs: Vec<String>,
     #[serde(default)]
     publish: Option<RawPublishSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    schedule: Option<lu_schedule::JobSchedule>,
 }
 
 impl TryFrom<RawJobSpec> for JobSpec {
@@ -1204,6 +1210,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
             workspace,
             cache_dirs: raw.cache_dirs,
             publish: raw.publish.map(PublishSpec::try_from).transpose()?,
+            schedule: raw.schedule,
         };
         spec.validate()?;
         Ok(spec)
@@ -1316,6 +1323,11 @@ impl JobSpec {
         }
         if let Some(expect) = &self.expect {
             expect.validate()?;
+        }
+        if let Some(schedule) = &self.schedule {
+            schedule
+                .validate("schedule")
+                .map_err(|error| invalid("schedule", error.reason()))?;
         }
         if self.requires.len() > MAX_REQUIRES_LABELS {
             return Err(invalid(
@@ -1590,6 +1602,14 @@ pub struct JobEdit {
     /// Replaces the child repository allowlist. An empty list means the parent repo only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawn_repos: Option<Vec<String>>,
+    /// Replaces the scheduling block. `None` leaves it alone, JSON `null` clears it, and an
+    /// object sets it. The edited spec is validated, so an invalid block is refused.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_schedule_option"
+    )]
+    pub schedule: Option<Option<lu_schedule::JobSchedule>>,
 }
 
 fn deserialize_collect_option<'de, D>(deserializer: D) -> Result<Option<CollectMode>, D::Error>
@@ -1635,6 +1655,42 @@ where
     }
 
     deserializer.deserialize_option(GroupVisitor)
+}
+
+/// Same presence rule as `group`: an absent `schedule` means "no change", a JSON `null` means
+/// "clear the block", and an object means "set the block".
+fn deserialize_schedule_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<lu_schedule::JobSchedule>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ScheduleVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ScheduleVisitor {
+        type Value = Option<Option<lu_schedule::JobSchedule>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a schedule block or null")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            lu_schedule::JobSchedule::deserialize(deserializer).map(|schedule| Some(Some(schedule)))
+        }
+    }
+
+    deserializer.deserialize_option(ScheduleVisitor)
 }
 
 fn deserialize_stuck_policy_option<'de, D>(deserializer: D) -> Result<Option<StuckPolicy>, D::Error>
@@ -1733,6 +1789,9 @@ impl JobEdit {
         }
         if let Some(spawn_repos) = &self.spawn_repos {
             next.spawn_repos = spawn_repos.clone();
+        }
+        if let Some(schedule) = &self.schedule {
+            next.schedule = schedule.clone();
         }
         if next.is_any_provider() {
             if self.model.is_some() || self.fallbacks.as_ref().is_some_and(|f| !f.is_empty()) {
@@ -1984,6 +2043,7 @@ mod tests {
             untrusted_context: false,
             draft: false,
             publish: None,
+            schedule: None,
         }
     }
 
@@ -2672,6 +2732,7 @@ mod tests {
             allow_spawn: Some(true),
             spawn_inherit: Some(true),
             spawn_repos: Some(vec!["https://example.test/other.git".to_owned()]),
+            schedule: None,
         };
         let next = edit.apply(&spec).unwrap();
         assert_eq!(next.provider.as_deref(), Some("new"));
@@ -3022,6 +3083,91 @@ mod tests {
             ..JobEdit::default()
         };
         assert_eq!(edit.apply(&spec).unwrap_err().field, "stuck_after_secs");
+    }
+
+    #[test]
+    fn schedule_round_trips_and_is_omitted_when_absent() {
+        let spec = sample();
+        assert_eq!(spec.schedule, None);
+        assert!(!spec.canonical_json().contains("schedule"));
+
+        let json = r#"{"source":{"repo":"https://example.net/r.git","ref":"main"},"task":"go",
+            "schedule":{"not_before":1700000000,"deadline":1700003600,
+            "on_deadline":"cancel","window":"nightly","fit":"5m"}}"#;
+        let spec: JobSpec = serde_json::from_str(json).unwrap();
+        let schedule = spec.schedule.as_ref().unwrap();
+        assert_eq!(schedule.not_before, Some(1_700_000_000));
+        assert_eq!(schedule.deadline, Some(1_700_003_600));
+        assert_eq!(schedule.on_deadline, lu_schedule::OnDeadline::Cancel);
+        assert_eq!(schedule.window.as_deref(), Some("nightly"));
+        assert_eq!(schedule.fit, lu_schedule::Fit::Seconds(300));
+        assert!(spec.validate().is_ok());
+
+        let canonical = spec.canonical_json();
+        assert!(canonical.contains("\"schedule\":{"), "{canonical}");
+        let parsed: JobSpec = serde_json::from_str(&canonical).unwrap();
+        assert_eq!(parsed, spec);
+        assert_eq!(parsed.canonical_json(), canonical);
+    }
+
+    #[test]
+    fn schedule_rejects_unknown_fields_and_invalid_values() {
+        let prefix = r#"{"source":{"repo":"https://example.net/r.git","ref":"main"},"task":"go","schedule":"#;
+        let error = serde_json::from_str::<JobSpec>(&format!("{prefix}{{\"later\":1}}}}"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown field") || error.contains("later"),
+            "{error}"
+        );
+
+        let error = serde_json::from_str::<JobSpec>(&format!(
+            "{prefix}{{\"deadline\":5,\"not_before\":10}}}}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("schedule"), "{error}");
+        assert_eq!(
+            error_field(&{
+                let mut spec = sample();
+                spec.schedule = Some(lu_schedule::JobSchedule {
+                    not_before: Some(10),
+                    deadline: Some(5),
+                    ..Default::default()
+                });
+                spec
+            }),
+            "schedule"
+        );
+    }
+
+    #[test]
+    fn job_edit_sets_and_clears_the_schedule_block() {
+        let spec = sample();
+        let edit: JobEdit =
+            serde_json::from_str(r#"{"schedule":{"not_before":1700000000}}"#).unwrap();
+        let expected = lu_schedule::JobSchedule {
+            not_before: Some(1_700_000_000),
+            ..Default::default()
+        };
+        assert_eq!(edit.schedule, Some(Some(expected.clone())));
+        let next = edit.apply(&spec).unwrap();
+        assert_eq!(next.schedule, Some(expected));
+
+        let clear: JobEdit = serde_json::from_str(r#"{"schedule":null}"#).unwrap();
+        assert_eq!(clear.schedule, Some(None));
+        assert_eq!(
+            serde_json::to_value(&clear).unwrap()["schedule"],
+            serde_json::Value::Null
+        );
+        assert_eq!(clear.apply(&next).unwrap().schedule, None);
+
+        let no_change: JobEdit = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(no_change.schedule, None);
+        assert_eq!(no_change.apply(&next).unwrap().schedule, next.schedule);
+
+        let invalid: JobEdit = serde_json::from_str(r#"{"schedule":{"not_before":-1}}"#).unwrap();
+        assert_eq!(invalid.apply(&spec).unwrap_err().field, "schedule");
     }
 
     #[test]

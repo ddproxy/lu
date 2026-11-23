@@ -332,8 +332,12 @@ pub async fn poll(
             let node_c = node.clone();
             let lease_ms = state.lease_ms;
             let n2 = now();
-            match tokio::task::spawn_blocking(move || store.next_assignment(&node_c, n2, lease_ms))
-                .await
+            let schedule = state.schedule();
+            match tokio::task::spawn_blocking(move || match &schedule {
+                Some(schedule) => store.next_assignment_scheduled(&node_c, n2, lease_ms, schedule),
+                None => store.next_assignment(&node_c, n2, lease_ms),
+            })
+            .await
             {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => return with_version(store_err(e).into_response()),
@@ -1720,6 +1724,7 @@ mod poll_renewal_tests {
                     expect: None,
                     stack_union_paths: Vec::new(),
                     stack_base_paths: Vec::new(),
+                    schedule: None,
                 },
                 attempt: 1,
                 node: Some(NodeName::parse("node-a").unwrap()),
@@ -1728,6 +1733,7 @@ mod poll_renewal_tests {
                 epoch,
                 created_at: 1,
                 updated_at: 2,
+                eligible_since: 1,
                 started_at: Some(2),
                 finished_at: None,
                 failure_class: None,
@@ -1953,7 +1959,8 @@ mod poll_renewal_tests {
             operators: vec![ControllerOperator {
                 name: "ops".to_owned(),
                 token_sha256: sha256_hex("unused-operator-token"),
-                ..Default::default()
+                schedule: false,
+                ..Default::default(),
             }],
             repos: Vec::new(),
             groups: Vec::new(),
@@ -2010,7 +2017,8 @@ mod poll_renewal_tests {
             operators: vec![ControllerOperator {
                 name: "ops".to_owned(),
                 token_sha256: sha256_hex("unused-operator-token"),
-                ..Default::default()
+                schedule: false,
+                ..Default::default(),
             }],
             repos: Vec::new(),
             groups: Vec::new(),

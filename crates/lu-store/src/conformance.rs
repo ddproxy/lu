@@ -58,6 +58,7 @@ pub fn spec(repo: &str, key: Option<&str>) -> JobSpec {
         publish: None,
         fallbacks: Vec::new(),
         expect: None,
+        schedule: None,
     }
 }
 
@@ -1393,6 +1394,7 @@ fn edit_job_changes_spec_and_dependency_state<S: Store>(s: &S) {
         group: None,
         on_stuck: None,
         stuck_after_secs: None,
+        schedule: None,
         allow_spawn: Some(true),
         spawn_inherit: Some(true),
         spawn_repos: None,

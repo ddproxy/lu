@@ -16,6 +16,7 @@ lu-auth = { path = "../lu-auth" }
 lu-audit = { path = "../lu-audit" }
 lu-config = { path = "../lu-config" }
 lu-proto = { path = "../lu-proto" }
+lu-schedule.workspace = true
 lu-serve = { path = "../lu-serve" }
 lu-staging = { path = "../lu-staging" }
 lu-store = { path = "../lu-store" }

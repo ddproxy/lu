@@ -274,6 +274,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         untrusted_context: false,
         draft: false,
         publish: None,
+        schedule: None,
     };
     let controller = Arc::new(PackController {
         spec,

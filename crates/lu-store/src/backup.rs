@@ -503,6 +503,7 @@ mod tests {
             publish: None,
             fallbacks: Vec::new(),
             expect: None,
+            schedule: None,
         }
     }
 

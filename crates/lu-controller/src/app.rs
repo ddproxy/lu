@@ -1,4 +1,4 @@
-use crate::routes::{agent, health, metrics, operator, scope, stats, status};
+use crate::routes::{agent, health, metrics, operator, schedule, scope, stats, status};
 use crate::state::AppState;
 use crate::time::{background_interval_secs, now};
 use axum::extract::DefaultBodyLimit;
@@ -10,6 +10,7 @@ use axum::Router;
 use lu_serve::with_request_ids;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct ControllerRuntime {
     pub state: Arc<AppState>,
@@ -115,6 +116,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(operator::sync_repo).layer(op_json),
         )
         .route("/v1/nodes", get(operator::list_nodes))
+        .route("/v1/schedule", get(schedule::show))
+        .route("/v1/schedule/calendars", get(schedule::list_calendars))
+        .route("/v1/schedule/calendars/{name}", get(schedule::get_calendar))
+        .route(
+            "/v1/schedule/explain",
+            post(schedule::explain).layer(op_json),
+        )
+        .route("/v1/schedule/reload", post(schedule::reload))
         .route("/v1/nodes/{name}/stats", get(operator::get_node_stats))
         .route(
             "/v1/nodes/{name}/workspaces/clean",
@@ -242,6 +251,33 @@ pub async fn recover_on_boot(state: &Arc<AppState>) -> Result<u64, String> {
 
 pub async fn maintenance_tick(state: &Arc<AppState>) {
     let n = now();
+    if !state.note_wall_tick(n.wall_unix) {
+        tracing::warn!(
+            wall_unix = n.wall_unix,
+            "wall clock moved backwards; leases stay on monotonic time"
+        );
+        state.set_schedule_wake(None);
+    }
+    if let Some(schedule) = state.schedule() {
+        let store = Arc::clone(&state.store);
+        match tokio::task::spawn_blocking(move || store.expire_deadlines(n, &schedule)).await {
+            Ok(Ok(expired)) => {
+                for (id, action) in expired {
+                    state.note_deadline_expired();
+                    state.waiters.notify_job(id.as_ref());
+                    state.record_audit(
+                        lu_audit::Event::DeadlineMissed,
+                        Some(id.as_str()),
+                        None,
+                        action.as_str(),
+                        lu_audit::Data::new().text(lu_audit::Field::Outcome, action.as_str()),
+                    );
+                }
+            }
+            Ok(Err(e)) => tracing::warn!(?e, "expire_deadlines failed"),
+            Err(e) => tracing::warn!(%e, "expire_deadlines task failed"),
+        }
+    }
     let cutoff = n.wall_unix.saturating_sub(state.drafts.ttl_secs as i64);
     let expired_drafts = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
@@ -318,6 +354,29 @@ pub async fn maintenance_tick(state: &Arc<AppState>) {
     if changed {
         state.waiters.notify_work();
     }
+    if let Some(schedule) = state.schedule() {
+        let store = Arc::clone(&state.store);
+        let queued = tokio::task::spawn_blocking(move || {
+            store.list_jobs(Some(lu_proto::JobState::Queued), 10_000, None)
+        })
+        .await;
+        let mut next = schedule.next_change(n.wall_unix);
+        if let Ok(Ok(jobs)) = queued {
+            for job in jobs {
+                let Some(js) = &job.spec.schedule else {
+                    continue;
+                };
+                for at in [js.not_before, js.deadline].into_iter().flatten() {
+                    if at > n.wall_unix {
+                        next = Some(next.map_or(at, |current| current.min(at)));
+                    }
+                }
+            }
+        }
+        state.set_schedule_wake(next);
+    } else {
+        state.set_schedule_wake(None);
+    }
 }
 
 pub async fn run_background(state: Arc<AppState>, shutdown: impl Future<Output = ()>) {
@@ -326,12 +385,22 @@ pub async fn run_background(state: Arc<AppState>, shutdown: impl Future<Output =
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        // Re-arm from the boundary recorded by the last tick. A clock fault clears that value and
+        // the next maintenance tick recomputes it from the corrected wall time.
+        let wake = state
+            .schedule_wake()
+            .map_or(Duration::from_secs(3600), |at| {
+                Duration::from_secs(at.saturating_sub(now().wall_unix).clamp(1, 3600) as u64)
+            });
         tokio::select! {
             _ = &mut shutdown => {
                 state.waiters.begin_shutdown();
                 break;
             }
             _ = ticker.tick() => {
+                maintenance_tick(&state).await;
+            }
+            _ = tokio::time::sleep(wake) => {
                 maintenance_tick(&state).await;
             }
         }

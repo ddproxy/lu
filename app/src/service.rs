@@ -33,6 +33,8 @@ pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
     if let Some(publish) = config.publish.clone() {
         state.set_publish(publish);
     }
+    state.set_config_path(config_path);
+    state.set_schedule(config.schedule().cloned());
     let audit_task = match &config.audit {
         Some(audit) => {
             let (writer, task) = lu_audit::Writer::open(
