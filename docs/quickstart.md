@@ -119,7 +119,7 @@ done
 Expected health response and node row; times and version vary:
 
 ```text
-{"db":"ok","ok":true,"version":"0.6.1"}
+{"db":"ok","ok":true,"version":"0.7.0"}
 NAME    VERSION  HARNESS  LABELS  CORDONS  LAST_SEEN             DRAINED
 node-a  0.5.1    idle     -       -        2026-11-21 14:22:00Z  no
 ```

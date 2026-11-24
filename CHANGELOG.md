@@ -5,6 +5,8 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.7.0]
+
 ### Added
 - `lu top` now uses the shared fw-tui table widget for node and job data. Columns are
   sortable with `s`, `S`, `r`, and header clicks, and the active sort is indicated in
