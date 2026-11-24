@@ -38,7 +38,7 @@ does not, so a binary cannot report a version other than its tag.
 ### Dev builds
 
 After CI passes on `main`, the `dev-release` workflow tags the commit `vX.Y.(Z+1)-dev.<N>.g<hash>`
-and builds it through the same release workflow. X.Y.Z is the latest stable tag and N is the number
+and dispatches the release workflow on that tag, so its attestation identity is `release.yml@refs/tags/<tag>` and `tuishou verify` accepts it. X.Y.Z is the latest stable tag and N is the number
 of commits since it, so dev builds order by N and rank below the stable release of the same
 version. They are GitHub pre-releases (never "latest"), carry the same attestation, report their
 dev version from `lu --version`, and only the newest ten are kept. Documentation-only changes do
