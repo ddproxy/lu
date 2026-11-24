@@ -16,8 +16,9 @@ use serde::Deserialize;
 
 use crate::{read_config_text, validate_abs_no_dotdot, ConfigError};
 
-const SCHEDULE_KEYS: [&str; 8] = [
+const SCHEDULE_KEYS: [&str; 9] = [
     "file",
+    "min_disk_free_pct",
     "horizon_secs",
     "step_budget",
     "staging_secs",
@@ -44,6 +45,8 @@ const TUNING_KEYS: [&str; 5] = [
 pub struct ScheduleConfig {
     /// Absolute path of another TOML document with the same top-level shape.
     pub file: Option<String>,
+    /// Minimum free work-filesystem space before a node may take work; zero disables the gate.
+    pub min_disk_free_pct: Option<u8>,
     pub horizon_secs: Option<i64>,
     pub step_budget: Option<usize>,
     pub staging_secs: Option<i64>,
@@ -332,6 +335,20 @@ fn optional_str(table: &toml::Table, field: &str, owner: &str) -> Result<(), Con
 }
 
 fn validate_tuning(table: &toml::Table) -> Result<(), ConfigError> {
+    if let Some(value) = table.get("min_disk_free_pct") {
+        let number = value.as_integer().ok_or_else(|| {
+            invalid(
+                "[schedule]",
+                "min_disk_free_pct must be an integer".to_string(),
+            )
+        })?;
+        if !(0..=100).contains(&number) {
+            return Err(invalid(
+                "[schedule]",
+                format!("min_disk_free_pct must be 0 to 100 (got {number})"),
+            ));
+        }
+    }
     for field in TUNING_KEYS {
         let Some(value) = table.get(field) else {
             continue;

@@ -1097,6 +1097,14 @@ impl Config {
         self.schedule_built.as_ref()
     }
 
+    /// Minimum free work-filesystem percentage required for dispatch. Zero disables the gate.
+    pub fn min_disk_free_pct(&self) -> u8 {
+        self.schedule
+            .as_ref()
+            .and_then(|schedule| schedule.min_disk_free_pct)
+            .unwrap_or(lu_proto::DEFAULT_MIN_DISK_FREE_PCT)
+    }
+
     fn parse_structure(text: &str) -> Result<Self, ConfigError> {
         let value: toml::Value =
             toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;

@@ -72,6 +72,7 @@ calendar gates. Unknown keys are rejected everywhere.
 | `staging_secs` | `300` | Non-negative integer. Staging allowance used by `fit`. |
 | `finish_secs` | `60` | Non-negative integer. Finish allowance used by `fit`. |
 | `starvation_secs` | `3600` | Positive integer. Age at which a job outranks all static priorities. |
+| `min_disk_free_pct` | `8` | Integer `0` to `100`. Minimum free work-filesystem percentage for dispatch; `0` disables the check. Read at controller start; `POST /v1/schedule/reload` does not change it. |
 | `calendars` | `[]` | Nested `[[schedule.calendars]]` alias. |
 | `attachments` | `[]` | Nested `[[schedule.attachments]]` alias. |
 
@@ -142,6 +143,7 @@ step_budget = 50000
 staging_secs = 300
 finish_secs = 60
 starvation_secs = 3600
+min_disk_free_pct = 8
 
 [[calendar]]
 name = "nightly"

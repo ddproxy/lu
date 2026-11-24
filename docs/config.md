@@ -99,6 +99,7 @@ and `[[attach]]` (`[[attachments]]`) tables, or nested `[[schedule.calendars]]` 
 | `staging_secs` | no | `300` | Non-negative integer; staging allowance for `fit`. |
 | `finish_secs` | no | `60` | Non-negative integer; finish allowance for `fit`. |
 | `starvation_secs` | no | `3600` | Positive integer; age at which a job outranks all static priorities. |
+| `min_disk_free_pct` | no | `8` | Integer `0` to `100`; minimum free work-filesystem percentage for dispatch. `0` disables the disk check. |
 | `calendars` | no | `[]` | Nested `[[schedule.calendars]]` alias. |
 | `attachments` | no | `[]` | Nested `[[schedule.attachments]]` alias. |
 

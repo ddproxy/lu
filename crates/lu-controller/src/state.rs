@@ -9,7 +9,7 @@ use lu_auth::{LoginThrottle, ThrottleSettings};
 use lu_config::{ArtifactsConfig, ControllerConfig, ScopeConfig};
 use lu_proto::{valid_group, JobId, NodeName, NodeStats, StuckPolicy, MAX_GROUP_RUNNING};
 use lu_staging::ArtifactDir;
-use lu_store::Store;
+use lu_store::{DispatchLimits, Store};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,6 +140,8 @@ pub struct AppState {
     pub lease_ms: u64,
     pub recovery_grace_ms: u64,
     pub cordon_ms: u64,
+    /// Node health gates applied atomically at dispatch.
+    dispatch_limits: DispatchLimits,
     /// How long a dependent blocked on a failed predecessor waits before it expires.
     pub blocked_dependent_ttl_secs: u64,
     /// Configured group caps, also installed in the store so dispatch enforces them atomically.
@@ -309,6 +311,7 @@ impl AppState {
             lease_ms: lease_secs.saturating_mul(1000),
             recovery_grace_ms: cfg.recovery_grace_secs.saturating_mul(1000),
             cordon_ms: cfg.provider_cooldown_secs.saturating_mul(1000),
+            dispatch_limits: DispatchLimits::default(),
             blocked_dependent_ttl_secs: cfg.blocked_dependent_ttl_secs(),
             group_limits: Mutex::new(group_limits),
             scope: scope.copied().unwrap_or_default(),
@@ -334,6 +337,16 @@ impl AppState {
             schedule_reloads: AtomicU64::new(0),
             config_path: OnceLock::new(),
         })
+    }
+
+    /// Current node health gates used by dispatch and waiting reasons.
+    pub fn dispatch_limits(&self) -> DispatchLimits {
+        self.dispatch_limits
+    }
+
+    /// Installs the node health gates from configuration.
+    pub fn set_dispatch_limits(&mut self, limits: DispatchLimits) {
+        self.dispatch_limits = limits;
     }
 
     /// Records the controller config path so a reload can revalidate the schedule document.

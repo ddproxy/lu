@@ -1524,6 +1524,7 @@ struct DispatchSnapshot {
 fn dispatch_node(
     tx: &rusqlite::Transaction<'_>,
     node: &NodeName,
+    limits: &crate::DispatchLimits,
 ) -> Result<Option<Heartbeat>, StoreError> {
     let row: Option<(String, i64)> = tx
         .query_row(
@@ -1541,6 +1542,9 @@ fn dispatch_node(
     }
     let hb: Heartbeat = serde_json::from_str(&json).map_err(internal)?;
     if !matches!(hb.harness, lu_proto::HarnessState::Idle) {
+        return Ok(None);
+    }
+    if crate::heartbeat_health_reason(node, &hb, limits).is_some() {
         return Ok(None);
     }
     let held: Option<i64> = tx
@@ -1666,12 +1670,13 @@ fn dispatch_snapshot(
     node: &NodeName,
     now: Now,
     schedule: &lu_schedule::Schedule,
+    limits: &crate::DispatchLimits,
 ) -> Result<Option<DispatchSnapshot>, StoreError> {
     let mut conn = store.conn.lock().map_err(|_| internal("mutex poisoned"))?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(internal)?;
-    let hb = match dispatch_node(&tx, node)? {
+    let hb = match dispatch_node(&tx, node, limits)? {
         Some(hb) => hb,
         None => {
             tx.commit().map_err(internal)?;
@@ -1776,6 +1781,7 @@ struct DispatchPoll<'a> {
     now: Now,
     lease_ms: u64,
     schedule: &'a lu_schedule::Schedule,
+    limits: &'a crate::DispatchLimits,
     snapshot: &'a DispatchSnapshot,
 }
 
@@ -1791,6 +1797,7 @@ fn commit_dispatch(
         now,
         lease_ms,
         schedule,
+        limits,
         snapshot,
     } = poll;
     let (provider, model) = choice;
@@ -1798,7 +1805,7 @@ fn commit_dispatch(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(internal)?;
-    if dispatch_node(&tx, node)?.is_none() {
+    if dispatch_node(&tx, node, limits)?.is_none() {
         tx.commit().map_err(internal)?;
         return Ok(None);
     }
@@ -2760,7 +2767,23 @@ impl Store for SqliteStore {
         now: Now,
         lease_ms: u64,
     ) -> Result<Option<Assignment>, StoreError> {
-        self.next_assignment_scheduled(node, now, lease_ms, &lu_schedule::Schedule::default())
+        self.next_assignment_with_limits(node, now, lease_ms, crate::DispatchLimits::default())
+    }
+
+    fn next_assignment_with_limits(
+        &self,
+        node: &NodeName,
+        now: Now,
+        lease_ms: u64,
+        limits: crate::DispatchLimits,
+    ) -> Result<Option<Assignment>, StoreError> {
+        self.next_assignment_scheduled_with_limits(
+            node,
+            now,
+            lease_ms,
+            &lu_schedule::Schedule::default(),
+            limits,
+        )
     }
 
     fn next_assignment_scheduled(
@@ -2770,11 +2793,28 @@ impl Store for SqliteStore {
         lease_ms: u64,
         schedule: &lu_schedule::Schedule,
     ) -> Result<Option<Assignment>, StoreError> {
+        self.next_assignment_scheduled_with_limits(
+            node,
+            now,
+            lease_ms,
+            schedule,
+            crate::DispatchLimits::default(),
+        )
+    }
+
+    fn next_assignment_scheduled_with_limits(
+        &self,
+        node: &NodeName,
+        now: Now,
+        lease_ms: u64,
+        schedule: &lu_schedule::Schedule,
+        limits: crate::DispatchLimits,
+    ) -> Result<Option<Assignment>, StoreError> {
         // Phase 1: a short read/write transaction collects the cheap checks and a snapshot of
         // candidates. Calendar evaluation happens with no write lock held. A second short
         // transaction re-checks the node and the chosen job before the lease is written, so a
         // concurrent poll cannot take the same job or the last group slot.
-        let snapshot = match dispatch_snapshot(self, node, now, schedule)? {
+        let snapshot = match dispatch_snapshot(self, node, now, schedule, &limits)? {
             Some(snapshot) => snapshot,
             None => return Ok(None),
         };
@@ -2783,6 +2823,7 @@ impl Store for SqliteStore {
             now,
             lease_ms,
             schedule,
+            limits: &limits,
             snapshot: &snapshot,
         };
         for candidate in &snapshot.candidates {

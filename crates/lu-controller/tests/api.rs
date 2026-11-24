@@ -114,15 +114,35 @@ async fn start_server_full(
     pack_cap: Option<usize>,
     repos: Vec<ControllerRepo>,
 ) -> TestServer {
-    start_server_inner(roots, pack_cap, repos, None, None).await
+    start_server_inner(roots, pack_cap, repos, None, None, None).await
 }
 
 async fn start_server_with_artifacts(artifacts: Option<ArtifactsConfig>) -> TestServer {
-    start_server_inner(Vec::new(), None, Vec::new(), artifacts, None).await
+    start_server_inner(Vec::new(), None, Vec::new(), artifacts, None, None).await
 }
 
 async fn start_server_with_read_budget(read_per_minute: usize) -> TestServer {
-    start_server_inner(Vec::new(), None, Vec::new(), None, Some(read_per_minute)).await
+    start_server_inner(
+        Vec::new(),
+        None,
+        Vec::new(),
+        None,
+        Some(read_per_minute),
+        None,
+    )
+    .await
+}
+
+async fn start_server_with_disk_limit(min_disk_free_pct: u8) -> TestServer {
+    start_server_inner(
+        Vec::new(),
+        None,
+        Vec::new(),
+        None,
+        None,
+        Some(min_disk_free_pct),
+    )
+    .await
 }
 
 async fn start_server_inner(
@@ -131,6 +151,7 @@ async fn start_server_inner(
     repos: Vec<ControllerRepo>,
     artifacts: Option<ArtifactsConfig>,
     read_per_minute: Option<usize>,
+    min_disk_free_pct: Option<u8>,
 ) -> TestServer {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("lu.db");
@@ -144,6 +165,9 @@ async fn start_server_inner(
     let store = Arc::new(SqliteStore::open(&db).unwrap());
     let mut state =
         AppState::from_config_with_artifacts(&cfg, store.clone(), artifacts.as_ref()).unwrap();
+    if let Some(min_disk_free_pct) = min_disk_free_pct {
+        state.set_dispatch_limits(lu_store::DispatchLimits { min_disk_free_pct });
+    }
     state.max_pack_bytes = pack_cap.unwrap_or(lu_staging::PACK_CAP_BYTES);
     let state = Arc::new(state);
     recover_on_boot(&state).await.unwrap();
@@ -905,6 +929,124 @@ async fn list_jobs_by_key_returns_zero_or_one_job() {
 
 fn heartbeat_json(node: &str) -> serde_json::Value {
     json!({"node": node, "harness": "idle", "providers": []})
+}
+
+async fn submit_and_id(srv: &TestServer) -> String {
+    let r = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&r), 201, "{r}");
+    serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+async fn job_view(srv: &TestServer, id: &str) -> serde_json::Value {
+    let r = raw_request(
+        srv.addr,
+        &format!(
+            "GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status(&r), 200, "{r}");
+    serde_json::from_str(body_str(&r)).unwrap()
+}
+
+fn has_assign(events: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(events)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["kind"] == "assign")
+}
+
+#[tokio::test]
+async fn unhealthy_nodes_are_reported_and_block_dispatch_until_recovery() {
+    let srv = start_server().await;
+    let id = submit_and_id(&srv).await;
+    let sick = json!({
+        "node": "node-a", "harness": "idle", "providers": [],
+        "harness_ok": false, "disk_free_pct": 50
+    });
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &sick).await;
+    assert_eq!(status(&r), 204, "{r}");
+
+    let view = job_view(&srv, &id).await;
+    assert_eq!(view["state"], "queued");
+    assert_eq!(view["waiting_reason"], "harness unhealthy on node node-a");
+    assert_eq!(view["blocked_reason"], "harness unhealthy on node node-a");
+
+    let r = raw_request(
+        srv.addr,
+        &format!(
+            "GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"
+        ),
+    )
+    .await;
+    let nodes: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(nodes[0]["harness_ok"], false);
+    assert_eq!(nodes[0]["disk_free_pct"], 50);
+
+    let r = raw_request(
+        srv.addr,
+        &format!(
+            "GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"
+        ),
+    )
+    .await;
+    let metrics = body_str(&r);
+    assert!(
+        metrics.contains("lu_node_harness_ok{node=\"node-a\"} 0"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("lu_node_disk_free_pct{node=\"node-a\"} 50"),
+        "{metrics}"
+    );
+
+    let low_disk = json!({
+        "node": "node-a", "harness": "idle", "providers": [],
+        "harness_ok": true, "disk_free_pct": 7
+    });
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &low_disk).await;
+    assert_eq!(status(&r), 204, "{r}");
+    let view = job_view(&srv, &id).await;
+    assert_eq!(view["waiting_reason"], "node node-a disk free 7% below 8");
+    assert_eq!(view["blocked_reason"], "node node-a disk free 7% below 8");
+
+    let recovered = json!({
+        "node": "node-a", "harness": "idle", "providers": [],
+        "harness_ok": true, "disk_free_pct": 9
+    });
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &recovered).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert!(has_assign(body_str(&r)), "{}", body_str(&r));
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn older_agents_without_health_fields_stay_eligible() {
+    let srv = start_server().await;
+    let _id = submit_and_id(&srv).await;
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert!(has_assign(body_str(&r)), "{}", body_str(&r));
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn a_zero_disk_threshold_disables_the_disk_gate() {
+    let srv = start_server_with_disk_limit(0).await;
+    let _id = submit_and_id(&srv).await;
+    let hb = json!({
+        "node": "node-a", "harness": "idle", "providers": [],
+        "harness_ok": true, "disk_free_pct": 0
+    });
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &hb).await;
+    assert_eq!(status(&r), 200, "{r}");
+    assert!(has_assign(body_str(&r)), "{}", body_str(&r));
+    let _ = srv.shutdown.send(());
 }
 
 async fn poll_with(addr: SocketAddr, token: &str, hb: &serde_json::Value) -> String {
@@ -2246,6 +2388,11 @@ async fn metrics_series_after_job_lifecycle() {
     );
     assert!(
         b.contains("lu_node_disk_free_percent{node=\"node-a\"} 25"),
+        "{b}"
+    );
+    assert!(b.contains("lu_node_harness_ok{node=\"node-a\"} 1"), "{b}");
+    assert!(
+        b.contains("lu_node_disk_free_pct{node=\"node-a\"} 100"),
         "{b}"
     );
     assert!(

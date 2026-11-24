@@ -198,6 +198,12 @@ pub struct NodeView {
     pub drain_origin: Option<String>,
     #[serde(default)]
     pub harness: Option<HarnessState>,
+    /// False when the latest heartbeat reports a broken harness; absent on older agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_ok: Option<bool>,
+    /// Free work-filesystem percentage from the latest heartbeat, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_pct: Option<u8>,
     #[serde(default)]
     pub providers: Vec<ProviderStatus>,
     /// Healthy provider/model pairs offered for `provider = "any"` jobs.
@@ -294,6 +300,8 @@ impl NodeView {
             draining,
             drain_origin: draining.then(|| "operator".to_owned()),
             harness: None,
+            harness_ok: None,
+            disk_free_pct: None,
             providers: Vec::new(),
             provider_models: Vec::new(),
             labels: Vec::new(),

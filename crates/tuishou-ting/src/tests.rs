@@ -12,7 +12,7 @@ use lu_client::{ApiError, Controller, DependencyView, PollRequest};
 use lu_config::{BaseSource, StackConfig};
 use lu_proto::{
     AgentEvent, ArtifactName, Completion, ExpectMode, ExpectSpec, FailureClass, HarnessState,
-    JobId, JobSpec, JobState, LogChunk, NodeName, OnConflict, Outcome, StuckPolicy,
+    HostStats, JobId, JobSpec, JobState, LogChunk, NodeName, OnConflict, Outcome, StuckPolicy,
     WorkspacePolicy, WorkspaceState, HARNESS_OK_FALSE, MAX_LOG_BYTES,
 };
 use lu_staging::{ExportedDiff, StackPolicy, Staging};
@@ -22,9 +22,9 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 
 use super::{
-    dependency_conflict_summary, evaluate_expect, housekeeping, workspaces::FsDeleter,
-    workspaces::RealClock, workspaces::Registry, workspaces::Settings, Agent, AgentError,
-    ConflictContext,
+    dependency_conflict_summary, disk_free_pct, evaluate_expect, housekeeping,
+    workspaces::FsDeleter, workspaces::RealClock, workspaces::Registry, workspaces::Settings,
+    Agent, AgentError, ConflictContext,
 };
 
 const TEST_HEARTBEAT_SECS: u64 = 5;
@@ -3613,4 +3613,23 @@ fn conflict_summary_reports_files_hunks_movement_and_covering_globs() {
         no_policy.contains("base globs covering conflicts: none"),
         "{no_policy}"
     );
+}
+
+#[test]
+fn disk_percentage_uses_work_filesystem_totals() {
+    let host = |free, total| HostStats {
+        load1: 0.0,
+        load5: 0.0,
+        load15: 0.0,
+        mem_total_kb: 0,
+        mem_available_kb: 0,
+        swap_used_kb: 0,
+        disk_free_bytes: Some(free),
+        disk_total_bytes: Some(total),
+        uptime_secs: 0,
+    };
+    assert_eq!(disk_free_pct(None), None);
+    assert_eq!(disk_free_pct(Some(&host(10, 0))), None);
+    assert_eq!(disk_free_pct(Some(&host(1, 4))), Some(25));
+    assert_eq!(disk_free_pct(Some(&host(u64::MAX, 1))), Some(100));
 }

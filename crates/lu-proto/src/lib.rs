@@ -39,7 +39,7 @@ pub use limits::{
 pub use node::{
     valid_provider_name, HarnessState, Heartbeat, HeartbeatError, HostStats, JobStats, NodeStats,
     ParseHarnessStateError, ParseProviderStateError, ProcessStats, ProviderModel, ProviderState,
-    ProviderStatus, WorkspaceState,
+    ProviderStatus, WorkspaceState, DEFAULT_MIN_DISK_FREE_PCT,
 };
 pub use publish::{PublishGateRecord, PublishRecord};
 pub use sanitize::{printable, truncate_chars};

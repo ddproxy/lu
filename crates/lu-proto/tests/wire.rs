@@ -127,6 +127,8 @@ fn a_heartbeat_carries_a_capped_forwarded_document() {
         provider_models: Vec::new(),
         reiki: Some(serde_json::json!({"providers": ["peer-a"]})),
         host: None,
+        harness_ok: Some(false),
+        disk_free_pct: Some(7),
         jobs: Vec::new(),
         labels: vec!["gpu".to_owned()],
         label_sources: std::collections::BTreeMap::new(),
@@ -141,6 +143,32 @@ fn a_heartbeat_carries_a_capped_forwarded_document() {
     beat.validate().unwrap();
     let wire = serde_json::to_string(&beat).unwrap();
     assert_eq!(serde_json::from_str::<Heartbeat>(&wire).unwrap(), beat);
+}
+
+#[test]
+fn heartbeat_health_fields_are_optional_and_lenient() {
+    let bare = serde_json::json!({"node": "peer-a", "harness": "idle", "future_field": 1});
+    let beat: Heartbeat = serde_json::from_value(bare).unwrap();
+    assert_eq!(beat.harness_ok, None);
+    assert_eq!(beat.disk_free_pct, None);
+
+    let full = serde_json::json!({
+        "node": "peer-a", "harness": "idle", "harness_ok": false, "disk_free_pct": 3
+    });
+    let beat: Heartbeat = serde_json::from_value(full).unwrap();
+    assert_eq!(beat.harness_ok, Some(false));
+    assert_eq!(beat.disk_free_pct, Some(3));
+    let wire = serde_json::to_value(&beat).unwrap();
+    assert_eq!(wire["harness_ok"], false);
+    assert_eq!(wire["disk_free_pct"], 3);
+    let older: Heartbeat = serde_json::from_str(r#"{"node":"peer-a","harness":"idle"}"#).unwrap();
+    assert!(older.harness_ok.is_none());
+
+    let bad = serde_json::json!({
+        "node": "peer-a", "harness": "idle", "disk_free_pct": 101
+    });
+    let error = serde_json::from_value::<Heartbeat>(bad).unwrap_err();
+    assert!(error.to_string().contains("0 to 100"), "{error}");
 }
 
 #[test]
@@ -303,6 +331,8 @@ fn job_and_node_views_match_the_documented_json() {
         draining: false,
         drain_origin: None,
         harness: Some(HarnessState::Idle),
+        harness_ok: Some(true),
+        disk_free_pct: Some(21),
         providers: vec![ProviderStatus {
             name: "peer-b".to_owned(),
             state: ProviderState::Ok,
@@ -359,6 +389,8 @@ fn job_and_node_views_match_the_documented_json() {
         "online": true,
         "draining": false,
         "harness": "idle",
+        "harness_ok": true,
+        "disk_free_pct": 21,
         "providers": [{"name": "peer-b", "state": "ok"}],
         "provider_models": [{"provider": "peer-b", "model": "other-model"}],
         "labels": ["gpu"],
@@ -537,4 +569,24 @@ fn deadline_missed_transitions_are_wired() {
         serde_json::to_string(&JobState::DeadlineMissed).unwrap(),
         "\"deadline_missed\""
     );
+}
+
+#[test]
+fn heartbeat_rejects_malformed_disk_free_pct_without_panicking() {
+    for bad in [
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!("12"),
+        serde_json::json!(null).clone(),
+    ] {
+        let value = serde_json::json!({"node": "peer-a", "harness": "idle", "disk_free_pct": bad});
+        let parsed = serde_json::from_value::<Heartbeat>(value);
+        if bad.is_null() {
+            assert_eq!(parsed.unwrap().disk_free_pct, None);
+        } else {
+            assert!(parsed.is_err(), "{bad}");
+        }
+    }
+    let nan = r#"{"node":"peer-a","harness":"idle","disk_free_pct":NaN}"#;
+    assert!(serde_json::from_str::<Heartbeat>(nan).is_err());
 }
