@@ -12,6 +12,8 @@ pub enum ErrorCode {
     Unprocessable,
     Conflict,
     StaleEpoch,
+    Precondition,
+    IdempotencyConflict,
     TooLarge,
     RateLimited,
     LimitExceeded,
@@ -28,6 +30,8 @@ impl ErrorCode {
             Self::Unprocessable => "unprocessable",
             Self::Conflict => "conflict",
             Self::StaleEpoch => "stale_epoch",
+            Self::Precondition => "precondition_failed",
+            Self::IdempotencyConflict => "idempotency_conflict",
             Self::TooLarge => "too_large",
             Self::RateLimited => "rate_limited",
             Self::LimitExceeded => "limit_exceeded",
@@ -44,6 +48,8 @@ impl ErrorCode {
             Self::Unprocessable => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Conflict => StatusCode::CONFLICT,
             Self::StaleEpoch => StatusCode::CONFLICT,
+            Self::Precondition => StatusCode::PRECONDITION_FAILED,
+            Self::IdempotencyConflict => StatusCode::UNPROCESSABLE_ENTITY,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::LimitExceeded => StatusCode::TOO_MANY_REQUESTS,
@@ -97,6 +103,15 @@ impl ApiError {
     }
     pub fn stale_epoch() -> Self {
         Self::new(ErrorCode::StaleEpoch, "stale epoch")
+    }
+    pub fn precondition(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Precondition, msg)
+    }
+    pub fn idempotency_conflict() -> Self {
+        Self::new(
+            ErrorCode::IdempotencyConflict,
+            "idempotency key already used for a different request",
+        )
     }
     pub fn too_large(msg: impl Into<String>) -> Self {
         Self::new(ErrorCode::TooLarge, msg)

@@ -154,6 +154,7 @@ pub fn store_err(e: lu_store::StoreError) -> ApiError {
             err
         }
         StoreError::StaleEpoch => ApiError::stale_epoch(),
+        StoreError::Precondition => ApiError::precondition("precondition failed"),
         StoreError::InvalidDependency(id) => {
             ApiError::unprocessable(format!("unknown dependency {id}"))
         }
@@ -175,6 +176,7 @@ pub async fn cancel_job_with_descendants(
     id: &lu_proto::JobId,
     keep_children: bool,
     keep_dependents: bool,
+    expected_updated_at: Option<i64>,
 ) -> Result<Vec<lu_proto::JobId>, ApiError> {
     let store = std::sync::Arc::clone(&state.store);
     let mut targets = vec![id.clone()];
@@ -233,14 +235,26 @@ pub async fn cancel_job_with_descendants(
             Err(_) => return Err(ApiError::internal()),
         }
     }
+    let guarded_id = id.clone();
     let result = tokio::task::spawn_blocking(move || {
         let mut changed = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for target in targets {
-            match store.cancel_job_with_dependents(&target, crate::time::now(), keep_dependents) {
+            let expected = if target == guarded_id {
+                expected_updated_at
+            } else {
+                None
+            };
+            match store.cancel_job_with_dependents(
+                &target,
+                crate::time::now(),
+                keep_dependents,
+                expected,
+            ) {
                 Ok(_) if seen.insert(target.clone()) => changed.push(target),
                 Ok(_) => {}
                 Err(lu_store::StoreError::Conflict { .. }) => {}
+                Err(lu_store::StoreError::Precondition) => {}
                 Err(error) => return Err(error),
             }
         }

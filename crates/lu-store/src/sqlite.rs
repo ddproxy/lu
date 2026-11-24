@@ -16,8 +16,8 @@ use lu_proto::{
 };
 
 use crate::{
-    Assignment, Cordon, CordonSource, JobCounts, JobRecord, NodeRecord, Now, ScopeLimits, Store,
-    StoreError,
+    Assignment, Cordon, CordonSource, JobCounts, JobRecord, NodeRecord, Now, RequestKeyReservation,
+    ScopeLimits, Store, StoreError,
 };
 
 const CURRENT_SCHEMA_VERSION: i64 = crate::SCHEMA_VERSION;
@@ -246,7 +246,7 @@ impl SqliteStore {
             // Schemas 1 through 4 add additive job columns. Fill them with zero/false/NULL so
             // older jobs keep their history and views stay compatible. Each column is checked
             // because a database briefly opened by a newer binary may already have some of them.
-            Some(1) | Some(2) | Some(3) | Some(4) | Some(5) => {
+            Some(1) | Some(2) | Some(3) | Some(4) | Some(5) | Some(6) => {
                 for (name, ddl) in [
                     (
                         "scrubbed_hits",
@@ -296,6 +296,8 @@ impl SqliteStore {
                     [],
                 )
                 .map_err(internal)?;
+                // Additive table for HTTP request keys. Existing rows are untouched.
+                ensure_request_keys(&tx)?;
                 tx.execute(
                     "UPDATE schema_version SET version = ?1",
                     params![CURRENT_SCHEMA_VERSION],
@@ -319,6 +321,25 @@ impl SqliteStore {
             }
         }
     }
+}
+
+/// Creates the HTTP request-key table for databases written before schema 7. No existing row is
+/// changed, so this is additive and safe to re-run.
+fn ensure_request_keys(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS request_keys (
+            operator TEXT NOT NULL,
+            key TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            status INTEGER NOT NULL,
+            response TEXT,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (operator, key)
+        );",
+    )
+    .map_err(internal)
 }
 
 /// True when `jobs` already has `name`. Used by the v1-v3 migrations so a partially upgraded
@@ -393,6 +414,19 @@ fn apply_baseline(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
             key TEXT PRIMARY KEY,
             spec_hash TEXT NOT NULL,
             job_id TEXT NOT NULL
+        );
+        -- HTTP request keys, distinct from job-spec `idempotency`. One row per
+        -- (operator, key) with a bound operation/body fingerprint and expiring stored response.
+        CREATE TABLE request_keys (
+            operator TEXT NOT NULL,
+            key TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            status INTEGER NOT NULL,
+            response TEXT,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (operator, key)
         );
         CREATE TABLE job_deps (
             job TEXT NOT NULL,
@@ -813,6 +847,32 @@ fn depends_on(
     Ok(false)
 }
 
+/// Checks an `If-Match` observation inside the caller's write transaction. The controller derives
+/// the expected value from the same body hash a GET returns; `updated_at` is the row version
+/// observed with that body. The check and the write share one transaction here.
+fn check_expected_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    expected: Option<i64>,
+) -> Result<(), StoreError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let current: Option<i64> = tx
+        .query_row(
+            "SELECT updated_at FROM jobs WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(internal)?;
+    if current != Some(expected) {
+        Err(StoreError::Precondition)
+    } else {
+        Ok(())
+    }
+}
+
 fn get_job_tx(
     tx: &rusqlite::Transaction<'_>,
     id: &str,
@@ -1222,6 +1282,7 @@ impl SqliteStore {
         lineage: Option<(&JobId, &JobId, u32)>,
         max_children: u64,
         max_descendants: u64,
+        require_absent: bool,
     ) -> Result<(JobRecord, bool), StoreError> {
         spec.validate()
             .map_err(|e| StoreError::InvalidSpec(e.to_string()))?;
@@ -1240,6 +1301,9 @@ impl SqliteStore {
                 .optional()
                 .map_err(internal)?;
             if let Some((hash, job_id)) = existing {
+                if require_absent {
+                    return Err(StoreError::Precondition);
+                }
                 if hash == canonical {
                     let (rec, _, _) = get_job_tx(&tx, &job_id)?;
                     tx.commit().map_err(internal)?;
@@ -1821,9 +1885,111 @@ fn commit_dispatch(
     }))
 }
 
+fn wall_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 impl Store for SqliteStore {
+    fn reserve_request_key(
+        &self,
+        operator: &str,
+        key: &str,
+        operation: &str,
+        fingerprint: &str,
+        ttl_secs: u64,
+    ) -> Result<RequestKeyReservation, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let now = wall_secs();
+        // An expired key frees the slot; a completed key with the same fingerprint replays.
+        tx.execute(
+            "DELETE FROM request_keys WHERE operator=?1 AND key=?2 AND expires_at<=?3",
+            params![operator, key, now],
+        )
+        .map_err(internal)?;
+        let existing: Option<(String, String, i64, Option<String>)> = tx
+            .query_row(
+                "SELECT operation,fingerprint,status,response FROM request_keys
+                 WHERE operator=?1 AND key=?2",
+                params![operator, key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        let result = match existing {
+            Some((op, fp, status, response))
+                if op == operation && fp == fingerprint && status == 1 =>
+            {
+                RequestKeyReservation::Replayed(response.unwrap_or_else(|| "null".to_owned()))
+            }
+            Some(_) => return Err(StoreError::Conflict { length: None }),
+            None => {
+                tx.execute(
+                    "INSERT INTO request_keys(operator,key,operation,fingerprint,status,response,created_at,expires_at)
+                     VALUES (?1,?2,?3,?4,0,NULL,?5,?6)",
+                    params![
+                        operator,
+                        key,
+                        operation,
+                        fingerprint,
+                        now,
+                        now.saturating_add(i64::try_from(ttl_secs).unwrap_or(i64::MAX))
+                    ],
+                )
+                .map_err(internal)?;
+                RequestKeyReservation::Reserved
+            }
+        };
+        tx.commit().map_err(internal)?;
+        Ok(result)
+    }
+
+    fn complete_request_key(
+        &self,
+        operator: &str,
+        key: &str,
+        response: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let body = serde_json::to_string(response).map_err(internal)?;
+        self.conn
+            .lock()
+            .map_err(|_| internal("mutex poisoned"))?
+            .execute(
+                "UPDATE request_keys SET status=1, response=?3
+                 WHERE operator=?1 AND key=?2",
+                params![operator, key, body],
+            )
+            .map_err(internal)?;
+        Ok(())
+    }
+
+    fn release_request_key(&self, operator: &str, key: &str) -> Result<(), StoreError> {
+        self.conn
+            .lock()
+            .map_err(|_| internal("mutex poisoned"))?
+            .execute(
+                "DELETE FROM request_keys WHERE operator=?1 AND key=?2",
+                params![operator, key],
+            )
+            .map_err(internal)?;
+        Ok(())
+    }
+
     fn create_job(&self, spec: &JobSpec, now: Now) -> Result<(JobRecord, bool), StoreError> {
-        self.create_job_inner(spec, now, None, 0, 0)
+        self.create_job_inner(spec, now, None, 0, 0, false)
+    }
+
+    fn create_job_if_absent(
+        &self,
+        spec: &JobSpec,
+        now: Now,
+    ) -> Result<(JobRecord, bool), StoreError> {
+        self.create_job_inner(spec, now, None, 0, 0, true)
     }
 
     fn create_draft_job(
@@ -1929,6 +2095,7 @@ impl Store for SqliteStore {
             Some((parent_job_id, root_job_id, depth)),
             limits.max_children,
             limits.max_descendants,
+            false,
         )
     }
 
@@ -2222,11 +2389,13 @@ impl Store for SqliteStore {
         id: &JobId,
         now: Now,
         keep_dependents: bool,
+        expected_updated_at: Option<i64>,
     ) -> Result<JobRecord, StoreError> {
         let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
+        check_expected_tx(&tx, id.as_str(), expected_updated_at)?;
         let (mut rec, cancelled_now) = cancel_job_tx(&tx, id, now)?;
         if cancelled_now && !keep_dependents {
             cancel_blocked_dependents_tx(&tx, id, now)?;
@@ -2242,6 +2411,7 @@ impl Store for SqliteStore {
         spec: &JobSpec,
         chain: bool,
         now: Now,
+        expected_updated_at: Option<i64>,
     ) -> Result<(JobRecord, Vec<(JobId, JobId)>), StoreError> {
         spec.validate()
             .map_err(|e| StoreError::InvalidSpec(e.to_string()))?;
@@ -2249,6 +2419,7 @@ impl Store for SqliteStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
+        check_expected_tx(&tx, id.as_str(), expected_updated_at)?;
         let (old, _, _) = get_job_tx(&tx, id.as_str())?;
         if !old.state.is_terminal() {
             return Err(StoreError::Conflict { length: None });
@@ -2418,6 +2589,36 @@ impl Store for SqliteStore {
             by_origin,
             oldest_created_at: oldest,
         })
+    }
+
+    fn approve_draft_if(
+        &self,
+        id: &JobId,
+        edit: Option<&lu_proto::JobEdit>,
+        target: JobState,
+        now: Now,
+        expected_updated_at: Option<i64>,
+    ) -> Result<JobRecord, StoreError> {
+        // The guard and the approval transition are checked in the same store transaction when
+        // there is no edit. An edit writes first, so its check-then-write window is documented in
+        // NOTES.md rather than hidden.
+        {
+            let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(internal)?;
+            check_expected_tx(&tx, id.as_str(), expected_updated_at)?;
+            tx.commit().map_err(internal)?;
+        }
+        let rec = self.get_job(id)?;
+        if rec.state != JobState::Draft {
+            return Err(StoreError::Conflict { length: None });
+        }
+        let _rec = match edit {
+            Some(edit) => self.edit_job(id, edit, now)?,
+            None => rec,
+        };
+        self.approve_draft(id, target, now)
     }
 
     fn approve_draft(
@@ -4324,7 +4525,7 @@ mod tests {
         {
             let _s = SqliteStore::open(&p).unwrap();
         }
-        for version in [0i64, 7, 9, 999] {
+        for version in [0i64, 8, 9, 999] {
             let conn = rusqlite::Connection::open(&p).unwrap();
             conn.execute("UPDATE schema_version SET version = ?1", params![version])
                 .unwrap();
@@ -4422,7 +4623,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, crate::SCHEMA_VERSION);
         let jobs = s.list_jobs(None, 10, None).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].scrubbed_hits, 0);
@@ -4495,7 +4696,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, crate::SCHEMA_VERSION);
         let jobs = s.list_jobs(None, 10, None).unwrap();
         assert_eq!(jobs.len(), 2);
         for job in &jobs {
@@ -4619,5 +4820,99 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_column, 1);
+    }
+
+    #[test]
+    fn request_keys_replay_only_matching_completed_requests() {
+        let path = temp_db("request-keys.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        let reservation = store
+            .reserve_request_key("principal", "key-1", "create", "fp-1", 60)
+            .unwrap();
+        assert_eq!(reservation, crate::RequestKeyReservation::Reserved);
+        store
+            .complete_request_key("principal", "key-1", &serde_json::json!({"ok": true}))
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve_request_key("principal", "key-1", "create", "fp-1", 60)
+                .unwrap(),
+            crate::RequestKeyReservation::Replayed("{\"ok\":true}".to_owned())
+        );
+        assert!(matches!(
+            store.reserve_request_key("principal", "key-1", "create", "fp-2", 60),
+            Err(crate::StoreError::Conflict { .. })
+        ));
+        assert!(matches!(
+            store.reserve_request_key("principal", "key-1", "cancel", "fp-1", 60),
+            Err(crate::StoreError::Conflict { .. })
+        ));
+        store.release_request_key("principal", "key-1").unwrap();
+        assert_eq!(
+            store
+                .reserve_request_key("principal", "key-1", "cancel", "fp-1", 60)
+                .unwrap(),
+            crate::RequestKeyReservation::Reserved
+        );
+    }
+
+    #[test]
+    fn request_keys_expire() {
+        let path = temp_db("request-keys-expire.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        store
+            .reserve_request_key("principal", "key-1", "create", "fp-1", 0)
+            .unwrap();
+        store
+            .complete_request_key("principal", "key-1", &serde_json::json!({"ok": true}))
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve_request_key("principal", "key-1", "create", "fp-1", 60)
+                .unwrap(),
+            crate::RequestKeyReservation::Reserved
+        );
+    }
+
+    #[test]
+    fn schema_six_database_gains_request_keys_in_place() {
+        let path = temp_db("v6-request-keys.sqlite");
+        let spec =
+            crate::conformance::spec("https://x/v6-request-keys.git", Some("v6-request-keys"));
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            store
+                .create_job(
+                    &spec,
+                    Now {
+                        wall_unix: 1_700_000_000,
+                        mono_ms: 1_000,
+                    },
+                )
+                .unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE request_keys;
+                 UPDATE schema_version SET version = 6;",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(store.job_by_key("v6-request-keys").is_some());
+        let conn = store.conn.lock().unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, crate::SCHEMA_VERSION);
+        let table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='request_keys'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1);
     }
 }

@@ -5,6 +5,7 @@
 
 use crate::auth::authenticate_operator;
 use crate::error::{ApiError, ErrorCode};
+use crate::routes::operator::{outcome_data, star_if_match};
 use crate::routes::{json_ok, json_value_ok, parse_query, store_err, with_version, MAX_JSON_BODY};
 use crate::state::AppState;
 use crate::time::now;
@@ -12,7 +13,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
-use lu_audit::{Data, Event, Field};
+use lu_audit::{Event, Field};
 use lu_proto::JobId;
 use lu_schedule::{
     Admissibility, AdmissionRequest, Budget, Calendar, CalendarState, Constraint, Schedule,
@@ -466,6 +467,9 @@ pub async fn reload(
     if !state.auth.can_schedule(&operator) {
         return with_version(ApiError::forbidden("schedule permission required").into_response());
     }
+    if let Err(error) = star_if_match(&state, &headers, "schedule_reload", &operator) {
+        return with_version(error.into_response());
+    }
     let path = match state.config_path() {
         Some(path) => path.to_path_buf(),
         None => {
@@ -488,7 +492,8 @@ pub async fn reload(
                 None,
                 None,
                 &operator,
-                Data::new().text(Field::Result, "rejected"),
+                outcome_data(&state, &operator, "schedule_reload", "rejected")
+                    .text(Field::Result, "rejected"),
             );
             return with_version(
                 ApiError::unprocessable(format!("schedule reload rejected: {error}"))
@@ -507,7 +512,7 @@ pub async fn reload(
         None,
         None,
         &operator,
-        Data::new()
+        outcome_data(&state, &operator, "schedule_reload", "applied")
             .text(Field::Result, "applied")
             .unsigned(Field::Count, calendars)
             .unsigned(Field::Class, attachments),

@@ -193,3 +193,56 @@ before each choice; where the design and the repository disagreed, the repositor
 - A per-provider start budget is configurable but defaults to zero (unlimited); phase 1's herd
   bound is one lease per node, with the provider rate-limit consequence documented in
   `docs/scheduling.md`.
+
+## Web UI write API notes
+
+These are the places where the write-side brief and the existing code disagreed, plus the races the
+HTTP guards cannot close. The repository behaviour won except where the brief named an exact status
+code.
+
+- **`Idempotency-Key` conflict status.** The existing tree used `409 idempotency_conflict` for a
+  reused key. The brief requires `422`, so `ErrorCode::IdempotencyConflict` now maps to HTTP 422.
+  The code name is kept because clients can distinguish it from a generic `unprocessable` error.
+  This also matches the brief's "same key, different body" wording; a different operation with the
+  same key gets the same result.
+- **Create with `If-Match: *`.** The store can only test whether the spec's own `idempotency_key`
+  is already present. A spec without one has no stored identity, so the header cannot make the
+  request conditional; the docs say this rather than implying a scan of every job.
+- **ETag source and viewer reads.** `job_if_match_guard` recomputes the same `JobView` body used by
+  `GET /v1/jobs/{id}` and hashes it with `read_api::etag_for`, so a GET ETag is accepted. A viewer
+  response has task and context removed by `role.rs` after the ETag header was set, so its body no
+  longer matches that ETag. Viewers cannot call any mutation, so this cannot be used to bypass a
+  guard; it is recorded because the read-side invariant is not literally true for viewers.
+- **`updated_at` granularity.** SQLite checks use the `updated_at` seconds observed with the GET
+  ETag. Create, retry, cancel and approval without an edit check and write in one immediate
+  transaction, but two writes inside the same second can produce an ABA race that the ETag's body
+  hash would have seen. `updated_at` is the only stored validator; a full body hash would need a new
+  column or table, which the one-table compatibility policy rules out.
+- **Multi-step paths.** `publish` runs an external git push before the store update, so the
+  `If-Match` check cannot hold across that side effect. `edit`, `reject` and `approve` with an
+  `edit` body check the validator, then write in separate transactions because the edit helper owns
+  its own transaction. A job can change between those steps. The guard still refuses a request that
+  is already stale at check time, and the failure is audited.
+- **Request-key lifecycle.** A key is reserved in its own transaction before the mutation and
+  completed or released after the response is built. A process crash between reserve and complete
+  leaves a pending row that conflicts with the same key until its 24-hour expiry. Failed mutations
+  release the key. The stored fingerprint is over the operation name and the raw request bytes, so
+  semantically equal JSON with different whitespace is a different body. Replays preserve the
+  status and the JSON object; key order may differ because the stored response is a JSON value.
+- **Audit fields.** Applied, replayed, precondition-failed and dry-run outcomes carry
+  `data.principal`, `data.role`, `data.operation` and `data.outcome`. Existing lifecycle events keep
+  the operator in `actor` and the role in `data.source`, which was already their contract.
+- **`OperatorRole::Admin`.** The role is parsed and reported in audit data but has no extra
+  permission; only `schedule = true` gates schedule reload. This is unchanged.
+- **`restrict_fields` on retry.** The original check covered only create. Retry now applies the
+  same `restricted_field` check to the parsed or stored spec, so a restricted token cannot widen
+  `allow_spawn`, spawn fields, stack paths or source-branch publishing through the retry route.
+- **Audit actor for publish.** Before this change the publish helper used the fixed actor
+  `"operator"`. The handler now emits a `publish` audit event with the real principal and role in
+  addition to the helper's result event.
+- **Dry-run ordering.** Create and workspace clean check `If-Match: *` before parsing their body or
+  queueing work. Retry and cancel validate the spec/query and check `If-Match` before returning the
+  dry-run response. A stale validator produces `412` and a precondition audit, not a dry-run audit.
+- **Compatibility probes.** `scripts/compat-test.sh` sends the new headers and `?dry_run=1` to both
+  controller builds. The mutating probe uses a harmless in-memory group limit, and the body probe
+  uses an invalid job spec so neither build stores anything.

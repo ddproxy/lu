@@ -32,7 +32,7 @@ undrains with `ting undrain`. That needs only the node's own token.
 4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store uses schema version 6. It creates the schema for a new database and migrates schema 1 to 5 databases in place on startup, adding the scrubbing, lineage, publish and stacked-chain columns (`staged_commit`, `blocked_reason`, `blocked_since`, `eligible_since`). Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly the current schema version (6), so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
+The store uses schema version 7. It creates the schema for a new database and migrates schema 1 to 6 databases in place on startup, adding the scrubbing, lineage, publish and stacked-chain columns (`staged_commit`, `blocked_reason`, `blocked_since`, `eligible_since`) and the additive `request_keys` table for HTTP idempotency. Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly the current schema version (7), so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
 
 There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
 
@@ -131,7 +131,7 @@ systemctl start lu-controller.service
 ```
 
 `lu restore` verifies the snapshot, refuses a file that is not a Lu database (an empty or
-foreign SQLite file would replace your data with nothing), requires exactly the current schema version (6) and
+foreign SQLite file would replace your data with nothing), requires exactly the current schema version (7) and
 every table that version creates, and refuses when the database is still in use, so stop the
 controller first.
 Only one restore runs at a time. It stages the copy beside the database with the old file's
@@ -157,6 +157,17 @@ tar -C /var/lib/lu -xzf /var/backups/lu/artifacts-YYYY-MM-DD.tar.gz
 chown -R lu:lu /var/lib/lu/artifacts
 chmod 0700 /var/lib/lu/artifacts
 ```
+
+## Conditional writes and request keys
+
+Operator writes accept the optional `If-Match` and `Idempotency-Key` headers and the `?dry_run=1`
+query parameter described in [api.md](api.md#conditional-and-idempotent-writes). A `412
+precondition_failed` means the job changed after the ETag was read; re-read the job and retry with
+the new ETag. An idempotent key is scoped to the authenticated principal and expires after 24 hours;
+the `request_keys` rows are removed opportunistically when that key is used again. Every applied,
+replayed, dry-run and precondition-failed mutation writes an audit record carrying the principal and
+role, so a replay is distinguishable from a fresh mutation. The older `idempotency` table maps job
+spec keys to jobs and is unchanged.
 
 ## What a controller restart does
 

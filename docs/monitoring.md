@@ -158,7 +158,7 @@ lu status --json
 {
   "version": "0.5.1",
   "uptime_secs": 3600,
-  "schema_version": 6,
+  "schema_version": 7,
   "db_bytes": 81920,
   "recovered_on_boot": 2,
   "jobs": {"draft": 3, "blocked": 0, "queued": 1, "leased": 1, "running": 2, "recovering": 0, "needs_input": 0, "done": 12, "failed": 1, "cancelled": 0, "expired": 1},

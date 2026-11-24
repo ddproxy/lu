@@ -2,8 +2,8 @@ use crate::auth::authenticate_operator;
 use crate::error::ApiError;
 use crate::limits::SYNC_PER_TOKEN;
 use crate::read_api::{
-    authenticate_read, job_summary, json_with_etag, parse_job_filter, scan_jobs, wants_summary,
-    JobsPage,
+    authenticate_read, etag_for, job_summary, json_with_etag, parse_job_filter, scan_jobs,
+    wants_summary, JobsPage,
 };
 use crate::routes::file_body::{file_len, into_response, stream_range};
 use crate::routes::{
@@ -12,9 +12,10 @@ use crate::routes::{
 use crate::state::AppState;
 use crate::time::now;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use lu_audit::{Data, Event, Field};
+use lu_auth::sha256_hex;
 use lu_proto::{
     redact_repo, valid_group, validate_idempotency_key, ArtifactName, CordonView, JobEdit, JobId,
     JobSpec, JobView, NodeName, NodeView, WorkspaceCleanResult,
@@ -22,6 +23,7 @@ use lu_proto::{
 use lu_serve::PeerAddr;
 use lu_store::{
     missing_labels, waiting_reason_with_groups, Cordon, CordonSource, JobRecord, NodeRecord, Now,
+    RequestKeyReservation,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -71,6 +73,208 @@ pub(crate) fn query_u64(
             .map(Some)
             .map_err(|_| ApiError::bad_request(format!("invalid {name}"))),
     }
+}
+
+/// HTTP request keys expire after a day. The table is pruned on each claim for that key.
+const REQUEST_KEY_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// A write's observation of a job body, used to make `If-Match` conditional inside the store
+/// transaction. The ETag comes from the same body a GET would return.
+#[derive(Debug, Clone, Copy)]
+struct JobGuard {
+    updated_at: i64,
+    has_dependencies: bool,
+}
+
+pub(crate) fn outcome_data(
+    state: &AppState,
+    operator: &str,
+    operation: &str,
+    outcome: &str,
+) -> Data {
+    Data::new()
+        .text(Field::Principal, operator)
+        .text(Field::Role, role_name(state, operator))
+        .text(Field::Operation, operation)
+        .text(Field::Outcome, outcome)
+}
+
+pub(crate) fn audit_precondition(state: &AppState, operator: &str, operation: &str) {
+    state.record_audit(
+        Event::MutationPreconditionFailed,
+        None,
+        None,
+        operator,
+        outcome_data(state, operator, operation, "precondition_failed"),
+    );
+}
+
+/// Reads a strong `If-Match`. Weak validators are accepted for compatibility with GET's weak
+/// comparison, but only as an exact match after stripping `W/`.
+fn if_match_header(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    match headers.get(header::IF_MATCH) {
+        None => Ok(None),
+        Some(value) => value
+            .to_str()
+            .map(|v| Some(v.trim().to_owned()))
+            .map_err(|_| ApiError::precondition("invalid If-Match")),
+    }
+}
+
+async fn job_if_match_guard(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    job_id: &JobId,
+    operation: &str,
+    operator: &str,
+) -> Result<Option<JobGuard>, ApiError> {
+    let Some(expected) = if_match_header(headers)? else {
+        return Ok(None);
+    };
+    let store = Arc::clone(&state.store);
+    let id = job_id.clone();
+    let rec = tokio::task::spawn_blocking(move || store.get_job(&id))
+        .await
+        .map_err(|_| ApiError::internal())?
+        .map_err(store_err)?;
+    let view = job_view_for(state, &rec).await?;
+    let body = serde_json::to_string(&view).map_err(|_| ApiError::internal())?;
+    let etag = etag_for(&body);
+    if expected != "*" && expected.trim_start_matches("W/") != etag {
+        state.record_audit(
+            Event::MutationPreconditionFailed,
+            Some(job_id.as_str()),
+            None,
+            operator,
+            outcome_data(state, operator, operation, "precondition_failed"),
+        );
+        return Err(ApiError::precondition(
+            "job changed since the ETag was read",
+        ));
+    }
+    Ok(Some(JobGuard {
+        updated_at: rec.updated_at,
+        has_dependencies: !rec.waiting_on.is_empty(),
+    }))
+}
+
+/// For mutations with no single resource representation, `*` asserts only that the caller made a
+/// conditional request. Other validators cannot be checked and are refused, not ignored.
+pub(crate) fn star_if_match(
+    state: &AppState,
+    headers: &HeaderMap,
+    operation: &str,
+    operator: &str,
+) -> Result<(), ApiError> {
+    if let Some(expected) = if_match_header(headers)? {
+        if expected != "*" {
+            audit_precondition(state, operator, operation);
+            return Err(ApiError::precondition(
+                "this mutation supports only If-Match: *",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn dry_run_requested(uri: &Uri) -> Result<bool, ApiError> {
+    let query = parse_query(uri);
+    match query.get("dry_run").map(String::as_str) {
+        None | Some("0") | Some("false") => Ok(false),
+        Some("1") | Some("true") => Ok(true),
+        Some(_) => Err(ApiError::bad_request("invalid dry_run")),
+    }
+}
+
+fn request_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    match headers.get("Idempotency-Key") {
+        None => Ok(None),
+        Some(value) => {
+            let key = value
+                .to_str()
+                .map_err(|_| ApiError::bad_request("invalid Idempotency-Key"))?;
+            validate_idempotency_key(key)
+                .map_err(|_| ApiError::bad_request("invalid Idempotency-Key"))?;
+            Ok(Some(key.to_owned()))
+        }
+    }
+}
+
+fn key_fingerprint(operation: &str, body: &[u8]) -> String {
+    let mut input = operation.as_bytes().to_vec();
+    input.push(0);
+    input.extend_from_slice(body);
+    sha256_hex(&String::from_utf8_lossy(&input))
+}
+
+/// Returns the stored response body when this key already completed the same operation.
+async fn claim_request_key(
+    state: &Arc<AppState>,
+    operator: &str,
+    key: &str,
+    operation: &str,
+    fingerprint: &str,
+) -> Result<Option<Value>, ApiError> {
+    let store = Arc::clone(&state.store);
+    let operator = operator.to_owned();
+    let key = key.to_owned();
+    let operation = operation.to_owned();
+    let fingerprint = fingerprint.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        store.reserve_request_key(
+            &operator,
+            &key,
+            &operation,
+            &fingerprint,
+            REQUEST_KEY_TTL_SECS,
+        )
+    })
+    .await
+    .map_err(|_| ApiError::internal())?
+    .map_err(|error| match error {
+        lu_store::StoreError::Conflict { .. } => ApiError::idempotency_conflict(),
+        other => store_err(other),
+    })?;
+    Ok(match result {
+        RequestKeyReservation::Reserved => None,
+        RequestKeyReservation::Replayed(body) => {
+            serde_json::from_str(&body).ok().filter(Value::is_object)
+        }
+    })
+}
+
+async fn complete_request_key(
+    state: &Arc<AppState>,
+    operator: &str,
+    key: &str,
+    status: StatusCode,
+    body: &Value,
+) {
+    let store = Arc::clone(&state.store);
+    let operator = operator.to_owned();
+    let key = key.to_owned();
+    let response = json!({ "status": status.as_u16(), "body": body });
+    let _ =
+        tokio::task::spawn_blocking(move || store.complete_request_key(&operator, &key, &response))
+            .await;
+}
+
+async fn release_request_key(state: &Arc<AppState>, operator: &str, key: &str) {
+    let store = Arc::clone(&state.store);
+    let operator = operator.to_owned();
+    let key = key.to_owned();
+    let _ = tokio::task::spawn_blocking(move || store.release_request_key(&operator, &key)).await;
+}
+
+/// Reconstitutes a replayed response, including its original status code.
+fn replayed_response(stored: &Value) -> Response {
+    let status = stored
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or(StatusCode::OK);
+    json_value_ok(status, stored.get("body").cloned().unwrap_or(Value::Null))
 }
 
 pub fn job_view(r: &JobRecord) -> JobView {
@@ -321,11 +525,25 @@ pub async fn create_job(
     State(state): State<Arc<AppState>>,
     peer: axum::Extension<PeerAddr>,
     headers: HeaderMap,
+    uri: Uri,
     req: axum::extract::Request,
 ) -> Response {
     let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
         Ok(o) => o,
         Err(e) => return with_version(e.into_response()),
+    };
+    let operation = "create";
+    let conditional = headers.contains_key(header::IF_MATCH);
+    let dry_run = match dry_run_requested(&uri) {
+        Ok(value) => value,
+        Err(error) => return with_version(error.into_response()),
+    };
+    if let Err(error) = star_if_match(&state, &headers, operation, &operator) {
+        return with_version(error.into_response());
+    }
+    let key = match request_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return with_version(error.into_response()),
     };
     let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
         Ok(b) => b,
@@ -348,6 +566,20 @@ pub async fn create_job(
             );
         }
     }
+    let fingerprint = key_fingerprint(operation, &bytes);
+    if dry_run {
+        state.record_audit(
+            Event::MutationDryRun,
+            None,
+            None,
+            &operator,
+            outcome_data(&state, &operator, operation, "dry_run"),
+        );
+        return with_version(json_ok(
+            StatusCode::OK,
+            &json!({ "dry_run": true, "operation": operation, "draft": spec.draft }),
+        ));
+    }
     if let Some(repo) = state.mirror.repo_for_url(&spec.repo) {
         let name = repo.name.clone();
         let git_ref = spec.git_ref.clone();
@@ -369,7 +601,23 @@ pub async fn create_job(
             Err(_) => return with_version(ApiError::internal().into_response()),
         }
     }
-    let submit_data = Data::new()
+    if let Some(idempotency_key) = &key {
+        match claim_request_key(&state, &operator, idempotency_key, operation, &fingerprint).await {
+            Ok(Some(stored)) => {
+                state.record_audit(
+                    Event::MutationReplay,
+                    None,
+                    None,
+                    &operator,
+                    outcome_data(&state, &operator, operation, "replayed"),
+                );
+                return with_version(replayed_response(&stored));
+            }
+            Ok(None) => {}
+            Err(error) => return with_version(error.into_response()),
+        }
+    }
+    let submit_data = outcome_data(&state, &operator, operation, "applied")
         .text(Field::Provider, spec.provider.as_deref().unwrap_or("any"))
         .text(Field::Model, spec.model.as_deref().unwrap_or(""));
     let collect_applies = spec.collect.applies_diffs();
@@ -383,6 +631,8 @@ pub async fn create_job(
         move || {
             if is_draft {
                 store.create_draft_job(&spec, now, max_total, max_per_source)
+            } else if conditional {
+                store.create_job_if_absent(&spec, now)
             } else {
                 store.create_job(&spec, now)
             }
@@ -391,7 +641,27 @@ pub async fn create_job(
     .await;
     let (rec, created) = match res {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Ok(Err(e)) => {
+            if let Some(idempotency_key) = &key {
+                let store = Arc::clone(&state.store);
+                let operator = operator.clone();
+                let idempotency_key = idempotency_key.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.release_request_key(&operator, &idempotency_key)
+                })
+                .await;
+            }
+            if matches!(e, lu_store::StoreError::Precondition) {
+                state.record_audit(
+                    Event::MutationPreconditionFailed,
+                    None,
+                    None,
+                    &operator,
+                    outcome_data(&state, &operator, operation, "precondition_failed"),
+                );
+            }
+            return with_version(store_err(e).into_response());
+        }
         Err(_) => return with_version(ApiError::internal().into_response()),
     };
     let nodes = match all_nodes(&state, now).await {
@@ -407,6 +677,15 @@ pub async fn create_job(
         Err(error) => return with_version(error.into_response()),
     };
     body.warnings = Some(warnings);
+    let response_value = serde_json::to_value(&body).unwrap_or(Value::Null);
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    if let Some(idempotency_key) = &key {
+        complete_request_key(&state, &operator, idempotency_key, status, &response_value).await;
+    }
     if created {
         state.record_audit(
             Event::Submitted,
@@ -425,9 +704,16 @@ pub async fn create_job(
             );
         }
         state.waiters.notify_work();
-        with_version(json_ok(StatusCode::CREATED, &body))
+        with_version(json_ok(status, &body))
     } else {
-        with_version(json_ok(StatusCode::OK, &body))
+        state.record_audit(
+            Event::MutationReplay,
+            Some(rec.id.as_str()),
+            None,
+            &operator,
+            outcome_data(&state, &operator, operation, "replayed"),
+        );
+        with_version(json_ok(status, &body))
     }
 }
 
@@ -449,6 +735,9 @@ pub async fn set_group_limit(
         Ok(operator) => operator,
         Err(_) => return with_version(ApiError::unauthorized().into_response()),
     };
+    if let Err(error) = star_if_match(&state, &headers, "group_limit", &operator) {
+        return with_version(error.into_response());
+    }
     if !valid_group(&group) {
         return with_version(ApiError::bad_request("invalid group name").into_response());
     }
@@ -470,7 +759,7 @@ pub async fn set_group_limit(
         None,
         None,
         &operator,
-        Data::new()
+        outcome_data(&state, &operator, "group_limit", "applied")
             .text(Field::Source, role_name(&state, &operator))
             .unsigned(Field::Count, body.max_running as u64),
     );
@@ -621,12 +910,38 @@ pub async fn publish_job(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if authenticate_operator(&headers, peer.0, &state.auth, &state.throttle).is_err() {
-        return with_version(ApiError::unauthorized().into_response());
-    }
+    let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
+        Ok(operator) => operator,
+        Err(error) => return with_version(error.into_response()),
+    };
+    let operation = "publish";
     let Ok(job_id) = JobId::parse(&id) else {
         return with_version(ApiError::not_found("not found").into_response());
     };
+    let key = match request_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return with_version(error.into_response()),
+    };
+    if let Err(error) = job_if_match_guard(&state, &headers, &job_id, operation, &operator).await {
+        return with_version(error.into_response());
+    }
+    let fingerprint = key_fingerprint(operation, &[]);
+    if let Some(idempotency_key) = &key {
+        match claim_request_key(&state, &operator, idempotency_key, operation, &fingerprint).await {
+            Ok(Some(stored)) => {
+                state.record_audit(
+                    Event::MutationReplay,
+                    Some(job_id.as_str()),
+                    None,
+                    &operator,
+                    outcome_data(&state, &operator, operation, "replayed"),
+                );
+                return with_version(replayed_response(&stored));
+            }
+            Ok(None) => {}
+            Err(error) => return with_version(error.into_response()),
+        }
+    }
     let rec = match tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         move || store.get_job(&job_id)
@@ -634,10 +949,18 @@ pub async fn publish_job(
     .await
     {
         Ok(Ok(rec)) => rec,
-        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Ok(Err(e)) => {
+            if let Some(k) = &key {
+                release_request_key(&state, &operator, k).await;
+            }
+            return with_version(store_err(e).into_response());
+        }
         Err(_) => return with_version(ApiError::internal().into_response()),
     };
     if !rec.state.is_terminal() {
+        if let Some(k) = &key {
+            release_request_key(&state, &operator, k).await;
+        }
         return with_version(ApiError::conflict("job is not finished").into_response());
     }
     let record = match crate::publish::publish(Arc::clone(&state), rec.clone()).await {
@@ -658,12 +981,27 @@ pub async fn publish_job(
                     ApiError::rate_limited(retry_after)
                 }
             };
+            if let Some(k) = &key {
+                release_request_key(&state, &operator, k).await;
+            }
             return with_version(response.into_response());
         }
     };
+    state.record_audit(
+        Event::Publish,
+        Some(rec.id.as_str()),
+        None,
+        &operator,
+        outcome_data(&state, &operator, operation, "applied")
+            .text(Field::Target, record.target.as_str()),
+    );
     match job_view_for(&state, &rec).await {
         Ok(mut view) => {
             view.publish = Some(record);
+            let value = serde_json::to_value(&view).unwrap_or(Value::Null);
+            if let Some(k) = &key {
+                complete_request_key(&state, &operator, k, StatusCode::OK, &value).await;
+            }
             with_version(json_ok(StatusCode::OK, &view))
         }
         Err(error) => with_version(error.into_response()),
@@ -677,42 +1015,127 @@ pub async fn retry_job(
     peer: axum::Extension<PeerAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    uri: axum::http::Uri,
+    uri: Uri,
     req: axum::extract::Request,
 ) -> Response {
     let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
         Ok(o) => o,
         Err(e) => return with_version(e.into_response()),
     };
+    let operation = "retry";
     let job_id = match JobId::parse(&id) {
         Ok(i) => i,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let dry_run = match dry_run_requested(&uri) {
+        Ok(value) => value,
+        Err(error) => return with_version(error.into_response()),
+    };
+    let key = match request_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return with_version(error.into_response()),
     };
     let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
         Ok(bytes) => bytes,
         Err(error) => return with_version(error.into_response()),
     };
-    let spec: JobSpec = match serde_json::from_slice(&bytes) {
-        Ok(spec) => spec,
-        Err(error) => {
-            return with_version(ApiError::unprocessable(error.to_string()).into_response())
+    let chain = query_flag(&parse_query(&uri), "chain");
+    // With no body, reuse the stored spec so a retry needs only the job id.
+    let spec = if bytes.is_empty() {
+        let store = Arc::clone(&state.store);
+        let id = job_id.clone();
+        let rec = match tokio::task::spawn_blocking(move || store.get_job(&id)).await {
+            Ok(Ok(rec)) => rec,
+            Ok(Err(error)) => return with_version(store_err(error).into_response()),
+            Err(_) => return with_version(ApiError::internal().into_response()),
+        };
+        rec.spec
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(spec) => spec,
+            Err(error) => {
+                return with_version(ApiError::unprocessable(error.to_string()).into_response())
+            }
         }
     };
     if let Err(error) = spec.validate() {
         return with_version(ApiError::unprocessable(error.to_string()).into_response());
     }
-    let chain = query_flag(&parse_query(&uri), "chain");
+    if state.auth.restricts_fields(&operator) {
+        if let Some(field) = restricted_field(&spec) {
+            return with_version(
+                ApiError::forbidden(format!("this token may not set {field}")).into_response(),
+            );
+        }
+    }
+    let guard = match job_if_match_guard(&state, &headers, &job_id, operation, &operator).await {
+        Ok(guard) => guard,
+        Err(error) => return with_version(error.into_response()),
+    };
+    if dry_run {
+        state.record_audit(
+            Event::MutationDryRun,
+            Some(job_id.as_str()),
+            None,
+            &operator,
+            outcome_data(&state, &operator, operation, "dry_run"),
+        );
+        return with_version(json_ok(
+            StatusCode::OK,
+            &json!({ "dry_run": true, "operation": operation, "job": job_id.to_string() }),
+        ));
+    }
+    let mut fingerprint_input = bytes.to_vec();
+    fingerprint_input.extend_from_slice(format!("\nchain={chain}").as_bytes());
+    let fingerprint = key_fingerprint(operation, &fingerprint_input);
+    if let Some(idempotency_key) = &key {
+        match claim_request_key(&state, &operator, idempotency_key, operation, &fingerprint).await {
+            Ok(Some(stored)) => {
+                state.record_audit(
+                    Event::MutationReplay,
+                    Some(job_id.as_str()),
+                    None,
+                    &operator,
+                    outcome_data(&state, &operator, operation, "replayed"),
+                );
+                return with_version(replayed_response(&stored));
+            }
+            Ok(None) => {}
+            Err(error) => return with_version(error.into_response()),
+        }
+    }
     let n = now();
     let retried = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         let id = job_id.clone();
         let spec = spec.clone();
-        move || store.retry_with_dependents(&id, &spec, chain, n)
+        let expected = guard.map(|g| g.updated_at);
+        move || store.retry_with_dependents(&id, &spec, chain, n, expected)
     })
     .await;
     let (rec, pairs) = match retried {
         Ok(Ok(value)) => value,
-        Ok(Err(error)) => return with_version(store_err(error).into_response()),
+        Ok(Err(error)) => {
+            if let Some(idempotency_key) = &key {
+                let store = Arc::clone(&state.store);
+                let operator = operator.clone();
+                let idempotency_key = idempotency_key.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.release_request_key(&operator, &idempotency_key)
+                })
+                .await;
+            }
+            if matches!(error, lu_store::StoreError::Precondition) {
+                state.record_audit(
+                    Event::MutationPreconditionFailed,
+                    Some(job_id.as_str()),
+                    None,
+                    &operator,
+                    outcome_data(&state, &operator, operation, "precondition_failed"),
+                );
+            }
+            return with_version(store_err(error).into_response());
+        }
         Err(_) => return with_version(ApiError::internal().into_response()),
     };
     let waiting_dependents = {
@@ -732,7 +1155,7 @@ pub async fn retry_job(
         Some(rec.id.as_str()),
         None,
         &operator,
-        Data::new()
+        outcome_data(&state, &operator, operation, "applied")
             .unsigned(Field::Count, pairs.len() as u64)
             .text(Field::Source, if chain { "chain" } else { "job" }),
     );
@@ -748,14 +1171,22 @@ pub async fn retry_job(
         state.waiters.notify_job(new.as_ref());
     }
     state.waiters.notify_work();
-    with_version(json_ok(
-        StatusCode::OK,
-        &json!({
-            "job": job_view_with_ttl(&rec, state.blocked_dependent_ttl_secs),
-            "retried": retry_pairs,
-            "waiting_dependents": waiting_dependents,
-        }),
-    ))
+    let response = json!({
+        "job": job_view_with_ttl(&rec, state.blocked_dependent_ttl_secs),
+        "retried": retry_pairs,
+        "waiting_dependents": waiting_dependents,
+    });
+    if let Some(idempotency_key) = &key {
+        complete_request_key(
+            &state,
+            &operator,
+            idempotency_key,
+            StatusCode::OK,
+            &response,
+        )
+        .await;
+    }
+    with_version(json_ok(StatusCode::OK, &response))
 }
 
 pub async fn cancel_job(
@@ -763,31 +1194,96 @@ pub async fn cancel_job(
     peer: axum::Extension<PeerAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    uri: axum::http::Uri,
+    uri: Uri,
 ) -> Response {
     let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
         Ok(o) => o,
         Err(e) => return with_version(e.into_response()),
     };
+    let operation = "cancel";
     let job_id = match JobId::parse(&id) {
         Ok(i) => i,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
+    };
+    let dry_run = match dry_run_requested(&uri) {
+        Ok(value) => value,
+        Err(error) => return with_version(error.into_response()),
+    };
+    let key = match request_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return with_version(error.into_response()),
     };
     // Both flags are operator escape hatches. By default a cancellation clears the spawn tree and
     // the blocked dependents that can no longer run after their predecessor dies.
     let query = crate::routes::parse_query(&uri);
     let keep_children = query_flag(&query, "keep_children");
     let keep_dependents = query_flag(&query, "keep_dependents");
+    let guard = match job_if_match_guard(&state, &headers, &job_id, operation, &operator).await {
+        Ok(guard) => guard,
+        Err(error) => return with_version(error.into_response()),
+    };
+    if dry_run {
+        state.record_audit(
+            Event::MutationDryRun,
+            Some(job_id.as_str()),
+            None,
+            &operator,
+            outcome_data(&state, &operator, operation, "dry_run"),
+        );
+        return with_version(json_ok(
+            StatusCode::OK,
+            &json!({ "dry_run": true, "operation": operation, "job": job_id.to_string() }),
+        ));
+    }
+    let fingerprint = key_fingerprint(operation, uri.query().unwrap_or("").as_bytes());
+    if let Some(idempotency_key) = &key {
+        match claim_request_key(&state, &operator, idempotency_key, operation, &fingerprint).await {
+            Ok(Some(stored)) => {
+                state.record_audit(
+                    Event::MutationReplay,
+                    Some(job_id.as_str()),
+                    None,
+                    &operator,
+                    outcome_data(&state, &operator, operation, "replayed"),
+                );
+                return with_version(replayed_response(&stored));
+            }
+            Ok(None) => {}
+            Err(error) => return with_version(error.into_response()),
+        }
+    }
+    let expected = guard.map(|g| g.updated_at);
     let changed = match crate::routes::cancel_job_with_descendants(
         &state,
         &job_id,
         keep_children,
         keep_dependents,
+        expected,
     )
     .await
     {
         Ok(ids) => ids,
-        Err(error) => return with_version(error.into_response()),
+        Err(error) => {
+            if let Some(idempotency_key) = &key {
+                let store = Arc::clone(&state.store);
+                let operator = operator.clone();
+                let idempotency_key = idempotency_key.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.release_request_key(&operator, &idempotency_key)
+                })
+                .await;
+            }
+            if error.code == crate::error::ErrorCode::Precondition {
+                state.record_audit(
+                    Event::MutationPreconditionFailed,
+                    Some(job_id.as_str()),
+                    None,
+                    &operator,
+                    outcome_data(&state, &operator, operation, "precondition_failed"),
+                );
+            }
+            return with_version(error.into_response());
+        }
     };
     if !changed.contains(&job_id) {
         let res = tokio::task::spawn_blocking({
@@ -801,12 +1297,17 @@ pub async fn cancel_job(
         return with_version(ApiError::conflict("job is already terminal").into_response());
     }
     for changed_id in &changed {
+        let data = outcome_data(&state, &operator, operation, "applied");
         state.record_audit(
             Event::Cancelled,
             Some(changed_id.as_str()),
             None,
             &operator,
-            Data::new(),
+            if changed_id == &job_id {
+                data
+            } else {
+                Data::new().text(Field::Source, "dependent")
+            },
         );
         state.waiters.notify_job(changed_id.as_ref());
     }
@@ -818,7 +1319,20 @@ pub async fn cancel_job(
     .await;
     match rec {
         Ok(Ok(rec)) => match job_view_for(&state, &rec).await {
-            Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
+            Ok(view) => {
+                let value = serde_json::to_value(&view).unwrap_or(Value::Null);
+                if let Some(idempotency_key) = &key {
+                    complete_request_key(
+                        &state,
+                        &operator,
+                        idempotency_key,
+                        StatusCode::OK,
+                        &value,
+                    )
+                    .await;
+                }
+                with_version(json_ok(StatusCode::OK, &view))
+            }
             Err(error) => with_version(error.into_response()),
         },
         Ok(Err(e)) => with_version(store_err(e).into_response()),
@@ -841,6 +1355,9 @@ pub async fn edit_job(
         Ok(i) => i,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
     };
+    if let Err(error) = job_if_match_guard(&state, &headers, &job_id, "edit", &operator).await {
+        return with_version(error.into_response());
+    }
     let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
         Ok(b) => b,
         Err(e) => return with_version(e.into_response()),
@@ -862,7 +1379,8 @@ pub async fn edit_job(
                 Some(rec.id.as_str()),
                 None,
                 &operator,
-                Data::new().text(Field::Source, role_name(&state, &operator)),
+                outcome_data(&state, &operator, "edit", "applied")
+                    .text(Field::Source, role_name(&state, &operator)),
             );
             state.waiters.notify_work();
             match job_view_for(&state, &rec).await {
@@ -947,8 +1465,13 @@ pub async fn approve_draft(
         Ok(operator) => operator,
         Err(_) => return with_version(ApiError::unauthorized().into_response()),
     };
+    let operation = "approve";
     let Ok(job_id) = JobId::parse(&id) else {
         return with_version(ApiError::not_found("not found").into_response());
+    };
+    let key = match request_key(&headers) {
+        Ok(key) => key,
+        Err(error) => return with_version(error.into_response()),
     };
     let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
         Ok(bytes) => bytes,
@@ -964,28 +1487,73 @@ pub async fn approve_draft(
             }
         }
     };
-    let store = Arc::clone(&state.store);
-    let result = tokio::task::spawn_blocking(move || {
-        let n = now();
-        let rec = store.get_job(&job_id)?;
-        if rec.state != lu_proto::JobState::Draft {
-            return Err(lu_store::StoreError::Conflict { length: None });
+    let guard = match job_if_match_guard(&state, &headers, &job_id, operation, &operator).await {
+        Ok(guard) => guard,
+        Err(error) => return with_version(error.into_response()),
+    };
+    let fingerprint = key_fingerprint(operation, &bytes);
+    if let Some(idempotency_key) = &key {
+        match claim_request_key(&state, &operator, idempotency_key, operation, &fingerprint).await {
+            Ok(Some(stored)) => {
+                state.record_audit(
+                    Event::MutationReplay,
+                    Some(job_id.as_str()),
+                    None,
+                    &operator,
+                    outcome_data(&state, &operator, operation, "replayed"),
+                );
+                return with_version(replayed_response(&stored));
+            }
+            Ok(None) => {}
+            Err(error) => return with_version(error.into_response()),
         }
-        let rec = match edit {
-            Some(edit) => store.edit_job(&job_id, &edit, n)?,
-            None => rec,
-        };
-        let target = if rec.waiting_on.is_empty() {
-            lu_proto::JobState::Queued
-        } else {
-            lu_proto::JobState::Blocked
-        };
-        store.approve_draft(&job_id, target, n)
+    }
+    let has_dependencies = match guard {
+        Some(g) => g.has_dependencies,
+        None => {
+            let store = Arc::clone(&state.store);
+            let id = job_id.clone();
+            match tokio::task::spawn_blocking(move || store.get_job(&id)).await {
+                Ok(Ok(rec)) => !rec.waiting_on.is_empty(),
+                _ => false,
+            }
+        }
+    };
+    let target = if has_dependencies {
+        lu_proto::JobState::Blocked
+    } else {
+        lu_proto::JobState::Queued
+    };
+    let store = Arc::clone(&state.store);
+    let id_for_write = job_id.clone();
+    let expected = guard.map(|g| g.updated_at);
+    let result = tokio::task::spawn_blocking(move || {
+        store.approve_draft_if(&id_for_write, edit.as_ref(), target, now(), expected)
     })
     .await;
     let rec = match result {
         Ok(Ok(rec)) => rec,
-        Ok(Err(e)) => return with_version(store_err(e).into_response()),
+        Ok(Err(e)) => {
+            if let Some(idempotency_key) = &key {
+                let store = Arc::clone(&state.store);
+                let operator = operator.clone();
+                let idempotency_key = idempotency_key.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.release_request_key(&operator, &idempotency_key)
+                })
+                .await;
+            }
+            if matches!(e, lu_store::StoreError::Precondition) {
+                state.record_audit(
+                    Event::MutationPreconditionFailed,
+                    Some(job_id.as_str()),
+                    None,
+                    &operator,
+                    outcome_data(&state, &operator, operation, "precondition_failed"),
+                );
+            }
+            return with_version(store_err(e).into_response());
+        }
         Err(_) => return with_version(ApiError::internal().into_response()),
     };
     // Only an explicit operator approval may enable a source-branch push for an intake job.
@@ -999,10 +1567,18 @@ pub async fn approve_draft(
         Some(rec.id.as_str()),
         None,
         &operator,
-        Data::new().text(Field::State, rec.state.as_str()),
+        outcome_data(&state, &operator, operation, "applied")
+            .text(Field::State, rec.state.as_str()),
     );
     match job_view_for(&state, &rec).await {
-        Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
+        Ok(view) => {
+            let value = serde_json::to_value(&view).unwrap_or(Value::Null);
+            if let Some(idempotency_key) = &key {
+                complete_request_key(&state, &operator, idempotency_key, StatusCode::OK, &value)
+                    .await;
+            }
+            with_version(json_ok(StatusCode::OK, &view))
+        }
         Err(error) => with_version(error.into_response()),
     }
 }
@@ -1022,6 +1598,9 @@ pub async fn reject_draft(
     let Ok(job_id) = JobId::parse(&id) else {
         return with_version(ApiError::not_found("not found").into_response());
     };
+    if let Err(error) = job_if_match_guard(&state, &headers, &job_id, "reject", &operator).await {
+        return with_version(error.into_response());
+    }
     let bytes = match read_raw_limited(req, MAX_JSON_BODY).await {
         Ok(bytes) => bytes,
         Err(error) => return with_version(error.into_response()),
@@ -1064,7 +1643,7 @@ pub async fn reject_draft(
         Some(rec.id.as_str()),
         None,
         &operator,
-        Data::new().text(Field::Mode, code),
+        outcome_data(&state, &operator, "reject", "applied").text(Field::Mode, code),
     );
     match job_view_for(&state, &rec).await {
         Ok(view) => with_version(json_ok(StatusCode::OK, &view)),
@@ -1291,19 +1870,27 @@ pub async fn clean_workspaces(
     peer: axum::Extension<PeerAddr>,
     headers: HeaderMap,
     Path(name): Path<String>,
-    uri: axum::http::Uri,
+    uri: Uri,
 ) -> Response {
     let operator = match authenticate_operator(&headers, peer.0, &state.auth, &state.throttle) {
         Ok(operator) => operator,
         Err(_) => return with_version(ApiError::unauthorized().into_response()),
     };
+    let operation = "clean";
+    let dry_run = match dry_run_requested(&uri) {
+        Ok(value) => value,
+        Err(error) => return with_version(error.into_response()),
+    };
+    if let Err(error) = star_if_match(&state, &headers, operation, &operator) {
+        return with_version(error.into_response());
+    }
     let node = match NodeName::parse(&name) {
         Ok(n) => n,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
     };
     let query = parse_query(&uri);
     for key in query.keys() {
-        if key != "all" && key != "job" {
+        if key != "all" && key != "job" && key != "dry_run" {
             return with_version(ApiError::bad_request("unknown query parameter").into_response());
         }
     }
@@ -1339,12 +1926,33 @@ pub async fn clean_workspaces(
     if !nodes.iter().any(|record| record.name == node) {
         return with_version(ApiError::not_found("not found").into_response());
     }
+    if dry_run {
+        state.record_audit(
+            Event::MutationDryRun,
+            None,
+            Some(node.as_str()),
+            &operator,
+            outcome_data(&state, &operator, operation, "dry_run"),
+        );
+        return with_version(json_ok(
+            StatusCode::OK,
+            &json!({
+                "dry_run": true,
+                "operation": operation,
+                "node": node.as_str(),
+                "queued": 1,
+                "refused_running": 0,
+                "missing": 0
+            }),
+        ));
+    }
     state.record_audit(
         Event::WorkspaceClean,
         None,
         Some(node.as_str()),
         &operator,
-        Data::new().text(Field::Source, role_name(&state, &operator)),
+        outcome_data(&state, &operator, operation, "applied")
+            .text(Field::Source, role_name(&state, &operator)),
     );
     let mut event = serde_json::json!({ "kind": "clean_workspaces", "all": all });
     if let Some(job) = job {
@@ -1389,6 +1997,9 @@ pub async fn sync_repo(
         Ok(operator) => operator,
         Err(_) => return with_version(ApiError::unauthorized().into_response()),
     };
+    if let Err(error) = star_if_match(&state, &headers, "repo_sync", &operator) {
+        return with_version(error.into_response());
+    }
     if state.mirror.repo(&name).is_none() {
         return with_version(ApiError::not_found("not found").into_response());
     }
@@ -1412,7 +2023,7 @@ pub async fn sync_repo(
                 None,
                 None,
                 &operator,
-                Data::new()
+                outcome_data(&state, &operator, "repo_sync", "applied")
                     .text(Field::Source, role_name(&state, &operator))
                     .text(Field::Remote, &log_name),
             );
@@ -1437,6 +2048,14 @@ pub async fn set_drain(
         Ok(o) => o,
         Err(e) => return with_version(e.into_response()),
     };
+    if let Err(error) = star_if_match(
+        &state,
+        &headers,
+        if draining { "drain" } else { "undrain" },
+        &operator,
+    ) {
+        return with_version(error.into_response());
+    }
     let node = match NodeName::parse(&name) {
         Ok(n) => n,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
@@ -1454,7 +2073,13 @@ pub async fn set_drain(
                 None,
                 Some(&audit_node),
                 &operator,
-                Data::new().bool(Field::State, draining),
+                outcome_data(
+                    &state,
+                    &operator,
+                    if draining { "drain" } else { "undrain" },
+                    "applied",
+                )
+                .bool(Field::State, draining),
             );
             state.waiters.notify_work();
             with_version(
@@ -1484,6 +2109,9 @@ pub async fn uncordon_node(
         Ok(o) => o,
         Err(e) => return with_version(e.into_response()),
     };
+    if let Err(error) = star_if_match(&state, &headers, "uncordon", &operator) {
+        return with_version(error.into_response());
+    }
     let node = match NodeName::parse(&name) {
         Ok(n) => n,
         Err(_) => return with_version(ApiError::not_found("not found").into_response()),
@@ -1541,7 +2169,8 @@ pub async fn uncordon_node(
                     None,
                     Some(&audit_node),
                     &operator,
-                    Data::new().text(Field::Provider, provider),
+                    outcome_data(&state, &operator, "uncordon", "applied")
+                        .text(Field::Provider, provider),
                 );
             }
             state.waiters.notify_work();

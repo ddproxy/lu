@@ -8,9 +8,16 @@ uses semantic versioning once it reaches 1.0.
 ### Added
 
 - Automatic dev builds: after CI passes on `main`, `dev-release` tags `vX.Y.(Z+1)-dev.<N>.g<hash>` (N = commits since the last stable tag) and builds it as a GitHub pre-release with attestation. The release workflow also refuses a stable tag that differs from the `Cargo.toml` version, and sets the dev version inside the build.
+- Web UI write controls. All operator mutations accept optional `If-Match`; stale validators return `412 precondition_failed`. `create`, `retry`, `cancel`, `approve` and `publish` accept a principal-scoped `Idempotency-Key` stored in one additive `request_keys` table with a 24-hour expiry: a repeat replays the stored status and body, and a changed body or operation returns `422 idempotency_conflict`. `create`, `retry`, `cancel` and workspace clean accept `?dry_run=1`, which validates and audits without writing. Retry with an empty body reuses the stored spec. Added `mutation_dry_run`, `mutation_replay` and `mutation_precondition_failed` audit events with principal and role.
+- Store schema 7: databases at versions 1–6 gain `request_keys` in place at startup; backups and restores require version 7. Migration and compatibility probes cover the change.
+
 ### Security
 
 - A job with `allow_spawn` is refused (`conflict`) when `[agent] harness_uid` is unset, because a harness sharing the agent's uid can read everything the agent can and the scope socket then identifies nothing. Set `harness_uid`, or opt in with `[agent] allow_shared_uid_scope = true`.
+
+### Fixed
+
+- Retry applies `restrict_fields` to the parsed or stored spec, so a restricted token cannot widen a job through the retry route.
 
 ## [0.6.1]
 
