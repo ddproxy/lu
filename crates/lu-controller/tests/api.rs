@@ -1467,7 +1467,9 @@ async fn node_stats_are_served_bounded_to_operator_and_clear_on_next_heartbeat()
             "workspace_count": 0,
             "workspace_reclaimed_bytes_total": 0,
             "workspace_evictions_total": 0,
-            "workspace_delete_errors_total": 0
+            "workspace_delete_errors_total": 0,
+            "gc_removed_total": 0,
+            "gc_bytes_freed_total": 0
         })
     };
 
@@ -1572,6 +1574,53 @@ async fn node_stats_are_served_bounded_to_operator_and_clear_on_next_heartbeat()
     assert_eq!(status(&r), 200, "{r}");
     let cleared: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
     assert_eq!(cleared, zero_workspace_stats(), "{r}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn gc_counters_reach_stats_views_and_metrics() {
+    let srv = start_server().await;
+    let heartbeat = json!({
+        "node": "node-a",
+        "harness": "idle",
+        "providers": [],
+        "gc_removed_total": 3,
+        "gc_bytes_freed_total": 4096
+    });
+    let poll_body = json!({"heartbeat": heartbeat, "wait_secs": 0}).to_string();
+    let req = format!(
+        "POST /v1/agent/poll HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        poll_body.len(), poll_body
+    );
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 204, "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/nodes/node-a/stats HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    let stats: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    assert_eq!(stats["gc_removed_total"], 3, "{r}");
+    assert_eq!(stats["gc_bytes_freed_total"], 4096, "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    let nodes: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let node = nodes.as_array().unwrap()[0].clone();
+    assert_eq!(node["gc_removed_total"], 3, "{r}");
+    assert_eq!(node["gc_bytes_freed_total"], 4096, "{r}");
+
+    let r = raw_request(srv.addr, &format!("GET /metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    let body = body_str(&r);
+    assert!(
+        body.contains("# TYPE lu_node_gc_removed_total counter"),
+        "{body}"
+    );
+    assert!(
+        body.contains("lu_node_gc_removed_total{node=\"node-a\"} 3"),
+        "{body}"
+    );
+    assert!(
+        body.contains("lu_node_gc_bytes_freed_total{node=\"node-a\"} 4096"),
+        "{body}"
+    );
 
     let _ = srv.shutdown.send(());
 }

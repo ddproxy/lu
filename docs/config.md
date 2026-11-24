@@ -242,7 +242,8 @@ Opt-in removal of old scratch directories, run by the agent at start and between
 
 | Key | Required | Default | Validation |
 | --- | --- | --- | --- |
-| `scratch_globs` | no | `[]` | At most 8 absolute patterns without `..`. Only the final path component may contain `*` or `?`, so a pattern cannot match above its parent directory. |
+| `scratch_globs` | no | `[]` | At most 8 absolute patterns without `..`. Only the final path component may contain `*` or `?`, so a pattern cannot match above its parent directory. A pattern's parent must not be `/`, `/home`, `/var`, `/tmp` or `/srv`. |
+| `extra_roots` | no | `[]` | At most 4 absolute, literal directories without `..` or wildcards, none of them `/`, `/home`, `/var`, `/tmp` or `/srv`. Each root is scanned for `target*` children. Use this for build output reached through a configured host path bind-mounted from a harness container. |
 | `min_age_hours` | no | `6` | Only a directory tree whose newest modification time is at least this many hours old is removable. |
 | `min_free_percent` | no | `15` | Act only while the filesystem holding the pattern's parent has less free space than this. `0` always acts on entries old enough by age. |
 | `max_remove_per_pass` | no | `10` | At least 1. The most directories removed in one pass. |
@@ -250,6 +251,7 @@ Opt-in removal of old scratch directories, run by the agent at start and between
 ```toml
 [agent.housekeeping]
 scratch_globs = ["/srv/work/target-*"]
+extra_roots = ["/srv/work/harness-scratch"]
 min_age_hours = 6
 min_free_percent = 15
 max_remove_per_pass = 10
@@ -257,10 +259,18 @@ max_remove_per_pass = 10
 
 A pass runs at agent start and after each finished job, never while a job is running, and at
 most once every 10 minutes. It removes directories only, oldest first, and stops when the
-filesystem is above `min_free_percent + 5` or `max_remove_per_pass` is reached. It never
-follows a symlink, never removes a pattern's parent, and never touches the configured
-`work_dir` or anything inside it. Job workspaces inside `work_dir` use the separate
-`[workspace]` lifecycle below.
+filesystem is above `min_free_percent + 5` or `max_remove_per_pass` is reached. Every removal
+is a direct child whose canonical path stays inside the configured parent. A pass never
+follows a symlink, never removes a parent, and never touches the configured `work_dir`, a
+registered job workspace, or a workspace queued for deletion. A directory containing `.git`
+or `Cargo.toml` is kept unless the matching pattern names build output (`target`, `target-*`
+or an `extra_roots` child).
+
+Set `CARGO_TARGET_DIR` to a path below a configured root, for example
+`/srv/work/target-$JOB_KEY` on the host or a path inside the bind-mounted scratch root in the
+harness container. Lu never enters a container or reads overlay storage: the container mount
+must expose its scratch directory at a host path named by `extra_roots`. Job workspaces inside
+`work_dir` use the separate `[workspace]` lifecycle below.
 
 ## `[workspace]`
 
@@ -558,7 +568,7 @@ unsafe_inline = false
 
 ## Paths and secret files
 
-- `db`, `artifacts_dir`, `work_dir`, `[audit] path`, each `local_repo_roots` entry, each `label_files` entry and each `scratch_globs` pattern must be absolute and must not contain a `..` component.
+- `db`, `artifacts_dir`, `work_dir`, `[audit] path`, each `local_repo_roots` entry, each `label_files` entry, each `scratch_globs` pattern and each `extra_roots` entry must be absolute and must not contain a `..` component.
 - `[tls] cert`, `[tls] key`, `token_file`, `ca_file`, `reiki_token_file`, `credential_file`, `[mirror.credentials]` token files, `[publish.remotes.<name>]` token files, each `[[intake.sources]].secret_file`, `opencode_password_file` and `[log] file` need not be absolute. Publish token files are the exception: their own table requires an absolute path.
 - Each secret read opens the path once with `O_NOFOLLOW` and `O_NONBLOCK`, then checks the open handle; a startup check and later use may open the same file separately. Secret files must be regular files, owned by the effective user, with no group or other permission bits (mode `0600` or tighter). A file with mode `0640` is refused for a secret. `lu serve` and `ting` check `[tls] key`, `token_file`, `reiki_token_file`, `credential_file`, publish token files and intake signing keys on load; `opencode_password_file` is checked when the agent starts.
 - The config file itself has no secret-file mode check; it normally contains only hashes and paths. Protect it anyway because it names the token and TLS key locations.

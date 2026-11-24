@@ -232,6 +232,12 @@ pub struct NodeStats {
     /// Failed deletion attempts; failures are retried and never silently ignored.
     #[serde(default)]
     pub workspace_delete_errors_total: u64,
+    /// Scratch directories removed by the agent's housekeeping since it started.
+    #[serde(default)]
+    pub gc_removed_total: u64,
+    /// Bytes freed by the agent's housekeeping since it started.
+    #[serde(default)]
+    pub gc_bytes_freed_total: u64,
     /// Kept and pending workspaces, oldest first, as last reported by the agent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<WorkspaceView>,
@@ -288,6 +294,12 @@ pub struct Heartbeat {
     /// Failed deletion attempts; failures are retried and never silently ignored.
     #[serde(default)]
     pub workspace_delete_errors_total: u64,
+    /// Scratch directories removed by housekeeping since the agent started.
+    #[serde(default)]
+    pub gc_removed_total: u64,
+    /// Bytes freed by housekeeping since the agent started.
+    #[serde(default)]
+    pub gc_bytes_freed_total: u64,
     /// Workspaces the agent is tracking, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<WorkspaceView>,
@@ -337,6 +349,10 @@ struct RawHeartbeat {
     #[serde(default)]
     pub workspace_delete_errors_total: u64,
     #[serde(default)]
+    pub gc_removed_total: u64,
+    #[serde(default)]
+    pub gc_bytes_freed_total: u64,
+    #[serde(default)]
     pub workspaces: Vec<WorkspaceView>,
 }
 
@@ -362,6 +378,8 @@ impl TryFrom<RawHeartbeat> for Heartbeat {
             workspace_reclaimed_bytes_total: raw.workspace_reclaimed_bytes_total,
             workspace_evictions_total: raw.workspace_evictions_total,
             workspace_delete_errors_total: raw.workspace_delete_errors_total,
+            gc_removed_total: raw.gc_removed_total,
+            gc_bytes_freed_total: raw.gc_bytes_freed_total,
             workspaces: raw.workspaces,
         };
         hb.trim_stats();
@@ -408,12 +426,14 @@ impl Heartbeat {
             jobs: self.jobs.clone(),
             labels: Vec::new(),
             label_sources: BTreeMap::new(),
-            // The workspace counters are a handful of numbers; the listing is bounded separately.
+            // The counters are a handful of numbers; the listing is bounded separately.
             workspace_bytes: self.workspace_bytes,
             workspace_count: self.workspace_count,
             workspace_reclaimed_bytes_total: self.workspace_reclaimed_bytes_total,
             workspace_evictions_total: self.workspace_evictions_total,
             workspace_delete_errors_total: self.workspace_delete_errors_total,
+            gc_removed_total: self.gc_removed_total,
+            gc_bytes_freed_total: self.gc_bytes_freed_total,
             workspaces: Vec::new(),
         };
         serde_json::to_vec(&stats)
@@ -680,6 +700,8 @@ mod tests {
             workspace_reclaimed_bytes_total: 0,
             workspace_evictions_total: 0,
             workspace_delete_errors_total: 0,
+            gc_removed_total: 0,
+            gc_bytes_freed_total: 0,
             workspaces: Vec::new(),
         }
     }
@@ -1080,6 +1102,8 @@ mod tests {
             workspace_reclaimed_bytes_total: 0,
             workspace_evictions_total: 0,
             workspace_delete_errors_total: 0,
+            gc_removed_total: 0,
+            gc_bytes_freed_total: 0,
             workspaces: Vec::new(),
         };
         assert!(serde_json::to_vec(&stats).unwrap().len() <= MAX_STATS_BYTES);

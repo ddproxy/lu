@@ -503,6 +503,7 @@ fn make_agent(
             Ok(harness_script(task_file))
         }),
         housekeeper: None,
+        gc_counters: Arc::new(housekeeping::GcCounters::default()),
     }
 }
 

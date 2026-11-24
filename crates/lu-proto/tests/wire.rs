@@ -138,6 +138,8 @@ fn a_heartbeat_carries_a_capped_forwarded_document() {
         workspace_reclaimed_bytes_total: 0,
         workspace_evictions_total: 0,
         workspace_delete_errors_total: 0,
+        gc_removed_total: 0,
+        gc_bytes_freed_total: 0,
         workspaces: Vec::new(),
     };
     beat.validate().unwrap();
@@ -431,6 +433,8 @@ fn job_and_node_views_match_the_documented_json() {
         workspace_reclaimed_bytes_total: 8_192,
         workspace_evictions_total: 2,
         workspace_delete_errors_total: 1,
+        gc_removed_total: 2,
+        gc_bytes_freed_total: 64,
         workspaces: vec![WorkspaceView {
             job_key: "ticket:42".to_owned(),
             state: WorkspaceState::Kept,
@@ -483,6 +487,8 @@ fn job_and_node_views_match_the_documented_json() {
         "workspace_reclaimed_bytes_total": 8_192,
         "workspace_evictions_total": 2,
         "workspace_delete_errors_total": 1,
+        "gc_removed_total": 2,
+        "gc_bytes_freed_total": 64,
         "workspaces": [{
             "job_key": "ticket:42",
             "state": "kept",

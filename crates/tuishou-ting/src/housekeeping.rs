@@ -1,11 +1,14 @@
 //! Opt-in removal of leftover scratch directories between jobs.
 //!
 //! A pass only looks at direct children of a configured pattern's parent and only removes
-//! regular directories. Everything else, including symlinks and the agent's work directory, is
-//! left alone. Any error ends that rule's pass instead of failing the agent.
+//! regular directories. Everything else, including symlinks, project roots, registered job
+//! workspaces and the agent's work directory, is left alone. Any error ends that rule's pass
+//! instead of failing the agent.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -17,6 +20,9 @@ pub const MIN_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Extra headroom above `min_free_percent` that a removal pass aims for.
 const TARGET_HEADROOM_PERCENT: u64 = 5;
+
+/// Parents too broad to sweep, even when an operator names one explicitly.
+const TOO_BROAD: [&str; 5] = ["/", "/home", "/var", "/tmp", "/srv"];
 
 /// Free and total bytes on the filesystem holding a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +83,103 @@ pub fn disk_space(_path: &Path) -> Option<DiskSpace> {
 
 type FreeSpaceFn = dyn Fn(&Path) -> Option<DiskSpace> + Send + Sync;
 
+/// Metadata a housekeeping decision needs. A symlink is always reported as such and is never
+/// followed by the filesystem seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsMeta {
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub modified: Option<SystemTime>,
+    pub len: u64,
+}
+
+/// The filesystem operations housekeeping is allowed to perform. Tests use an in-memory tree
+/// so every safety rule can be checked without touching a real disk.
+pub trait FsOps: Send + Sync {
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>>;
+    fn symlink_metadata(&self, path: &Path) -> io::Result<FsMeta>;
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
+}
+
+#[derive(Debug, Default)]
+pub struct RealFs;
+
+impl FsOps for RealFs {
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        fs::canonicalize(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+        fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> io::Result<FsMeta> {
+        let meta = fs::symlink_metadata(path)?;
+        let modified = meta.modified().ok();
+        Ok(FsMeta {
+            is_dir: meta.is_dir(),
+            is_symlink: meta.file_type().is_symlink(),
+            modified,
+            len: meta.len(),
+        })
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        fs::remove_dir_all(path)
+    }
+}
+
+/// Wall-clock and monotonic time, injected so age and interval tests never sleep.
+pub trait TimeSource: Send + Sync {
+    fn now(&self) -> SystemTime;
+    fn monotonic(&self) -> Instant;
+}
+
+#[derive(Debug, Default)]
+pub struct RealTime;
+
+impl TimeSource for RealTime {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+
+    fn monotonic(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// Cumulative housekeeping counters, shared with the agent's heartbeat builders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GcCounts {
+    pub removed_total: u64,
+    pub bytes_freed_total: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct GcCounters {
+    removed_total: AtomicU64,
+    bytes_freed_total: AtomicU64,
+}
+
+impl GcCounters {
+    pub fn snapshot(&self) -> GcCounts {
+        GcCounts {
+            removed_total: self.removed_total.load(Ordering::Relaxed),
+            bytes_freed_total: self.bytes_freed_total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record(&self, summary: PassSummary) {
+        self.removed_total
+            .fetch_add(summary.removed as u64, Ordering::Relaxed);
+        self.bytes_freed_total
+            .fetch_add(summary.freed_bytes, Ordering::Relaxed);
+    }
+}
+
 /// What one due pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PassSummary {
@@ -88,6 +191,8 @@ pub struct PassSummary {
 struct Rule {
     parent: PathBuf,
     pattern: String,
+    /// Whether the rule names build output, the only case where a project marker is tolerated.
+    target_pattern: bool,
 }
 
 /// Stateful housekeeping for one agent. `run` is a no-op while a job is active or within
@@ -98,6 +203,9 @@ pub struct Housekeeper {
     min_free_percent: u64,
     max_remove_per_pass: usize,
     free_space: Arc<FreeSpaceFn>,
+    fs: Arc<dyn FsOps>,
+    time: Arc<dyn TimeSource>,
+    counters: Arc<GcCounters>,
     last_pass: Option<Instant>,
 }
 
@@ -110,34 +218,69 @@ impl Housekeeper {
     where
         F: Fn(&Path) -> Option<DiskSpace> + Send + Sync + 'static,
     {
-        let rules = config
+        Self::with_io(config, free_space, Arc::new(RealFs), Arc::new(RealTime))
+    }
+
+    /// Full injection seam: filesystem, clock and free-space probe are all replaceable.
+    pub fn with_io<F>(
+        config: HousekeepingConfig,
+        free_space: F,
+        fs: Arc<dyn FsOps>,
+        time: Arc<dyn TimeSource>,
+    ) -> Self
+    where
+        F: Fn(&Path) -> Option<DiskSpace> + Send + Sync + 'static,
+    {
+        let mut rules: Vec<Rule> = config
             .scratch_globs
             .iter()
             .filter_map(|glob| {
                 let path = Path::new(glob);
+                let pattern = path.file_name()?.to_string_lossy().into_owned();
                 Some(Rule {
                     parent: path.parent()?.to_path_buf(),
-                    pattern: path.file_name()?.to_string_lossy().into_owned(),
+                    target_pattern: is_target_pattern(&pattern),
+                    pattern,
                 })
             })
             .collect();
+        // Harness containers write build output into a bind-mounted host path. The mount is
+        // configured as an extra parent; only its `target*` children are eligible.
+        rules.extend(config.extra_roots.into_iter().map(|root| Rule {
+            parent: PathBuf::from(root),
+            pattern: "target*".to_owned(),
+            target_pattern: true,
+        }));
         Self {
             rules,
             min_age_hours: config.min_age_hours,
             min_free_percent: config.min_free_percent,
             max_remove_per_pass: config.max_remove_per_pass,
             free_space: Arc::new(free_space),
+            fs,
+            time,
+            counters: Arc::new(GcCounters::default()),
             last_pass: None,
         }
     }
 
+    /// A shared view of cumulative removals, for both idle and busy heartbeats.
+    pub fn counters(&self) -> Arc<GcCounters> {
+        Arc::clone(&self.counters)
+    }
+
     /// Runs a pass when due. `None` means it was skipped because a job is active or the last
-    /// pass was too recent.
-    pub fn run(&mut self, work_dir: &Path, job_running: bool) -> Option<PassSummary> {
+    /// pass was too recent. `protected` holds workspace trees that must never be touched.
+    pub fn run(
+        &mut self,
+        work_dir: &Path,
+        job_running: bool,
+        protected: &[PathBuf],
+    ) -> Option<PassSummary> {
         if job_running {
             return None;
         }
-        let now = Instant::now();
+        let now = self.time.monotonic();
         if self
             .last_pass
             .is_some_and(|last| now.duration_since(last) < MIN_INTERVAL)
@@ -145,16 +288,26 @@ impl Housekeeper {
             return None;
         }
         self.last_pass = Some(now);
-        Some(self.pass(work_dir))
+        let summary = self.pass(work_dir, protected);
+        self.counters.record(summary);
+        Some(summary)
     }
 
-    fn pass(&self, work_dir: &Path) -> PassSummary {
-        let work_canon = fs::canonicalize(work_dir).ok();
+    fn pass(&self, work_dir: &Path, protected: &[PathBuf]) -> PassSummary {
+        let work_canon = self.fs.canonicalize(work_dir).ok();
+        let guarded: Vec<PathBuf> = protected
+            .iter()
+            .filter_map(|path| self.fs.canonicalize(path).ok())
+            .collect();
         let mut summary = PassSummary::default();
         'rules: for rule in &self.rules {
-            let Ok(parent) = fs::canonicalize(&rule.parent) else {
+            let Ok(parent) = self.fs.canonicalize(&rule.parent) else {
                 continue;
             };
+            if is_too_broad(&parent) {
+                warn!(path = %parent.display(), "refusing a housekeeping root that is too broad");
+                continue;
+            }
             if self.min_free_percent > 0 {
                 let Some(space) = (self.free_space)(&parent) else {
                     continue;
@@ -167,7 +320,7 @@ impl Housekeeper {
                 .min_free_percent
                 .saturating_add(TARGET_HEADROOM_PERCENT)
                 .min(100);
-            let mut candidates = self.candidates(rule, &parent, work_canon.as_deref());
+            let mut candidates = self.candidates(rule, &parent, work_canon.as_deref(), &guarded);
             candidates.sort_by_key(|candidate| candidate.newest);
             for candidate in candidates {
                 if summary.removed >= self.max_remove_per_pass {
@@ -181,7 +334,7 @@ impl Housekeeper {
                         break;
                     }
                 }
-                match fs::remove_dir_all(&candidate.canonical) {
+                match self.fs.remove_dir_all(&candidate.canonical) {
                     Ok(()) => {
                         info!(
                             path = %candidate.path.display(),
@@ -214,37 +367,51 @@ impl Housekeeper {
         summary
     }
 
-    fn candidates(&self, rule: &Rule, parent: &Path, work_canon: Option<&Path>) -> Vec<Candidate> {
-        let now = SystemTime::now();
-        let Ok(entries) = fs::read_dir(parent) else {
+    fn candidates(
+        &self,
+        rule: &Rule,
+        parent: &Path,
+        work_canon: Option<&Path>,
+        guarded: &[PathBuf],
+    ) -> Vec<Candidate> {
+        let now = self.time.now();
+        let Ok(entries) = self.fs.read_dir(parent) else {
             return Vec::new();
         };
         let mut found = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
+        for path in entries {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
             if !glob_matches(&rule.pattern, name) {
                 continue;
             }
-            let path = entry.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else {
+            let Ok(meta) = self.fs.symlink_metadata(&path) else {
                 continue;
             };
-            if !meta.is_dir() || meta.file_type().is_symlink() {
+            if !meta.is_dir || meta.is_symlink {
                 continue;
             }
-            let Ok(canonical) = fs::canonicalize(&path) else {
+            let Ok(canonical) = self.fs.canonicalize(&path) else {
                 continue;
             };
-            if canonical.parent() != Some(parent) {
+            // A direct child of the canonical parent is the longest path that can be removed
+            // without escaping the configured root through a link or a path component.
+            if canonical.parent() != Some(parent) || canonical == parent {
                 continue;
             }
-            if work_canon.is_some_and(|work| canonical == work || canonical.starts_with(work)) {
+            if work_canon.is_some_and(|work| overlaps(&canonical, work))
+                || guarded.iter().any(|g| overlaps(&canonical, g))
+            {
                 continue;
             }
-            let Some((newest, size_bytes)) = scan_tree(&path) else {
+            let has_marker = [".git", "Cargo.toml"]
+                .iter()
+                .any(|marker| self.fs.symlink_metadata(&path.join(marker)).is_ok());
+            if has_marker && !(rule.target_pattern && is_target_name(name)) {
+                continue;
+            }
+            let Some((newest, size_bytes)) = self.scan_tree(&path) else {
                 continue;
             };
             let age = now.duration_since(newest).unwrap_or(Duration::ZERO);
@@ -261,6 +428,34 @@ impl Housekeeper {
         }
         found
     }
+
+    /// Newest modification time and apparent size of a directory tree, without following links.
+    /// `None` means part of the tree could not be read, so the entry is not safe to remove.
+    fn scan_tree(&self, root: &Path) -> Option<(SystemTime, u64)> {
+        let mut newest = None;
+        let mut size_bytes = 0u64;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let meta = self.fs.symlink_metadata(&path).ok()?;
+            if meta.is_symlink {
+                continue;
+            }
+            if let Some(modified) = meta.modified {
+                newest = Some(match newest {
+                    Some(current) if current >= modified => current,
+                    _ => modified,
+                });
+            }
+            if meta.is_dir {
+                for child in self.fs.read_dir(&path).ok()? {
+                    stack.push(child);
+                }
+            } else {
+                size_bytes = size_bytes.saturating_add(meta.len);
+            }
+        }
+        Some((newest?, size_bytes))
+    }
 }
 
 struct Candidate {
@@ -271,33 +466,20 @@ struct Candidate {
     age: Duration,
 }
 
-/// Newest modification time and apparent size of a directory tree, without following links.
-/// `None` means part of the tree could not be read, so the entry is not safe to remove.
-fn scan_tree(root: &Path) -> Option<(SystemTime, u64)> {
-    let mut newest = None;
-    let mut size_bytes = 0u64;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(path) = stack.pop() {
-        let meta = fs::symlink_metadata(&path).ok()?;
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if let Ok(modified) = meta.modified() {
-            newest = Some(match newest {
-                Some(current) if current >= modified => current,
-                _ => modified,
-            });
-        }
-        if meta.is_dir() {
-            for entry in fs::read_dir(&path).ok()? {
-                let entry = entry.ok()?;
-                stack.push(entry.path());
-            }
-        } else {
-            size_bytes = size_bytes.saturating_add(meta.len());
-        }
-    }
-    Some((newest?, size_bytes))
+fn is_too_broad(path: &Path) -> bool {
+    TOO_BROAD.iter().any(|wide| path == Path::new(wide))
+}
+
+fn overlaps(entry: &Path, guarded: &Path) -> bool {
+    entry == guarded || entry.starts_with(guarded) || guarded.starts_with(entry)
+}
+
+fn is_target_pattern(pattern: &str) -> bool {
+    pattern == "target" || pattern == "target*" || pattern.starts_with("target-")
+}
+
+fn is_target_name(name: &str) -> bool {
+    name == "target" || name.starts_with("target-")
 }
 
 /// Matches one path component using only `*` and `?`.
@@ -331,304 +513,603 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Mutex;
 
-    fn make_config(pattern: &str) -> HousekeepingConfig {
-        HousekeepingConfig {
-            scratch_globs: vec![pattern.to_owned()],
-            min_age_hours: 0,
-            min_free_percent: 0,
-            max_remove_per_pass: 10,
+    #[derive(Clone)]
+    struct FakeEntry {
+        dir: bool,
+        symlink: bool,
+        target: Option<PathBuf>,
+        modified: SystemTime,
+        len: u64,
+    }
+
+    #[derive(Default)]
+    struct FakeFs {
+        entries: Mutex<BTreeMap<PathBuf, FakeEntry>>,
+        removed: Mutex<Vec<PathBuf>>,
+    }
+
+    impl FakeFs {
+        fn ancestors(path: &Path) -> Vec<PathBuf> {
+            let mut parents = Vec::new();
+            let mut current = path.parent();
+            while let Some(parent) = current {
+                if parent.as_os_str().is_empty() {
+                    break;
+                }
+                parents.push(parent.to_path_buf());
+                current = parent.parent();
+            }
+            parents.reverse();
+            parents
+        }
+
+        fn insert_dir(&self, path: &Path, modified: SystemTime) {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries.entry(path.to_path_buf()).or_insert(FakeEntry {
+                dir: true,
+                symlink: false,
+                target: None,
+                modified,
+                len: 0,
+            });
+        }
+
+        fn dir(&self, path: &Path, modified: SystemTime) {
+            for parent in Self::ancestors(path) {
+                self.insert_dir(&parent, modified);
+            }
+            self.insert_dir(path, modified);
+        }
+
+        fn file(&self, path: &Path, len: u64, modified: SystemTime) {
+            for parent in Self::ancestors(path) {
+                self.insert_dir(&parent, modified);
+            }
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries.insert(
+                path.to_path_buf(),
+                FakeEntry {
+                    dir: false,
+                    symlink: false,
+                    target: None,
+                    modified,
+                    len,
+                },
+            );
+        }
+
+        fn symlink(&self, path: &Path, target: &Path, modified: SystemTime) {
+            for parent in Self::ancestors(path) {
+                self.insert_dir(&parent, modified);
+            }
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries.insert(
+                path.to_path_buf(),
+                FakeEntry {
+                    dir: false,
+                    symlink: true,
+                    target: Some(target.to_path_buf()),
+                    modified,
+                    len: 1,
+                },
+            );
+        }
+
+        fn entry(&self, path: &Path) -> io::Result<FakeEntry> {
+            self.entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(path)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing path"))
         }
     }
 
-    fn scratch(label: &str) -> PathBuf {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "lu-housekeeping-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    fn work_dir(root: &Path) -> PathBuf {
-        let work = root.join("work");
-        fs::create_dir_all(&work).unwrap();
-        work
-    }
-
-    fn always_free(_: &Path) -> Option<DiskSpace> {
-        Some(DiskSpace {
-            free_bytes: 0,
-            total_bytes: 100,
-        })
-    }
-
-    fn make(path: &Path) {
-        fs::create_dir_all(path).unwrap();
-        fs::write(path.join("file"), b"x").unwrap();
-    }
-
-    fn set_age(path: &Path, secs: u64) {
-        let modified = SystemTime::now() - Duration::from_secs(secs) - Duration::from_secs(60 * 60);
-        let mut stack = vec![path.to_path_buf()];
-        while let Some(path) = stack.pop() {
-            let file = fs::File::open(&path).unwrap();
-            file.set_modified(modified).unwrap();
-            if path.is_dir() {
-                for entry in fs::read_dir(&path).unwrap() {
-                    stack.push(entry.unwrap().path());
-                }
+    impl FsOps for FakeFs {
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            let entry = self.entry(path)?;
+            if entry.symlink {
+                let target = entry.target.unwrap_or_default();
+                return self.canonicalize(&target);
             }
+            Ok(path.to_path_buf())
+        }
+
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
+            let entry = self.entry(path)?;
+            if !entry.dir || entry.symlink {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "not a directory",
+                ));
+            }
+            Ok(self
+                .entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .filter(|candidate| candidate.parent() == Some(path))
+                .cloned()
+                .collect())
+        }
+
+        fn symlink_metadata(&self, path: &Path) -> io::Result<FsMeta> {
+            let entry = self.entry(path)?;
+            Ok(FsMeta {
+                is_dir: entry.dir,
+                is_symlink: entry.symlink,
+                modified: Some(entry.modified),
+                len: entry.len,
+            })
+        }
+
+        fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+            let entry = self.entry(path)?;
+            if !entry.dir || entry.symlink {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "not a directory",
+                ));
+            }
+            // Remove the tree without following links, then record the root the caller removed.
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let victims: Vec<PathBuf> = entries
+                .keys()
+                .filter(|candidate| *candidate == path || candidate.starts_with(path))
+                .cloned()
+                .collect();
+            for victim in victims {
+                entries.remove(&victim);
+            }
+            drop(entries);
+            self.removed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(path.to_path_buf());
+            Ok(())
+        }
+    }
+
+    struct FakeTime {
+        epoch: SystemTime,
+        base: Instant,
+        elapsed: Mutex<Duration>,
+    }
+
+    impl FakeTime {
+        fn new() -> Self {
+            Self {
+                epoch: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                base: Instant::now() - Duration::from_secs(3600),
+                elapsed: Mutex::new(Duration::ZERO),
+            }
+        }
+
+        fn advance(&self, amount: Duration) {
+            let mut elapsed = self.elapsed.lock().unwrap_or_else(|e| e.into_inner());
+            *elapsed += amount;
+        }
+    }
+
+    impl TimeSource for FakeTime {
+        fn now(&self) -> SystemTime {
+            let elapsed = self.elapsed.lock().unwrap_or_else(|e| e.into_inner());
+            self.epoch + *elapsed
+        }
+
+        fn monotonic(&self) -> Instant {
+            let elapsed = self.elapsed.lock().unwrap_or_else(|e| e.into_inner());
+            self.base + *elapsed
+        }
+    }
+
+    struct Fixture {
+        fs: Arc<FakeFs>,
+        time: Arc<FakeTime>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                fs: Arc::new(FakeFs::default()),
+                time: Arc::new(FakeTime::new()),
+            }
+        }
+
+        fn old(&self) -> SystemTime {
+            self.time.now() - Duration::from_secs(10 * 3600)
+        }
+
+        fn make(&self, path: &str) {
+            let path = Path::new(path);
+            self.fs.dir(path, self.old());
+            self.fs.file(&path.join("blob"), 8, self.old());
+        }
+
+        fn config(pattern: &str) -> HousekeepingConfig {
+            HousekeepingConfig {
+                scratch_globs: vec![pattern.to_owned()],
+                extra_roots: Vec::new(),
+                min_age_hours: 0,
+                min_free_percent: 0,
+                max_remove_per_pass: 10,
+            }
+        }
+
+        fn house(&self, config: HousekeepingConfig) -> Housekeeper {
+            Housekeeper::with_io(
+                config,
+                |_: &Path| {
+                    Some(DiskSpace {
+                        free_bytes: 0,
+                        total_bytes: 100,
+                    })
+                },
+                self.fs.clone(),
+                self.time.clone(),
+            )
+        }
+
+        fn removed(&self) -> Vec<PathBuf> {
+            let mut paths = self.fs.removed.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *paths)
+        }
+    }
+
+    fn free_at(percent: Arc<AtomicU64>) -> impl Fn(&Path) -> Option<DiskSpace> + Send + Sync {
+        move |_: &Path| {
+            Some(DiskSpace {
+                free_bytes: percent.load(Ordering::Relaxed),
+                total_bytes: 100,
+            })
         }
     }
 
     #[test]
     fn removes_oldest_first() {
-        let root = scratch("oldest");
-        let work = work_dir(&root);
-        let parent = root.join("scratch");
-        fs::create_dir_all(&parent).unwrap();
-        make(&parent.join("target-old"));
-        make(&parent.join("target-new"));
-        set_age(&parent.join("target-old"), 10 * 3600);
-        set_age(&parent.join("target-new"), 3600);
-        let mut config = make_config(&format!("{}/*", parent.display()));
+        let f = Fixture::new();
+        f.make("/scratch/target-old");
+        f.make("/scratch/target-new");
+        f.fs.file(
+            Path::new("/scratch/target-new/blob"),
+            8,
+            f.time.now() - Duration::from_secs(3600),
+        );
+        let mut config = Fixture::config("/scratch/*");
         config.max_remove_per_pass = 1;
-        let mut house = Housekeeper::with_free_space(config, always_free);
-        let summary = house.run(&work, false).unwrap();
+        let mut house = f.house(config);
+        let summary = house.run(Path::new("/work"), false, &[]).unwrap();
         assert_eq!(summary.removed, 1);
-        assert!(!parent.join("target-old").exists());
-        assert!(parent.join("target-new").exists());
-        let _ = fs::remove_dir_all(root);
+        assert!(f.removed().contains(&PathBuf::from("/scratch/target-old")));
     }
 
     #[test]
     fn respects_the_age_threshold() {
-        let root = scratch("age");
-        let work = work_dir(&root);
-        let parent = root.join("scratch");
-        fs::create_dir_all(&parent).unwrap();
-        make(&parent.join("target-old"));
-        make(&parent.join("target-young"));
-        set_age(&parent.join("target-old"), 8 * 3600);
-        set_age(&parent.join("target-young"), 2 * 3600);
-        let mut config = make_config(&format!("{}/*", parent.display()));
+        let f = Fixture::new();
+        f.make("/scratch/target-old");
+        f.make("/scratch/target-young");
+        f.fs.file(
+            Path::new("/scratch/target-young/blob"),
+            8,
+            f.time.now() - Duration::from_secs(3600),
+        );
+        let mut config = Fixture::config("/scratch/*");
         config.min_age_hours = 6;
-        let mut house = Housekeeper::with_free_space(config, always_free);
-        house.run(&work, false).unwrap();
-        assert!(!parent.join("target-old").exists());
-        assert!(parent.join("target-young").exists());
-        let _ = fs::remove_dir_all(root);
+        let mut house = f.house(config);
+        house.run(Path::new("/work"), false, &[]).unwrap();
+        assert_eq!(f.removed(), [PathBuf::from("/scratch/target-old")]);
     }
 
     #[test]
     fn respects_the_free_percent_threshold() {
-        let root = scratch("free");
-        let work = work_dir(&root);
-        let parent = root.join("scratch");
-        fs::create_dir_all(&parent).unwrap();
-        make(&parent.join("target-a"));
-        set_age(&parent.join("target-a"), 10 * 3600);
-        let mut config = make_config(&format!("{}/*", parent.display()));
+        let f = Fixture::new();
+        f.make("/scratch/target-a");
+        let mut config = Fixture::config("/scratch/*");
         config.min_free_percent = 15;
-        let free = Arc::new(std::sync::atomic::AtomicU64::new(30));
-        let injected = {
-            let free = Arc::clone(&free);
-            move |_: &Path| {
-                Some(DiskSpace {
-                    free_bytes: free.load(Ordering::Relaxed),
-                    total_bytes: 100,
-                })
-            }
-        };
-        let mut house = Housekeeper::with_free_space(config, injected);
-        assert_eq!(house.run(&work, false).unwrap().removed, 0);
-        assert!(parent.join("target-a").exists());
+        let free = Arc::new(AtomicU64::new(30));
+        let mut house = Housekeeper::with_io(
+            config,
+            free_at(Arc::clone(&free)),
+            f.fs.clone(),
+            f.time.clone(),
+        );
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            0
+        );
+        assert!(f.removed().is_empty());
 
         free.store(10, Ordering::Relaxed);
-        let mut config = make_config(&format!("{}/*", parent.display()));
+        let mut config = Fixture::config("/scratch/*");
         config.min_free_percent = 15;
-        let injected = {
-            let free = Arc::clone(&free);
-            move |_: &Path| {
-                Some(DiskSpace {
-                    free_bytes: free.load(Ordering::Relaxed),
-                    total_bytes: 100,
-                })
-            }
-        };
-        let mut house = Housekeeper::with_free_space(config, injected);
-        assert_eq!(house.run(&work, false).unwrap().removed, 1);
-        assert!(!parent.join("target-a").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn stops_at_the_per_pass_cap() {
-        let root = scratch("cap");
-        let work = work_dir(&root);
-        let parent = root.join("scratch");
-        fs::create_dir_all(&parent).unwrap();
-        for name in ["target-a", "target-b", "target-c"] {
-            make(&parent.join(name));
-            set_age(&parent.join(name), 10 * 3600);
-        }
-        let mut config = make_config(&format!("{}/*", parent.display()));
-        config.max_remove_per_pass = 2;
-        let mut house = Housekeeper::with_free_space(config, always_free);
-        let summary = house.run(&work, false).unwrap();
-        assert_eq!(summary.removed, 2);
-        let left = ["target-a", "target-b", "target-c"]
-            .iter()
-            .filter(|name| parent.join(name).exists())
-            .count();
-        assert_eq!(left, 1);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn never_follows_a_symlink_to_another_directory() {
-        let root = scratch("symlink");
-        let work = work_dir(&root);
-        let parent = root.join("scratch");
-        let elsewhere = root.join("elsewhere");
-        fs::create_dir_all(&parent).unwrap();
-        make(&elsewhere);
-        std::os::unix::fs::symlink(&elsewhere, parent.join("target-link")).unwrap();
-        let mut config = make_config(&format!("{}/*", parent.display()));
-        config.min_age_hours = 0;
-        let mut house = Housekeeper::with_free_space(config, always_free);
-        let summary = house.run(&work, false).unwrap();
-        assert_eq!(summary.removed, 0);
-        assert!(elsewhere.exists());
-        assert!(parent.join("target-link").symlink_metadata().is_ok());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn never_removes_the_work_directory_or_its_contents() {
-        let root = scratch("work");
-        let work = work_dir(&root);
-        make(&work.join("target-child"));
-        set_age(&work.join("target-child"), 10 * 3600);
-        set_age(&work, 10 * 3600);
-        let mut config = make_config(&format!("{}/*", root.display()));
-        config.min_age_hours = 0;
-        let mut house = Housekeeper::with_free_space(config, always_free);
-        let summary = house.run(&work, false).unwrap();
-        assert_eq!(summary.removed, 0);
-        assert!(work.exists());
-        assert!(work.join("target-child").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn never_removes_files_even_when_they_match() {
-        let root = scratch("files");
-        let work = work_dir(&root);
-        let parent = root.join("scratch");
-        fs::create_dir_all(&parent).unwrap();
-        fs::write(parent.join("target-file"), b"x").unwrap();
-        let mut config = make_config(&format!("{}/*", parent.display()));
-        config.min_age_hours = 0;
-        let mut house = Housekeeper::with_free_space(config, always_free);
-        assert_eq!(house.run(&work, false).unwrap().removed, 0);
-        assert!(parent.join("target-file").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn nothing_runs_while_a_job_is_active() {
-        let root = scratch("busy");
-        let work = work_dir(&root);
-        let parent = root.join("scratch");
-        fs::create_dir_all(&parent).unwrap();
-        make(&parent.join("target-a"));
-        set_age(&parent.join("target-a"), 10 * 3600);
-        let mut config = make_config(&format!("{}/*", parent.display()));
-        config.min_age_hours = 0;
-        let mut house = Housekeeper::with_free_space(config, always_free);
-        assert!(house.run(&work, true).is_none());
-        assert!(parent.join("target-a").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn runs_at_most_once_every_ten_minutes() {
-        let root = scratch("interval");
-        let work = work_dir(&root);
-        let parent = root.join("scratch");
-        fs::create_dir_all(&parent).unwrap();
-        make(&parent.join("target-old"));
-        make(&parent.join("target-new"));
-        set_age(&parent.join("target-old"), 10 * 3600);
-        set_age(&parent.join("target-new"), 10 * 3600);
-        let mut config = make_config(&format!("{}/*", parent.display()));
-        config.max_remove_per_pass = 1;
-        let mut house = Housekeeper::with_free_space(config, always_free);
-        assert_eq!(house.run(&work, false).unwrap().removed, 1);
-        assert!(house.run(&work, false).is_none());
-        let left = fs::read_dir(&parent).unwrap().count();
-        assert_eq!(left, 1);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn errors_are_swallowed() {
-        let root = scratch("errors");
-        let work = work_dir(&root);
-        let missing = root.join("missing");
-        let mut config = make_config(&format!("{}/*", missing.display()));
-        config.min_age_hours = 0;
-        let mut house = Housekeeper::with_free_space(config, always_free);
-        let summary = house.run(&work, false).unwrap();
-        assert_eq!(summary.removed, 0);
-        assert_eq!(summary.failed, 0);
-
-        let file = root.join("not-a-directory");
-        fs::write(&file, b"x").unwrap();
-        let mut config = make_config(&format!("{}/*", file.display()));
-        config.min_age_hours = 0;
-        let mut house = Housekeeper::with_free_space(config, always_free);
-        assert_eq!(house.run(&work, false).unwrap().removed, 0);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_missing_free_space_reading_removes_nothing() {
-        let root = scratch("nospace");
-        let work = work_dir(&root);
-        let parent = root.join("scratch");
-        fs::create_dir_all(&parent).unwrap();
-        make(&parent.join("target-a"));
-        set_age(&parent.join("target-a"), 10 * 3600);
-        let mut config = make_config(&format!("{}/*", parent.display()));
-        config.min_age_hours = 0;
-        config.min_free_percent = 15;
-        let mut house = Housekeeper::with_free_space(config, |_: &Path| None);
-        assert_eq!(house.run(&work, false).unwrap().removed, 0);
-        assert!(parent.join("target-a").exists());
-        let _ = fs::remove_dir_all(root);
+        let mut house = Housekeeper::with_io(config, free_at(free), f.fs.clone(), f.time.clone());
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            1
+        );
     }
 
     #[test]
     fn zero_free_threshold_does_not_need_a_reading() {
-        let root = scratch("nospace-zero");
-        let work = work_dir(&root);
-        let parent = root.join("scratch");
-        fs::create_dir_all(&parent).unwrap();
-        make(&parent.join("target-a"));
-        set_age(&parent.join("target-a"), 10 * 3600);
-        let mut config = make_config(&format!("{}/*", parent.display()));
-        config.min_age_hours = 0;
-        let mut house = Housekeeper::with_free_space(config, |_: &Path| None);
-        assert_eq!(house.run(&work, false).unwrap().removed, 1);
-        assert!(!parent.join("target-a").exists());
-        let _ = fs::remove_dir_all(root);
+        let f = Fixture::new();
+        f.make("/scratch/target-a");
+        let mut house = Housekeeper::with_io(
+            Fixture::config("/scratch/*"),
+            |_: &Path| None,
+            f.fs.clone(),
+            f.time.clone(),
+        );
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            1
+        );
+    }
+
+    #[test]
+    fn stops_at_the_per_pass_cap() {
+        let f = Fixture::new();
+        for name in ["target-a", "target-b", "target-c"] {
+            f.make(&format!("/scratch/{name}"));
+        }
+        let mut config = Fixture::config("/scratch/*");
+        config.max_remove_per_pass = 2;
+        let mut house = f.house(config);
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            2
+        );
+        assert_eq!(f.removed().len(), 2);
+    }
+
+    #[test]
+    fn never_follows_a_symlink() {
+        let f = Fixture::new();
+        f.make("/elsewhere");
+        f.fs.symlink(
+            Path::new("/scratch/target-link"),
+            Path::new("/elsewhere"),
+            f.old(),
+        );
+        let mut house = f.house(Fixture::config("/scratch/*"));
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            0
+        );
+        assert!(f.removed().is_empty());
+    }
+
+    #[test]
+    fn a_symlink_inside_a_candidate_is_not_followed() {
+        let f = Fixture::new();
+        f.make("/scratch/target-a");
+        f.make("/elsewhere");
+        f.fs.symlink(
+            Path::new("/scratch/target-a/escape"),
+            Path::new("/elsewhere"),
+            f.old(),
+        );
+        let mut house = f.house(Fixture::config("/scratch/*"));
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            1
+        );
+        assert_eq!(f.removed(), [PathBuf::from("/scratch/target-a")]);
+        assert!(!f
+            .removed()
+            .iter()
+            .any(|path| path.starts_with("/elsewhere")));
+    }
+
+    #[test]
+    fn refuses_roots_that_are_too_broad() {
+        for wide in TOO_BROAD {
+            let f = Fixture::new();
+            let pattern = if wide == "/" {
+                "/target-*".to_owned()
+            } else {
+                format!("{wide}/target-*")
+            };
+            let mut house = f.house(Fixture::config(&pattern));
+            f.make(&format!("{}/target-a", wide.trim_end_matches('/')));
+            assert_eq!(
+                house.run(Path::new("/work"), false, &[]).unwrap().removed,
+                0,
+                "{wide}"
+            );
+            assert!(f.removed().is_empty());
+        }
+    }
+
+    #[test]
+    fn project_markers_stop_removal_outside_target_rules() {
+        let f = Fixture::new();
+        f.make("/scratch/target-a");
+        f.fs.file(Path::new("/scratch/target-a/Cargo.toml"), 8, f.old());
+        f.make("/scratch/target-b");
+        f.fs.dir(Path::new("/scratch/target-b/.git"), f.old());
+        let mut house = f.house(Fixture::config("/scratch/*"));
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            0
+        );
+        assert!(f.removed().is_empty());
+    }
+
+    #[test]
+    fn target_rules_may_remove_their_own_build_output() {
+        let f = Fixture::new();
+        f.make("/scratch/target-debug");
+        f.fs.file(Path::new("/scratch/target-debug/Cargo.toml"), 8, f.old());
+        f.make("/scratch/target-release");
+        f.fs.dir(Path::new("/scratch/target-release/.git"), f.old());
+        let mut config = Fixture::config("/scratch/target-*");
+        config.max_remove_per_pass = 2;
+        let mut house = f.house(config);
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            2
+        );
+        assert_eq!(f.removed().len(), 2);
+    }
+
+    #[test]
+    fn active_and_draining_workspaces_are_protected() {
+        let f = Fixture::new();
+        f.make("/scratch/job-active");
+        f.make("/scratch/job-draining");
+        let mut house = f.house(Fixture::config("/scratch/*"));
+        let protected = [
+            PathBuf::from("/scratch/job-active"),
+            PathBuf::from("/scratch/job-draining"),
+        ];
+        assert_eq!(
+            house
+                .run(Path::new("/work"), false, &protected)
+                .unwrap()
+                .removed,
+            0
+        );
+        assert!(f.removed().is_empty());
+    }
+
+    #[test]
+    fn a_workspace_inside_a_candidate_protects_the_candidate() {
+        let f = Fixture::new();
+        f.make("/scratch/target-a");
+        f.fs.dir(Path::new("/scratch/target-a/job"), f.time.now());
+        let mut house = f.house(Fixture::config("/scratch/*"));
+        assert_eq!(
+            house
+                .run(
+                    Path::new("/work"),
+                    false,
+                    &[PathBuf::from("/scratch/target-a/job")],
+                )
+                .unwrap()
+                .removed,
+            0
+        );
+        assert!(f.removed().is_empty());
+    }
+
+    #[test]
+    fn never_removes_the_work_directory() {
+        let f = Fixture::new();
+        f.make("/work/target-child");
+        let mut house = f.house(Fixture::config("/work/*"));
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            0
+        );
+        assert!(f.removed().is_empty());
+    }
+
+    #[test]
+    fn never_removes_files_even_when_they_match() {
+        let f = Fixture::new();
+        f.fs.file(Path::new("/scratch/target-file"), 8, f.old());
+        let mut house = f.house(Fixture::config("/scratch/*"));
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            0
+        );
+        assert!(f.removed().is_empty());
+    }
+
+    #[test]
+    fn nothing_runs_while_a_job_is_active() {
+        let f = Fixture::new();
+        f.make("/scratch/target-a");
+        let mut house = f.house(Fixture::config("/scratch/*"));
+        assert!(house.run(Path::new("/work"), true, &[]).is_none());
+        assert!(f.removed().is_empty());
+    }
+
+    #[test]
+    fn runs_at_most_once_every_ten_minutes() {
+        let f = Fixture::new();
+        f.make("/scratch/target-a");
+        let mut config = Fixture::config("/scratch/*");
+        config.max_remove_per_pass = 1;
+        let mut house = f.house(config);
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            1
+        );
+        assert!(house.run(Path::new("/work"), false, &[]).is_none());
+        f.time.advance(MIN_INTERVAL - Duration::from_secs(1));
+        assert!(house.run(Path::new("/work"), false, &[]).is_none());
+        f.time.advance(Duration::from_secs(2));
+        let summary = house.run(Path::new("/work"), false, &[]).unwrap();
+        assert_eq!(summary.removed, 0);
+    }
+
+    #[test]
+    fn counters_accumulate_across_passes() {
+        let f = Fixture::new();
+        f.make("/scratch/target-a");
+        let mut house = Housekeeper::with_io(
+            Fixture::config("/scratch/*"),
+            |_: &Path| None,
+            f.fs.clone(),
+            f.time.clone(),
+        );
+        let counters = house.counters();
+        assert_eq!(counters.snapshot(), GcCounts::default());
+        house.run(Path::new("/work"), false, &[]).unwrap();
+        assert_eq!(
+            counters.snapshot(),
+            GcCounts {
+                removed_total: 1,
+                bytes_freed_total: 8
+            }
+        );
+        f.time.advance(MIN_INTERVAL + Duration::from_secs(1));
+        house.run(Path::new("/work"), false, &[]).unwrap();
+        assert_eq!(counters.snapshot().removed_total, 1);
+    }
+
+    #[test]
+    fn extra_roots_scan_their_target_children() {
+        let f = Fixture::new();
+        f.make("/host-scratch/target-debug");
+        f.make("/host-scratch/other");
+        let config = HousekeepingConfig {
+            extra_roots: vec!["/host-scratch".to_owned()],
+            ..Fixture::config("/unused/*")
+        };
+        let mut house = f.house(config);
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            1
+        );
+        assert_eq!(f.removed(), [PathBuf::from("/host-scratch/target-debug")]);
+    }
+
+    #[test]
+    fn a_missing_parent_removes_nothing() {
+        let f = Fixture::new();
+        let mut house = f.house(Fixture::config("/missing/*"));
+        let summary = house.run(Path::new("/work"), false, &[]).unwrap();
+        assert_eq!(summary, PassSummary::default());
+    }
+
+    #[test]
+    fn a_missing_free_space_reading_removes_nothing() {
+        let f = Fixture::new();
+        f.make("/scratch/target-a");
+        let mut config = Fixture::config("/scratch/*");
+        config.min_free_percent = 15;
+        let mut house = Housekeeper::with_io(config, |_: &Path| None, f.fs.clone(), f.time.clone());
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            0
+        );
+        assert!(f.removed().is_empty());
     }
 
     #[test]
@@ -642,11 +1123,12 @@ mod tests {
 
     #[test]
     fn disk_space_reads_the_holding_filesystem() {
-        let root = scratch("disk");
-        let space = disk_space(&root).unwrap();
+        let dir = std::env::temp_dir().join(format!("lu-housekeeping-disk-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let space = disk_space(&dir).unwrap();
         assert!(space.total_bytes > 0);
         assert!(space.free_bytes <= space.total_bytes);
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -663,12 +1145,12 @@ mod tests {
 
     #[test]
     fn housekeeper_ignores_a_pattern_without_a_parent() {
-        let root = scratch("noparent");
-        let work = work_dir(&root);
-        let mut config = make_config("/");
-        config.min_age_hours = 0;
-        let mut house = Housekeeper::with_free_space(config, always_free);
-        assert_eq!(house.run(&work, false).unwrap().removed, 0);
-        let _ = fs::remove_dir_all(root);
+        let f = Fixture::new();
+        let mut house = f.house(Fixture::config("/"));
+        assert_eq!(
+            house.run(Path::new("/work"), false, &[]).unwrap().removed,
+            0
+        );
+        assert!(f.removed().is_empty());
     }
 }

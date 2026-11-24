@@ -264,6 +264,8 @@ pub struct Agent {
     allow_shared_uid_scope: bool,
     builder: Arc<CommandBuilder>,
     housekeeper: Option<housekeeping::Housekeeper>,
+    /// Shared cumulative housekeeping counters, read by both idle and busy heartbeats.
+    gc_counters: Arc<housekeeping::GcCounters>,
     /// Owns every workspace tree and its retention counters. Deletions run on the sweeper, never
     /// on the poll loop that starts jobs.
     workspaces: Arc<Registry>,
@@ -339,6 +341,9 @@ impl Agent {
                 .with_probes(probes.results()),
         );
         let housekeeper = config.housekeeping.map(housekeeping::Housekeeper::new);
+        let gc_counters = housekeeper
+            .as_ref()
+            .map_or_else(Default::default, housekeeping::Housekeeper::counters);
         let reiki_probe = match (
             config.reiki_health_url.as_deref(),
             config.reiki_token_file.as_deref(),
@@ -392,6 +397,7 @@ impl Agent {
                     .map_err(|error| error.to_string())
             }),
             housekeeper,
+            gc_counters,
             workspaces,
         })
     }
@@ -444,7 +450,8 @@ impl Agent {
 
     fn housekeep(&mut self, job_running: bool) {
         if let Some(housekeeper) = self.housekeeper.as_mut() {
-            housekeeper.run(&self.work_dir, job_running);
+            let protected = self.workspaces.protected_paths();
+            housekeeper.run(&self.work_dir, job_running, &protected);
         }
     }
 
@@ -624,6 +631,7 @@ impl Agent {
             self.harness_ok.load(Ordering::SeqCst),
         );
         let ws = self.workspaces.stats();
+        let gc = self.gc_counters.snapshot();
         let host = proc::host_stats(&self.work_dir);
         let pct = disk_free_pct(host.as_ref());
         let mut beat = Heartbeat {
@@ -645,6 +653,8 @@ impl Agent {
             workspace_reclaimed_bytes_total: ws.reclaimed_bytes_total,
             workspace_evictions_total: ws.evictions_total,
             workspace_delete_errors_total: ws.delete_errors_total,
+            gc_removed_total: gc.removed_total,
+            gc_bytes_freed_total: gc.bytes_freed_total,
             workspaces: self.workspaces.list(),
         };
         beat.trim_stats();
@@ -1275,6 +1285,7 @@ impl Agent {
                 observation: observation.clone(),
                 work_dir: self.work_dir.clone(),
                 workspaces: Arc::clone(&self.workspaces),
+                gc: Arc::clone(&self.gc_counters),
                 stuck: stuck.map(|(policy, after_secs)| StuckTask { policy, after_secs }),
                 stuck_poll_period: self.stuck_poll_period,
                 stuck_clock: Arc::clone(&self.stuck_clock),
@@ -2199,6 +2210,7 @@ struct ControlTask {
     observation: Option<Arc<Mutex<proc::JobObservation>>>,
     work_dir: PathBuf,
     workspaces: Arc<Registry>,
+    gc: Arc<housekeeping::GcCounters>,
     stuck: Option<StuckTask>,
     stuck_poll_period: Duration,
     stuck_clock: Arc<dyn proc::Clock>,
@@ -2219,6 +2231,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
         observation,
         work_dir,
         workspaces,
+        gc,
         stuck,
         stuck_poll_period,
         stuck_clock,
@@ -2329,6 +2342,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                 );
                 let ws = workspaces.stats();
                 let ws_list = workspaces.list();
+                let gc = gc.snapshot();
                 let pct = disk_free_pct(host.as_ref());
                 let mut beat = Heartbeat {
                     node: node.clone(),
@@ -2349,6 +2363,8 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                     workspace_reclaimed_bytes_total: ws.reclaimed_bytes_total,
                     workspace_evictions_total: ws.evictions_total,
                     workspace_delete_errors_total: ws.delete_errors_total,
+                    gc_removed_total: gc.removed_total,
+                    gc_bytes_freed_total: gc.bytes_freed_total,
                     workspaces: ws_list,
                 };
                 beat.trim_stats();
