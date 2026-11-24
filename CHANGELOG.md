@@ -11,6 +11,7 @@ uses semantic versioning once it reaches 1.0.
   the header. Job priority is displayed in a `PRI` column after `STATE`.
 - Job and node selection follows the same row across refreshes and re-sorts.
 - Heartbeats may carry optional `harness_ok` and `disk_free_pct`. Dispatch skips nodes reporting an unhealthy harness or free disk space below `[schedule] min_disk_free_pct` (default `8`; `0` disables). Queued jobs report the reason in `waiting_reason` and `blocked_reason`; `lu nodes`, `lu node`, `/metrics` expose the signals, and a later healthy heartbeat makes the node eligible again.
+- Full dev build versions are preserved end to end: `lu --version`, `ting --version`, heartbeat versions, `/v1/health`, `/v1/status`, `x-lu-version`, `/metrics` and MCP server info report the rewritten workspace version. Added fake-dev-version tests for parsing, ordering and display; the TUI version column now grows to fit a dev version, and `set-release-version.py` accepts `+HASH` metadata. [Dev build format](docs/install.md#dev-builds).
 
 ### Added
 

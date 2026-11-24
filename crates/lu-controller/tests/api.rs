@@ -331,11 +331,16 @@ async fn health_is_unauthenticated_and_has_version() {
     )
     .await;
     assert_eq!(status(&resp), 200, "{resp}");
-    assert!(header_value(&resp, "x-lu-version").is_some(), "{resp}");
+    assert_eq!(
+        header_value(&resp, "x-lu-version"),
+        Some(concat!("lu/", env!("CARGO_PKG_VERSION"))),
+        "{resp}"
+    );
     let b = body(&resp);
     let v: serde_json::Value = serde_json::from_str(b).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["db"], "ok");
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     let _ = srv.shutdown.send(());
 }
 

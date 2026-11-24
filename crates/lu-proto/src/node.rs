@@ -752,6 +752,14 @@ mod tests {
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.version.as_deref(), Some("0.1.10"));
 
+        for version in ["0.6.2-dev.1.gc08a5a0", "0.6.2-dev.1+gc08a5a0"] {
+            beat.version = Some(version.to_owned());
+            assert!(beat.validate().is_ok(), "{version}");
+            let json = serde_json::to_string(&beat).unwrap();
+            let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.version.as_deref(), Some(version));
+        }
+
         for version in [
             String::new(),
             "has\nnewline".to_owned(),

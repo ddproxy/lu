@@ -130,6 +130,40 @@ fn wide_terminal_render_is_stable() {
 }
 
 #[test]
+fn a_dev_version_is_rendered_in_full() {
+    const DEV: &str = "0.6.2-dev.1.gc08a5a0";
+    let mut dev = node("peer-a", "idle", Some(1), false, 0);
+    dev.version = Some(DEV.to_owned());
+    let mut dashboard = Dashboard::new();
+    dashboard.apply(
+        Ok(Snapshot {
+            nodes: vec![dev],
+            jobs: Vec::new(),
+            controller_version: None,
+            drafts: 0,
+            oldest_draft_secs: 0,
+        }),
+        Instant::now(),
+    );
+    let view = dashboard.view(Instant::now());
+    let mut terminal = Terminal::new(TestBackend::new(200, 12)).unwrap();
+    terminal
+        .draw(|frame| {
+            draw_with_theme(frame, &view, Theme::truecolor());
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let text: String = (0..12)
+        .map(|y| {
+            (0..200)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    assert!(text.contains(DEV), "rendered table clips the dev version");
+}
+
+#[test]
 fn narrow_terminal_render_is_stable() {
     check(
         "narrow_80",
