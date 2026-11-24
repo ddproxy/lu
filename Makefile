@@ -1,4 +1,4 @@
-.PHONY: help build install uninstall install-units uninstall-units du clean clean-debug clean-release clean-stale
+.PHONY: help build install uninstall install-units uninstall-units du test lint check docs-check clean clean-debug clean-release clean-stale
 
 # root installs to /usr/local, anyone else to ~/.local; override with PREFIX=
 PREFIX ?= $(if $(filter 0,$(shell id -u)),/usr/local,$(HOME)/.local)
@@ -22,6 +22,20 @@ help:  ## list targets
 build:  ## release build of lu (with the tui feature) and ting
 	cargo build --release --locked -p lu --features tui
 	cargo build --release --locked -p tuishou-ting
+
+test:  ## workspace tests, with and without the tui feature
+	cargo test --locked --workspace
+	cargo test --locked --workspace --features tui
+
+lint:  ## format check and clippy with warnings denied, with and without the tui feature
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets --locked -- -D warnings
+	cargo clippy --workspace --all-targets --locked --features tui -- -D warnings
+
+check: lint test  ## run lint and test
+
+docs-check:  ## check README sections, doc links, command names and config examples
+	./scripts/check-docs.sh
 
 install: build $(INSTALL_UNITS)  ## build and install lu and ting into PREFIX/bin (~/.local, or /usr/local as root; PREFIX= and DESTDIR= override)
 	install -d '$(DESTDIR)$(BINDIR)'

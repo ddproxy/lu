@@ -1,0 +1,45 @@
+# Lu documentation index
+
+Lu is a small job queue for finite coding-agent work against git repositories. The `lu` binary is
+the controller and operator CLI; `ting` is the node agent. Start with README.md for the quickstart
+and command list.
+
+- [README](README.md): overview, quickstart, commands, limits and docs links.
+- [AGENTS](AGENTS.md): build, test, lint and repository conventions for contributors.
+- [Security policy](SECURITY.md): private vulnerability reporting and supported versions.
+- [Changelog](CHANGELOG.md): released changes.
+- [Quickstart](docs/quickstart.md): ten-minute one-machine walkthrough with expected output.
+- [Install](docs/install.md): release archives, source builds and service layout.
+- [Configuration](docs/config.md): every config table, validation rule and examples.
+- [Operations](docs/operations.md): upgrade, rollback, backup, restore and fleet changes.
+- [Security](docs/security.md): tokens, TLS, intake signing and the controller boundary.
+- [Limits](docs/limits.md): what Lu does not protect against and fail-open cases.
+- [Troubleshooting](docs/troubleshooting.md): exact errors and the checks that fix them.
+- [HTTP API](docs/api.md): routes, request and response shapes.
+- [ting reference](docs/ting.md): node agent CLI and exit codes.
+- [Architecture concepts](docs/concepts.md): jobs, nodes, leases and artifacts.
+- [Job lifecycle](docs/lifecycle.md): states and transitions.
+- [Dependencies](docs/dependencies.md): chaining, collection and blocked dependents.
+- [Batch submissions](docs/batch.md): directory and checklist batch planning.
+- [Drafts](docs/drafts.md): signed intake proposals and approval.
+- [Publishing](docs/publish.md): publishing a finished diff.
+- [Workspaces](docs/workspaces.md): checkout staging and workspace policies.
+- [Dispatch](docs/dispatch.md): labels, taints, providers and placement.
+- [Monitoring](docs/monitoring.md): metrics and node contribution statistics.
+- [Audit record](docs/audit.md): hash chain, verification and anchoring.
+- [Tokens and TLS](docs/tokens-and-tls.md): file rules, rotation and transport security.
+- [Security scanning](docs/security-scanning.md): workflows and release verification.
+- [Compatibility](docs/compatibility.md): wire rules and release update order.
+- [Client guide](docs/client-guide.md): operator CLI and MCP client usage.
+- [MCP server](docs/mcp.md): operator tools and the scoped harness server.
+- [opencode harness](docs/opencode-harness.md): harness setup and provider credentials.
+- [Reiki](docs/reiki.md): provider health and cordon behaviour.
+- [Worked examples](docs/examples.md): end-to-end task examples.
+- [Intake](docs/intake.md): signed webhook intake rules.
+- [Adding a node](docs/onboarding-nodes.md): node onboarding steps.
+- [Ting migration](docs/migration-ting.md): upgrading an existing agent host.
+- [Scope](docs/scope.md): audit scope and boundaries.
+- [Container scope](docs/scope-container.md): container deployment scope.
+- [Ansible scope](docs/scope-ansible.md): Ansible deployment scope.
+- [FAQ](docs/faq.md): common questions.
+- [Agent self-drain notes](NOTES.md): operator and agent drain coordination.
