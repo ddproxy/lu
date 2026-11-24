@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use crate::graph::{self, Graph};
 use crate::sanitize::printable;
-use lu_proto::{HarnessState, JobState, ProviderState};
+use lu_proto::limits::MAX_VERSION_BYTES;
+use lu_proto::{same_build, HarnessState, JobState, ProviderState};
 
 /// Reduces a source repository URL or absolute path to `owner/name`, dropping the scheme,
 /// credentials, host, query, fragment and a trailing `.git`. Unusable values become `-`; none of
@@ -998,6 +999,8 @@ pub struct ViewModel {
     pub node_rows: usize,
     /// Widths of the flexible job columns, shared by the model and the table widget.
     pub job_columns: JobColumns,
+    /// Width of the node version column, grown to fit a full dev version when one is present.
+    pub node_version_width: usize,
     pub node_names: Vec<String>,
     pub job_ids: Vec<String>,
     /// The job selected in both the Jobs table and the graph.
@@ -1321,7 +1324,7 @@ fn pad_left(text: &str, width: usize) -> String {
     }
 }
 
-fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
+fn node_line(node: &NodeRow, controller_version: Option<&str>, version_width: usize) -> Line {
     let (base_state, base_tone) = node_state_base(node);
     let seen = node.seen_secs_ago.map_or("-".to_owned(), short_age);
     let version = node
@@ -1332,10 +1335,11 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
         .unwrap_or_else(|| "-".to_owned());
     let version_tone = match controller_version {
         Some(cv) => {
-            if node.version.as_deref() != Some(cv) {
-                Tone::Warn
-            } else {
+            let controller = cv.split(" · ").next().unwrap_or(cv);
+            if same_build(&version, controller) {
                 Tone::Plain
+            } else {
+                Tone::Warn
             }
         }
         None => Tone::Plain,
@@ -1392,7 +1396,10 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
     let mut segments = vec![
         Segment::new(pad_right(&clip(&node.name, 12), 12), Tone::Plain),
         Segment::new(" ", Tone::Plain),
-        Segment::new(pad_right(&clip(&version, 10), 10), version_tone),
+        Segment::new(
+            pad_right(&clip(&version, version_width), version_width),
+            version_tone,
+        ),
         Segment::new(" ", Tone::Plain),
     ];
     // state column (14)
@@ -1448,44 +1455,33 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>) -> Line {
             worst(std::iter::once(row_tone).chain(provider_cells.iter().map(|(_, tone)| *tone)));
     }
     let mut line = Line::rich(segments);
-    // ensure plain text matches expected formatting for providers spacing
+    let version_cell = clip(&version, version_width);
     if !providers_plain.is_empty() {
-        let expected_prefix = format!(
-            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}  ",
-            clip(&node.name, 12),
-            clip(&version, 10),
-            clip(&state_plain, 14),
-            pad_right(&seen, 8).trim_end(),
-            load_text,
-            mem_text,
-            workspace_text,
-            workspace_total_text
-        );
-        // rebuild plain text cleanly
         line.text = format!(
-            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}  {}",
+            "{:<12} {:<width$} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}  {}",
             clip(&node.name, 12),
-            clip(&version, 10),
+            version_cell,
             clip(&state_plain, 14),
             seen,
             load_text,
             mem_text,
             workspace_text,
             workspace_total_text,
-            providers_plain
+            providers_plain,
+            width = version_width
         );
-        let _ = expected_prefix;
     } else {
         line.text = format!(
-            "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}",
+            "{:<12} {:<width$} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}",
             clip(&node.name, 12),
-            clip(&version, 10),
+            version_cell,
             clip(&state_plain, 14),
             seen,
             load_text,
             mem_text,
             workspace_text,
-            workspace_total_text
+            workspace_total_text,
+            width = version_width
         );
     }
     if !node.labels.is_empty() {
@@ -1723,10 +1719,26 @@ impl ViewModel {
             process,
             cordon_pane,
         } = args;
+        let version_width = snapshot
+            .nodes
+            .iter()
+            .filter_map(|node| node.version.as_deref())
+            .map(|version| printable(version).chars().count())
+            .max()
+            .unwrap_or(10)
+            .clamp(10, MAX_VERSION_BYTES);
         let mut lines = vec![Line::new(
             format!(
-                "{:<12} {:<10} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}  PROVIDERS",
-                "NODE", "VERSION", "STATE", "SEEN", "LOAD", "MEM", "WORKSPACES", "WS TOTALS"
+                "{:<12} {:<width$} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}  PROVIDERS",
+                "NODE",
+                "VERSION",
+                "STATE",
+                "SEEN",
+                "LOAD",
+                "MEM",
+                "WORKSPACES",
+                "WS TOTALS",
+                width = version_width
             ),
             Tone::Heading,
         )];
@@ -1734,7 +1746,7 @@ impl ViewModel {
             lines.push(Line::new("no nodes have reported", Tone::Dim));
         }
         for node in &snapshot.nodes {
-            lines.push(node_line(node, controller_version));
+            lines.push(node_line(node, controller_version, version_width));
         }
         lines.push(Line::new("", Tone::Plain));
         // The border costs two cells on each side; leave one spare for narrow panes.
@@ -1858,6 +1870,7 @@ impl ViewModel {
             focus: selection.focus,
             node_rows,
             job_columns: columns,
+            node_version_width: version_width,
             node_names: snapshot
                 .nodes
                 .iter()
@@ -2527,6 +2540,47 @@ mod tests {
                 .any(|s| s.text.trim() == "0.2.0" && s.tone == Tone::Plain),
             "{:?}",
             same.segments
+        );
+    }
+
+    #[test]
+    fn full_dev_version_is_shown_and_matches_the_prefixed_controller_header() {
+        const DEV: &str = "0.6.2-dev.1.gc08a5a0";
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        dashboard.apply(
+            Ok(Snapshot {
+                drafts: 0,
+                oldest_draft_secs: 0,
+                controller_version: Some(format!("lu/{DEV}")),
+                nodes: vec![node_full(
+                    "dev",
+                    "idle",
+                    Some(1),
+                    Some(DEV),
+                    None,
+                    None,
+                    None,
+                    0,
+                )],
+                jobs: Vec::new(),
+            }),
+            t0,
+        );
+        let view = dashboard.view(t0);
+        assert_eq!(view.node_version_width, DEV.len());
+        let row = view
+            .lines
+            .iter()
+            .find(|l| l.text.starts_with("dev"))
+            .unwrap();
+        assert!(row.text.contains(DEV), "{}", row.text);
+        assert!(
+            row.segments
+                .iter()
+                .any(|s| s.text.trim() == DEV && s.tone == Tone::Plain),
+            "{:?}",
+            row.segments
         );
     }
 

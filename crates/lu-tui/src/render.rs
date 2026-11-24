@@ -254,10 +254,14 @@ fn compare_compound(a: &str, b: &str) -> Ordering {
         })
 }
 
-fn node_columns() -> Vec<TableColumn> {
+fn node_columns(view: &ViewModel) -> Vec<TableColumn> {
     vec![
         TableColumn::sortable("NODE", ColWidth::Fixed(12), SortKind::Text),
-        TableColumn::sortable("VERSION", ColWidth::Fixed(10), SortKind::Text),
+        TableColumn::sortable(
+            "VERSION",
+            ColWidth::Fixed(view.node_version_width as u16),
+            SortKind::Text,
+        ),
         TableColumn::sortable(
             "STATE",
             ColWidth::Fixed(14),
@@ -490,9 +494,11 @@ fn table_widths(columns: &[TableColumn], base: &[usize]) -> Vec<usize> {
 
 fn node_table_rows(view: &ViewModel, columns: &[TableColumn]) -> Vec<TableRow> {
     let lines = &view.lines[1..1 + view.node_names.len()];
+    let mut widths = NODE_WIDTHS.to_vec();
+    widths[1] = view.node_version_width;
     table_rows(
         lines,
-        &table_widths(columns, &NODE_WIDTHS),
+        &table_widths(columns, &widths),
         &view.node_names,
         true,
         columns.len(),
@@ -803,7 +809,7 @@ fn draw_with_theme_and_tables(
     frame.render_widget(nodes_block, node_area);
     frame.render_widget(jobs_block, jobs_area);
 
-    let nodes_columns = fit_columns(node_columns(), nodes.width as usize);
+    let nodes_columns = fit_columns(node_columns(view), nodes.width as usize);
     let jobs_columns = fit_columns(job_columns(view), jobs.width as usize);
     let node_rows = node_table_rows(view, &nodes_columns);
     let job_rows = job_table_rows(view, &jobs_columns);

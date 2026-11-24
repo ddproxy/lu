@@ -1,5 +1,5 @@
 //! Wire types for the controller API: job ids and node names, the job spec, job states, failure
-//! classes, node heartbeats, events, size limits and output sanitising.
+//! classes, node heartbeats, events, size limits, build versions and output sanitising.
 //!
 //! This crate is pure data and rules: no I/O, no async. Everything an agent sends is untrusted,
 //! so every field is range-checked, strings are capped, and [`printable`] neutralises anything
@@ -17,6 +17,7 @@ pub mod scope;
 pub mod spec;
 pub mod state;
 pub mod stats;
+pub mod version;
 pub mod view;
 
 pub use event::{AgentEvent, Completion, CompletionError, LogChunk, LogChunkError, Outcome};
@@ -65,6 +66,7 @@ pub use stats::{
     RepoContribution, StatsAggregate, StatsGroup, StatsQuery, StatsReport, STATS_BUCKETS_SECS,
     STATS_BUCKET_LABELS, STATS_GROUPS, TERMINAL_STATES, TOP_REPOSITORIES,
 };
+pub use version::{same_build, BuildVersion, ParseVersionError};
 pub use view::{
     AgentSelfView, CordonView, JobView, NodeView, WorkspaceCleanResult, WorkspaceRelease,
     WorkspaceView,

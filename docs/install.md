@@ -32,18 +32,37 @@ and `contrib/`. The workflow builds with Rust 1.99, runs `cargo build --release 
 --features tui --target <target>` and `cargo build --release --locked -p tuishou-ting --target
 <target>`, smoke-runs both binaries, and verifies the tag before publishing.
 
-A stable tag must equal the `Cargo.toml` workspace version; the release workflow refuses a tag that
-does not, so a binary cannot report a version other than its tag.
+A stable tag must equal the `Cargo.toml` workspace version. The release workflow calls
+`scripts/set-release-version.py`, which checks that equality and stops on a mismatch, so a stable
+binary cannot report a version other than its tag.
 
 ### Dev builds
 
-After CI passes on `main`, the `dev-release` workflow tags the commit `vX.Y.(Z+1)-dev.<N>.g<hash>`
-and dispatches the release workflow on that tag, so its attestation identity is `release.yml@refs/tags/<tag>` and `tuishou verify` accepts it. X.Y.Z is the latest stable tag and N is the number
-of commits since it, so dev builds order by N and rank below the stable release of the same
-version. They are GitHub pre-releases (never "latest"), carry the same attestation, report their
-dev version from `lu --version`, and only the newest ten are kept. Documentation-only changes do
-not produce one. A canary node can follow them with tuishou's `channel = "dev"`; controllers
-should stay on stable releases, because schema migrations only move forward.
+After CI passes on `main`, the `dev-release` workflow tags the commit
+`vX.Y.(Z+1)-dev.N.gHASH` and dispatches the release workflow on that tag, so its attestation
+identity is `release.yml@refs/tags/<tag>` and `tuishou verify` accepts it. `X.Y.Z` is the latest
+stable tag, `N` is the number of commits since it, and `HASH` is a seven-character commit hash.
+
+The part after `v` is the build version, for example `0.6.2-dev.1.gc08a5a0`. The release script
+writes it into `[workspace.package].version` in `Cargo.toml` and into the workspace members in
+`Cargo.lock` before the build, so every binary is built from that version. It also accepts the
+equivalent `vX.Y.(Z+1)-dev.N+HASH` spelling, which becomes `0.6.2-dev.1+gc08a5a0`; generated tags
+use the `.gHASH` pre-release form. Both `lu --version` and `ting --version` print the full string,
+including the counter and hash, with no `v` prefix.
+
+The same full string appears in the agent's heartbeat `version` field (and therefore in `lu nodes`,
+`lu node` and `ting status --json`), in the controller's `/v1/health` and `/v1/status` responses,
+in the `x-lu-version` response header, in `lu_build_info{version=...}` on `/metrics`, and in the
+MCP `serverInfo.version`. There is no separate `/version` route. Dev versions follow SemVer
+precedence: `0.6.1 < 0.6.2-dev.1.gc08a5a0 < 0.6.2-dev.2.gc08a5a0 < 0.6.2 < 0.6.3`. They are
+GitHub pre-releases (never "latest"), carry the same attestation, and only the newest ten are kept.
+Documentation-only changes do not produce one.
+
+Agent and controller versions are not gated against each other: either side may be newer, and an
+agent reports its version as opaque text up to 32 printable ASCII bytes. `lu top` colours a node
+whose version differs from the controller's; an exact dev version fits the table. A canary
+node can follow dev builds with tuishou's `channel = "dev"`. Controllers should stay on stable releases, because schema
+migrations only move forward.
 
 Worked example:
 
