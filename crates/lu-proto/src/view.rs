@@ -204,6 +204,10 @@ pub struct NodeView {
     /// Free work-filesystem percentage from the latest heartbeat, when reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_pct: Option<u8>,
+    /// The controller's `[schedule] min_disk_free_pct`. Absent on older controllers, whose
+    /// clients cannot compare `disk_free_pct` against a threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_disk_free_pct: Option<u8>,
     #[serde(default)]
     pub providers: Vec<ProviderStatus>,
     /// Healthy provider/model pairs offered for `provider = "any"` jobs.
@@ -249,6 +253,35 @@ pub struct NodeView {
     pub workspaces: Vec<WorkspaceView>,
 }
 
+/// How strongly an operator client should present a node's latest health heartbeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeHealthLevel {
+    /// Nothing to report; an older controller without a threshold also lands here.
+    Ok,
+    /// Disk is below twice the configured minimum but not below the minimum itself.
+    Warning,
+    /// Harness reported down, or disk is below the configured minimum.
+    Critical,
+}
+
+/// The health cell shared by `lu nodes` and `lu top`. The text is `"-"` when healthy so both
+/// clients show a problem only when the controller's threshold says there is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeHealth {
+    pub text: String,
+    pub level: NodeHealthLevel,
+}
+
+impl NodeHealth {
+    /// The value for a node with no health problem to report.
+    pub fn healthy() -> Self {
+        Self {
+            text: "-".to_owned(),
+            level: NodeHealthLevel::Ok,
+        }
+    }
+}
+
 /// The calling agent's own node view from `GET /v1/agent/self`. The field set is deliberately
 /// fixed: an agent cannot ask for another node, and no field reveals tokens or configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,6 +323,33 @@ pub struct WorkspaceRelease {
 }
 
 impl NodeView {
+    /// Health text and severity from the latest heartbeat. Without a controller threshold the
+    /// disk percentage cannot be judged, so it stays hidden; a missing field means healthy.
+    pub fn health(&self) -> NodeHealth {
+        if self.harness_ok == Some(false) {
+            return NodeHealth {
+                text: "harness down".to_owned(),
+                level: NodeHealthLevel::Critical,
+            };
+        }
+        let (Some(pct), Some(min)) = (self.disk_free_pct, self.min_disk_free_pct) else {
+            return NodeHealth::healthy();
+        };
+        if pct < min {
+            return NodeHealth {
+                text: format!("disk free {pct}%"),
+                level: NodeHealthLevel::Critical,
+            };
+        }
+        if pct < min.saturating_mul(2) {
+            return NodeHealth {
+                text: format!("disk free {pct}%"),
+                level: NodeHealthLevel::Warning,
+            };
+        }
+        NodeHealth::healthy()
+    }
+
     /// A view for a drain route that answered 204.
     pub fn placeholder(name: NodeName, draining: bool) -> Self {
         Self {
@@ -302,6 +362,7 @@ impl NodeView {
             harness: None,
             harness_ok: None,
             disk_free_pct: None,
+            min_disk_free_pct: None,
             providers: Vec::new(),
             provider_models: Vec::new(),
             labels: Vec::new(),

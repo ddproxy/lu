@@ -5,7 +5,8 @@
 
 use std::time::Instant;
 
-use lu_tui::model::{Dashboard, JobRow, NodeRow, ProviderCell, Snapshot};
+use lu_proto::{NodeHealth, NodeHealthLevel};
+use lu_tui::model::{Dashboard, JobRow, NodeRow, ProviderCell, Snapshot, Update};
 use lu_tui::render::{draw_with_theme, Theme};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -15,6 +16,7 @@ fn node(name: &str, harness: &str, seen: Option<u64>, drained: bool, stuck: u64)
     NodeRow {
         name: name.to_owned(),
         harness: harness.to_owned(),
+        health: NodeHealth::healthy(),
         drained,
         seen_secs_ago: seen,
         providers: vec![ProviderCell {
@@ -86,9 +88,14 @@ fn fixture() -> Dashboard {
     dashboard
 }
 
-fn render(width: u16, height: u16, theme: Theme) -> (Buffer, String) {
+fn render_dashboard(
+    dashboard: Dashboard,
+    width: u16,
+    height: u16,
+    theme: Theme,
+) -> (Buffer, String) {
     let t0 = Instant::now();
-    let view = fixture().view_with_width(t0, width);
+    let view = dashboard.view_with_width(t0, width);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|frame| {
@@ -108,14 +115,29 @@ fn render(width: u16, height: u16, theme: Theme) -> (Buffer, String) {
     (buffer, format!("{text}\n"))
 }
 
-fn check(name: &str, width: u16, height: u16, theme: Theme, expected: &str) {
-    let (_, text) = render(width, height, theme);
+fn render(width: u16, height: u16, theme: Theme) -> (Buffer, String) {
+    render_dashboard(fixture(), width, height, theme)
+}
+
+fn check_dashboard(
+    name: &str,
+    dashboard: Dashboard,
+    width: u16,
+    height: u16,
+    theme: Theme,
+    expected: &str,
+) {
+    let (_, text) = render_dashboard(dashboard, width, height, theme);
     let path = format!("{}/tests/golden/{name}.txt", env!("CARGO_MANIFEST_DIR"));
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         std::fs::write(&path, &text).expect("write golden file");
         return;
     }
     assert_eq!(text, expected, "golden render for {name}");
+}
+
+fn check(name: &str, width: u16, height: u16, theme: Theme, expected: &str) {
+    check_dashboard(name, fixture(), width, height, theme, expected);
 }
 
 #[test]
@@ -194,4 +216,54 @@ fn no_color_render_is_stable_and_has_no_colors() {
             assert_eq!(cell.bg, ratatui::style::Color::Reset, "cell at {x},{y}");
         }
     }
+}
+
+#[test]
+fn node_health_and_container_error_render_is_stable() {
+    let ok = node("ok", "idle", Some(1), false, 0);
+    let mut warning = node("warn", "idle", Some(2), false, 0);
+    warning.health = NodeHealth {
+        text: "disk free 7%".to_owned(),
+        level: NodeHealthLevel::Warning,
+    };
+    let mut critical = node("crit", "busy", Some(3), false, 0);
+    critical.health = NodeHealth {
+        text: "disk free 3%".to_owned(),
+        level: NodeHealthLevel::Critical,
+    };
+    let mut harness_down = node("down", "idle", Some(4), false, 0);
+    harness_down.health = NodeHealth {
+        text: "harness down".to_owned(),
+        level: NodeHealthLevel::Critical,
+    };
+    let mut running = job("01RUN", "running", "alpha/one", "running job", "");
+    running.node = Some("crit".to_owned());
+
+    let mut dashboard = Dashboard::new();
+    dashboard.apply(
+        Ok(Snapshot {
+            nodes: vec![ok, warning, critical, harness_down],
+            jobs: vec![running],
+            controller_version: None,
+            drafts: 0,
+            oldest_draft_secs: 0,
+        }),
+        Instant::now(),
+    );
+    dashboard.toggle_focus();
+    dashboard.toggle_process_pane();
+    dashboard.apply_update(Update::ProcessStats {
+        job_id: "01RUN".to_owned(),
+        node: "crit".to_owned(),
+        result: Err("podman: no such container: harness-crit".to_owned()),
+    });
+
+    check_dashboard(
+        "health_and_container",
+        dashboard,
+        160,
+        24,
+        Theme::truecolor(),
+        include_str!("golden/health_and_container.txt"),
+    );
 }

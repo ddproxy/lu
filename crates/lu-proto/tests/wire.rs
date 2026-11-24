@@ -8,9 +8,9 @@ use lu_schedule::{BlockReason, Constraint, JobSchedule, OnDeadline};
 
 use lu_proto::{
     printable, truncate_chars, AgentEvent, ArtifactName, Choice, Completion, CordonView,
-    FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobState, JobView, LogChunk, NodeName,
-    NodeView, Outcome, ProviderModel, ProviderState, ProviderStatus, WorkspacePolicy,
-    WorkspaceState, WorkspaceView,
+    FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobState, JobView, LogChunk, NodeHealth,
+    NodeHealthLevel, NodeName, NodeView, Outcome, ProviderModel, ProviderState, ProviderStatus,
+    WorkspacePolicy, WorkspaceState, WorkspaceView,
 };
 
 fn job_id() -> JobId {
@@ -169,6 +169,62 @@ fn heartbeat_health_fields_are_optional_and_lenient() {
     });
     let error = serde_json::from_value::<Heartbeat>(bad).unwrap_err();
     assert!(error.to_string().contains("0 to 100"), "{error}");
+}
+
+#[test]
+fn node_view_threshold_is_optional_and_drives_health() {
+    let full = serde_json::json!({
+        "name": "peer-a", "harness_ok": true, "disk_free_pct": 7, "min_disk_free_pct": 8
+    });
+    let node: NodeView = serde_json::from_value(full).unwrap();
+    assert_eq!(node.min_disk_free_pct, Some(8));
+    assert_eq!(
+        node.health(),
+        NodeHealth {
+            text: "disk free 7%".to_owned(),
+            level: NodeHealthLevel::Critical
+        }
+    );
+    let wire = serde_json::to_value(&node).unwrap();
+    assert_eq!(wire["min_disk_free_pct"], 8);
+
+    let older: NodeView = serde_json::from_value(serde_json::json!({
+        "name": "peer-a", "harness_ok": false, "disk_free_pct": 7
+    }))
+    .unwrap();
+    assert_eq!(older.min_disk_free_pct, None);
+    assert_eq!(
+        older.health(),
+        NodeHealth {
+            text: "harness down".to_owned(),
+            level: NodeHealthLevel::Critical
+        }
+    );
+
+    let warning: NodeView = serde_json::from_value(serde_json::json!({
+        "name": "peer-a", "disk_free_pct": 9, "min_disk_free_pct": 8
+    }))
+    .unwrap();
+    assert_eq!(
+        warning.health(),
+        NodeHealth {
+            text: "disk free 9%".to_owned(),
+            level: NodeHealthLevel::Warning
+        }
+    );
+
+    let healthy: NodeView = serde_json::from_value(serde_json::json!({
+        "name": "peer-a", "disk_free_pct": 16, "min_disk_free_pct": 8
+    }))
+    .unwrap();
+    assert_eq!(healthy.health(), NodeHealth::healthy());
+
+    let no_threshold: NodeView = serde_json::from_value(serde_json::json!({
+        "name": "peer-a", "disk_free_pct": 7
+    }))
+    .unwrap();
+    assert_eq!(no_threshold.min_disk_free_pct, None);
+    assert_eq!(no_threshold.health(), NodeHealth::healthy());
 }
 
 #[test]
@@ -333,6 +389,7 @@ fn job_and_node_views_match_the_documented_json() {
         harness: Some(HarnessState::Idle),
         harness_ok: Some(true),
         disk_free_pct: Some(21),
+        min_disk_free_pct: Some(8),
         providers: vec![ProviderStatus {
             name: "peer-b".to_owned(),
             state: ProviderState::Ok,
@@ -391,6 +448,7 @@ fn job_and_node_views_match_the_documented_json() {
         "harness": "idle",
         "harness_ok": true,
         "disk_free_pct": 21,
+        "min_disk_free_pct": 8,
         "providers": [{"name": "peer-b", "state": "ok"}],
         "provider_models": [{"provider": "peer-b", "model": "other-model"}],
         "labels": ["gpu"],

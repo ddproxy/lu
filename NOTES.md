@@ -418,3 +418,35 @@ Claims in the request were checked against the existing script and workflows bef
   tampered archive before any binary ran.
 - The checkout's `.git` directory is not writable, so no commit was created. The terse message
   prepared for it is `compat-test: fetch and verify previous releases`.
+
+## Node health and process pane verification
+
+### Verified against the code
+
+- There was no podman-specific error path. Process stats failures reach `lu top` as a generic
+  `stats unavailable: {error}` line through `Update::ProcessStats`. The plain headline is therefore
+  chosen by matching known runtime/container substrings, while the exact error is kept on a dim
+  `detail:` line. Other errors keep the original headline.
+- `lu nodes` already had a `HEALTH` column and called `node_health_reason`; the reason logic now
+  lives in `lu_proto::NodeView::health()` so the CLI and TUI cannot drift. `lu top`'s node table had
+  no health or disk data, so it gained a 15-wide `HEALTH` column after `STATE`.
+- `GET /v1/nodes` did not expose the configured threshold. `NodeView.min_disk_free_pct` is
+  `Option<u8>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`, so an older
+  client reads the new answer and an older controller's answer deserializes with `None`. With no
+  threshold, disk stays out of `HEALTH`; with `0`, the disk comparison is disabled.
+- `harness_ok: false` wins over disk state. Otherwise a percentage below the threshold is critical,
+  a percentage below twice the threshold is a warning, and other percentages are hidden. The CLI
+  prints plain text; the warning style exists only in `lu top` (`Tone::Warn`) and critical uses
+  `Tone::Bad`.
+- `/metrics` exposes raw heartbeat signals and has no threshold series, so the health cell uses
+  the API field instead of deriving a value from the metrics.
+
+### Verification
+
+- `cargo fmt --all --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean, with and without `--features tui`.
+- `cargo test --workspace` — passed, with and without `--features tui`.
+- `scripts/check-docs.sh` — passed.
+
+The checkout has no writable git metadata, so changes remain local and uncommitted. Commit messages
+were kept terse as requested.

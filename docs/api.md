@@ -281,6 +281,7 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `harness` | string | Last reported harness state: `idle` or `busy`. |
 | `harness_ok` | boolean or null | `false` when the latest heartbeat reports an unhealthy agent harness; absent for older agents, which are treated as healthy. |
 | `disk_free_pct` | integer or null | Free work-filesystem percentage from the latest heartbeat, `0` to `100`; absent for older agents, which are treated as healthy. |
+| `min_disk_free_pct` | integer or null | The controller's `[schedule] min_disk_free_pct` (default `8`; `0` disables the disk gate). Absent on older controllers. Operator clients use it to judge `disk_free_pct`: `harness_ok: false` is `harness down`, a value below the minimum is critical, and a value below twice the minimum is a warning. |
 | `providers` | array | Provider names and states from the latest heartbeat. |
 | `provider_models` | array | Healthy `{provider, model}` pairs published by the agent for `provider = "any"` jobs. Always present, including `[]` when empty. |
 | `labels` | array of strings | Labels from the latest heartbeat. |
@@ -299,6 +300,8 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `workspace_evictions_total` | integer | Workspaces removed by eviction since the agent started. |
 | `workspace_delete_errors_total` | integer | Failed deletion attempts since the agent started; failures are retried. |
 | `workspaces` | array of `WorkspaceView` | Kept and pending workspaces, oldest first, from the latest heartbeat. |
+
+A client talking to an older controller that omits `min_disk_free_pct` cannot judge the percentage, so `lu nodes` and `lu top` leave disk out of `HEALTH`; the raw `disk_free_pct` is still present in the node view and in `lu nodes`' `DISK_FREE` column.
 
 ### `WorkspaceView`
 

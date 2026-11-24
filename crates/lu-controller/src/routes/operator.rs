@@ -471,6 +471,7 @@ fn node_view(
     n: &NodeRecord,
     stats: Option<&lu_proto::NodeStats>,
     cordons: Vec<CordonView>,
+    min_disk_free_pct: u8,
 ) -> NodeView {
     let host = stats.and_then(|stats| stats.host.as_ref());
     let stuck = stats
@@ -486,6 +487,7 @@ fn node_view(
         harness: Some(n.heartbeat.harness),
         harness_ok: n.heartbeat.harness_ok,
         disk_free_pct: n.heartbeat.disk_free_pct,
+        min_disk_free_pct: Some(min_disk_free_pct),
         providers: n.heartbeat.providers.clone(),
         provider_models: n.heartbeat.provider_models.clone(),
         labels: n.heartbeat.labels.clone(),
@@ -1845,7 +1847,12 @@ pub async fn list_nodes(
                         .filter(|(cordon, _)| cordon.node == node.name)
                         .map(|(_, view)| view.clone())
                         .collect();
-                    node_view(node, stats.get(&node.name), details)
+                    node_view(
+                        node,
+                        stats.get(&node.name),
+                        details,
+                        state.dispatch_limits().min_disk_free_pct,
+                    )
                 })
                 .collect::<Vec<_>>();
             with_version(json_with_etag(&headers, &node_views))

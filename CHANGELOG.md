@@ -11,6 +11,7 @@ uses semantic versioning once it reaches 1.0.
   the header. Job priority is displayed in a `PRI` column after `STATE`.
 - Job and node selection follows the same row across refreshes and re-sorts.
 - Heartbeats may carry optional `harness_ok` and `disk_free_pct`. Dispatch skips nodes reporting an unhealthy harness or free disk space below `[schedule] min_disk_free_pct` (default `8`; `0` disables). Queued jobs report the reason in `waiting_reason` and `blocked_reason`; `lu nodes`, `lu node`, `/metrics` expose the signals, and a later healthy heartbeat makes the node eligible again.
+- `GET /v1/nodes` adds optional `min_disk_free_pct`. `lu nodes` and `lu top` use it to show `harness down` or `disk free N%` only for real problems, with a warning tone in `lu top` below twice the threshold.
 - Full dev build versions are preserved end to end: `lu --version`, `ting --version`, heartbeat versions, `/v1/health`, `/v1/status`, `x-lu-version`, `/metrics` and MCP server info report the rewritten workspace version. Added fake-dev-version tests for parsing, ordering and display; the TUI version column now grows to fit a dev version, and `set-release-version.py` accepts `+HASH` metadata. [Dev build format](docs/install.md#dev-builds).
 
 ### Added
@@ -28,6 +29,7 @@ uses semantic versioning once it reaches 1.0.
 
 - `lu retry <id>` requeues the named terminal job in place: its attempt is incremented, its outcome is cleared and blocked dependents with `predecessor failed` are restored after it, transitively with `--chain`. Cancelled or failed dependents stay untouched. Plain output is `retried <id>; requeued N dependents`; any other state, including `done`, is refused with a clear conflict. The API reply now carries `requeued` ids instead of old/new pairs.
 - Retry applies `restrict_fields` to the parsed or stored spec, so a restricted token cannot widen a job through the retry route.
+- `lu top`'s `x` process pane shows `harness container not running on this node` instead of a raw runtime error when the harness container is gone; the exact error stays on a detail line.
 
 ### Fixed
 
