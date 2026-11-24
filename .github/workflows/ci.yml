@@ -32,6 +32,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked --features tui -- -D warnings
       - name: Check monitoring assets
         run: ./scripts/check-monitoring.sh
+      - name: Check docs examples
+        run: ./scripts/check-docs.sh
       - run: cargo test --locked --workspace
       - run: cargo test --locked --workspace --features tui
 

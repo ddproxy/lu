@@ -30,7 +30,7 @@ Given a trusted copy of the last hash recorded elsewhere (see below), this gives
 
 Changing a byte of an existing line changes its hash and breaks that line and its successor. Inserting a line breaks the sequence or the `prev` link. Deleting a middle line breaks the `prev` link along with the hash mismatch; deleting trailing lines is caught by comparing the final head to the trusted hash. `verify --head <hash>` performs that comparison, and detects a truncated file even though every remaining line is internally consistent.
 
-Pass `--json` to `lu audit verify` for machine-readable output (`ok`, `records`, `head`). `lu audit tail <path> [-n <lines>]` prints the last records, and `lu audit head <path>` prints the current head hash.
+Pass `--json` to `lu audit verify` for machine-readable output (`ok`, `records`, `head`). `lu audit tail <path> [-l <lines>]` prints the last records (`-l` / `--lines`, default `20`), and `lu audit head <path>` prints the current head hash.
 
 ## What verification does not prove
 

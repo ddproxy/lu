@@ -7,6 +7,7 @@ uses semantic versioning once it reaches 1.0.
 
 ### Added
 
+- Standardised README and docs: status, install, configuration, operation, security, compatibility, limits and contribution sections. `AGENTS.md`, `llms.txt` and a docs check cover links, CLI names and config examples.
 - Automatic dev builds: after CI passes on `main`, `dev-release` tags `vX.Y.(Z+1)-dev.<N>.g<hash>` (N = commits since the last stable tag) and builds it as a GitHub pre-release with attestation. The release workflow also refuses a stable tag that differs from the `Cargo.toml` version, and sets the dev version inside the build.
 - Web UI write controls. All operator mutations accept optional `If-Match`; stale validators return `412 precondition_failed`. `create`, `retry`, `cancel`, `approve` and `publish` accept a principal-scoped `Idempotency-Key` stored in one additive `request_keys` table with a 24-hour expiry: a repeat replays the stored status and body, and a changed body or operation returns `422 idempotency_conflict`. `create`, `retry`, `cancel` and workspace clean accept `?dry_run=1`, which validates and audits without writing. Retry with an empty body reuses the stored spec. Added `mutation_dry_run`, `mutation_replay` and `mutation_precondition_failed` audit events with principal and role.
 - Store schema 7: databases at versions 1–6 gain `request_keys` in place at startup; backups and restores require version 7. Migration and compatibility probes cover the change.
@@ -18,6 +19,10 @@ uses semantic versioning once it reaches 1.0.
 ### Fixed
 
 - Retry applies `restrict_fields` to the parsed or stored spec, so a restricted token cannot widen a job through the retry route.
+
+### Fixed
+
+- Docs name `lu audit tail -l` and list `lu cancel --keep-dependents` and `lu collect --allow-scrubbed`.
 
 ## [0.6.1]
 

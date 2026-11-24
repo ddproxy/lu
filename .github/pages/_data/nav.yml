@@ -41,7 +41,11 @@
     - { title: Security scanning, url: /docs/security-scanning.html }
 - title: Reference
   items:
+    - { title: Documentation index, url: /docs/README.html }
     - { title: HTTP API, url: /docs/api.html }
+    - { title: ting reference, url: /docs/ting.html }
+    - { title: Audit record, url: /docs/audit.html }
+    - { title: Compatibility between releases, url: /docs/compatibility.html }
     - { title: Client guide, url: /docs/client-guide.html }
     - { title: MCP server, url: /docs/mcp.html }
     - { title: FAQ, url: /docs/faq.html }
