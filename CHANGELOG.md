@@ -6,6 +6,12 @@ uses semantic versioning once it reaches 1.0.
 ## [Unreleased]
 
 ### Added
+- `lu top` now uses the shared fw-tui table widget for node and job data. Columns are
+  sortable with `s`, `S`, `r`, and header clicks, and the active sort is indicated in
+  the header. Job priority is displayed in a `PRI` column after `STATE`.
+- Job and node selection follows the same row across refreshes and re-sorts.
+
+### Added
 
 - Standardised README and docs: status, install, configuration, operation, security, compatibility, limits and contribution sections. `AGENTS.md`, `llms.txt` and a docs check cover links, CLI names and config examples.
 - Automatic dev builds: after CI passes on `main`, `dev-release` tags `vX.Y.(Z+1)-dev.<N>.g<hash>` (N = commits since the last stable tag) and builds it as a GitHub pre-release with attestation. The release workflow also refuses a stable tag that differs from the `Cargo.toml` version, and sets the dev version inside the build.

@@ -1,22 +1,42 @@
+use std::cmp::Ordering;
+
+use fw_tui::theme::Theme as WidgetTheme;
+use fw_tui::widgets::{
+    render_table_sorted, ColWidth, SortKind, TableColumn, TableRow, TableViewState,
+};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph, Sparkline};
+use ratatui::widgets::{Block, Paragraph, Sparkline, Widget};
 use ratatui::Frame;
 
 use crate::graph::{self, NodeRect, RenderedGraph};
-use crate::model::{Focus, Tone, ViewModel};
+use crate::model::{Focus, Line as ModelLine, Tone, ViewModel};
+
+/// Persistent table state: sorting and the scroll offset survive refreshes.
+#[derive(Debug, Clone, Default)]
+pub struct TableUi {
+    pub nodes: TableViewState,
+    pub jobs: TableViewState,
+}
 
 /// Where the mouse sees each pane; coordinates are terminal cells.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LayoutInfo {
     /// Content area of the Nodes block, with its header on row zero.
     pub nodes: Rect,
-    /// Content area of the Jobs block, with a blank row, then its header.
+    /// Content area of the Jobs block, with its header on row zero.
     pub jobs: Rect,
     /// Content area of the Graph block, matching the node rectangles in `rendered_graph`.
     pub graph: Rect,
     pub rendered_graph: RenderedGraph,
+    /// Column metadata from the last frame, for click hit testing and sort keys.
+    pub nodes_columns: Vec<TableColumn>,
+    pub jobs_columns: Vec<TableColumn>,
+    /// Displayed data-row order from the last frame; maps a clicked row to a model row.
+    pub nodes_order: Vec<usize>,
+    pub jobs_order: Vec<usize>,
 }
 
 impl Default for LayoutInfo {
@@ -26,6 +46,10 @@ impl Default for LayoutInfo {
             jobs: Rect::new(0, 0, 0, 0),
             graph: Rect::new(0, 0, 0, 0),
             rendered_graph: RenderedGraph::default(),
+            nodes_columns: Vec::new(),
+            jobs_columns: Vec::new(),
+            nodes_order: Vec::new(),
+            jobs_order: Vec::new(),
         }
     }
 }
@@ -144,31 +168,6 @@ fn style_for(tone: Tone, theme: Theme) -> Style {
     }
 }
 
-fn model_line(line: &crate::model::Line, selected: bool, theme: Theme) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = if line.segments.is_empty() {
-        vec![Span::styled(line.text.clone(), style_for(line.tone, theme))]
-    } else {
-        line.segments
-            .iter()
-            .map(|segment| Span::styled(segment.text.clone(), style_for(segment.tone, theme)))
-            .collect()
-    };
-    if selected {
-        // Underline rather than reverse: reverse is used by the 16-colour badges.
-        spans = spans
-            .into_iter()
-            .map(|span| {
-                Span::styled(
-                    span.content.into_owned(),
-                    span.style
-                        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
-                )
-            })
-            .collect();
-    }
-    Line::from(spans)
-}
-
 fn pane_line(line: &crate::model::Line, theme: Theme) -> Line<'static> {
     if line.segments.is_empty() {
         Line::from(Span::styled(line.text.clone(), style_for(line.tone, theme)))
@@ -180,6 +179,345 @@ fn pane_line(line: &crate::model::Line, theme: Theme) -> Line<'static> {
                 .collect::<Vec<_>>(),
         )
     }
+}
+
+// The widget takes plain cell strings; the surrounding style map is re-applied after drawing so
+// state badges, version warnings and memory colours keep the same tokens as before.
+fn widget_theme(theme: Theme) -> WidgetTheme {
+    WidgetTheme {
+        title: if theme.color {
+            Style::default()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        },
+        label: Style::default(),
+        dim: Style::default(),
+        good: Style::default(),
+        warn: Style::default(),
+        bad: Style::default(),
+        accent: Style::default(),
+        selected_row: Style::default(),
+        header_bar: Style::default().add_modifier(Modifier::BOLD),
+        border: Style::default(),
+        border_focused: Style::default(),
+    }
+}
+
+fn state_rank(value: &str) -> u8 {
+    match value.trim() {
+        "running" | "leased" => 0,
+        "queued" | "recovering" | "needs_input" | "stale" | "busy" => 1,
+        "blocked" | "draft" | "drained" => 2,
+        "done" => 3,
+        "failed" | "offline" => 4,
+        "cancelled" | "expired" | "deadline_missed" | "idle" => 5,
+        _ => 6,
+    }
+}
+
+fn compare_state(a: &str, b: &str) -> Ordering {
+    state_rank(a)
+        .cmp(&state_rank(b))
+        .then_with(|| a.trim().cmp(b.trim()))
+}
+
+fn metric(value: &str) -> f64 {
+    let trimmed = value.trim().replace(',', "");
+    let (number, factor) = match trimmed.chars().last() {
+        Some('k' | 'K') => (&trimmed[..trimmed.len() - 1], 1_000.0),
+        Some('m' | 'M') => (&trimmed[..trimmed.len() - 1], 1_000_000.0),
+        Some('g' | 'G') => (&trimmed[..trimmed.len() - 1], 1_000_000_000.0),
+        Some('B' | '%') if trimmed.len() > 1 => (&trimmed[..trimmed.len() - 1], 1.0),
+        _ => (trimmed.as_str(), 1.0),
+    };
+    number
+        .parse::<f64>()
+        .ok()
+        .map(|value| value * factor)
+        .unwrap_or(f64::MAX)
+}
+
+fn compound_part(value: &str, index: usize) -> &str {
+    value.split('/').nth(index).unwrap_or("")
+}
+
+fn compare_compound(a: &str, b: &str) -> Ordering {
+    metric(compound_part(a, 0))
+        .partial_cmp(&metric(compound_part(b, 0)))
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| {
+            metric(compound_part(a, 1))
+                .partial_cmp(&metric(compound_part(b, 1)))
+                .unwrap_or(Ordering::Equal)
+        })
+}
+
+fn node_columns() -> Vec<TableColumn> {
+    vec![
+        TableColumn::sortable("NODE", ColWidth::Fixed(12), SortKind::Text),
+        TableColumn::sortable("VERSION", ColWidth::Fixed(10), SortKind::Text),
+        TableColumn::sortable(
+            "STATE",
+            ColWidth::Fixed(14),
+            SortKind::Custom(compare_state),
+        ),
+        TableColumn::sortable("SEEN", ColWidth::Fixed(8), SortKind::Duration),
+        TableColumn::sortable("LOAD", ColWidth::Fixed(6), SortKind::Number).right(),
+        TableColumn::sortable("MEM", ColWidth::Fixed(5), SortKind::Number).right(),
+        TableColumn::sortable(
+            "WORKSPACES",
+            ColWidth::Fixed(12),
+            SortKind::Custom(compare_compound),
+        )
+        .right(),
+        TableColumn::sortable(
+            "WS TOTALS",
+            ColWidth::Fixed(16),
+            SortKind::Custom(compare_compound),
+        )
+        .right(),
+        TableColumn::sortable("PROVIDERS", ColWidth::Flex(1), SortKind::Text),
+    ]
+}
+
+fn column_min_width(column: &TableColumn) -> usize {
+    match column.width {
+        ColWidth::Fixed(width) | ColWidth::Min(width) => usize::from(width),
+        ColWidth::Flex(_) => 0,
+    }
+}
+
+/// Drops the lowest-priority trailing columns until the rest fit without clipping.
+fn fit_columns(mut columns: Vec<TableColumn>, width: usize) -> Vec<TableColumn> {
+    while columns.len() > 1 {
+        let needed: usize = columns.iter().map(column_min_width).sum::<usize>() + columns.len() - 1;
+        if needed <= width {
+            break;
+        }
+        columns.pop();
+    }
+    columns
+}
+
+fn job_columns(view: &ViewModel) -> Vec<TableColumn> {
+    let widths = view.job_columns;
+    let mut columns = vec![
+        TableColumn::sortable("JOB", ColWidth::Fixed(10), SortKind::Text),
+        TableColumn::sortable(
+            "STATE",
+            ColWidth::Fixed(11),
+            SortKind::Custom(compare_state),
+        ),
+        TableColumn::sortable("PRI", ColWidth::Fixed(3), SortKind::Number).right(),
+        TableColumn::sortable("NODE", ColWidth::Fixed(9), SortKind::Text),
+        TableColumn::sortable("REPO", ColWidth::Fixed(widths.repo as u16), SortKind::Text),
+        TableColumn::sortable("TRY", ColWidth::Fixed(3), SortKind::Number).right(),
+        TableColumn::sortable("AGE", ColWidth::Fixed(6), SortKind::Duration),
+    ];
+    if widths.title > 0 {
+        columns.push(TableColumn::sortable(
+            "TITLE",
+            ColWidth::Fixed(widths.title as u16),
+            SortKind::Text,
+        ));
+    }
+    if widths.note > 0 {
+        columns.push(TableColumn::sortable(
+            "NOTE",
+            ColWidth::Fixed(widths.note as u16),
+            SortKind::Text,
+        ));
+    }
+    columns
+}
+
+fn constraint(width: ColWidth) -> Constraint {
+    match width {
+        ColWidth::Fixed(width) => Constraint::Length(width),
+        ColWidth::Min(width) => Constraint::Min(width),
+        ColWidth::Flex(width) => Constraint::Fill(width.max(1)),
+    }
+}
+
+fn column_rects(area: Rect, columns: &[TableColumn]) -> Vec<Rect> {
+    if area.width == 0 {
+        return Vec::new();
+    }
+    Layout::horizontal(
+        columns
+            .iter()
+            .map(|column| constraint(column.width))
+            .collect::<Vec<_>>(),
+    )
+    .spacing(1)
+    .split(Rect::new(area.x, area.y, area.width, 1))
+    .to_vec()
+}
+
+/// Splits a model line into the widget's cells; `gap` strips the extra space before PROVIDERS.
+fn cells_from_line(text: &str, widths: &[usize], gap: bool) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut at = 0usize;
+    let mut cells = Vec::with_capacity(widths.len() + 1);
+    for (index, &width) in widths.iter().enumerate() {
+        let end = (at + width).min(chars.len());
+        cells.push(chars[at..end].iter().collect());
+        at = if index + 1 < widths.len() {
+            (end + 1).min(chars.len())
+        } else {
+            end
+        };
+    }
+    let rest: String = chars[at..].iter().collect();
+    if gap {
+        cells.push(rest.strip_prefix(' ').unwrap_or(&rest).to_owned());
+    } else {
+        cells.push(rest);
+    }
+    cells
+}
+
+fn table_rows(
+    lines: &[ModelLine],
+    widths: &[usize],
+    keys: &[String],
+    gap: bool,
+    expected: usize,
+) -> Vec<TableRow> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let mut cells = cells_from_line(&line.text, widths, gap);
+            cells.resize(expected, String::new());
+            let mut row = TableRow::new(cells);
+            if let Some(key) = keys.get(index) {
+                row = row.with_key(key.clone());
+            }
+            row
+        })
+        .collect()
+}
+
+/// The widget draws plain strings; Lu's badge colours are re-applied on top afterwards.
+fn apply_line_styles(
+    buffer: &mut Buffer,
+    rects: &[Rect],
+    origin_x: u16,
+    line: &ModelLine,
+    y: u16,
+    selected: bool,
+    theme: Theme,
+) {
+    let mut at = 0usize;
+    for segment in &line.segments {
+        for _ in segment.text.chars() {
+            if let Some(rect) = rects.iter().find(|rect| {
+                let start = usize::from(rect.x.saturating_sub(origin_x));
+                at >= start && at < start.saturating_add(usize::from(rect.width))
+            }) {
+                let style = style_for(segment.tone, theme);
+                let style = if selected {
+                    style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    style
+                };
+                buffer[(rect.x, y)].set_style(style);
+            }
+            at += 1;
+        }
+    }
+}
+
+/// Draws one table through the shared widget and returns the visible rows in draw order.
+/// Each returned value is an index into the caller's row and line slices.
+fn draw_table(
+    buffer: &mut Buffer,
+    area: Rect,
+    columns: &[TableColumn],
+    rows: &[TableRow],
+    lines: &[ModelLine],
+    state: &mut TableViewState,
+    theme: Theme,
+) -> Vec<usize> {
+    render_table_sorted(area, buffer, columns, rows, state, &widget_theme(theme));
+    if rows.is_empty() || area.height < 2 {
+        return Vec::new();
+    }
+    let order = state.sorted_indices(columns, rows);
+    let start = state.offset.min(order.len() - 1);
+    let end = start
+        .saturating_add(usize::from(area.height - 2))
+        .min(order.len());
+    let visible = order[start..end].to_vec();
+    let rects = column_rects(area, columns);
+    for (position, &index) in visible.iter().enumerate() {
+        if let Some(line) = lines.get(index) {
+            let y = area.y + 1 + position as u16;
+            apply_line_styles(
+                &mut *buffer,
+                &rects,
+                area.x,
+                line,
+                y,
+                index == state.selected,
+                theme,
+            );
+        }
+    }
+    visible
+}
+
+const NODE_WIDTHS: [usize; 8] = [12, 10, 14, 8, 6, 5, 12, 16];
+
+fn job_widths(view: &ViewModel) -> Vec<usize> {
+    let widths = view.job_columns;
+    let mut result = vec![10, 11, 3, 9, widths.repo, 3, 6];
+    if widths.title > 0 {
+        result.push(widths.title);
+    }
+    if widths.note > 0 {
+        result.push(widths.note);
+    }
+    result
+}
+
+fn table_widths(columns: &[TableColumn], base: &[usize]) -> Vec<usize> {
+    base[..base.len().min(columns.len())].to_vec()
+}
+
+fn node_table_rows(view: &ViewModel, columns: &[TableColumn]) -> Vec<TableRow> {
+    let lines = &view.lines[1..1 + view.node_names.len()];
+    table_rows(
+        lines,
+        &table_widths(columns, &NODE_WIDTHS),
+        &view.node_names,
+        true,
+        columns.len(),
+    )
+}
+
+fn job_table_rows(view: &ViewModel, columns: &[TableColumn]) -> Vec<TableRow> {
+    let start = 3 + view.node_rows;
+    let lines = &view.lines[start..start + view.job_ids.len()];
+    table_rows(
+        lines,
+        &table_widths(columns, &job_widths(view)),
+        &view.job_ids,
+        false,
+        columns.len(),
+    )
+}
+
+/// Empty tables keep model-owned placeholder text, outside the widget's row list.
+fn draw_placeholder(buffer: &mut Buffer, area: Rect, line: &ModelLine, theme: Theme) {
+    if area.width == 0 || area.height < 2 {
+        return;
+    }
+    Paragraph::new(Text::from(vec![pane_line(line, theme)]))
+        .render(Rect::new(area.x, area.y + 1, area.width, 1), buffer);
 }
 
 fn draw_process_pane(
@@ -353,11 +691,27 @@ fn draw_gauges(frame: &mut Frame, charts: &[crate::model::Chart], area: Rect, th
 
 /// Lays out a view model with colours taken from the environment.
 pub fn draw(frame: &mut Frame, view: &ViewModel) -> LayoutInfo {
-    draw_with_theme(frame, view, Theme::from_env())
+    let mut tables = TableUi::default();
+    draw_with_tables(frame, view, &mut tables)
+}
+
+/// Keeps sort and selection state across frames; used by the interactive event loop.
+pub fn draw_with_tables(frame: &mut Frame, view: &ViewModel, tables: &mut TableUi) -> LayoutInfo {
+    draw_with_theme_and_tables(frame, view, Theme::from_env(), tables)
 }
 
 /// Lays out a view model; all text decisions were made in the model.
 pub fn draw_with_theme(frame: &mut Frame, view: &ViewModel, theme: Theme) -> LayoutInfo {
+    let mut tables = TableUi::default();
+    draw_with_theme_and_tables(frame, view, theme, &mut tables)
+}
+
+fn draw_with_theme_and_tables(
+    frame: &mut Frame,
+    view: &ViewModel,
+    theme: Theme,
+    tables: &mut TableUi,
+) -> LayoutInfo {
     let area = frame.area();
     let gauge_height = u16::from(area.height >= 12 && !view.charts.is_empty());
     let [gauges, body, status, footer] = Layout::vertical([
@@ -396,12 +750,17 @@ pub fn draw_with_theme(frame: &mut Frame, view: &ViewModel, theme: Theme) -> Lay
     let rendered = graph_view.map(|graph| graph::render(graph, area.width as usize, false));
     // The panel never pushes the other panes: it gets at most a third of the screen,
     // with three content rows and a border whenever there is a graph to show.
+    // Each widget reserves two rows for its header and scroll window, so the graph yields space
+    // rather than pushing table rows off screen.
+    let table_need = view.node_rows.min(6) + 4 + view.job_ids.len().min(5) + 4;
+    let table_room = usize::from(body.height.saturating_sub(bottom_height))
+        .saturating_sub(table_need.min(usize::from(u16::MAX)));
     let graph_height = rendered
         .as_ref()
         .filter(|graph| !graph.lines.is_empty())
         .map_or(0, |graph| {
             let cap = area.height / 3;
-            let room = body.height.saturating_sub(bottom_height).saturating_sub(1);
+            let room = u16::try_from(table_room).unwrap_or(u16::MAX);
             ((graph.lines.len() + 2) as u16).max(5).min(cap).min(room)
         });
     let [table_area, graph_area, bottom_area] = Layout::vertical([
@@ -434,49 +793,85 @@ pub fn draw_with_theme(frame: &mut Frame, view: &ViewModel, theme: Theme) -> Lay
             Style::default()
         });
     let node_lines = 1 + view.node_rows;
-    let node_height = u16::try_from(node_lines + 2)
+    let node_height = u16::try_from(node_lines + 3)
         .unwrap_or(u16::MAX)
         .min(table_area.height);
     let [node_area, jobs_area] =
         Layout::vertical([Constraint::Length(node_height), Constraint::Min(0)]).areas(table_area);
-    let node_widget: Vec<Line> = view
-        .lines
-        .iter()
-        .take(node_lines)
-        .enumerate()
-        .map(|(index, line)| model_line(line, view.selected_line == Some(index), theme))
-        .collect();
-    let mut job_widget: Vec<Line> = view
-        .lines
-        .iter()
-        .skip(node_lines)
-        .enumerate()
-        .map(|(index, line)| {
-            model_line(line, view.selected_line == Some(node_lines + index), theme)
-        })
-        .collect();
     let nodes = nodes_block.inner(node_area);
     let jobs = jobs_block.inner(jobs_area);
-    // Short lists leave the bottom of the Jobs pane empty; fill it with fleet totals.
-    if job_widget.len() + 2 <= usize::from(jobs.height) {
-        job_widget.push(Line::from(""));
-        job_widget.push(Line::from(Span::styled(
-            view.summary.clone(),
-            if theme.color {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            },
-        )));
+    frame.render_widget(nodes_block, node_area);
+    frame.render_widget(jobs_block, jobs_area);
+
+    let nodes_columns = fit_columns(node_columns(), nodes.width as usize);
+    let jobs_columns = fit_columns(job_columns(view), jobs.width as usize);
+    let node_rows = node_table_rows(view, &nodes_columns);
+    let job_rows = job_table_rows(view, &jobs_columns);
+    // The view model counts rows in data order; the widget keeps its own selection index.
+    if view.focus == Focus::Nodes {
+        if let Some(index) = view.selected_line.and_then(|line| line.checked_sub(1)) {
+            if index < node_rows.len() {
+                tables.nodes.selected = index;
+            }
+        }
     }
-    frame.render_widget(
-        Paragraph::new(Text::from(node_widget)).block(nodes_block),
-        node_area,
+    if view.focus == Focus::Jobs {
+        let first_job = 3 + view.node_rows;
+        if let Some(index) = view
+            .selected_line
+            .and_then(|line| line.checked_sub(first_job))
+        {
+            if index < job_rows.len() {
+                tables.jobs.selected = index;
+            }
+        }
+    }
+    let nodes_order = draw_table(
+        frame.buffer_mut(),
+        nodes,
+        &nodes_columns,
+        &node_rows,
+        &view.lines[1..1 + node_rows.len()],
+        &mut tables.nodes,
+        theme,
     );
-    frame.render_widget(
-        Paragraph::new(Text::from(job_widget)).block(jobs_block),
-        jobs_area,
+    let jobs_order = draw_table(
+        frame.buffer_mut(),
+        jobs,
+        &jobs_columns,
+        &job_rows,
+        &view.lines[3 + view.node_rows..3 + view.node_rows + job_rows.len()],
+        &mut tables.jobs,
+        theme,
     );
+    if view.node_names.is_empty() {
+        if let Some(line) = view.lines.get(1) {
+            draw_placeholder(frame.buffer_mut(), nodes, line, theme);
+        }
+    }
+    if view.job_ids.is_empty() {
+        if let Some(line) = view.lines.get(3 + view.node_rows) {
+            draw_placeholder(frame.buffer_mut(), jobs, line, theme);
+        }
+    }
+    // Short lists leave the bottom of the Jobs pane empty; fill it with fleet totals.
+    if job_rows.len() + 4 <= usize::from(jobs.height) {
+        let summary = Paragraph::new(Text::from(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                view.summary.clone(),
+                if theme.color {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                },
+            )),
+        ]));
+        summary.render(
+            Rect::new(jobs.x, jobs.y + job_rows.len() as u16 + 2, jobs.width, 2),
+            frame.buffer_mut(),
+        );
+    }
 
     let mut graph_rect = Rect::new(0, 0, 0, 0);
     let mut shown_graph = RenderedGraph::default();
@@ -585,6 +980,10 @@ pub fn draw_with_theme(frame: &mut Frame, view: &ViewModel, theme: Theme) -> Lay
         jobs,
         graph: graph_rect,
         rendered_graph: shown_graph,
+        nodes_columns,
+        jobs_columns,
+        nodes_order,
+        jobs_order,
     }
 }
 
@@ -662,6 +1061,7 @@ mod tests {
                     state: "running".to_owned(),
                     node: Some("peer-a".to_owned()),
                     repo: "owner/name".to_owned(),
+                    priority: 5,
                     git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 5,
@@ -677,7 +1077,7 @@ mod tests {
 
     #[test]
     fn a_live_screen_draws_nodes_jobs_status_and_footer() {
-        let text = screen(&dashboard().view(Instant::now()), 90, 12);
+        let text = screen(&dashboard().view_with_width(Instant::now(), 90), 90, 12);
         assert!(text.contains("lu top"));
         assert!(text.contains("peer-a"));
         assert!(text.contains("01ABC"));
@@ -687,7 +1087,7 @@ mod tests {
         let view = dashboard().view(Instant::now());
         let mut focus = dashboard();
         focus.toggle_focus();
-        let text = screen(&focus.view(Instant::now()), 90, 12);
+        let text = screen(&focus.view_with_width(Instant::now(), 90), 90, 12);
         assert!(text.contains("x proc"), "{text}");
         assert!(!view.footer.contains("x proc"));
     }
@@ -749,7 +1149,7 @@ mod tests {
             }),
             Instant::now(),
         );
-        let view = dashboard.view(Instant::now());
+        let view = dashboard.view_with_width(Instant::now(), 120);
         let text = screen(&view, 120, 20);
         assert!(text.contains("!zen"), "{text}");
         assert!(text.contains("!openrouter~"), "{text}");
@@ -773,13 +1173,17 @@ mod tests {
         let mut dashboard = dashboard();
         let t0 = Instant::now();
         dashboard.toggle_pause(t0);
-        let text = screen(&dashboard.view(t0 + Duration::from_secs(7)), 90, 12);
+        let text = screen(
+            &dashboard.view_with_width(t0 + Duration::from_secs(7), 90),
+            90,
+            12,
+        );
         assert!(text.contains("paused: showing data from 7s ago"), "{text}");
     }
 
     #[test]
     fn a_tall_screen_draws_a_compact_gauge_strip() {
-        let text = screen(&dashboard().view(Instant::now()), 100, 30);
+        let text = screen(&dashboard().view_with_width(Instant::now(), 100), 100, 30);
         assert!(text.contains("RUN 1"), "{text}");
         assert!(text.contains("PROV 0"), "{text}");
         assert!(!text.contains("running jobs"), "{text}");
@@ -796,6 +1200,7 @@ mod tests {
             state: state.to_owned(),
             node: None,
             repo: "owner/name".to_owned(),
+            priority: 5,
             git_ref: "main".to_owned(),
             attempt: 1,
             age_secs: 1,
@@ -822,7 +1227,7 @@ mod tests {
             }),
             Instant::now(),
         );
-        let text = screen(&dashboard.view(Instant::now()), 90, 30);
+        let text = screen(&dashboard.view_with_width(Instant::now(), 90), 90, 30);
         assert!(text.contains("┌Graph"), "{text}");
         let row = |needle: &str| {
             text.lines()
@@ -840,7 +1245,7 @@ mod tests {
         assert!(!second.contains("tests"), "{second}");
 
         dashboard.toggle_graph();
-        let hidden = screen(&dashboard.view(Instant::now()), 90, 30);
+        let hidden = screen(&dashboard.view_with_width(Instant::now(), 90), 90, 30);
         assert!(!hidden.contains("├─▶"), "{hidden}");
     }
 
@@ -859,6 +1264,7 @@ mod tests {
                     state: "running".to_owned(),
                     node: None,
                     repo: "owner/name".to_owned(),
+                    priority: 5,
                     git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 1,
@@ -869,7 +1275,7 @@ mod tests {
             }),
             Instant::now(),
         );
-        let text = screen(&dashboard.view(Instant::now()), 90, 12);
+        let text = screen(&dashboard.view_with_width(Instant::now(), 90), 90, 12);
         assert!(!text.contains('▶'), "{text}");
     }
 
@@ -891,7 +1297,7 @@ mod tests {
             job_id: id,
             result: Ok("first\nlast".to_owned()),
         });
-        let text = screen(&dashboard.view(t0), 90, 20);
+        let text = screen(&dashboard.view_with_width(t0, 90), 90, 20);
         assert!(text.contains("log 01ABC"), "{text}");
         assert!(text.contains("last"), "{text}");
     }
@@ -931,6 +1337,7 @@ mod tests {
                     state: "running".to_owned(),
                     node: Some("peer-a".to_owned()),
                     repo: "owner/name".to_owned(),
+                    priority: 5,
                     git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 5,
@@ -961,7 +1368,7 @@ mod tests {
                 }],
             })),
         });
-        let text = screen(&dashboard.view(t0), 120, 35);
+        let text = screen(&dashboard.view_with_width(t0, 120), 120, 35);
         assert!(text.contains("process 01RUN @ peer-a"), "{text}");
         assert!(text.contains("output idle 130s"), "{text}");
         assert!(text.contains("cpu idle 140s"), "{text}");
@@ -980,6 +1387,7 @@ mod tests {
             state: "queued".to_owned(),
             node: None,
             repo: "owner/name".to_owned(),
+            priority: 5,
             git_ref: "main".to_owned(),
             attempt: 1,
             age_secs: 1,
@@ -1005,7 +1413,7 @@ mod tests {
             }),
             Instant::now(),
         );
-        let text = screen(&dashboard.view(Instant::now()), 60, 30);
+        let text = screen(&dashboard.view_with_width(Instant::now(), 60), 60, 30);
         assert!(text.contains("┌Graph +4 jobs, 4 components"), "{text}");
         assert!(!text.contains("not shown"), "{text}");
     }
@@ -1032,14 +1440,14 @@ mod tests {
             }),
             Instant::now(),
         );
-        let text = screen(&dashboard.view(Instant::now()), 60, 24);
-        assert!(text.contains("┌Graph +12 rows"), "{text}");
+        let text = screen(&dashboard.view_with_width(Instant::now(), 60), 60, 24);
+        assert!(text.contains("┌Graph +13 rows"), "{text}");
         let panel = text
             .lines()
             .skip_while(|line| !line.starts_with("┌Graph"))
             .take_while(|line| !line.starts_with("└"))
             .count();
-        assert_eq!(panel, 7, "{text}");
+        assert_eq!(panel, 6, "{text}");
         assert!(text.lines().any(|line| line.contains("├─▶")), "{text}");
     }
 
@@ -1059,6 +1467,7 @@ mod tests {
                 state: "running".to_owned(),
                 node: None,
                 repo: "owner/name".to_owned(),
+                priority: 5,
                 git_ref: "main".to_owned(),
                 attempt: 1,
                 age_secs: 1,
@@ -1131,6 +1540,7 @@ mod tests {
                 state: "running".to_owned(),
                 node: None,
                 repo: "owner/name".to_owned(),
+                priority: 5,
                 git_ref: "main".to_owned(),
                 attempt: 1,
                 age_secs: 1,
@@ -1200,6 +1610,93 @@ mod tests {
             .draw(|frame| layout = draw_with_theme(frame, view, theme))
             .unwrap();
         (layout, terminal.backend().buffer().clone())
+    }
+
+    fn draw_with_tables(
+        view: &ViewModel,
+        width: u16,
+        height: u16,
+        theme: Theme,
+        tables: &mut TableUi,
+    ) -> (LayoutInfo, Buffer) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut layout = LayoutInfo::default();
+        terminal
+            .draw(|frame| layout = draw_with_theme_and_tables(frame, view, theme, tables))
+            .unwrap();
+        (layout, terminal.backend().buffer().clone())
+    }
+
+    fn sorting_dashboard() -> Dashboard {
+        let mut dashboard = Dashboard::new();
+        let job = |id: &str, state: &str, priority: u8, age_secs: u64| JobRow {
+            id: id.to_owned(),
+            state: state.to_owned(),
+            priority,
+            age_secs,
+            ..job_row(id, &[])
+        };
+        dashboard.apply(
+            Ok(Snapshot {
+                nodes: Vec::new(),
+                jobs: vec![
+                    job("01ZZZ", "done", 1, 600),
+                    job("01AAA", "running", 9, 60),
+                    job("01MMM", "failed", 5, 300),
+                ],
+                controller_version: None,
+                drafts: 0,
+                oldest_draft_secs: 0,
+            }),
+            Instant::now(),
+        );
+        dashboard.toggle_focus();
+        dashboard
+    }
+
+    fn row_text(text: &str, y: u16) -> &str {
+        text.lines().nth(usize::from(y)).unwrap_or("")
+    }
+
+    #[test]
+    fn job_columns_sort_by_number_state_and_duration() {
+        let view = sorting_dashboard().view_with_width(Instant::now(), 120);
+        for (column, expected) in [
+            (2usize, vec![0usize, 2, 1]), // PRI: 1, 5, 9
+            (1usize, vec![1, 0, 2]),      // STATE: running, done, failed
+            (6usize, vec![1, 2, 0]),      // AGE: 1m, 5m, 10m
+        ] {
+            let mut tables = TableUi::default();
+            tables.jobs.cycle_sort(column);
+            let (layout, buffer) = draw_with_tables(&view, 120, 20, Theme::plain(), &mut tables);
+            assert_eq!(layout.jobs_order, expected, "column {column}");
+            let text = text_of(&buffer);
+            let header = row_text(&text, layout.jobs.y);
+            if column != 2 {
+                assert!(header.contains("^"), "{header}");
+            }
+            let first = row_text(&text, layout.jobs.y + 1);
+            let model_index = expected[0];
+            assert!(first.contains(&view.job_ids[model_index]), "{first}");
+        }
+    }
+
+    #[test]
+    fn sorting_keeps_the_selection_on_the_same_job() {
+        let mut dashboard = sorting_dashboard();
+        assert!(dashboard.select_job_id("01MMM", Focus::Jobs));
+        let view = dashboard.view_with_width(Instant::now(), 120);
+        let mut tables = TableUi::default();
+        tables.jobs.cycle_sort(2);
+        let (layout, _) = draw_with_tables(&view, 120, 20, Theme::plain(), &mut tables);
+        assert_eq!(view.job_ids[tables.jobs.selected], "01MMM");
+        assert_eq!(
+            layout
+                .jobs_order
+                .iter()
+                .position(|&i| i == tables.jobs.selected),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1305,11 +1802,15 @@ mod tests {
             t0,
         );
         assert!(dashboard.select_job_id("01A", Focus::Jobs));
-        let (layout, buffer) =
-            draw_view_with_theme(&dashboard.view(t0), 100, 20, Theme::standard());
+        let (layout, buffer) = draw_view_with_theme(
+            &dashboard.view_with_width(t0, 100),
+            100,
+            20,
+            Theme::standard(),
+        );
         let state_x = layout.jobs.x + 11;
-        let selected = &buffer[(state_x, layout.jobs.y + 2)];
-        let other = &buffer[(state_x, layout.jobs.y + 3)];
+        let selected = &buffer[(state_x, layout.jobs.y + 1)];
+        let other = &buffer[(state_x, layout.jobs.y + 2)];
         assert!(
             selected.modifier.contains(Modifier::UNDERLINED),
             "{selected:?}"

@@ -7,13 +7,14 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
+use fw_tui::widgets::sort_column_at;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use crate::graph::{self, Step};
 use crate::model::{Dashboard, Focus, Request, Snapshot, Update, ViewModel};
-use crate::render::{self, LayoutInfo};
+use crate::render::{self, LayoutInfo, TableUi};
 use crate::terminal::TerminalGuard;
 
 /// Longest a key press waits before the screen is redrawn anyway.
@@ -76,6 +77,8 @@ enum ClickTarget {
     Node(usize),
     JobRow(usize),
     GraphJob(String),
+    SortNodes(usize),
+    SortJobs(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,8 +87,10 @@ pub enum MouseAction {
     SelectJob(usize),
     SelectGraphJob(String),
     OpenJob(String, Focus),
+    SortNodes(usize),
+    SortJobs(usize),
     ScrollGraph(bool),
-    ScrollTable(bool),
+    ScrollTable { jobs: bool, down: bool },
 }
 
 /// Remembers the last click so a second press on the same target can open its log.
@@ -109,16 +114,27 @@ fn target_at(x: u16, y: u16, layout: &LayoutInfo, view: &ViewModel) -> Option<Cl
             .map(|id| ClickTarget::GraphJob(id.to_owned()));
     }
     if inside(layout.nodes, x, y) {
-        let row = usize::from(y - layout.nodes.y);
-        return row
-            .checked_sub(1)
+        if y == layout.nodes.y {
+            return sort_column_at(layout.nodes, x, &layout.nodes_columns)
+                .map(ClickTarget::SortNodes);
+        }
+        let row = usize::from(y - layout.nodes.y - 1);
+        return layout
+            .nodes_order
+            .get(row)
+            .copied()
             .filter(|&index| index < view.node_names.len())
             .map(ClickTarget::Node);
     }
     if inside(layout.jobs, x, y) {
-        let row = usize::from(y - layout.jobs.y);
-        return row
-            .checked_sub(2)
+        if y == layout.jobs.y {
+            return sort_column_at(layout.jobs, x, &layout.jobs_columns).map(ClickTarget::SortJobs);
+        }
+        let row = usize::from(y - layout.jobs.y - 1);
+        return layout
+            .jobs_order
+            .get(row)
+            .copied()
             .filter(|&index| index < view.job_ids.len())
             .map(ClickTarget::JobRow);
     }
@@ -149,6 +165,8 @@ impl MouseState {
                 self.last = Some((target.clone(), now));
                 match target {
                     ClickTarget::Node(index) => Some(MouseAction::SelectNode(index)),
+                    ClickTarget::SortNodes(column) => Some(MouseAction::SortNodes(column)),
+                    ClickTarget::SortJobs(column) => Some(MouseAction::SortJobs(column)),
                     ClickTarget::JobRow(index) => {
                         if repeated {
                             view.job_ids
@@ -172,15 +190,63 @@ impl MouseState {
                 let down = matches!(event.kind, MouseEventKind::ScrollDown);
                 if inside(layout.graph, event.column, event.row) {
                     Some(MouseAction::ScrollGraph(down))
-                } else if inside(layout.nodes, event.column, event.row)
-                    || inside(layout.jobs, event.column, event.row)
-                {
-                    Some(MouseAction::ScrollTable(down))
+                } else if inside(layout.nodes, event.column, event.row) {
+                    Some(MouseAction::ScrollTable { jobs: false, down })
+                } else if inside(layout.jobs, event.column, event.row) {
+                    Some(MouseAction::ScrollTable { jobs: true, down })
                 } else {
                     None
                 }
             }
             _ => None,
+        }
+    }
+}
+
+/// `s`, `S` and `r` act on the table that owns the current focus.
+fn handle_sort_key(
+    key: KeyEvent,
+    view: &ViewModel,
+    tables: &mut TableUi,
+    layout: &LayoutInfo,
+) -> bool {
+    match view.focus {
+        Focus::Nodes => tables.nodes.handle_sort_key(key, &layout.nodes_columns),
+        Focus::Jobs => tables.jobs.handle_sort_key(key, &layout.jobs_columns),
+        Focus::Graph => false,
+    }
+}
+
+/// Moves the model selection to the adjacent row as the operator sees it, not in data order.
+fn move_display_selection(
+    dashboard: &mut Dashboard,
+    tables: &TableUi,
+    layout: &LayoutInfo,
+    jobs: bool,
+    down: bool,
+) {
+    let (state, order) = if jobs {
+        (&tables.jobs, &layout.jobs_order)
+    } else {
+        (&tables.nodes, &layout.nodes_order)
+    };
+    if order.is_empty() {
+        return;
+    }
+    let position = order
+        .iter()
+        .position(|&index| index == state.selected)
+        .unwrap_or(0);
+    let next = if down {
+        (position + 3).min(order.len() - 1)
+    } else {
+        position.saturating_sub(3)
+    };
+    if let Some(&index) = order.get(next) {
+        if jobs {
+            dashboard.select_job_at(index, Focus::Jobs);
+        } else {
+            dashboard.select_node_at(index);
         }
     }
 }
@@ -197,6 +263,7 @@ pub fn run_live(
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut dashboard = Dashboard::new();
+    let mut tables = TableUi::default();
     let mut layout = LayoutInfo::default();
     let mut mouse = MouseState::default();
     while !stop.load(Ordering::Relaxed) {
@@ -208,9 +275,10 @@ pub fn run_live(
         }
         let width = terminal.size().map_or(200, |size| size.width);
         let view = dashboard.view_with_width(Instant::now(), width);
-        terminal.draw(|frame| layout = render::draw(frame, &view))?;
+        terminal.draw(|frame| layout = render::draw_with_tables(frame, &view, &mut tables))?;
         if event::poll(POLL)? {
             match event::read()? {
+                Event::Key(key) if handle_sort_key(key, &view, &mut tables, &layout) => {}
                 Event::Key(key) => match action_for(key) {
                     Some(Action::Quit) => break,
                     Some(Action::Escape) => {
@@ -268,8 +336,22 @@ pub fn run_live(
                                     request(Request::Log { job_id });
                                 }
                             }
+                            MouseAction::SortNodes(column) => {
+                                tables.nodes.cycle_sort(column);
+                            }
+                            MouseAction::SortJobs(column) => {
+                                tables.jobs.cycle_sort(column);
+                            }
                             MouseAction::ScrollGraph(down) => dashboard.scroll_graph(down),
-                            MouseAction::ScrollTable(down) => dashboard.scroll_table(down),
+                            MouseAction::ScrollTable { jobs, down } => {
+                                move_display_selection(
+                                    &mut dashboard,
+                                    &tables,
+                                    &layout,
+                                    jobs,
+                                    down,
+                                );
+                            }
                         }
                     }
                 }
@@ -384,6 +466,7 @@ mod tests {
                         state: "done".to_owned(),
                         node: None,
                         repo: "owner/name".to_owned(),
+                        priority: 5,
                         git_ref: "main".to_owned(),
                         attempt: 1,
                         age_secs: 1,
@@ -397,6 +480,7 @@ mod tests {
                         state: "running".to_owned(),
                         node: None,
                         repo: "owner/name".to_owned(),
+                        priority: 5,
                         git_ref: "main".to_owned(),
                         attempt: 1,
                         age_secs: 1,
@@ -412,11 +496,24 @@ mod tests {
     }
 
     fn view_and_layout(dashboard: &Dashboard) -> (ViewModel, LayoutInfo) {
-        let view = dashboard.view(Instant::now());
+        let view = dashboard.view_with_width(Instant::now(), 100);
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut layout = LayoutInfo::default();
         terminal
             .draw(|frame| layout = render::draw(frame, &view))
+            .unwrap();
+        (view, layout)
+    }
+
+    fn view_and_layout_with_tables(
+        dashboard: &Dashboard,
+        tables: &mut TableUi,
+    ) -> (ViewModel, LayoutInfo) {
+        let view = dashboard.view_with_width(Instant::now(), 100);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut layout = LayoutInfo::default();
+        terminal
+            .draw(|frame| layout = render::draw_with_tables(frame, &view, tables))
             .unwrap();
         (view, layout)
     }
@@ -475,7 +572,7 @@ mod tests {
             Some(MouseAction::SelectNode(0))
         );
         let x = layout.jobs.x + 1;
-        let y = layout.jobs.y + 2;
+        let y = layout.jobs.y + 1;
         assert_eq!(
             state.handle(
                 click(MouseEventKind::Down(MouseButton::Left), x, y),
@@ -518,7 +615,10 @@ mod tests {
         );
         assert_eq!(
             state.handle(up, &layout, &view, now),
-            Some(MouseAction::ScrollTable(false))
+            Some(MouseAction::ScrollTable {
+                jobs: false,
+                down: false
+            })
         );
     }
 
@@ -541,5 +641,92 @@ mod tests {
         );
         modified.modifiers = KeyModifiers::CONTROL;
         assert_eq!(state.handle(modified, &layout, &view, now), None);
+    }
+
+    #[test]
+    fn sort_keys_change_the_focused_table() {
+        let base = dashboard();
+        let view = base.view_with_width(Instant::now(), 100);
+        let (_, layout) = view_and_layout(&base);
+        let mut tables = TableUi::default();
+        assert!(handle_sort_key(
+            press(KeyCode::Char('s'), KeyModifiers::NONE),
+            &view,
+            &mut tables,
+            &layout
+        ));
+        assert_eq!(tables.nodes.sort.unwrap().column, 0);
+        assert!(handle_sort_key(
+            press(KeyCode::Char('r'), KeyModifiers::NONE),
+            &view,
+            &mut tables,
+            &layout
+        ));
+        assert!(tables.nodes.sort.unwrap().descending);
+        assert!(handle_sort_key(
+            press(KeyCode::Char('S'), KeyModifiers::SHIFT),
+            &view,
+            &mut tables,
+            &layout
+        ));
+        assert_eq!(tables.jobs.sort, None);
+
+        let mut focused_dashboard = base;
+        focused_dashboard.toggle_focus();
+        let view = focused_dashboard.view_with_width(Instant::now(), 100);
+        let (_, layout) = view_and_layout(&focused_dashboard);
+        assert!(handle_sort_key(
+            press(KeyCode::Char('s'), KeyModifiers::NONE),
+            &view,
+            &mut tables,
+            &layout
+        ));
+        assert_eq!(tables.jobs.sort.unwrap().column, 0);
+    }
+
+    #[test]
+    fn clicking_a_header_cycles_that_tables_sort() {
+        let dashboard = dashboard();
+        let (view, layout) = view_and_layout(&dashboard);
+        let now = Instant::now();
+        let mut state = MouseState::default();
+        let node_header = click(
+            MouseEventKind::Down(MouseButton::Left),
+            layout.nodes.x + 1,
+            layout.nodes.y,
+        );
+        assert_eq!(
+            state.handle(node_header, &layout, &view, now),
+            Some(MouseAction::SortNodes(0))
+        );
+        let job_header = click(
+            MouseEventKind::Down(MouseButton::Left),
+            layout.jobs.x + 1,
+            layout.jobs.y,
+        );
+        assert_eq!(
+            state.handle(job_header, &layout, &view, now),
+            Some(MouseAction::SortJobs(0))
+        );
+    }
+
+    #[test]
+    fn clicks_in_a_sorted_table_select_the_job_under_the_pointer() {
+        let mut dashboard = dashboard();
+        dashboard.toggle_focus();
+        let mut tables = TableUi::default();
+        tables.jobs.cycle_sort(0);
+        let (view, layout) = view_and_layout_with_tables(&dashboard, &mut tables);
+        assert_eq!(layout.jobs_order, vec![1, 0]);
+        let mut state = MouseState::default();
+        let first_row = click(
+            MouseEventKind::Down(MouseButton::Left),
+            layout.jobs.x + 1,
+            layout.jobs.y + 1,
+        );
+        assert_eq!(
+            state.handle(first_row, &layout, &view, Instant::now()),
+            Some(MouseAction::SelectJob(1))
+        );
     }
 }

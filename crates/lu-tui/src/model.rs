@@ -108,6 +108,8 @@ pub struct JobRow {
     pub node: Option<String>,
     /// Normalised `owner/name` of the job's source repository, never a URL.
     pub repo: String,
+    /// Dispatch priority, 0-9; higher dispatches first.
+    pub priority: u8,
     /// Source ref as reported by the controller, shown with the repo in the detail line.
     pub git_ref: String,
     pub attempt: u32,
@@ -432,6 +434,17 @@ impl Dashboard {
     pub fn apply(&mut self, result: Result<Snapshot, String>, now: Instant) {
         match result {
             Ok(snapshot) => {
+                // A refresh may reorder rows; keep the selection on the same logical row.
+                let selected_job_id = self
+                    .current()
+                    .jobs
+                    .get(self.selection.job)
+                    .map(|job| job.id.clone());
+                let selected_node_name = self
+                    .current()
+                    .nodes
+                    .get(self.selection.node)
+                    .map(|node| node.name.clone());
                 self.history.push(Sample::of(&snapshot));
                 if self.history.len() > HISTORY {
                     self.history.remove(0);
@@ -456,8 +469,18 @@ impl Dashboard {
                         }
                     }
                 }
-                self.selection.clamp(&snapshot);
                 self.live = snapshot;
+                if let Some(index) = selected_job_id
+                    .and_then(|id| self.live.jobs.iter().position(|job| job.id == id))
+                {
+                    self.selection.job = index;
+                }
+                if let Some(index) = selected_node_name
+                    .and_then(|name| self.live.nodes.iter().position(|node| node.name == name))
+                {
+                    self.selection.node = index;
+                }
+                self.selection.clamp(&self.live);
                 self.updated = Some(now);
                 self.error = None;
                 self.updates += 1;
@@ -973,6 +996,8 @@ pub struct ViewModel {
     pub focus: Focus,
     /// How many rows the node table occupies, for mouse hit testing.
     pub node_rows: usize,
+    /// Widths of the flexible job columns, shared by the model and the table widget.
+    pub job_columns: JobColumns,
     pub node_names: Vec<String>,
     pub job_ids: Vec<String>,
     /// The job selected in both the Jobs table and the graph.
@@ -1026,21 +1051,22 @@ fn clip(text: &str, width: usize) -> String {
     out
 }
 
-/// Width budget for the three flexible job columns. The mandatory columns (id, state, node,
+/// Width budget for the three flexible job columns. The mandatory columns (id, state, pri, node,
 /// repo, try and age) keep their minimums; NOTE gives way first, then TITLE, then REPO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct JobColumns {
-    repo: usize,
-    title: usize,
-    note: usize,
+pub struct JobColumns {
+    pub repo: usize,
+    pub title: usize,
+    pub note: usize,
 }
 
-const JOB_FIXED: usize = 10 + 11 + 9 + 3 + 6 + 7; // id, state, node, try, age and six gaps
+const JOB_FIXED: usize = 10 + 11 + 3 + 9 + 3 + 6 + 8; // fixed cells and eight gaps
 const REPO_MAX: usize = 14;
 const REPO_MIN: usize = 6;
 const TITLE_MAX: usize = 38;
 const TITLE_MIN: usize = 8;
-const NOTE_MAX: usize = 60;
+// The shared table widget clips a cell to 40 cells, so the note budget stops there too.
+const NOTE_MAX: usize = 40;
 const NOTE_MIN: usize = 6;
 
 fn take_from(width: &mut usize, floor: usize, needed: usize) -> usize {
@@ -1584,9 +1610,10 @@ fn process_pane_view(
 fn job_header(columns: JobColumns) -> Line {
     Line::new(
         format!(
-            "{:<10} {:<11} {:<9} {:<repo$} {:>3} {:<6} {:<title$} {}",
+            "{:<10} {:<11} {:>3} {:<9} {:<repo$} {:>3} {:<6} {:<title$} {}",
             "JOB",
             "STATE",
+            "PRI",
             "NODE",
             "REPO",
             "TRY",
@@ -1616,6 +1643,8 @@ fn job_line(job: &JobRow, columns: JobColumns) -> Line {
         Segment::new(pad_right(&short_id, 10), Tone::Plain),
         Segment::new(" ", Tone::Plain),
         Segment::new(pad_right(&state, 11), job_badge_tone(&job.state)),
+        Segment::new(" ", Tone::Plain),
+        Segment::new(format!("{:>3}", job.priority), Tone::Plain),
         Segment::new(" ", Tone::Plain),
         Segment::new(pad_right(&node, 9), Tone::Plain),
         Segment::new(" ", Tone::Plain),
@@ -1807,13 +1836,13 @@ impl ViewModel {
         });
         let footer = match selection.focus {
             Focus::Nodes => {
-                "↑↓/jk node  Tab/⇧Tab focus  d drain  g graph  p pause  q quit"
+                "↑↓/jk node  s/S/r/click sort  Tab focus  d drain  g graph  p pause  q quit"
             }
             Focus::Jobs => {
-                "↑↓/jk job  Tab/⇧Tab focus  Enter log  x proc  Esc close  g graph  p pause  q quit"
+                "↑↓/jk job  s/S/r/click sort  Tab focus  ⏎ log  x proc  g graph  p pause  q quit"
             }
             Focus::Graph => {
-                "h/l parent-child  j/k sibling  Home/End ends  Enter log  click select  wheel scroll  Tab/⇧Tab focus  q quit"
+                "h/l parent-child  j/k sibling  Home/End ends  ⏎ log  click/wheel  Tab focus  q quit"
             }
         }
         .to_owned();
@@ -1828,6 +1857,7 @@ impl ViewModel {
             selected_line,
             focus: selection.focus,
             node_rows,
+            job_columns: columns,
             node_names: snapshot
                 .nodes
                 .iter()
@@ -1934,6 +1964,7 @@ mod tests {
             state: state.to_owned(),
             node: Some("ct-1".to_owned()),
             repo: "owner/name".to_owned(),
+            priority: 5,
             git_ref: "main".to_owned(),
             attempt: 1,
             age_secs: 125,
@@ -2546,6 +2577,7 @@ mod tests {
                     state: "running".to_owned(),
                     node: Some("n1".to_owned()),
                     repo: "owner/name".to_owned(),
+                    priority: 5,
                     git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 1,
@@ -2589,6 +2621,7 @@ mod tests {
                     state: "running".to_owned(),
                     node: Some("n1".to_owned()),
                     repo: "owner/name".to_owned(),
+                    priority: 5,
                     git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 1,
@@ -2735,6 +2768,7 @@ mod tests {
                     state: "running".to_owned(),
                     node: Some("node\u{1b}[31m".to_owned()),
                     repo: "owner/name".to_owned(),
+                    priority: 5,
                     git_ref: "main".to_owned(),
                     attempt: 1,
                     age_secs: 1,
@@ -2917,6 +2951,30 @@ mod tests {
         assert_eq!(dashboard.view(t0).selected_job.as_deref(), Some("01ABC"));
     }
 
+    #[test]
+    fn a_refresh_keeps_the_selected_job_when_rows_are_reordered() {
+        let t0 = Instant::now();
+        let mut dashboard = Dashboard::new();
+        let mut initial = snapshot();
+        initial.jobs = vec![job("01A", "running"), job("01B", "queued")];
+        dashboard.apply(Ok(initial), t0);
+        dashboard.toggle_focus();
+        assert!(dashboard.select_job_id("01B", Focus::Jobs));
+        assert_eq!(dashboard.view(t0).selected_job.as_deref(), Some("01B"));
+
+        let mut refreshed = snapshot();
+        refreshed.jobs = vec![job("01B", "queued"), job("01A", "running")];
+        dashboard.apply(Ok(refreshed), t0);
+        let view = dashboard.view(t0);
+        assert_eq!(view.job_ids, vec!["01B", "01A"]);
+        assert_eq!(view.selected_job.as_deref(), Some("01B"));
+        assert_eq!(
+            view.selected_line,
+            Some(3 + view.node_rows),
+            "the first job row after the refresh"
+        );
+    }
+
     fn navigation_graph() -> (Dashboard, Graph) {
         let jobs = vec![
             job("01A", "running"),
@@ -3026,8 +3084,8 @@ mod tests {
         let jobs = dashboard.view(t0).footer.clone();
         dashboard.toggle_focus();
         let graph = dashboard.view(t0).footer.clone();
-        assert!(nodes.contains("d drain") && !nodes.contains("Enter log"));
-        assert!(jobs.contains("Enter log") && jobs.contains("x proc"));
+        assert!(nodes.contains("d drain") && !nodes.contains("log"));
+        assert!(jobs.contains("log") && jobs.contains("x proc"));
         assert!(graph.contains("h/l parent-child") && graph.contains("Home/End"));
         assert_ne!(nodes, jobs);
         assert_ne!(jobs, graph);

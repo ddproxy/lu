@@ -44,6 +44,7 @@ fn job(id: &str, state: &str, repo: &str, title: &str, note: &str) -> JobRow {
         state: state.to_owned(),
         node: Some("peer-a".to_owned()),
         repo: repo.to_owned(),
+        priority: 5,
         git_ref: "main".to_owned(),
         attempt: 1,
         age_secs: 125,

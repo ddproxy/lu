@@ -1,24 +1,24 @@
 RUN 1 · │ QUE 1 · │ BUSY 1 · │ PROV 4 ·
 ┌lu top X.Y.Z · controller - · drafts 0────────────────────────────────────────┐
-│NODE         VERSION    STATE          SEEN       LOAD   MEM   WORKSPACES     │
+│NODE         VERSION    STATE          SEEN     LOAD   MEM   WORKSPACES       │
 │peer-a       -          busy           1s          0.5   20%       1/1.0K     │
 │peer-b       -          idle           2s          0.5   20%       1/1.0K     │
 │peer-c       -          drained        3s          0.5   20%       1/1.0K     │
 │peer-d       -          stale stuck    -           0.5   20%       1/1.0K     │
+│                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 ┌Jobs──────────────────────────────────────────────────────────────────────────┐
+│JOB        STATE       PRI NODE      REPO         TRY AGE    TITLE    NOTE    │
+│01AAAA     running       5 peer-a    alpha/one      1 2m     a short…         │
+│01BBBB     queued        5 peer-a    beta/two       1 2m     a title… a not…  │
+│01CCCC     failed        5 peer-a    gamma/three    1 2m     broken   timeo…  │
+│01DDDD     done          5 peer-a    delta/four     1 2m     finished no ch…  │
+│01EEEE     cancelled     5 peer-a    epsilon/five   1 2m     stopped          │
 │                                                                              │
-│JOB        STATE       NODE      REPO           TRY AGE    TITLE      NOTE    │
-│01AAAA     running     peer-a    alpha/one        1 2m     a short t…         │
-│01BBBB     queued      peer-a    beta/two         1 2m     a title l… a not…  │
-│01CCCC     failed      peer-a    gamma/three      1 2m     broken     timeo…  │
-│01DDDD     done        peer-a    delta/four       1 2m     finished   no ch…  │
-│01EEEE     cancelled   peer-a    epsilon/five     1 2m     stopped            │
 └──────────────────────────────────────────────────────────────────────────────┘
 ┌Graph─────────────────────────────────────────────────────────────────────────┐
 │▶ 1AAAA  ○ 1BBBB                                                              │
 │                                                                              │
-│                                                                              │
 └01AAAA  running  alpha/one  main  a short title───────────────────────────────┘
 live, update 1, 0s ago
-↑↓/jk node  Tab/⇧Tab focus  d drain  g graph  p pause  q quit
+↑↓/jk node  s/S/r/click sort  Tab focus  d drain  g graph  p pause  q quit
