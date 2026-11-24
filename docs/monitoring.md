@@ -94,8 +94,9 @@ payload text: a rise in `bad_signature` points at a sender or signing-key mismat
 particular rule, so correlate with the operator's intake logs and [intake.md](intake.md#outcomes-and-metrics).
 
 `lu_blocked_dependents_total` counts jobs blocked by a failed or cancelled predecessor. A sustained
-non-zero value means someone should retry the predecessor (`lu retry <id>`, or `--chain` to retry
-the dependents as well); otherwise those jobs fail with class `dependency` when the TTL expires.
+non-zero value means someone should retry the predecessor in place (`lu retry <id>`, or `--chain`
+to restore blocked dependents transitively); otherwise those jobs fail with class `dependency` when
+the TTL expires.
 `lu top` shows the same waiting-dependent count; see
 [dependencies.md](dependencies.md#waiting-and-promotion).
 

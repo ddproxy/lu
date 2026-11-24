@@ -66,7 +66,7 @@ State definitions, legal transitions and the full state table are in
 | `queued` | `lu nodes --json`: an online, idle, non-draining node with every required label and provider. |
 | `leased` / `running` | `lu node <node>` for the latest heartbeat and process tree. |
 | `recovering` | Agent heartbeat and `recovery_grace_secs`; a late write with an old epoch is discarded. |
-| `done`, `failed`, `cancelled` | `lu logs <id>` and `lu fetch <id>`; `lu retry <id>` resubmits the spec. |
+| `done`, `failed`, `cancelled` | `lu logs <id>` and `lu fetch <id>`; `lu retry <id>` requeues the same job. (not for `done`) |
 
 A queued job that cannot be placed shows the first blocking reason in `lu show` and `lu top`: a full group cap, then a missing label, an untolerated taint or no healthy provider pair. For what a drain or provider cordon does, see [Provider cordons and node drains](operations.md#provider-cordons-and-node-drains).
 
@@ -82,7 +82,7 @@ lu undrain node-a
 
 | Symptom | Check | Action |
 | --- | --- | --- |
-| Dependent stays `blocked` with `predecessor failed` | `lu show <dependent>` lists the predecessor and the `blocked_until` deadline; `lu ls --state blocked` shows the backlog. | Retry the predecessor with `lu retry <predecessor>` to reattach waiting dependents, or `lu retry <predecessor> --chain` to retry the dependents as well. Otherwise they fail with class `dependency` at `[controller] blocked_dependent_ttl` (default 24h). `lu top` and `lu_blocked_dependents_total` show the count. |
+| Dependent stays `blocked` with `predecessor failed` | `lu show <dependent>` lists the predecessor and the `blocked_until` deadline; `lu ls --state blocked` shows the backlog. | Retry the predecessor with `lu retry <predecessor>` to requeue it in place and restore waiting dependents, or `lu retry <predecessor> --chain` to restore blocked dependents transitively. Cancelled or failed dependents stay untouched. Otherwise they fail with class `dependency` at `[controller] blocked_dependent_ttl` (default 24h). `lu top` and `lu_blocked_dependents_total` show the count. |
 | Waiting dependents were cancelled | A plain `lu cancel <predecessor>` cancels them. | Leave them blocked next time with `lu cancel <predecessor> --keep-dependents`. |
 | Conflict summary names two commits | The dependencies recorded different `staged_commit` values. The agent staged their newest common ancestor, but a dependency patch did not apply there (or no common ancestor exists). | Inspect the named commits and the dependencies' `diff.patch` files. When a common ancestor exists and every patch applies, it is used automatically; otherwise resolve the patches and resubmit the chain. |
 | Conflict on a `union_paths` or `base_paths` path | The summary lists every file and hunk, whether the base moved, and the covered policy paths. | Check the agent's `[stack]` lists and the job's narrower `stack_union_paths`/`stack_base_paths`; uncovered paths always fail closed. See [Policy paths](dependencies.md#policy-paths-for-known-safe-conflicts). |
@@ -114,7 +114,10 @@ lu fetch 01ARZ3NDEKTSV4RRFFQ69G5FAV --out results
 lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --provider openai
 ```
 
-`lu retry` requires a terminal job. The new job has no idempotency key unless `--key` is given.
+`lu retry` requires a `failed`, `cancelled`, `expired` or `deadline_missed` job;
+any other state, including `done`, is a usage error. It keeps the same job id, so the printed id is the one to inspect
+and fetch. `--key` updates the stored idempotency mapping for this attempt; a request key replays
+the stored retry response.
 
 ## Logs and artifacts
 

@@ -2,7 +2,7 @@
 
 A job can wait for earlier jobs and, by default, build on their diffs. Dependencies are supplied
 at submission and can be changed later with `lu edit`; `lu retry` can also replace the whole list
-when it resubmits a finished job.
+when it requeues a finished job in place.
 
 ```mermaid
 graph TD
@@ -35,8 +35,8 @@ lu submit --key ship --after-key test --after-key lint \
   `include_failed: true`. With that opt-in the dead dependency is accepted, the dependent starts
   `queued` when the rest of its dependency set is ready, and a later dependency failure releases
   the dependent instead of failing it with `failure_class: "dependency"`.
-- `lu retry <id> --after ... --after-key ...` replaces the dependency list on the new job. An old
-  job must be terminal first.
+- `lu retry <id> --after ... --after-key ...` replaces the dependency list on the requeued job,
+  which keeps its id. The job must be failed, cancelled, expired or deadline-missed first.
 - `lu submit --batch ... --chain` depends each job on all earlier jobs in the batch. Checklist
   `after:` hints and sidecar `after_keys` add dependencies; hints may name earlier batch slugs or
   existing job keys. See [Batch submissions](batch.md#dependencies).
@@ -53,8 +53,9 @@ When a job completes `done`, the controller moves each blocked direct dependent 
 dependency set is now `done` to `queued`. A failed or cancelled predecessor does **not** fail its
 dependents immediately: they stay `blocked` with `blocked_reason: "predecessor failed"` so an
 operator can retry the predecessor instead of rebuilding the chain. `lu retry <predecessor>`
-reattaches its waiting dependents to the new job; `lu retry <predecessor> --chain` also retries the
-dependents and rewrites their `after` references to the retried jobs. Cancelling a predecessor
+requeues the predecessor in place and restores its waiting dependents after it;
+`lu retry <predecessor> --chain` also restores blocked dependents transitively, keeping their ids
+and `after` references. Cancelled or failed dependents stay untouched. Cancelling a predecessor
 cancels its waiting dependents as well unless the operator passes
 `lu cancel <predecessor> --keep-dependents`. If no retry happens within
 `[controller] blocked_dependent_ttl` (default `24h`), a blocked dependent fails with
@@ -67,8 +68,8 @@ a dependency fails uses the wait-and-retry behaviour above.
 
 ```sh
 lu show 01ARZ3NDEKTSV4RRFFQ69G5FAV   # blocked_reason: predecessor failed
-lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV   # reattach waiting dependents to the new job
-lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --chain  # also retry the dependents and their references
+lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV   # requeue in place and restore waiting dependents
+lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --chain  # restore blocked dependents transitively
 lu cancel 01ARZ3NDEKTSV4RRFFQ69G5FAV --keep-dependents
 ```
 

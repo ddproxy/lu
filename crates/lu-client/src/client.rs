@@ -322,12 +322,12 @@ impl Client {
         self.scrub(parse_job(&reply.body))
     }
 
-    /// Recreates a finished job. `chain` also recreates its blocked dependents onto the new ids.
+    /// Requeues a finished job in place. `chain` also restores its blocked dependents.
     pub async fn retry(&self, id: &JobId, spec: &JobSpec) -> Result<RetryReply> {
         self.retry_with_dependents(id, spec, false).await
     }
 
-    /// Recreates a finished job and, when `chain` is set, its blocked dependents.
+    /// Requeues a finished job in place and, when `chain` is set, its blocked dependents.
     pub async fn retry_with_dependents(
         &self,
         id: &JobId,

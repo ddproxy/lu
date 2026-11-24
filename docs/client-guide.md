@@ -41,7 +41,7 @@ Global flags: `--config <path>` (default `lu.toml`) and `--json` (raw controller
 | `lu status` | `lu status --json` | Uptime, schema, db size, queue and node counts. |
 | `lu submit` | `lu submit --repo /srv/app --ref main --task-file task.txt --wait` | Submits a job and waits for a terminal state. |
 | `lu submit --batch` | `lu submit --batch ./tasks --key-prefix release-1 --defaults ./defaults.toml` | Submits one idempotent job per task in a directory or checklist. |
-| `lu retry` | `lu retry 01AR... --provider anthropic --key retry-2` | Resubmits a finished job's spec as a new job; `--chain` also retries dependents and rewrites their references. |
+| `lu retry` | `lu retry 01AR... --provider anthropic --key retry-2` | Requeues a failed, cancelled, expired or deadline-missed job in place and prints `retried <id>; requeued N dependents`; `--chain` restores blocked dependents transitively. |
 | `lu ls` | `lu ls --state failed --limit 10` | Newest-first job list. |
 | `lu show` | `lu show 01AR...` | One job plus each dependency and its state. |
 | `lu graph` | `lu graph 01AR...` | Horizontal dependency graph for one component, with task titles. |
@@ -71,8 +71,9 @@ lu show 01ARZ3NDEKTSV4RRFFQ69G5FAV
 ```
 
 Each `submit` prints its new job id; use that id with `lu show`. For a chain blocked by a failed
-predecessor, `lu retry <predecessor>` reattaches the waiting dependents, while
-`lu retry <predecessor> --chain` also retries those dependents and rewrites their references.
+predecessor, `lu retry <predecessor>` requeues that job in place and restores its waiting dependents
+after it, while `lu retry <predecessor> --chain` restores blocked dependents transitively without
+changing their ids.
 A plain `lu cancel` cancels
 the waiting dependents too; `lu cancel --keep-dependents` leaves them blocked. See
 [Dependencies](dependencies.md#waiting-and-promotion).

@@ -219,7 +219,7 @@ pub struct RetryArgs {
     /// Job id.
     #[arg(value_parser = parse_job_id)]
     pub id: JobId,
-    /// Recreate blocked dependents too, remapped onto the new job ids.
+    /// Restore blocked dependents transitively, keeping their job ids.
     #[arg(long)]
     pub chain: bool,
     /// Replace the provider name.
@@ -968,9 +968,9 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
         .get_job(&args.id)
         .await
         .map_err(|error| error.to_string())?;
-    if !view.state.is_terminal() {
+    if !view.state.is_retryable() {
         eprintln!(
-            "lu: job {} is {}; retry resubmits a finished job (done, failed or cancelled)",
+            "lu: job {} is {}; retry requires failed, cancelled, expired or deadline_missed",
             view.id,
             state_name(view.state)
         );
@@ -1038,7 +1038,7 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
     }
     let merged_expect = expect.merged(spec.expect.as_ref());
     spec.expect = merged_expect;
-    // A retry is a new job; only --key gives it an idempotency key.
+    // The job keeps its id; --key still updates the idempotency mapping for this attempt.
     spec.idempotency_key = args.key;
     spec.validate().map_err(|error| error.to_string())?;
 
@@ -1051,10 +1051,11 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
         let text = serde_json::to_string(&reply).map_err(|error| error.to_string())?;
         print_raw(&text);
     } else {
-        println!("{} {}", reply.job.id, state_name(reply.job.state));
-        if !reply.retried.is_empty() {
-            println!("retried {} dependents", reply.retried.len());
-        }
+        println!(
+            "retried {}; requeued {} dependents",
+            reply.job.id,
+            reply.requeued.len()
+        );
         if reply.waiting_dependents > 0 {
             println!("waiting_dependents {}", reply.waiting_dependents);
         }

@@ -153,6 +153,10 @@ pub fn store_err(e: lu_store::StoreError) -> ApiError {
             }
             err
         }
+        StoreError::NotRetryable(state) => ApiError::conflict(format!(
+            "job is {}; retry requires failed, cancelled, expired or deadline_missed",
+            state.as_str()
+        )),
         StoreError::StaleEpoch => ApiError::stale_epoch(),
         StoreError::Precondition => ApiError::precondition("precondition failed"),
         StoreError::InvalidDependency(id) => {

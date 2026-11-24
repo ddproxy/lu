@@ -48,22 +48,13 @@ pub struct DependencyView {
     pub staged_commit: Option<String>,
 }
 
-/// One job recreated by a chained retry. The old id stays terminal for its audit trail.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetryPair {
-    #[serde(default)]
-    pub old: JobId,
-    #[serde(default)]
-    pub new: JobId,
-}
-
-/// The result of an operator retry. `retried` is empty for a plain retry; `waiting_dependents`
-/// reports how many dependents are still blocked waiting for a retry or TTL expiry.
+/// The result of an operator retry. `requeued` lists the dependents restored after the root;
+/// `waiting_dependents` reports how many dependents are still blocked waiting for a retry or TTL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryReply {
     pub job: JobView,
     #[serde(default)]
-    pub retried: Vec<RetryPair>,
+    pub requeued: Vec<JobId>,
     #[serde(default)]
     pub waiting_dependents: u64,
 }

@@ -4746,6 +4746,307 @@ async fn dry_run_does_not_store_a_job() {
     let _ = srv.shutdown.send(());
 }
 
+async fn fail_submitted_job(srv: &TestServer, id: &str) {
+    finish_submitted_job(srv, id, json!({"failed": "execution"})).await;
+}
+
+async fn finish_submitted_job(srv: &TestServer, id: &str, outcome: serde_json::Value) {
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let epoch = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign" && e["job_id"] == id)
+        .unwrap_or_else(|| panic!("no assignment for {id}: {events}"))["epoch"]
+        .as_u64()
+        .unwrap();
+    let b = json!({"epoch": epoch}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", b.len(), b);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let r = complete_as(srv, AGENT_A_TOKEN, id, epoch, outcome, None).await;
+    assert_eq!(status(&r), 200, "{r}");
+}
+
+async fn job_value(srv: &TestServer, id: &str) -> serde_json::Value {
+    let r = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}"))).await;
+    assert_eq!(status(&r), 200, "{r}");
+    serde_json::from_str(body_str(&r)).unwrap()
+}
+
+#[tokio::test]
+async fn retry_requeues_a_failed_job_without_dependents_in_place() {
+    let srv = start_server().await;
+    let key = format!("retry-solo-{}", std::process::id());
+    let created = submit_spec(srv.addr, &sample_spec(Some(&key))).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&created)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fail_submitted_job(&srv, &id).await;
+    let before = job_value(&srv, &id).await;
+    assert_eq!(before["state"], "failed");
+
+    let retried = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{id}/retry"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&retried), 200, "{retried}");
+    let value: serde_json::Value = serde_json::from_str(body_str(&retried)).unwrap();
+    assert_eq!(value["job"]["id"], json!(id));
+    assert_eq!(value["job"]["state"], "queued");
+    assert_eq!(value["requeued"], json!([]));
+
+    let after = job_value(&srv, &id).await;
+    assert_eq!(after["state"], "queued");
+    assert_eq!(after["attempt"], json!(2));
+    assert_eq!(after["failure_class"], json!(null));
+    assert_eq!(after["summary"], json!(null));
+    assert_eq!(after["blocked_reason"], json!(null));
+    let lookup = raw_request(srv.addr, &operator_get(&format!("/v1/jobs?key={key}"))).await;
+    let found: serde_json::Value = serde_json::from_str(body_str(&lookup)).unwrap();
+    assert_eq!(found["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(found["jobs"][0]["id"], json!(id));
+    let listed = raw_request(srv.addr, &operator_get("/v1/jobs")).await;
+    let listed: serde_json::Value = serde_json::from_str(body_str(&listed)).unwrap();
+    assert_eq!(listed["jobs"].as_array().unwrap().len(), 1);
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn retry_leaves_cancelled_dependents_untouched() {
+    let srv = start_server().await;
+    let root_key = format!("retry-cancel-root-{}", std::process::id());
+    let root_created = submit_spec(srv.addr, &sample_spec(Some(&root_key))).await;
+    assert_eq!(status(&root_created), 201, "{root_created}");
+    let root_id = serde_json::from_str::<serde_json::Value>(body_str(&root_created)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let root = JobId::parse(&root_id).unwrap();
+    let mut cancelled_spec = sample_spec(Some(&format!("retry-cancel-dep-{}", std::process::id())));
+    cancelled_spec.after = vec![root.clone()];
+    let mut waiting_spec = sample_spec(Some(&format!("retry-wait-dep-{}", std::process::id())));
+    waiting_spec.after = vec![root.clone()];
+    let cancelled_created = submit_spec(srv.addr, &cancelled_spec).await;
+    let waiting_created = submit_spec(srv.addr, &waiting_spec).await;
+    assert_eq!(status(&cancelled_created), 201, "{cancelled_created}");
+    assert_eq!(status(&waiting_created), 201, "{waiting_created}");
+    let cancelled_id = serde_json::from_str::<serde_json::Value>(body_str(&cancelled_created))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let waiting_id = serde_json::from_str::<serde_json::Value>(body_str(&waiting_created)).unwrap()
+        ["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cancelled = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{cancelled_id}/cancel"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&cancelled), 200, "{cancelled}");
+    fail_submitted_job(&srv, &root_id).await;
+
+    let retried = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{root_id}/retry?chain=1"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&retried), 200, "{retried}");
+    let value: serde_json::Value = serde_json::from_str(body_str(&retried)).unwrap();
+    assert_eq!(value["job"]["id"], json!(root_id));
+    assert_eq!(value["requeued"], json!([waiting_id]));
+
+    let cancelled_after = job_value(&srv, &cancelled_id).await;
+    assert_eq!(cancelled_after["state"], "cancelled");
+    let waiting_after = job_value(&srv, &waiting_id).await;
+    assert_eq!(waiting_after["state"], "blocked");
+    assert_eq!(waiting_after["blocked_reason"], json!(null));
+    assert_eq!(waiting_after["after"], json!([root_id]));
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn retry_requeues_a_stack_chain_in_place() {
+    let srv = start_server().await;
+    let mut root_spec = sample_spec(Some(&format!("retry-stack-root-{}", std::process::id())));
+    root_spec.stack_union_paths = vec!["src/main.rs".to_owned()];
+    root_spec.stack_base_paths = vec!["base/main.rs".to_owned()];
+    let created = submit_spec(srv.addr, &root_spec).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let root_id = serde_json::from_str::<serde_json::Value>(body_str(&created)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let root = JobId::parse(&root_id).unwrap();
+    let mut first_spec = sample_spec(Some(&format!("retry-stack-first-{}", std::process::id())));
+    first_spec.after = vec![root.clone()];
+    first_spec.stack_union_paths = vec!["lib/first.rs".to_owned()];
+    let mut second_spec = sample_spec(Some(&format!("retry-stack-second-{}", std::process::id())));
+    second_spec.stack_union_paths = vec!["lib/second.rs".to_owned()];
+    let first_created = submit_spec(srv.addr, &first_spec).await;
+    assert_eq!(status(&first_created), 201, "{first_created}");
+    let first_id = serde_json::from_str::<serde_json::Value>(body_str(&first_created)).unwrap()
+        ["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    second_spec.after = vec![JobId::parse(&first_id).unwrap()];
+    let second_created = submit_spec(srv.addr, &second_spec).await;
+    assert_eq!(status(&second_created), 201, "{second_created}");
+    let second_id = serde_json::from_str::<serde_json::Value>(body_str(&second_created)).unwrap()
+        ["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fail_submitted_job(&srv, &root_id).await;
+
+    let retried = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{root_id}/retry?chain=1"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&retried), 200, "{retried}");
+    let value: serde_json::Value = serde_json::from_str(body_str(&retried)).unwrap();
+    assert_eq!(value["job"]["id"], json!(root_id));
+    assert_eq!(value["job"]["state"], "queued");
+    assert_eq!(value["requeued"], json!([first_id, second_id]));
+
+    for (id, union) in [(&first_id, "lib/first.rs"), (&second_id, "lib/second.rs")] {
+        let after = job_value(&srv, id).await;
+        assert_eq!(after["state"], "blocked");
+        assert_eq!(after["blocked_reason"], json!(null));
+        assert_eq!(after["attempt"], json!(1));
+        assert_eq!(after["spec"]["stack_union_paths"], json!([union]));
+    }
+    let retried_root = job_value(&srv, &root_id).await;
+    assert_eq!(retried_root["attempt"], json!(2));
+    assert_eq!(
+        retried_root["spec"]["stack_union_paths"],
+        json!(["src/main.rs"])
+    );
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn retry_refuses_a_nonterminal_job_with_a_clear_conflict() {
+    let srv = start_server().await;
+    let created = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&created)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let retried = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{id}/retry"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&retried), 409, "{retried}");
+    let value: serde_json::Value = serde_json::from_str(body_str(&retried)).unwrap();
+    assert_eq!(value["error"], "conflict");
+    assert!(
+        body_str(&retried).contains("retry requires failed, cancelled, expired or deadline_missed"),
+        "{retried}"
+    );
+    let dry_run = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{id}/retry?dry_run=1"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&dry_run), 409, "{dry_run}");
+    assert!(
+        body_str(&dry_run).contains("retry requires failed, cancelled, expired or deadline_missed"),
+        "{dry_run}"
+    );
+    let after = job_value(&srv, &id).await;
+    assert_eq!(after["state"], "queued");
+    assert_eq!(after["attempt"], json!(1));
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn retry_needs_the_operator_token_and_writes_an_audit_event() {
+    let srv = start_server().await;
+    let path = srv._tmp.path().join("retry-audit.jsonl");
+    let (writer, _task) = lu_audit::Writer::open(&path, Arc::clone(&srv.state.audit_write_errors))
+        .await
+        .unwrap();
+    srv.state.set_audit(writer);
+    let created = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&created)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fail_submitted_job(&srv, &id).await;
+
+    let denied = agent_call(
+        srv.addr,
+        AGENT_A_TOKEN,
+        &format!("POST /v1/jobs/{id}/retry"),
+        "",
+    )
+    .await;
+    assert!(
+        matches!(status(&denied), 401 | 403),
+        "agent token must not retry: {denied}"
+    );
+    assert_eq!(job_value(&srv, &id).await["state"], "failed");
+
+    let retried = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{id}/retry"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&retried), 200, "{retried}");
+    let mut text = String::new();
+    for _ in 0..100 {
+        text = std::fs::read_to_string(&path).unwrap_or_default();
+        if text.contains("\"retried\"") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(text.contains("\"retried\""), "{text}");
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn retry_refuses_a_done_job_and_leaves_it_untouched() {
+    let srv = start_server().await;
+    let created = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&created)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    finish_submitted_job(&srv, &id, json!("done")).await;
+    let retried = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{id}/retry"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&retried), 409, "{retried}");
+    assert!(body_str(&retried).contains("job is done"), "{retried}");
+    let after = job_value(&srv, &id).await;
+    assert_eq!(after["state"], "done");
+    assert_eq!(after["attempt"], json!(1));
+
+    let _ = srv.shutdown.send(());
+}
+
 #[tokio::test]
 async fn retry_without_a_body_reuses_the_stored_spec() {
     let srv = start_server().await;
@@ -4774,14 +5075,17 @@ async fn retry_without_a_body_reuses_the_stored_spec() {
     .await;
     assert_eq!(status(&retried), 200, "{retried}");
     let value: serde_json::Value = serde_json::from_str(body_str(&retried)).unwrap();
-    let new_id = value
+    let retried_id = value
         .get("job")
         .and_then(|job| job.get("id"))
         .and_then(serde_json::Value::as_str)
         .unwrap();
-    assert_ne!(new_id, old_id);
-    let new_job = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{new_id}"))).await;
+    assert_eq!(retried_id, old_id);
+    assert_eq!(value["job"]["state"], "queued");
+    assert_eq!(value["requeued"], json!([]));
+    let new_job = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{retried_id}"))).await;
     let new_value: serde_json::Value = serde_json::from_str(body_str(&new_job)).unwrap();
+    assert_eq!(new_value["attempt"], json!(2));
     assert_eq!(
         new_value
             .get("spec")
@@ -4946,11 +5250,25 @@ async fn write_dry_runs_leave_jobs_and_clean_queue_untouched() {
         .to_owned();
     let job = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}"))).await;
     let etag = header_value(&job, "etag").unwrap().to_owned();
+    let retry_spec_key = format!("dry-retry-{}", std::process::id());
+    let retry_source = submit_spec(srv.addr, &sample_spec(Some(&retry_spec_key))).await;
+    assert_eq!(status(&retry_source), 201, "{retry_source}");
+    let retry_id = serde_json::from_str::<serde_json::Value>(body_str(&retry_source)).unwrap()
+        ["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let terminal = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{retry_id}/cancel"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&terminal), 200, "{terminal}");
 
     let stale = raw_request(
         srv.addr,
         &post_with_headers(
-            &format!("/v1/jobs/{id}/retry?dry_run=1"),
+            &format!("/v1/jobs/{retry_id}/retry?dry_run=1"),
             "",
             "If-Match: \"00000000000000000000000000000000\"\r\n",
         ),
@@ -4958,7 +5276,7 @@ async fn write_dry_runs_leave_jobs_and_clean_queue_untouched() {
     .await;
     assert_eq!(status(&stale), 412, "{stale}");
     for path in [
-        format!("/v1/jobs/{id}/retry?dry_run=1"),
+        format!("/v1/jobs/{retry_id}/retry?dry_run=1"),
         format!("/v1/jobs/{id}/cancel?dry_run=1"),
     ] {
         let dry = raw_request(srv.addr, &post_with_headers(&path, "", "")).await;
@@ -4969,8 +5287,9 @@ async fn write_dry_runs_leave_jobs_and_clean_queue_untouched() {
     let listed = raw_request(srv.addr, &operator_get("/v1/jobs")).await;
     let value: serde_json::Value = serde_json::from_str(body_str(&listed)).unwrap();
     let jobs = value["jobs"].as_array().unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0]["state"], "queued");
+    assert_eq!(jobs.len(), 2);
+    let original = jobs.iter().find(|j| j["id"] == id).unwrap();
+    assert_eq!(original["state"], "queued");
     assert_eq!(header_value(&job, "etag"), Some(etag.as_str()));
 
     let poll = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;

@@ -25,6 +25,7 @@ uses semantic versioning once it reaches 1.0.
 
 ### Fixed
 
+- `lu retry <id>` requeues the named terminal job in place: its attempt is incremented, its outcome is cleared and blocked dependents with `predecessor failed` are restored after it, transitively with `--chain`. Cancelled or failed dependents stay untouched. Plain output is `retried <id>; requeued N dependents`; any other state, including `done`, is refused with a clear conflict. The API reply now carries `requeued` ids instead of old/new pairs.
 - Retry applies `restrict_fields` to the parsed or stored spec, so a restricted token cannot widen a job through the retry route.
 
 ### Fixed

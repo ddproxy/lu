@@ -81,7 +81,8 @@ Full input rules are in [Batch submissions](batch.md).
 
 ## Retry with a provider override
 
-`lu retry` needs a terminal job. Absent fields are inherited from the source spec; supplied fields
+`lu retry` needs a failed, cancelled, expired or deadline-missed job. It requeues that job in place, so the printed id is the same one
+passed on the command line. Absent fields are inherited from the stored spec; supplied fields
 replace them.
 
 ```sh
@@ -90,11 +91,11 @@ lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV \
   --key retry-2 --wait
 ```
 
-The new job id is printed first, then the final state. Give `--key` if the retry must be
-idempotent; otherwise the retry has no key.
+The retried id and dependent count are printed first; with `--wait` the final state follows on
+stderr. Give `--key` if the idempotency mapping for this attempt must be explicit.
 
 ```text
-01ARZ3NDEKTSV4RRFFQ69G5FBV
+retried 01ARZ3NDEKTSV4RRFFQ69G5FAV; requeued 0 dependents
 state: done
 ```
 

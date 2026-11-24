@@ -168,7 +168,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     blocked_dependents_are_reported_and_expire(&make());
     staged_commit_is_recorded_for_active_jobs(&make());
     cancel_with_dependents_keeps_or_cascades(&make());
-    retry_with_dependents_reattaches_or_clones(&make());
+    retry_with_dependents_requeues_in_place(&make());
     collect_size_is_checked_at_submit(&make());
     job_counts(&make());
     draft_lifecycle(&make);
@@ -833,7 +833,7 @@ fn cancel_with_dependents_keeps_or_cascades<S: Store>(s: &S) {
     }
 }
 
-fn retry_with_dependents_reattaches_or_clones<S: Store>(s: &S) {
+fn retry_with_dependents_requeues_in_place<S: Store>(s: &S) {
     let a_spec = spec("https://x/retry-direct.git", Some("retry-direct"));
     let (a, _) = s.create_job(&a_spec, now(1, 1)).unwrap();
     let (b, _) = s
@@ -857,27 +857,43 @@ fn retry_with_dependents_reattaches_or_clones<S: Store>(s: &S) {
     finish_failed(s, &a.id, "retry-direct-node", 10, 10);
     assert_eq!(
         s.retry_with_dependents(&b.id, &a_spec, false, now(11, 11), None),
-        Err(StoreError::Conflict { length: None }),
+        Err(StoreError::NotRetryable(JobState::Blocked)),
         "a blocked job is not retryable"
     );
+    let done_spec = spec("https://x/retry-done.git", Some("retry-done"));
+    let (d, _) = s.create_job(&done_spec, now(1, 1)).unwrap();
+    finish_done(s, &d.id, "retry-done-node", 10, 10);
+    assert_eq!(
+        s.retry_with_dependents(&d.id, &done_spec, false, now(11, 11), None),
+        Err(StoreError::NotRetryable(JobState::Done)),
+        "a done job is not retryable"
+    );
+    assert_eq!(s.get_job(&d.id).unwrap().attempt, 1);
 
-    let (root, pairs) = s
+    let epoch_before = s.get_job(&a.id).unwrap().epoch;
+    let (root, requeued) = s
         .retry_with_dependents(&a.id, &a_spec, false, now(12, 12), None)
         .unwrap();
-    assert_eq!(pairs, vec![(a.id.clone(), root.id.clone())]);
+    assert_eq!(root.id, a.id);
+    assert_eq!(requeued, vec![b.id.clone()]);
     assert_eq!(root.state, JobState::Queued);
-    assert_eq!(root.attempt, 1);
-    assert_eq!(s.job_by_key("retry-direct").unwrap().id, root.id);
+    assert_eq!(root.attempt, 2);
+    assert_eq!(
+        root.epoch, epoch_before,
+        "epoch stays monotonic to fence stale agents"
+    );
+    assert_eq!(root.blocked_reason, None);
+    assert_eq!(s.job_by_key("retry-direct").unwrap().id, a.id);
     let b2 = s.get_job(&b.id).unwrap();
     assert_eq!(b2.state, JobState::Blocked);
-    assert_eq!(b2.spec.after, vec![root.id.clone()]);
-    assert_eq!(b2.waiting_on, vec![root.id.clone()]);
+    assert_eq!(b2.spec.after, vec![a.id.clone()]);
+    assert_eq!(b2.waiting_on, vec![a.id.clone()]);
     assert_eq!(b2.blocked_reason, None);
     assert_eq!(b2.blocked_since, None);
     assert_eq!(b2.summary, None);
     // Transitive dependents are left alone by a direct-only retry.
     assert_blocked_on_predecessor(&s.get_job(&c.id).unwrap(), &b.id, 10);
-    s.cancel_job(&root.id, now(20, 20)).unwrap();
+    s.cancel_job(&a.id, now(20, 20)).unwrap();
 
     let x_spec = spec("https://x/retry-chain.git", Some("retry-chain"));
     let (x, _) = s.create_job(&x_spec, now(13, 13)).unwrap();
@@ -889,38 +905,28 @@ fn retry_with_dependents_reattaches_or_clones<S: Store>(s: &S) {
     let (z, _) = s.create_job(&z_spec, now(15, 15)).unwrap();
     finish_failed(s, &x.id, "retry-chain-node", 20, 20);
 
-    let (new_x, pairs) = s
+    let (retried_x, requeued) = s
         .retry_with_dependents(&x.id, &x_spec, true, now(21, 21), None)
         .unwrap();
-    assert_eq!(pairs.len(), 3);
-    assert_eq!(pairs[0], (x.id.clone(), new_x.id.clone()));
-    let new_y_id = pairs
-        .iter()
-        .find(|(old, _)| old == &y.id)
-        .map(|(_, new)| new.clone())
-        .expect("y was cloned");
-    let new_z_id = pairs
-        .iter()
-        .find(|(old, _)| old == &z.id)
-        .map(|(_, new)| new.clone())
-        .expect("z was cloned");
-    assert_eq!(new_x.state, JobState::Queued);
+    assert_eq!(retried_x.id, x.id);
+    assert_eq!(retried_x.state, JobState::Queued);
+    assert_eq!(retried_x.attempt, 2);
+    assert_eq!(requeued, vec![y.id.clone(), z.id.clone()]);
     for (id, after) in [
-        (new_y_id.clone(), vec![new_x.id.clone()]),
-        (new_z_id.clone(), vec![new_y_id.clone()]),
+        (y.id.clone(), vec![x.id.clone()]),
+        (z.id.clone(), vec![y.id.clone()]),
     ] {
         let rec = s.get_job(&id).unwrap();
         assert_eq!(rec.state, JobState::Blocked);
         assert_eq!(rec.spec.after, after);
         assert_eq!(rec.waiting_on, rec.spec.after);
         assert_eq!(rec.blocked_reason, None);
+        assert_eq!(rec.blocked_since, None);
         assert_eq!(rec.attempt, 1);
     }
-    assert_eq!(s.job_by_key("retry-chain").unwrap().id, new_x.id);
-    assert_eq!(s.job_by_key("retry-chain-y").unwrap().id, new_y_id);
-    assert_eq!(s.job_by_key("retry-chain-z").unwrap().id, new_z_id);
-    assert_blocked_on_predecessor(&s.get_job(&y.id).unwrap(), &x.id, 20);
-    assert_blocked_on_predecessor(&s.get_job(&z.id).unwrap(), &y.id, 20);
+    assert_eq!(s.job_by_key("retry-chain").unwrap().id, x.id);
+    assert_eq!(s.job_by_key("retry-chain-y").unwrap().id, y.id);
+    assert_eq!(s.job_by_key("retry-chain-z").unwrap().id, z.id);
 }
 
 fn collect_size_is_checked_at_submit<S: Store>(s: &S) {

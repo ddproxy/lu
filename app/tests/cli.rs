@@ -1619,15 +1619,37 @@ fn finished_job(id: &str, state: &str) -> Value {
 }
 
 fn retry_reply(job: Value) -> Value {
-    json!({"job": job, "retried": [], "waiting_dependents": 0})
+    json!({"job": job, "requeued": [], "waiting_dependents": 0})
+}
+
+fn retry_reply_with(job: Value, requeued: &[String]) -> Value {
+    json!({"job": job, "requeued": requeued, "waiting_dependents": 0})
+}
+
+async fn retry_wait_server(id: &str) -> TestServer {
+    let id = id.to_owned();
+    let finished = finished_job(&id, "failed");
+    let posted = retry_reply(job_json(&id, "queued"));
+    let is_posted = Arc::new(Mutex::new(false));
+    let seen = Arc::clone(&is_posted);
+    start(move |record| {
+        if record.method == "POST" {
+            *seen.lock().unwrap() = true;
+            Reply::json(&posted)
+        } else if *seen.lock().unwrap() {
+            Reply::json(&job_json(&id, "failed"))
+        } else {
+            Reply::json(&finished)
+        }
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_replaces_or_clears_label_requirements() {
     let id = job_id();
-    let new_id = job_id();
     let finished = finished_job(&id, "failed");
-    let created = retry_reply(job_json(&new_id, "queued"));
+    let created = retry_reply(job_json(&id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1665,9 +1687,8 @@ async fn retry_replaces_or_clears_label_requirements() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_replaces_or_clears_tolerations() {
     let id = job_id();
-    let new_id = job_id();
     let finished = finished_job(&id, "failed");
-    let created = retry_reply(job_json(&new_id, "queued"));
+    let created = retry_reply(job_json(&id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1712,9 +1733,8 @@ async fn retry_replaces_or_clears_tolerations() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_replaces_or_clears_fallback_choices() {
     let id = job_id();
-    let new_id = job_id();
     let finished = finished_job(&id, "failed");
-    let created = retry_reply(job_json(&new_id, "queued"));
+    let created = retry_reply(job_json(&id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1765,9 +1785,8 @@ async fn retry_replaces_or_clears_fallback_choices() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_resubmits_the_finished_spec_and_applies_the_overrides() {
     let id = job_id();
-    let new_id = job_id();
     let finished = finished_job(&id, "failed");
-    let created = retry_reply(job_json(&new_id, "queued"));
+    let created = retry_reply(job_json(&id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1797,7 +1816,10 @@ async fn retry_resubmits_the_finished_spec_and_applies_the_overrides() {
         &dir,
     );
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), format!("{new_id} queued"));
+    assert_eq!(
+        stdout(&output).trim(),
+        format!("retried {id}; requeued 0 dependents")
+    );
     let records = server.records.lock().unwrap();
     assert_eq!(records[0].method, "GET");
     assert_eq!(records[0].path, format!("/v1/jobs/{id}"));
@@ -1821,11 +1843,10 @@ async fn retry_resubmits_the_finished_spec_and_applies_the_overrides() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_overrides_or_inherits_the_stuck_policy_and_interval() {
     let id = job_id();
-    let new_id = job_id();
     let mut finished = finished_job(&id, "failed");
     finished["spec"]["on_stuck"] = json!("retry");
     finished["spec"]["stuck_after_secs"] = json!(900);
-    let created = retry_reply(job_json(&new_id, "queued"));
+    let created = retry_reply(job_json(&id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1865,9 +1886,8 @@ async fn retry_overrides_or_inherits_the_stuck_policy_and_interval() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_keeps_the_old_spec_and_sends_no_idempotency_key_by_default() {
     let id = job_id();
-    let new_id = job_id();
     let finished = finished_job(&id, "cancelled");
-    let created = retry_reply(job_json(&new_id, "queued"));
+    let created = retry_reply(job_json(&id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1880,7 +1900,10 @@ async fn retry_keeps_the_old_spec_and_sends_no_idempotency_key_by_default() {
     let token = write_token(&dir, "operator.token", TOKEN);
     let output = run_with_env(&["retry", &id], &env_for(&server, &token), None, &dir);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), format!("{new_id} queued"));
+    assert_eq!(
+        stdout(&output).trim(),
+        format!("retried {id}; requeued 0 dependents")
+    );
     let records = server.records.lock().unwrap();
     assert_eq!(records[1].header("idempotency-key"), None);
     let spec: Value = serde_json::from_slice(&records[1].body).unwrap();
@@ -1893,15 +1916,51 @@ async fn retry_keeps_the_old_spec_and_sends_no_idempotency_key_by_default() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_reports_requeued_dependents() {
+    let id = job_id();
+    let dep_a = job_id();
+    let dep_b = job_id();
+    let finished = finished_job(&id, "failed");
+    let mut created = retry_reply_with(job_json(&id, "queued"), &[dep_a.clone(), dep_b.clone()]);
+    created["waiting_dependents"] = json!(1);
+    let server = start(move |record| {
+        if record.method == "POST" {
+            Reply::json(&created)
+        } else {
+            Reply::json(&finished)
+        }
+    })
+    .await;
+    let dir = scratch("retry-requeued");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &["retry", &id, "--chain"],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output).trim(),
+        format!("retried {id}; requeued 2 dependents\nwaiting_dependents 1")
+    );
+    let records = server.records.lock().unwrap();
+    let post = records.iter().find(|r| r.method == "POST").unwrap();
+    assert_eq!(post.query.as_deref(), Some("chain=1"));
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_resolves_after_key_to_a_dependency() {
     let old = job_id();
     let dep = job_id();
-    let new_id = job_id();
     let finished = finished_job(&old, "failed");
     let dep_id = dep.clone();
+    let reply_id = old.clone();
     let server = start(move |record| {
         if record.method == "POST" {
-            Reply::json(&retry_reply(job_json(&new_id, "queued")))
+            Reply::json(&retry_reply(job_json(&reply_id, "queued")))
         } else if record.query.is_some() {
             Reply::json(&json!({"jobs": [job_json(&dep_id, "done")], "next": null}))
         } else {
@@ -1927,16 +1986,22 @@ async fn retry_resolves_after_key_to_a_dependency() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retry_refuses_a_job_that_is_not_finished() {
+async fn retry_refuses_a_job_that_is_not_failed() {
+    for state in ["running", "done"] {
+        retry_refused_for(state).await;
+    }
+}
+
+async fn retry_refused_for(state: &str) {
     let id = job_id();
-    let body = job_json(&id, "running");
+    let body = job_json(&id, state);
     let server = start(move |_| Reply::json(&body)).await;
-    let dir = scratch("retry-not-terminal");
+    let dir = scratch(&format!("retry-not-retryable-{state}"));
     let token = write_token(&dir, "operator.token", TOKEN);
     let output = run_with_env(&["retry", &id], &env_for(&server, &token), None, &dir);
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("retry resubmits a finished job"),
+        stderr(&output).contains("retry requires failed, cancelled, expired or deadline_missed"),
         "{}",
         stderr(&output)
     );
@@ -1951,9 +2016,8 @@ async fn retry_refuses_a_job_that_is_not_finished() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_json_prints_the_retry_reply() {
     let id = job_id();
-    let new_id = job_id();
-    let finished = finished_job(&id, "done");
-    let created = retry_reply(job_json(&new_id, "queued"));
+    let finished = finished_job(&id, "failed");
+    let created = retry_reply(job_json(&id, "queued"));
     let server = start(move |record| {
         if record.method == "POST" {
             Reply::json(&created)
@@ -1972,9 +2036,9 @@ async fn retry_json_prints_the_retry_reply() {
     );
     assert!(output.status.success(), "{}", stderr(&output));
     let reply: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
-    assert_eq!(reply["job"]["id"], json!(new_id));
+    assert_eq!(reply["job"]["id"], json!(id));
     assert_eq!(reply["job"]["state"], json!("queued"));
-    assert_eq!(reply["retried"], json!([]));
+    assert_eq!(reply["requeued"], json!([]));
     assert_eq!(reply["waiting_dependents"], json!(0));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1982,38 +2046,29 @@ async fn retry_json_prints_the_retry_reply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_wait_reports_the_new_jobs_state_and_exit_code() {
     let id = job_id();
-    let new_id = job_id();
-    let finished = finished_job(&id, "done");
-    let post_id = new_id.clone();
-    let poll_id = new_id.clone();
-    let old_path = id.clone();
-    let server = start(move |record| {
-        if record.method == "POST" {
-            Reply::json(&retry_reply(job_json(&post_id, "queued")))
-        } else if record.path == format!("/v1/jobs/{old_path}") {
-            Reply::json(&finished)
-        } else {
-            Reply::json(&job_json(&poll_id, "failed"))
-        }
-    })
-    .await;
     let dir = scratch("retry-wait");
     let token = write_token(&dir, "operator.token", TOKEN);
-    let envs = env_for(&server, &token);
 
+    let server = retry_wait_server(&id).await;
+    let envs = env_for(&server, &token);
     let output = run_with_env(&["retry", &id, "--wait"], &envs, None, &dir);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), format!("{new_id} queued"));
+    assert_eq!(
+        stdout(&output).trim(),
+        format!("retried {id}; requeued 0 dependents")
+    );
     assert!(
         stderr(&output).contains("state: failed"),
         "{}",
         stderr(&output)
     );
 
-    let output = run_with_env(&["--json", "retry", &id, "--wait"], &envs, None, &dir);
+    let json_server = retry_wait_server(&id).await;
+    let json_envs = env_for(&json_server, &token);
+    let output = run_with_env(&["--json", "retry", &id, "--wait"], &json_envs, None, &dir);
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     let text = stdout(&output);
-    assert!(text.contains(&new_id), "{text}");
+    assert!(text.contains(&id), "{text}");
     assert!(text.contains(r#""state":"failed""#), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
