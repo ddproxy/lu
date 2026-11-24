@@ -1,6 +1,6 @@
 # Choosing where a job runs
 
-A job runs on a node that is idle, not draining and able to serve what the job needs. Two optional fields on a job narrow that choice: labels describe what the node can do, and provider choices describe which model the harness may use. A node must satisfy the labels first, then it must be able to serve one of the provider choices.
+A job runs on a node that is idle, not draining and able to serve what the job needs. Two optional fields on a job narrow that choice: labels describe what the node can do, and provider choices describe which model the harness may use. A node must satisfy the labels first, then it must be able to serve one of the provider choices. An agent also reports optional `harness_ok` and `disk_free_pct` in its heartbeat; a node reporting a failed harness or free space below `[schedule] min_disk_free_pct` (default `8`, `0` disables) is skipped until a later heartbeat recovers.
 
 ## Priority and groups
 

@@ -27,8 +27,8 @@ use lu_client::{ApiError, Controller, DependencyView};
 use lu_config::{AgentConfig, BaseSource, StackConfig, StuckPolicy as ConfigStuckPolicy};
 use lu_proto::{
     effective_stuck, printable, truncate_chars, AgentEvent, ArtifactName, Completion, ExpectMode,
-    ExpectSpec, FailureClass, HarnessState, Heartbeat, JobId, JobSpec, JobStats, NodeName,
-    OnConflict, Outcome, ProviderModel, ProviderState, ProviderStatus, StuckPolicy,
+    ExpectSpec, FailureClass, HarnessState, Heartbeat, HostStats, JobId, JobSpec, JobStats,
+    NodeName, OnConflict, Outcome, ProviderModel, ProviderState, ProviderStatus, StuckPolicy,
     WorkspacePolicy, HARNESS_OK_FALSE, MAX_DIFF_BYTES, MAX_NODE_LABELS, MAX_SUMMARY_BYTES,
     MAX_TAINTS,
 };
@@ -204,6 +204,18 @@ fn add_harness_status(labels: &mut Vec<String>, taints: &mut Vec<String>, ok: bo
     if !taints.iter().any(|taint| taint == HARNESS_OK_FALSE) && taints.len() < MAX_TAINTS {
         taints.push(HARNESS_OK_FALSE.to_owned());
     }
+}
+
+/// Free work-filesystem space as a percentage, clamped to 0-100. A missing or zero total means
+/// the platform could not sample the filesystem, so no health signal is published.
+fn disk_free_pct(host: Option<&HostStats>) -> Option<u8> {
+    let host = host?;
+    let (free, total) = (host.disk_free_bytes?, host.disk_total_bytes?);
+    if total == 0 {
+        return None;
+    }
+    let pct = (free as u128).saturating_mul(100) / (total as u128);
+    Some(pct.min(100) as u8)
 }
 
 /// The node agent. One instance runs one job at a time.
@@ -612,6 +624,8 @@ impl Agent {
             self.harness_ok.load(Ordering::SeqCst),
         );
         let ws = self.workspaces.stats();
+        let host = proc::host_stats(&self.work_dir);
+        let pct = disk_free_pct(host.as_ref());
         let mut beat = Heartbeat {
             node: self.node.clone(),
             harness,
@@ -619,7 +633,9 @@ impl Agent {
             providers: current.providers,
             provider_models,
             reiki: current.reiki,
-            host: proc::host_stats(&self.work_dir),
+            host,
+            harness_ok: Some(self.harness_ok.load(Ordering::SeqCst)),
+            disk_free_pct: pct,
             jobs: Vec::new(),
             labels,
             label_sources: label_set.label_sources,
@@ -2313,6 +2329,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                 );
                 let ws = workspaces.stats();
                 let ws_list = workspaces.list();
+                let pct = disk_free_pct(host.as_ref());
                 let mut beat = Heartbeat {
                     node: node.clone(),
                     harness: HarnessState::Busy,
@@ -2321,6 +2338,8 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                     provider_models,
                     reiki: current.reiki,
                     host,
+                    harness_ok: Some(harness_ok.load(Ordering::SeqCst)),
+                    disk_free_pct: pct,
                     jobs,
                     labels: beat_labels,
                     label_sources: label_set.label_sources,

@@ -1578,6 +1578,15 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
                     .map(display_field)
                     .unwrap_or_else(|| "-".to_owned()),
                 harness_name(node.harness),
+                match node.harness_ok {
+                    Some(false) => "bad".to_owned(),
+                    Some(true) => "ok".to_owned(),
+                    None => "-".to_owned(),
+                },
+                node.disk_free_pct
+                    .map(|pct| format!("{pct}%"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                node_health_reason(node),
                 labels_cell(&labels, 40),
                 labels_cell(&cordons, 24),
                 time(node.last_seen),
@@ -1590,6 +1599,9 @@ async fn nodes_inner(_args: NodesArgs, config: &Path, json: bool) -> Result<Exit
             "NAME",
             "VERSION",
             "HARNESS",
+            "HARNESS_OK",
+            "DISK_FREE",
+            "HEALTH",
             "LABELS",
             "CORDONS",
             "LAST_SEEN",
@@ -2498,6 +2510,21 @@ fn print_node(node: &NodeView) {
                 .unwrap_or_else(|| "-".to_owned()),
         ),
         ("harness", harness_name(node.harness)),
+        (
+            "harness_ok",
+            match node.harness_ok {
+                Some(false) => "bad".to_owned(),
+                Some(true) => "ok".to_owned(),
+                None => "-".to_owned(),
+            },
+        ),
+        (
+            "disk_free_pct",
+            node.disk_free_pct
+                .map(|pct| format!("{pct}%"))
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        ("health", node_health_reason(node)),
         ("last_seen", time(node.last_seen)),
         (
             "draining",
@@ -2827,6 +2854,17 @@ pub(crate) fn job_title(task: &str) -> String {
         .unwrap_or(line)
         .trim();
     line.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Why the latest heartbeat makes a node ineligible, without assuming a configured threshold.
+pub(crate) fn node_health_reason(node: &NodeView) -> String {
+    if node.harness_ok == Some(false) {
+        return "harness unhealthy".to_owned();
+    }
+    if let Some(pct) = node.disk_free_pct {
+        return format!("disk free {pct}%");
+    }
+    "-".to_owned()
 }
 
 pub(crate) fn harness_name(value: Option<HarnessState>) -> String {

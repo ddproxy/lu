@@ -570,6 +570,27 @@ pub async fn metrics(
         }
     }
 
+    out.push_str("# HELP lu_node_harness_ok Whether the latest heartbeat reports a usable harness (1 when absent)\n");
+    out.push_str("# TYPE lu_node_harness_ok gauge\n");
+    for node_rec in &nodes {
+        let node_name = escape_label(node_rec.name.as_str());
+        let ok = u64::from(node_rec.heartbeat.harness_ok.unwrap_or(true));
+        out.push_str(&gauge("lu_node_harness_ok", &[("node", &node_name)], ok));
+        out.push('\n');
+    }
+
+    out.push_str("# HELP lu_node_disk_free_pct Free work filesystem percent from the latest heartbeat (100 when absent)\n");
+    out.push_str("# TYPE lu_node_disk_free_pct gauge\n");
+    for node_rec in &nodes {
+        let node_name = escape_label(node_rec.name.as_str());
+        out.push_str(&gauge(
+            "lu_node_disk_free_pct",
+            &[("node", &node_name)],
+            u64::from(node_rec.heartbeat.disk_free_pct.unwrap_or(100)),
+        ));
+        out.push('\n');
+    }
+
     out.push_str("# HELP lu_node_disk_free_percent Free space on each node's work filesystem\n");
     out.push_str("# TYPE lu_node_disk_free_percent gauge\n");
     for node_rec in &nodes {

@@ -10,6 +10,7 @@ uses semantic versioning once it reaches 1.0.
   sortable with `s`, `S`, `r`, and header clicks, and the active sort is indicated in
   the header. Job priority is displayed in a `PRI` column after `STATE`.
 - Job and node selection follows the same row across refreshes and re-sorts.
+- Heartbeats may carry optional `harness_ok` and `disk_free_pct`. Dispatch skips nodes reporting an unhealthy harness or free disk space below `[schedule] min_disk_free_pct` (default `8`; `0` disables). Queued jobs report the reason in `waiting_reason` and `blocked_reason`; `lu nodes`, `lu node`, `/metrics` expose the signals, and a later healthy heartbeat makes the node eligible again.
 
 ### Added
 

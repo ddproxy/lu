@@ -22,8 +22,8 @@ use lu_proto::{
 };
 use lu_serve::PeerAddr;
 use lu_store::{
-    missing_labels, waiting_reason_with_groups, Cordon, CordonSource, JobRecord, NodeRecord, Now,
-    RequestKeyReservation,
+    is_node_health_reason, missing_labels, waiting_reason_with_groups_and_limits, Cordon,
+    CordonSource, JobRecord, NodeRecord, Now, RequestKeyReservation,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -389,8 +389,21 @@ async fn group_counts(state: &Arc<AppState>) -> Result<HashMap<String, usize>, A
 async fn job_view_for(state: &Arc<AppState>, rec: &JobRecord) -> Result<JobView, ApiError> {
     let nodes = all_nodes(state, now()).await?;
     let counts = group_counts(state).await?;
-    let reason = waiting_reason_with_groups(rec, &nodes, &counts, &state.group_limits());
+    let reason = waiting_reason_with_groups_and_limits(
+        rec,
+        &nodes,
+        &counts,
+        &state.group_limits(),
+        &state.dispatch_limits(),
+    );
     let mut view = job_view_with(rec, reason, state.blocked_dependent_ttl_secs);
+    if let Some(reason) = view
+        .waiting_reason
+        .as_deref()
+        .filter(|r| is_node_health_reason(r))
+    {
+        view.blocked_reason = Some(reason.to_owned());
+    }
     view.waiting_detail = schedule_waiting_detail(state, rec);
     view.audit_write_errors = Some(state.audit_write_errors());
     view.publish_target = crate::publish::target_text(state, rec);
@@ -402,15 +415,24 @@ fn job_views(
     nodes: &[NodeRecord],
     counts: &HashMap<String, usize>,
     limits: &HashMap<String, usize>,
+    dispatch_limits: &lu_store::DispatchLimits,
     blocked_ttl_secs: u64,
 ) -> Vec<JobView> {
     jobs.iter()
         .map(|job| {
-            job_view_with(
+            let mut view = job_view_with(
                 job,
-                waiting_reason_with_groups(job, nodes, counts, limits),
+                waiting_reason_with_groups_and_limits(job, nodes, counts, limits, dispatch_limits),
                 blocked_ttl_secs,
-            )
+            );
+            if let Some(reason) = view
+                .waiting_reason
+                .as_deref()
+                .filter(|r| is_node_health_reason(r))
+            {
+                view.blocked_reason = Some(reason.to_owned());
+            }
+            view
         })
         .collect()
 }
@@ -462,6 +484,8 @@ fn node_view(
         draining: n.draining,
         drain_origin: n.draining.then(|| n.drain_origin.as_str().to_owned()),
         harness: Some(n.heartbeat.harness),
+        harness_ok: n.heartbeat.harness_ok,
+        disk_free_pct: n.heartbeat.disk_free_pct,
         providers: n.heartbeat.providers.clone(),
         provider_models: n.heartbeat.provider_models.clone(),
         labels: n.heartbeat.labels.clone(),
@@ -867,6 +891,7 @@ async fn render_job_page(
             &nodes,
             &counts,
             &state.group_limits(),
+            &state.dispatch_limits(),
             state.blocked_dependent_ttl_secs,
         ),
         next,
@@ -1445,6 +1470,7 @@ pub async fn list_drafts(
                 &nodes,
                 &counts,
                 &state.group_limits(),
+                &state.dispatch_limits(),
                 state.blocked_dependent_ttl_secs,
             ),
             "next": next,

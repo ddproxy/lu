@@ -82,6 +82,8 @@ pub fn hb(name: &str, harness: HarnessState, providers: Vec<(&str, ProviderState
         provider_models: Vec::new(),
         reiki: None,
         host: None,
+        harness_ok: None,
+        disk_free_pct: None,
         jobs: Vec::new(),
         labels: Vec::new(),
         label_sources: std::collections::BTreeMap::new(),

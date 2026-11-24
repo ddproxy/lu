@@ -331,3 +331,42 @@ terse as requested.
   columns.
 - `ViewModel.lines` remains the source for `--once` and existing text tests. The sorted order is
   applied at render time so the plain-text path and its tests keep their original ordering.
+
+## Sick-node heartbeat gating verification
+
+### Verified against the code
+
+- `Heartbeat` and `RawHeartbeat` now carry `harness_ok: Option<bool>` and
+  `disk_free_pct: Option<u8>`. `RawHeartbeat` has no `deny_unknown_fields`, so unknown fields are
+  ignored in either direction as `docs/compatibility.md` requires. `disk_free_pct > 100` is
+  rejected during heartbeat validation.
+- `ting` derives both fields from the same signals it already had: `harness_ok` from its
+  harness-launch atomic, and `disk_free_pct` from the free/total work-filesystem bytes in
+  `HostStats`. Both heartbeat builders (idle and busy paths) send the values.
+- The `nodes` row stores the whole heartbeat as `heartbeat_json`, so the new values persist with
+  the node record and no schema migration is needed. `SCHEMA_VERSION` stays `7`.
+- The disk gate is enforced inside the SQLite dispatch transaction, so a concurrent poll cannot
+  lease to a node whose latest heartbeat is unhealthy. Recovery needs only the next heartbeat.
+- Absent fields are treated as healthy for old agents. The config key was added to `[schedule]`
+  because no `[limits]` table exists in the code or docs. `0` disables the disk gate.
+- Controller tests cover a blocked then recovered node, old agents without the fields, and a
+  zero threshold. `lu nodes`, `lu node`, `GET /v1/nodes`, job reasons and `/metrics` expose the
+  new state.
+
+### Where the code disagreed with the request
+
+- The task asked for the reason in `blocked_reason`. In the code, `JobView.waiting_reason` is the
+  canonical field for why a `queued` job cannot be placed, while `blocked_reason` is persisted for
+  jobs in `blocked` state after a failed dependency. Both are populated with the new health reason
+  for queued jobs, without changing stored job state, so the CLI and API wording stays consistent
+  with the request while the canonical reason remains available.
+- `/metrics` already exported `lu_node_disk_free_percent{node}`, derived from heartbeat byte
+  totals. The new `lu_node_disk_free_pct{node}` reports the explicit heartbeat percentage; both
+  series are emitted, with different names and absent-field behaviour.
+- The agent already published harness health as a `harness_ok=false` label and taint. The new
+  boolean is an independent signal used by the controller gate; the label and taint are unchanged.
+- `docs/monitoring.md` claimed schema version `6` while `SCHEMA_VERSION` and
+  `docs/operations.md` say `7`. The monitoring doc was corrected to match the code.
+- `docs/api.md` says request bodies reject unknown fields, but heartbeat decoding is deliberately
+  lenient for forward compatibility. The heartbeat-specific paragraph now describes the actual
+  behaviour.

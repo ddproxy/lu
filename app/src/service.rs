@@ -21,7 +21,7 @@ pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
     let store = lu_store::sqlite::SqliteStore::open(&controller.db)
         .map_err(|e| format!("cannot open {}: {e:?}", controller.db))?;
     let store: Arc<dyn lu_store::Store> = Arc::new(store);
-    let state = Arc::new(ControllerState::from_config_with_all(
+    let mut state = ControllerState::from_config_with_all(
         controller,
         store,
         config.artifacts.as_ref(),
@@ -29,7 +29,11 @@ pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
         config.drafts.as_ref(),
         config.intake.clone(),
         config.mirror.as_ref(),
-    )?);
+    )?;
+    state.set_dispatch_limits(lu_store::DispatchLimits {
+        min_disk_free_pct: config.min_disk_free_pct(),
+    });
+    let state = Arc::new(state);
     if let Some(publish) = config.publish.clone() {
         state.set_publish(publish);
     }

@@ -14,6 +14,8 @@ pub const SCHEMA_VERSION: i64 = 7;
 #[cfg(test)]
 pub mod conformance;
 #[cfg(test)]
+mod health_tests;
+#[cfg(test)]
 mod model;
 
 use std::collections::HashMap;
@@ -27,6 +29,52 @@ use lu_proto::{
 pub struct Now {
     pub wall_unix: i64,
     pub mono_ms: u64,
+}
+
+pub use lu_proto::DEFAULT_MIN_DISK_FREE_PCT;
+
+/// Health gates applied atomically when a node asks for its next job. A limit of zero disables
+/// the disk gate; absent heartbeat fields leave older agents eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchLimits {
+    pub min_disk_free_pct: u8,
+}
+
+impl Default for DispatchLimits {
+    fn default() -> Self {
+        Self {
+            min_disk_free_pct: DEFAULT_MIN_DISK_FREE_PCT,
+        }
+    }
+}
+
+/// Why a node's latest heartbeat makes it ineligible for dispatch, if it does.
+pub fn heartbeat_health_reason(
+    name: &NodeName,
+    heartbeat: &Heartbeat,
+    limits: &DispatchLimits,
+) -> Option<String> {
+    if heartbeat.harness_ok == Some(false) {
+        return Some(format!("harness unhealthy on node {name}"));
+    }
+    let pct = heartbeat.disk_free_pct?;
+    (pct < limits.min_disk_free_pct).then(|| {
+        format!(
+            "node {name} disk free {pct}% below {}",
+            limits.min_disk_free_pct
+        )
+    })
+}
+
+/// Why a node record is ineligible for dispatch, if it does.
+pub fn node_health_reason(node: &NodeRecord, limits: &DispatchLimits) -> Option<String> {
+    heartbeat_health_reason(&node.name, &node.heartbeat, limits)
+}
+
+/// Whether a waiting reason reports a node health gate rather than a label, taint or provider gate.
+pub fn is_node_health_reason(reason: &str) -> bool {
+    reason.starts_with("harness unhealthy on node ")
+        || (reason.contains(" disk free ") && reason.contains(" below "))
 }
 
 /// Bounds checked atomically when a child is created.
@@ -252,6 +300,23 @@ pub fn waiting_reason_with_groups(
     group_counts: &HashMap<String, usize>,
     group_limits: &HashMap<String, usize>,
 ) -> Option<String> {
+    waiting_reason_with_groups_and_limits(
+        job,
+        nodes,
+        group_counts,
+        group_limits,
+        &DispatchLimits::default(),
+    )
+}
+
+/// Like [`waiting_reason_with_groups`], with the dispatch health gates in `limits`.
+pub fn waiting_reason_with_groups_and_limits(
+    job: &JobRecord,
+    nodes: &[NodeRecord],
+    group_counts: &HashMap<String, usize>,
+    group_limits: &HashMap<String, usize>,
+    limits: &DispatchLimits,
+) -> Option<String> {
     if job.state != JobState::Queued {
         return None;
     }
@@ -263,12 +328,21 @@ pub fn waiting_reason_with_groups(
             }
         }
     }
-    waiting_reason(job, nodes)
+    waiting_reason_with_limits(job, nodes, limits)
 }
 
 /// Why a queued job cannot be placed: first a missing label, then a taint no matching node is
-/// tolerated for.
+/// tolerated for. Uses the default health gates.
 pub fn waiting_reason(job: &JobRecord, nodes: &[NodeRecord]) -> Option<String> {
+    waiting_reason_with_limits(job, nodes, &DispatchLimits::default())
+}
+
+/// Like [`waiting_reason`], with the dispatch health gates in `limits`.
+pub fn waiting_reason_with_limits(
+    job: &JobRecord,
+    nodes: &[NodeRecord],
+    limits: &DispatchLimits,
+) -> Option<String> {
     if job.state != JobState::Queued {
         return None;
     }
@@ -299,6 +373,13 @@ pub fn waiting_reason(job: &JobRecord, nodes: &[NodeRecord]) -> Option<String> {
         })
     {
         return Some("no node has a healthy provider for provider \"any\"".to_owned());
+    }
+    let unhealthy: Vec<String> = eligible
+        .iter()
+        .filter_map(|node| node_health_reason(node, limits))
+        .collect();
+    if !eligible.is_empty() && unhealthy.len() == eligible.len() {
+        return unhealthy.into_iter().next();
     }
     None
 }
@@ -658,6 +739,18 @@ pub trait Store: Send + Sync + 'static {
         now: Now,
         lease_ms: u64,
     ) -> Result<Option<Assignment>, StoreError>;
+    /// Leases with the health gates in `limits`. Stores without health support fall back to the
+    /// plain path, which keeps older and in-memory stores lenient.
+    fn next_assignment_with_limits(
+        &self,
+        node: &NodeName,
+        now: Now,
+        lease_ms: u64,
+        limits: DispatchLimits,
+    ) -> Result<Option<Assignment>, StoreError> {
+        let _ = limits;
+        self.next_assignment(node, now, lease_ms)
+    }
     /// Like [`Store::next_assignment`], but evaluates the time-aware gates in `schedule` before
     /// leasing. Stores without schedule support fall back to the plain path.
     fn next_assignment_scheduled(
@@ -669,6 +762,19 @@ pub trait Store: Send + Sync + 'static {
     ) -> Result<Option<Assignment>, StoreError> {
         let _ = schedule;
         self.next_assignment(node, now, lease_ms)
+    }
+    /// Leases with both the schedule and the health gates. Stores without support fall back to
+    /// the scheduled path.
+    fn next_assignment_scheduled_with_limits(
+        &self,
+        node: &NodeName,
+        now: Now,
+        lease_ms: u64,
+        schedule: &lu_schedule::Schedule,
+        limits: DispatchLimits,
+    ) -> Result<Option<Assignment>, StoreError> {
+        let _ = limits;
+        self.next_assignment_scheduled(node, now, lease_ms, schedule)
     }
     /// Ends queued or blocked jobs whose start deadline has passed and whose `on_deadline` asks
     /// for termination. Returns each id with the configured action so the caller can audit it.

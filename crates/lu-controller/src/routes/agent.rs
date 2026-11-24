@@ -333,9 +333,11 @@ pub async fn poll(
             let lease_ms = state.lease_ms;
             let n2 = now();
             let schedule = state.schedule();
+            let limits = state.dispatch_limits();
             match tokio::task::spawn_blocking(move || match &schedule {
-                Some(schedule) => store.next_assignment_scheduled(&node_c, n2, lease_ms, schedule),
-                None => store.next_assignment(&node_c, n2, lease_ms),
+                Some(schedule) => store
+                    .next_assignment_scheduled_with_limits(&node_c, n2, lease_ms, schedule, limits),
+                None => store.next_assignment_with_limits(&node_c, n2, lease_ms, limits),
             })
             .await
             {

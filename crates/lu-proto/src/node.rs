@@ -237,6 +237,9 @@ pub struct NodeStats {
     pub workspaces: Vec<WorkspaceView>,
 }
 
+/// Default minimum free work-filesystem space, in percent, before a node may take work.
+pub const DEFAULT_MIN_DISK_FREE_PCT: u8 = 8;
+
 /// A periodic message from an agent. Receivers ignore fields they do not know, so an agent may be
 /// newer than its controller; only add optional fields. `reiki` is the opaque health document, forwarded unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -254,6 +257,12 @@ pub struct Heartbeat {
     pub reiki: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostStats>,
+    /// False when the agent's harness is unhealthy. Absent means healthy for older agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_ok: Option<bool>,
+    /// Free space on the work filesystem as a percentage. Absent means no health signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_pct: Option<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -301,6 +310,12 @@ struct RawHeartbeat {
     pub reiki: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostStats>,
+    /// False when the agent's harness is unhealthy. Absent means healthy for older agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_ok: Option<bool>,
+    /// Free space on the work filesystem as a percentage. Absent means no health signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_pct: Option<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -336,6 +351,8 @@ impl TryFrom<RawHeartbeat> for Heartbeat {
             provider_models: raw.provider_models,
             reiki: raw.reiki,
             host: raw.host,
+            harness_ok: raw.harness_ok,
+            disk_free_pct: raw.disk_free_pct,
             jobs: raw.jobs,
             labels: raw.labels,
             label_sources: raw.label_sources,
@@ -406,6 +423,11 @@ impl Heartbeat {
 
     /// Checks the caps a single heartbeat must respect.
     pub fn validate(&self) -> Result<(), HeartbeatError> {
+        if let Some(value) = self.disk_free_pct {
+            if value > 100 {
+                return Err(HeartbeatError::DiskFreePct { value });
+            }
+        }
         if let Some(version) = &self.version {
             if version.is_empty()
                 || version.len() > MAX_VERSION_BYTES
@@ -525,6 +547,7 @@ impl Heartbeat {
 /// Why a heartbeat was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeartbeatError {
+    DiskFreePct { value: u8 },
     Version { value: String },
     TooManyProviders { got: usize },
     ProviderName { index: usize, name: String },
@@ -547,6 +570,9 @@ pub enum HeartbeatError {
 impl std::fmt::Display for HeartbeatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::DiskFreePct { value } => {
+                write!(f, "disk_free_pct must be 0 to 100 (got {value})")
+            }
             Self::Version { value } => write!(
                 f,
                 "the agent version {value:?} must be 1 to {MAX_VERSION_BYTES} printable ASCII characters"
@@ -643,6 +669,8 @@ mod tests {
             provider_models: Vec::new(),
             reiki: None,
             host: None,
+            harness_ok: None,
+            disk_free_pct: None,
             jobs: Vec::new(),
             labels: Vec::new(),
             label_sources: BTreeMap::new(),

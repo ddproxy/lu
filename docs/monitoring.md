@@ -36,7 +36,7 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_build_info{version}` | gauge | Always `1`; controller build version. |
 | `lu_uptime_seconds` | gauge | Seconds since the controller process started. |
 | `lu_db_bytes` | gauge | SQLite file size, excluding `-wal` and `-shm`. |
-| `lu_schema_version` | gauge | Schema version the binary expects; currently `6`. |
+| `lu_schema_version` | gauge | Schema version the binary expects; currently `7`. |
 | `lu_recovered_on_boot` | gauge | Jobs moved to `recovering` by this process's boot recovery. |
 | `lu_queue_oldest_seconds` | gauge | Age of the oldest `queued` or `blocked` job, or `0` when none. |
 | `lu_jobs{state}` | gauge | Jobs in each of twelve zero-filled states: `draft`, `blocked`, `queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`, `expired`, `deadline_missed`. There are no separate schedule-wait or reload counters. |
@@ -65,6 +65,8 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_node_last_seen_seconds{node}` | gauge | Seconds since that node's last heartbeat. |
 | `lu_node_labels_info{node,label}` | gauge | `1` per label in the node's latest heartbeat. |
 | `lu_node_disk_free_percent{node}` | gauge | Free space percentage on the node's work filesystem, when its latest heartbeat reported disk totals. |
+| `lu_node_harness_ok{node}` | gauge | `1` when the latest heartbeat reports a healthy harness or omits `harness_ok` (older agents); `0` when it reports `harness_ok: false`. |
+| `lu_node_disk_free_pct{node}` | gauge | Free work-filesystem percentage from the heartbeat's `disk_free_pct`. Older agents without the field report `100`. |
 | `lu_node_providers{node,provider,state}` | gauge | `1` per reported provider; `state` is `ok`, `cooling`, `disabled` or `unknown`. |
 | `lu_audit_write_errors_total` | counter | Audit record enqueue or write failures since this controller process started. Always present, `0` when auditing is off. A non-zero value means one or more events were not recorded; the job still completed. |
 | `lu_node_cordon_seconds_remaining{node,provider,source}` | gauge | Seconds left on a failure cordon; `0` for Reiki cordons that lift on healthy heartbeats. |

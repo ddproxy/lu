@@ -176,6 +176,12 @@ pub struct PollRequest {
     pub reiki: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<HostStats>,
+    /// False when the agent's harness is unhealthy. Absent means healthy for older agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness_ok: Option<bool>,
+    /// Free space on the work filesystem as a percentage, from 0 to 100.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_free_pct: Option<u8>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<JobStats>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -220,6 +226,8 @@ impl From<Heartbeat> for PollRequest {
             provider_models: beat.provider_models,
             reiki: beat.reiki,
             host: beat.host,
+            harness_ok: beat.harness_ok,
+            disk_free_pct: beat.disk_free_pct,
             jobs: beat.jobs,
             labels: beat.labels,
             label_sources: beat.label_sources,
@@ -469,6 +477,8 @@ mod tests {
             provider_models: Vec::new(),
             reiki: None,
             host: None,
+            harness_ok: Some(true),
+            disk_free_pct: Some(42),
             jobs: Vec::new(),
             labels: Vec::new(),
             label_sources: BTreeMap::new(),
@@ -481,6 +491,8 @@ mod tests {
             workspaces: vec![workspace.clone()],
         };
         let request = PollRequest::from(beat);
+        assert_eq!(request.harness_ok, Some(true));
+        assert_eq!(request.disk_free_pct, Some(42));
         assert_eq!(request.workspace_bytes, 64);
         assert_eq!(request.workspace_count, 1);
         assert_eq!(request.workspace_reclaimed_bytes_total, 128);

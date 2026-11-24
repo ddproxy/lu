@@ -98,6 +98,7 @@ fn scheduling_examples_are_valid_config() {
         "schedule.staging_secs",
         "schedule.finish_secs",
         "schedule.starvation_secs",
+        "schedule.min_disk_free_pct",
         "calendar[].name",
         "calendar[].offset",
         "calendar[].default",
