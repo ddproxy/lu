@@ -599,6 +599,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fw-tui"
+version = "0.1.0"
+source = "git+https://github.com/ddproxy/fw-tui?rev=8a9fb414c79d7784009e1a3ec3a3688e197931fe#8a9fb414c79d7784009e1a3ec3a3688e197931fe"
+dependencies = [
+ "crossterm",
+ "ratatui",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1247,6 +1256,7 @@ name = "lu-tui"
 version = "0.6.1"
 dependencies = [
  "crossterm",
+ "fw-tui",
  "lu-proto",
  "ratatui",
 ]

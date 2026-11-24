@@ -293,3 +293,41 @@ claim disagreed with the tree, the tree won and the docs were corrected; no feat
 Work remains local and uncommitted: the checkout's `.git` directory is root-owned and unwritable
 by the current uid, so `git status` fails and no commit could be created. Commit messages were kept
 terse as requested.
+
+## `lu top` sortable table verification
+
+### Verified against the code
+
+- The shared widget is `fw_tui::widgets::render_table_sorted`, pinned to main commit
+  `8a9fb414c79d7784009e1a3ec3a3688e197931fe`. It owns header rendering, the sort indicator,
+  header hit-testing through `sort_column_at`, and key handling through `handle_sort_key`.
+- `JobView.spec.priority` already existed and is `0-9`; `JobRow.priority` now carries it into
+  the TUI and the `PRI` column is inserted after `STATE`.
+- The sort kinds are per table column: numeric for `PRI`, `TRY` and the three `WS` counters;
+  duration for `AGE`, `WAIT`, `RUN` and `TOTAL`; text for names, providers, models, repos and
+  notes. `STATE` and `WS TOTALS` use custom comparators for semantic state order and
+  completed/failed/running totals respectively.
+- Column widths come from the TUI's existing `LayoutInfo`. The widget caps a cell to 40
+  characters, so `NOTE_MAX` was reduced from 64 to 40 to avoid a second, log-specific cap.
+- Selection is restored by `JobRow.id` and `NodeRow.name`, so it follows the same row across
+  data refreshes and re-sorts. Row keys are also registered with the widget so its own row
+  tracking uses the same identity.
+
+### Where the code disagreed with the request
+
+- The shared widget draws the table header itself, on the inner row directly below the
+  dashboard. The TUI no longer stamps a separate header line; `LayoutInfo` now reserves that
+  row, and the narrow-column fit logic drops trailing columns rather than clipping identity or
+  state cells.
+- The widget's minimum row height reserves two inner rows for the header and scroll window.
+  The graph and table areas were adjusted to yield those rows; this slightly changes the 80-column
+  golden layout.
+- The sort indicator is drawn inside the column width. The three-cell `PRI` and `TRY` columns
+  cannot show an arrow alongside the header text at 80 columns, although they remain sortable;
+  wider columns display the indicator.
+- Mouse wheel and double-click still use Lu's own hit-testing because they change selection and
+  scroll position rather than sort order. Displayed column indices are translated back to data
+  column indices through `LayoutInfo.*_order` so these actions track the sorted and hidden
+  columns.
+- `ViewModel.lines` remains the source for `--once` and existing text tests. The sorted order is
+  applied at render time so the plain-text path and its tests keep their original ordering.

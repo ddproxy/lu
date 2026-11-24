@@ -153,6 +153,7 @@ async fn snapshot(client: &Client) -> Result<(Snapshot, u64), String> {
                     state: operator::state_name(job.state).to_owned(),
                     node: job.node.as_ref().map(ToString::to_string),
                     repo: repo_label(&job.spec.repo),
+                    priority: job.spec.priority,
                     git_ref: printable(&job.spec.git_ref),
                     attempt: job.attempt,
                     age_secs: now.saturating_sub(job.created_at),

@@ -9,12 +9,13 @@ publish.workspace = true
 
 [features]
 # Off by default: the model and sanitizer build without a terminal library.
-tui = ["dep:ratatui", "dep:crossterm"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:fw-tui", "fw-tui/tui"]
 
 [dependencies]
 lu-proto = { path = "../lu-proto" }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
+fw-tui = { git = "https://github.com/ddproxy/fw-tui", rev = "8a9fb414c79d7784009e1a3ec3a3688e197931fe", optional = true }
 
 [lints]
 workspace = true
