@@ -246,3 +246,50 @@ code.
 - **Compatibility probes.** `scripts/compat-test.sh` sends the new headers and `?dry_run=1` to both
   controller builds. The mutating probe uses a harmless in-memory group limit, and the body probe
   uses an invalid job spec so neither build stores anything.
+
+## Scheduling documentation reconciliation
+
+Claims below were checked against the code while updating the phase-1 scheduling docs. Where a
+claim disagreed with the tree, the tree won and the docs were corrected; no feature work was done.
+
+- **State count.** The repo has twelve `JobState`s, not eleven. The twelfth is `deadline_missed`,
+  terminal, reachable only from `queued` or `blocked`. `expire` and `cancel` both end there with
+  summary `deadline missed` and a `deadline_missed` audit event; neither reuses `expired`.
+  `StatsReport` and node contribution series omit it, but `lu status --json`, `GET /v1/status` and
+  `lu_jobs{state="deadline_missed"}` include it. Older docs claiming four terminal states were
+  wrong.
+- **Dispatch order.** `SQLiteStore::next_assignment_scheduled` sorts by starvation class desc,
+  effective priority desc, `dispatch_seq` asc, then `eligible_since` asc. `queue_key()` returns
+  `(starved, effective, eligible_since, dispatch_seq)` but the comparator puts `.3` before `.2`, so
+  the tuple order alone is misleading. The earlier note in this file that listed
+  `eligible_since` before `dispatch_seq` was also wrong. Effective priority can rise by up to two
+  points with age; a starved job outranks every static priority. Docs that said "priority then
+  submission order" were corrected.
+- **Config reload.** There is no general config, token, TLS or agent reload and `SIGHUP` is not
+  handled, but `POST /v1/schedule/reload` exists. It re-reads the controller config path, validates
+  the whole file, and atomically swaps only the schedule; a rejected reload leaves the active
+  schedule unchanged. It requires `schedule = true` on `[[controller.operators]]` (default deny).
+  Read-only schedule routes need an ordinary non-viewer operator token; viewers are not in the
+  allow-list.
+- **API surface.** `JobSpec.schedule`, `JobEdit.schedule`, `JobView.schedule` and
+  `JobView.waiting_detail` exist. `waiting_detail` is filled by the single-job view path, not the
+  list path. `GET /v1/schedule`, `GET /v1/schedule/calendars{/,name}`, `POST /v1/schedule/explain`
+  and `POST /v1/schedule/reload` are registered. The docs now list them; the CLI has no
+  `lu schedule` command and no scheduling flags on submit/edit/retry/collect/batch/MCP paths.
+- **Metrics.** No `lu_jobs_waiting_schedule{code}`, schedule-wait counter or reload counter is
+  exported, despite comments in `state.rs`. Schedule wait/reload counters exist only in the
+  controller process. `JobView.waiting_detail` is the structured local view of the same evaluator.
+- **Stale source comments (left unchanged, docs follow the code).** `state.rs` says the schedule is
+  swapped by `lu schedule reload` (no such command), `lu-schedule` says `next_change` is shared with
+  `lu schedule`, `on_deadline = "cancel"` is described as ending "as cancelled" (the wire state is
+  `deadline_missed`), and `Schedule::admissible` is described as used at submit (only
+  `POST /v1/schedule/explain` and tests call it). The earlier note in this file claiming a
+  configurable per-provider start budget also has no matching config key or code path.
+- **Docs test.** `crates/lu-config/tests/docs.rs` extracts `toml` blocks from `docs/scheduling.md`,
+  checks their key paths against an allowlist, deserialises them with `lu_config::Config::parse`
+  using runtime-generated token hashes, and proves an unknown key is rejected. No token-shaped
+  value is stored in source.
+
+Work remains local and uncommitted: the checkout's `.git` directory is root-owned and unwritable
+by the current uid, so `git status` fails and no commit could be created. Commit messages were kept
+terse as requested.

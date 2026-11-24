@@ -10,8 +10,9 @@ config that already contains `[[controller.agents]]` for the node.
 ## 1. Register the identity and start drained
 
 Generate a token, put its hash in the controller config and restart the controller. There is no
-config reload; token hashes and TLS material are read at startup. See
-[Tokens and TLS](tokens-and-tls.md#rotation).
+general config reload; token hashes and TLS material are read at startup. The schedule alone can be
+swapped with `POST /v1/schedule/reload`. See [Tokens and TLS](tokens-and-tls.md#rotation) and
+[Time-aware scheduling](scheduling.md#inspecting-scheduling).
 
 ```toml
 [[controller.agents]]

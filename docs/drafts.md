@@ -18,8 +18,8 @@ stateDiagram-v2
 ```
 
 The state list is exactly `draft`, `blocked`, `queued`, `leased`, `running`, `recovering`,
-`needs_input`, `done`, `failed`, `cancelled`, `expired`. `expired` is terminal; an expired draft
-cannot be approved or edited. Rejection ends in `cancelled`. The full state machine is in
+`needs_input`, `done`, `failed`, `cancelled`, `expired`, `deadline_missed`. `expired` is terminal; an
+expired draft cannot be approved or edited. Rejection ends in `cancelled`. The full state machine is in
 [Job Lifecycle](lifecycle.md#drafts).
 
 ## Job fields
@@ -115,7 +115,7 @@ table.
 `lu top` shows the draft count and the age of the oldest draft. `/metrics` exports
 `lu_drafts{state}` for the draft inventory and `lu_intake_total{source,result}` for intake
 outcomes, including drafts refused because a cap was full. The `jobs` object in `GET /v1/status`
-uses the eleven-state list, so it includes `draft` and `expired`; see
+uses the twelve-state list, so it includes `draft`, `expired` and `deadline_missed`; see
 [monitoring.md](monitoring.md#series).
 
 ## Security boundary

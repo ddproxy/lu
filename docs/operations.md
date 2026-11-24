@@ -34,7 +34,7 @@ undrains with `ting undrain`. That needs only the node's own token.
 
 The store uses schema version 7. It creates the schema for a new database and migrates schema 1 to 6 databases in place on startup, adding the scrubbing, lineage, publish and stacked-chain columns (`staged_commit`, `blocked_reason`, `blocked_since`, `eligible_since`) and the additive `request_keys` table for HTTP idempotency. Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly the current schema version (7), so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
 
-There is no online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
+There is no general online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. The exception is `POST /v1/schedule/reload`, which an operator with `schedule = true` can use to swap in the schedule from the controller config file without a restart; see [Time-aware scheduling](scheduling.md#inspecting-scheduling). For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
 
 ## Upgrading the controller
 

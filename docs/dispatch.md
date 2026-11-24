@@ -4,7 +4,7 @@ A job runs on a node that is idle, not draining and able to serve what the job n
 
 ## Priority and groups
 
-`--priority N` sets an integer from 0 (lowest) to 9 (highest); the default is 5. Dispatch takes the highest priority first and, within a priority, the earliest submitted job first (persisted submission order, not wall-clock id order). A newly submitted high-priority job overtakes older, lower-priority queued jobs.
+`--priority N` sets an integer from 0 (lowest) to 9 (highest); the default is 5. Dispatch orders queued jobs by starvation class, then effective priority, then `dispatch_seq` and `eligible_since` ascending. Effective priority starts at `spec.priority` and gains up to two points as the job waits; once a job is older than `[schedule] starvation_secs` (default 3600) it outranks every static priority. `dispatch_seq` is persisted submission order, not wall-clock id order. See [Time-aware scheduling](scheduling.md#admission-deadlines-and-queue-order).
 
 `--group NAME` marks a job as part of a concurrency group. Names are 1-64 characters from `A-Z a-z 0-9 . _ -`. A controller can cap a group with `[[controller.groups]]` or set a runtime cap with `PUT /v1/groups/{name}/limit`; jobs in uncapped groups are unlimited. Runtime caps stay in controller memory and return to configured values on restart. Jobs count toward the cap while `leased`, `running`, `recovering` or `needs_input`. A queued job blocked by a full group stays queued and reports `group limit (<name> <running>/<max>)` in `waiting_reason`. Cancellation and failure release the slot.
 

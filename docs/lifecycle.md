@@ -15,6 +15,8 @@ stateDiagram-v2
     blocked --> queued: last dependency done or predecessor retried
     blocked --> failed: blocked-dependent ttl elapsed
     blocked --> cancelled: cancel (also cancels waiting dependents)
+    blocked --> deadline_missed: start deadline passed with on_deadline expire or cancel
+    queued --> deadline_missed: start deadline passed with on_deadline expire or cancel
     queued --> leased: dispatch to an idle agent
     queued --> blocked: edit adds an unfinished dependency
     queued --> cancelled: cancel
@@ -41,6 +43,7 @@ stateDiagram-v2
     failed --> [*]
     cancelled --> [*]
     expired --> [*]
+    deadline_missed --> [*]
     note right of needs_input
       Reserved in this version;
       no code path enters it.
@@ -48,23 +51,27 @@ stateDiagram-v2
 ```
 
 The state list is exactly `draft`, `blocked`, `queued`, `leased`, `running`, `recovering`,
-`needs_input`, `done`, `failed`, `cancelled`, `expired`. Waiting for a failed predecessor adds no
-state: the dependent remains `blocked` with a `blocked_reason` and a deadline. `needs_input` is part of the wire enum and
-the transition table, but it is reserved and unreachable in this version. The terminal states are
-`done`, `failed`, `cancelled` and `expired`; they have no outgoing edges.
+`needs_input`, `done`, `failed`, `cancelled`, `expired`, `deadline_missed`. Waiting for a failed
+predecessor adds no state: the dependent remains `blocked` with a `blocked_reason` and a deadline.
+`needs_input` is part of the wire enum and the transition table, but it is reserved and unreachable
+in this version. The terminal states are `done`, `failed`, `cancelled`, `expired` and
+`deadline_missed`; they have no outgoing edges. `deadline_missed` is reached only from `queued` or
+`blocked` when a job's start deadline passes with `on_deadline = "expire"` or `"cancel"`. Both
+actions end the same way: `finished_at` is set and the summary is `deadline missed`. See
+[scheduling.md](scheduling.md#admission-deadlines-and-queue-order).
 
 ## Transition reference
 
 | From | Allowed targets | What causes it |
 | --- | --- | --- |
 | `draft` | `queued`, `blocked`, `cancelled`, `expired` | Operator approval with all dependencies done or with unmet dependencies; rejection; `ttl` elapsed. Never dispatched in this state. |
-| `blocked` | `queued`, `cancelled`, `failed` | All dependencies become `done` or a failed predecessor is retried; operator cancel (also cancels waiting dependents); `[controller] blocked_dependent_ttl` expires after a predecessor failed. |
-| `queued` | `leased`, `blocked`, `cancelled` | Dispatch to an idle, non-draining agent; edit adds an unfinished dependency; operator cancel. |
+| `blocked` | `queued`, `cancelled`, `failed`, `deadline_missed` | All dependencies become `done` or a failed predecessor is retried; operator cancel (also cancels waiting dependents); `[controller] blocked_dependent_ttl` expires after a predecessor failed; start deadline passes with `on_deadline = "expire"` or `"cancel"`. |
+| `queued` | `leased`, `blocked`, `cancelled`, `deadline_missed` | Dispatch to an idle, non-draining agent; edit adds an unfinished dependency; operator cancel; start deadline passes with `on_deadline = "expire"` or `"cancel"`. |
 | `leased` | `running`, `queued`, `recovering`, `cancelled`, `failed` | Agent starts; retryable failure or lost lease; lease expiry or controller restart; cancel; non-retryable failure. |
 | `running` | `done`, `failed`, `cancelled`, `queued`, `recovering` | Harness success; terminal failure (including stuck cancel); honoured cancel; provider or stuck retry; lease expiry. |
 | `recovering` | `running`, `done`, `leased`, `queued`, `failed`, `cancelled` | Same-epoch renewal; same-epoch completion; reassignment; grace expiry with or without retry budget; operator cancel. |
 | `needs_input` | `running`, `failed`, `cancelled` | Reserved edges only; not reachable in this version. |
-| `done`, `failed`, `cancelled`, `expired` | none | Terminal. |
+| `done`, `failed`, `cancelled`, `expired`, `deadline_missed` | none | Terminal. |
 
 ## Leases and epochs
 
@@ -85,8 +92,11 @@ the transition table, but it is reserved and unreachable in this version. The te
 - After `recovery_grace_secs` (default 30, allowed 0–600), the controller requeues the job or
   fails it with class `node`, incrementing the attempt and clearing the node.
 
-Dispatch considers only `queued` jobs, highest `priority` first and then earliest submission;
-`draft` and `expired` jobs are never assigned.
+Dispatch considers only `queued` jobs. The store orders them by starvation class descending,
+effective priority descending, then `dispatch_seq` ascending and `eligible_since` ascending;
+effective priority starts at `spec.priority` and gains up to two points as the job waits, and a job
+older than `[schedule] starvation_secs` outranks every static priority. `draft` and terminal jobs
+are never assigned.
 The node must have a current heartbeat, must be idle and not draining, and must not already hold a
 `leased`, `running` or `recovering` job. The job's required labels must be a subset of the node's
 labels; if it names a provider, the

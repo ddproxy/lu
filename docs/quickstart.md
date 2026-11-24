@@ -241,5 +241,6 @@ The controller stops accepting connections on `SIGTERM` and drains in-flight req
 - The task needs a working provider. A provider failure requeues while the attempt budget allows,
   then fails the job; `lu show` reports `failure provider`. See
   [Running the opencode harness](opencode-harness.md).
-- There is no config reload. Restart `lu serve` after editing config or token hashes, and restart
-  `ting` after editing its config.
+- There is no general config reload. Restart `lu serve` after editing config or token hashes, and
+  restart `ting` after editing its config. The schedule alone can be swapped with
+  `POST /v1/schedule/reload`; see [Time-aware scheduling](scheduling.md#inspecting-scheduling).
