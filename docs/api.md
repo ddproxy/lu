@@ -15,7 +15,7 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `GET /v1/jobs?key=<key>` | Look up an idempotency key. Returns the same envelope with zero or one job and `next: null`; other filters are ignored. An empty, over-long or malformed key is `400 bad_request`. |
 | `GET /v1/jobs/{id}` | Return a `JobView` with an `ETag`; see [Reads](#reads-validators-summaries-filters-and-budget). An unknown id is `404 not_found`. |
 | `POST /v1/jobs/{id}/cancel` with optional `?keep_children=1` and `?keep_dependents=1` | `draft`, `blocked`, `queued` and `recovering` jobs become `cancelled` at once; `leased`, `running` and `needs_input` jobs get `cancel_requested = true` and the agent is told on its next poll. Descendants are cancelled too unless `keep_children=1` is set, and blocked dependents waiting on this predecessor (`blocked_reason: "predecessor failed"`) are cancelled too unless `keep_dependents=1` is set; terminal dependents and descendants are left as they are. A terminal target job is `409 conflict`. Returns a `JobView`. The CLI spells these flags `--keep-children` and `--keep-dependents`. |
-| `POST /v1/jobs/{id}/edit` body `JobEdit` | Change a `queued` or `blocked` job's provider, model, fallbacks, requirements, tolerations, dependencies, collect mode, conflict policy or failed-input opt-in in place. Absent fields stay unchanged; an empty array clears a list. The job keeps its id and dependents. Returns a `JobView`. Another state is `409 conflict`; a dependency cycle is `400 bad_request`; an invalid spec or an unknown, failed or cancelled dependency is `422 unprocessable`, naming the fault. `include_failed` also permits an already dead dependency. Edited dependencies move the job between `blocked` and `queued` and respect the 16-dependency limit. |
+| `POST /v1/jobs/{id}/edit` body `JobEdit` | Change a `queued` or `blocked` job's provider, model, fallbacks, requirements, tolerations, dependencies, collect mode, conflict policy, failed-input opt-in or schedule block in place. Absent fields stay unchanged; an empty array clears a list. The job keeps its id and dependents. Returns a `JobView`. Another state is `409 conflict`; a dependency cycle is `400 bad_request`; an invalid spec or an unknown, failed or cancelled dependency is `422 unprocessable`, naming the fault. `include_failed` also permits an already dead dependency. Edited dependencies move the job between `blocked` and `queued` and respect the 16-dependency limit. |
 | `POST /v1/jobs/{id}/retry?chain=1` body `JobSpec` | Recreate a finished job from the supplied spec and return `{"job":JobView,"retried":[{"old","new"}],"waiting_dependents":N}`. A nonterminal job is `409 conflict`; an invalid spec is `422 unprocessable`. Without `chain`, blocked dependents waiting on the old job are reattached to the new one; with it, they are cloned too and the `retried` array lists every old/new pair. |
 | `GET /v1/drafts?limit=<n>` | List draft records oldest first; `limit` defaults to 200 and is capped at 1000. An unparseable `limit` is `400 bad_request`. The response has `drafts` and a `next` id. See [drafts.md](drafts.md#http-api). |
 | `POST /v1/jobs/{id}/publish` | Publish a finished job's stored diff to its configured remote. Operator-only. A nonterminal job is `409 conflict`; a denied target is `403 forbidden`; a full hourly push budget is `429 rate_limited` with `Retry-After`; missing publish config or spec and typed git/runtime precondition errors are `422 unprocessable`. Returns a `JobView` with `publish` set. See [publish.md](publish.md). |
@@ -29,6 +29,10 @@ Operator clients send an operator token from `LU_TOKEN_FILE` or an operator file
 | `GET /v1/repos` | Return `{"repos":[{"name","url","synced_at","heads"}]}`. `synced_at` is null before the first sync; `heads` maps up to 20 branch names to commit ids. |
 | `POST /v1/repos/{name}/sync` | Fetch one configured mirror and return `{"name","heads","synced_at"}`. At most one sync runs at a time and each operator may start 6 per minute; contention or an exhausted budget is `429 rate_limited` with `Retry-After`. An unknown configured name is `404`; a fetch failure is `500` with any credential removed from the message. |
 | `GET /v1/nodes` | Return an array of `NodeView`s with an `ETag`; see [Reads](#reads-validators-summaries-filters-and-budget). |
+| `GET /v1/schedule?at=` | Return scheduling defaults, the current time, the next boundary and every calendar and attachment scope. `at` accepts a Unix second or a civil time such as `2026-06-01T09:00:00Z`; a bad value is `400`. With no `[schedule]` config this returns `{"configured":false,"calendars":[],"attachments":[]}`; the other schedule routes return `404`. |
+| `GET /v1/schedule/calendars?from=&days=` and `GET /v1/schedule/calendars/{name}?from=&days=` | Return each calendar, or one named calendar, with expanded available and unavailable intervals. `from` accepts the same formats as `at`; `days` is clamped to 1–366 and defaults to 7. An unknown name is `404`. |
+| `POST /v1/schedule/explain` body `{"id":"<job id>","at":<unix>,"node":"<name>"}` | Read-only evaluation of a stored job against the active schedule. `at` and `node` are optional; without `node` up to 64 node/provider/model candidates are evaluated. Returns per-candidate decisions, an overall `admissibility`, the spec's schedule and the next boundary. An unknown job is `404`, malformed JSON is `422`. |
+| `POST /v1/schedule/reload` | Re-read the controller config file and atomically swap in its `[schedule]` section. Needs the `schedule = true` permission on the operator; without it the route is `403`. An invalid config is `422` and leaves the active schedule unchanged. Returns `{"applied":true,"calendars":N,"attachments":N}`. |
 | `GET /v1/nodes/{name}/stats` | Return the latest `NodeStats` from the node's heartbeat, with an `ETag`. An unknown node is `404`; a known node with no stats returns `{}`. Stats live in memory and are lost on controller restart. |
 | `POST /v1/nodes/{name}/drain` | Stop assigning new jobs to the node. A node that has never heartbeated is `404`. This sets an operator-owned drain; an agent cannot clear it with `/v1/agent/undrain`. |
 | `POST /v1/nodes/{name}/undrain` | Let the node take new jobs again. A node that has never heartbeated is `404`. This clears an operator-owned drain. |
@@ -129,7 +133,7 @@ dropped and counted as `invalid`. An allow rule that fails drops the event witho
 | `requires` | array of labels | no | At most 8 labels; omitted when empty. |
 | `tolerates` | array of taints | no | At most 8 taints; omitted when empty. A tainted node takes the job only if it tolerates every taint. |
 | `fallbacks` | array of objects | no | Up to 4 alternative `{provider, model}` choices, tried in order when the primary provider is unavailable on a node. Omitted when empty; forbidden when `provider` is `any`. |
-| `priority` | integer | no | `0` to `9`; defaults to `5`. Higher dispatches first, then submission order. Always present in views. |
+| `priority` | integer | no | `0` to `9`; defaults to `5`. Higher dispatches first, then `dispatch_seq` ascending and `eligible_since` ascending; starvation class is considered before priority. Always present in views. |
 | `group` | string | no | `1` to 64 characters from `A-Z a-z 0-9 . _ -`; omitted when absent. A configured `[[controller.groups]]` entry or a runtime cap from `PUT /v1/groups/{name}/limit` caps concurrent jobs with the same value. |
 | `allow_spawn` | boolean | no | Defaults to `false`; omitted when `false`. Operator-set with `lu submit --allow-spawn`. Without it the job's harness gets no scoped socket and `submit_child` is refused. A job cannot grant itself this right. |
 | `spawn_inherit` | boolean | no | Defaults to `false`; omitted when `false`. Only when true do children inherit `allow_spawn` and may themselves spawn. Set with `lu submit --spawn-inherit`. |
@@ -139,6 +143,7 @@ dropped and counted as `invalid`. An allow rule that fails drops the event witho
 | `cache_dirs` | array of strings | no | Up to 16 unique relative paths of 1–256 bytes each, created inside the job workspace before the harness runs. Omitted when empty. Absolute paths, `..`, `.`, empty segments, backslashes and unsafe characters are refused. |
 | `expect` | object | no | Expected outputs of a successful run; omitted when absent. Accepts `{ files, changed, forbid_changed, min_diff_bytes, max_diff_bytes, mode }`. Each list holds at most 16 entries. `files` are relative paths without `..`; `changed` and `forbid_changed` accept `*`, `**` and `?` globs. `min_diff_bytes` and `max_diff_bytes` bound the exported diff size. `mode` is `suspect` (default) or `fail`. |
 | `publish` | `PublishSpec` object | no | Omitted when absent. If present, the job has a publish step that only runs when an operator calls the publish route. See [PublishSpec](#publishspec) and [publish.md](publish.md). |
+| `schedule` | `JobSchedule` object | no | Omitted when absent. Time gates for the job; see [JobSchedule](#jobschedule) and [scheduling.md](scheduling.md). |
 
 ### `SourceSpec`
 
@@ -181,13 +186,29 @@ semantics are in [drafts.md](drafts.md#job-fields).
 
 `PublishRecord` in a `JobView` contains `detail`, `branch`, `remote`, `base_commit`, `commit`, `gates`, `target` and, for source-branch targets, `source_branch`. `detail` is a fixed code such as `published`, `published_snapshot_fallback`, `gates_failed`, `hold`, `no_snapshot_prefix` or `failed`. Gate entries carry `name`, `job_id`, `result` (`pass`, `fail` or `error`) and an optional `exit_code`. No credential is present in the record.
 
+### `JobSchedule`
+
+| Field | Type | Rule |
+| --- | --- | --- |
+| `not_before` | integer | Optional positive Unix second; earliest allowed start. |
+| `deadline` | integer | Optional positive Unix second; latest allowed start, not before `not_before`. |
+| `on_deadline` | string | `expire` (default), `run` or `cancel`. |
+| `window` | string | Optional calendar name; a soft gate that starts only while it is available. |
+| `requires_calendar_state` | object | Optional `{calendar, state, lead, tail}` soft gate; `state` is `available` or `unavailable`, and `lead`/`tail` are duration strings or integer seconds. |
+| `fit` | string or integer | `timeout` (default), `none`, or a duration; how much of a state interval must remain. |
+
+Unknown fields are rejected. Durations accept integer seconds or a string with an `s`, `m`, `h` or
+`d` suffix. Submit validates shape and names but does not check whether a start exists in the
+horizon; use `POST /v1/schedule/explain`. See [scheduling.md](scheduling.md).
+
 ### `JobView`
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `id` | string | Job id. |
-| `state` | string | One of `draft`, `blocked`, `queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`, `expired`. |
+| `state` | string | One of `draft`, `blocked`, `queued`, `leased`, `running`, `recovering`, `needs_input`, `done`, `failed`, `cancelled`, `expired`, `deadline_missed`. |
 | `spec` | `JobSpec` | The submitted spec. |
+| `schedule` | `JobSchedule` object or null | Omitted when absent. The job's time constraints, echoed from the spec. |
 | `attempt` | integer | 1-based attempt number. |
 | `node` | string or null | Node holding the job. |
 | `epoch` | integer | Lease epoch used for fencing. |
@@ -205,13 +226,14 @@ semantics are in [drafts.md](drafts.md#job-fields).
 | `parent_job_id` | string or null | Parent of a job submitted through a harness's scoped socket; omitted for top-level jobs. |
 | `root_job_id` | string or null | Root of the spawn tree; omitted for older rows. Every job submitted through the scoped path carries it. |
 | `depth` | integer | Distance from the root; `0` for a top-level job. |
-| `waiting_reason` | string or null | Why a queued job cannot be placed, such as `group limit (build 4/4)`, `no node with label php8.3`, `only tainted nodes are free: homelab` or `no node has a healthy provider for provider "any"`. A group cap is reported before label, taint and provider reasons. |
+| `waiting_reason` | string or null | Why a queued job cannot be placed, such as `group limit (build 4/4)`, `no node with label php8.3`, `only tainted nodes are free: homelab` or `no node has a healthy provider for provider "any"`. A group cap is reported before label, taint and provider reasons. Scheduling blockers such as `window` and `requires_state` also use this field. |
+| `waiting_detail` | array | Structured scheduling blockers, omitted when empty. Each entry has `constraint`, `message`, optional `gate`, `rule` and `until`; constraints are `not_before`, `deadline`, `window`, `requires_state`, `window_too_short`, `gate_global`, `gate_group`, `gate_node`, `gate_provider`, `gate_model`, `unknown_calendar`, `eval_budget` and `clock`. Present on single-job views (`GET /v1/jobs/{id}`, `lu show --json`) but not list views. |
 | `staged_commit` | string or null | Commit the agent actually staged for this job, recorded before dependency patches are applied. A dependent with no pinned `source.base` inherits this value from its dependencies; omitted until the agent stages the tree. Also present on dependency entries from `GET /v1/agent/jobs/{id}/deps`. |
 | `blocked_reason` | string or null | Why a `blocked` job is waiting: `predecessor failed` after a failed or cancelled dependency. Omitted for other blocked jobs. |
 | `blocked_until` | integer or null | Unix seconds at which a blocked dependent's `[controller] blocked_dependent_ttl` expires and the job fails with `failure_class: "dependency"`; derived from the stored `blocked_since` time. Omitted for other jobs. |
 | `assigned_provider` | string or null | The provider chosen for the current attempt, or `null` when no provider was assigned. |
 | `assigned_model` | string or null | The model of that chosen pair. |
-| `diff_bytes` | integer or null | Present only for terminal jobs (`done`, `failed`, `cancelled`, `expired`). Size of the stored `diff.patch` in bytes, or `0` when none is stored. A failed job can have a non-empty partial diff; clients can fetch it with `GET /v1/jobs/{id}/artifacts/diff.patch`. |
+| `diff_bytes` | integer or null | Present only for terminal jobs (`done`, `failed`, `cancelled`, `expired`, `deadline_missed`). Size of the stored `diff.patch` in bytes, or `0` when none is stored. A failed job can have a non-empty partial diff; clients can fetch it with `GET /v1/jobs/{id}/artifacts/diff.patch`. |
 | `scrubbed_hits` | integer | Number of secret-like matches replaced in stored artifacts and logs. Zero when scrubbing is off or nothing matched. |
 | `patch_scrubbed` | boolean | True when controller-side scrubbing changed the stored `diff.patch`. Such a patch may no longer apply cleanly; `lu collect` requires `--allow-scrubbed`. |
 | `patch_secret_hits` | object | High-confidence secret hits found in added patch lines when `[artifacts] scrub_patch = false`. Shape: `{"count": <integer>, "rules": [<string>]}`. Rules name the matched detectors and never include matched text. `lu collect` and publishing refuse a patch with `count > 0` unless the same opt-in flag is given. |
@@ -237,11 +259,12 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `collect` | string | One of `none`, `files`, `apply` or `both`, or an accepted alias. |
 | `include_failed` | boolean | When true, failed or cancelled dependencies are accepted and their stored diffs are available as inputs. |
 | `on_conflict` | string | One of `fail`, `markers` or `skip`, case-insensitive; replaces the conflict policy. |
-| `priority` | integer | `0` to `9`; higher dispatches first, then submission order. |
+| `priority` | integer | `0` to `9`; higher dispatches first, then `dispatch_seq` ascending and `eligible_since` ascending, after the starvation class. |
 | `group` | string or null | `1` to 64 characters from `A-Z a-z 0-9 . _ -`, or `null` to clear the group. |
 | `after` | array of job ids | At most 16 unique ids, without a cycle or a finished dependency unless `include_failed` is set. |
 | `expect` | object | Replacement expectation fields: `files`, `changed`, `forbid_changed`, `min_diff_bytes`, `max_diff_bytes`, `mode`. Present lists replace the stored ones; present bounds and mode are set; absent fields stay unchanged. |
 | `publish` | `PublishSpec` object | Replacement publish settings. For drafts, `lu edit <draft> --publish` and `lu approve <draft> --edit --publish` set this field. |
+| `schedule` | `JobSchedule` object or null | Replacement time constraints; `null` clears the block. See [JobSchedule](#jobschedule). |
 
 `HostStats`: `load1`, `load5`, `load15`, `mem_total_kb`, `mem_available_kb`, `swap_used_kb`, `disk_free_bytes` and `disk_total_bytes` (both optional; they describe the agent's work filesystem and are omitted when it cannot be read), `uptime_secs`. Host numbers are read from `/proc`; non-Linux agents report no host stats.
 
@@ -305,7 +328,7 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `schema_version` | integer | Schema version the binary expects. |
 | `db_bytes` | integer | Size of the SQLite file, excluding `-wal` and `-shm`. |
 | `recovered_on_boot` | integer | Jobs moved to `recovering` by startup recovery. |
-| `jobs` | object | Counts for all eleven states (`draft` through `expired`), zero-filled. |
+| `jobs` | object | Counts for all twelve states (`draft` through `deadline_missed`), zero-filled. |
 | `waiting_dependents` | integer | Blocked dependents waiting on a failed or cancelled predecessor, matching `lu_blocked_dependents_total`. |
 | `oldest_queued_secs` | integer | Age of the oldest `queued` or `blocked` job, or `0`. |
 | `providers` | object | Per provider name: `ok`, `cooling` and `other` counts of online nodes, and `soonest_secs` (earliest return of a cooling provider, or `null`). |
@@ -486,7 +509,7 @@ The controller applies the lineage, repo, provider/model, priority, label, timeo
 
 ## Controller rules
 - A `draft` is stored and visible but never dispatched. Approval moves it to `queued` when all dependencies are `done`, or to `blocked` otherwise; rejection cancels it. A draft that reaches the `[drafts] ttl` becomes `expired`, a terminal state. See [drafts.md](drafts.md).
-- Queue order is priority descending, then submission order ascending, held in the persisted `dispatch_seq` column so wall-clock steps and same-millisecond ids cannot reorder the queue. A job in a configured or runtime-capped group is dispatched only while its group has fewer than `max_running` jobs in `leased`, `running`, `recovering` or `needs_input`; a job blocked by a full group stays `queued` with `group limit (<name> <running>/<max>)` as its waiting reason. Provider, label and taint rules decide node eligibility; priority orders queued jobs and a group cap blocks dispatch, neither makes an ineligible node eligible.
+- Queue order is starvation class descending, then effective priority descending, then `dispatch_seq` ascending and `eligible_since` ascending. Effective priority starts at `spec.priority` and gains up to two points as the job waits; a job older than `[schedule] starvation_secs` outranks every static priority. `dispatch_seq` is persisted so same-millisecond ids cannot reorder the queue; eligibility time is a later tie-break. A job in a configured or runtime-capped group is dispatched only while its group has fewer than `max_running` jobs in `leased`, `running`, `recovering` or `needs_input`; a job blocked by a full group stays `queued` with `group limit (<name> <running>/<max>)` as its waiting reason. Provider, label and taint rules decide node eligibility; priority orders queued jobs and a group cap blocks dispatch, neither makes an ineligible node eligible. See [scheduling.md](scheduling.md).
 
 - A job with `after` dependencies starts `blocked`. When a dependency becomes `done`, every blocked dependent whose dependencies are all `done` becomes `queued` in the same transaction. When a dependency becomes `failed` or `cancelled`, blocked dependents stay `blocked` with `blocked_reason: "predecessor failed"` and a `blocked_until` deadline from `[controller] blocked_dependent_ttl` (default 24h) instead of failing at once. `lu retry <predecessor>` reattaches waiting dependents to the new job; `lu retry <predecessor> --chain` also retries the dependents and rewrites their `after` references. Cancelling a predecessor cancels waiting dependents unless `?keep_dependents=1` (`--keep-dependents`) is set. At the deadline a blocked dependent fails with `failure_class: "dependency"` and a summary naming the predecessor. A dependent with `include_failed: true` may accept a dead dependency at submit time and is released once its other dependencies are `done`. Dependency failures never retry; see [dependencies.md](dependencies.md#waiting-and-promotion).
 - A dependent job with `collect` of `apply` or `both` (default `apply`) stages one base for the whole chain: its pinned `source.base`, or the `staged_commit` inherited from its dependencies. All dependencies must agree on the inherited commit; when they disagree, the agent stages their newest common ancestor. If any patch then fails to apply, it fails with `failure_class: "conflict"` and a summary naming every contested commit. The job's `diff.patch` is relative to that base, includes applied dependency changes, and must be merged onto a moved branch by the operator after the chain finishes. The agent fetches the dependency list and applies each finished dependency's `diff.patch` in `after` order before starting the harness. `collect` of `files` stages inputs without applying diffs; `none` skips dependency inputs. A dependency with no diff is skipped. Each patch is tried with libgit2 apply, libgit2 three-way, then `git apply --3way` when `git` is on the agent's PATH. `spec.on_conflict = "fail"` (the default) stops before the harness and completes `Failed(Conflict)` with a summary naming the input, file and hunk; `skip` leaves the patch unapplied and records the first failing file and hunk in `INDEX.md`; `markers` leaves labelled conflict markers in the affected files and records `markers (N files)`. Later inputs still apply under `skip` and `markers`. The agent's opt-in `[stack] union_paths` and `base_paths`, narrowed by the per-job `stack_union_paths`/`stack_base_paths`, resolve only covered paths; everything else fails closed. `conflict` never retries. The job's `diff.patch` is always against its staged base, includes applied dependency changes and any conflict markers, and excludes `.lu`. At most 16 inputs and 64 MiB of stored diffs are accepted, checked again at stage time; see [dependencies.md](dependencies.md#one-base-per-chain).

@@ -130,7 +130,7 @@ systemctl enable --now lu-controller.service
 curl -fsS https://lu.example.net:7600/v1/health
 ```
 
-`lu check` validates config values, reports database health and lists the checks it ran. It opens no secret files and binds no port. `lu serve` validates the whole file and its secret files before binding. A non-loopback `listen` requires `[tls]`; there is no config reload, so restart after editing config, TLS files or token hashes.
+`lu check` validates config values, reports database health and lists the checks it ran. It opens no secret files and binds no port. `lu serve` validates the whole file and its secret files before binding. A non-loopback `listen` requires `[tls]`; there is no general config reload, so restart after editing config, TLS files or token hashes. The schedule alone can be swapped with `POST /v1/schedule/reload`; see [Time-aware scheduling](scheduling.md#inspecting-scheduling).
 
 ### Running the controller under systemd
 

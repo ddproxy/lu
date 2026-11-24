@@ -46,8 +46,13 @@ At least one of `[controller]` and `[agent]` must be present. A file may contain
 | --- | --- | --- | --- |
 | `name` | yes | — | 1 to 64 characters from `A-Z a-z 0-9 . _ -`; unique among operators. |
 | `token_sha256` | yes | — | Exactly 64 lowercase hexadecimal characters. Unique across all operators and agents. |
+| `role` | no | `operator` | `viewer`, `operator` or `admin`. `viewer` may only read selected summary routes and never sees task text, context, logs or artifacts; `admin` is reserved and currently the same as `operator`. |
+| `expires_at` | no | — | UTC time `YYYY-MM-DDTHH:MM:SSZ`. The token is refused as unknown from that instant on. |
+| `restrict_fields` | no | `false` | Refuses job fields that widen what a job may do, such as spawning, source-branch publishing and scrubbed patches. |
+| `schedule` | no | `false` | Permission for `POST /v1/schedule/reload`. Read-only schedule routes need only an ordinary operator token. |
 
-A token must not work in both scopes. Reusing a hash across the two arrays is refused.
+A token must not work in both scopes. Reusing a hash across the two arrays is refused. A viewer or
+`restrict_fields` token also requires an `[audit] path`; see [tokens-and-tls.md](tokens-and-tls.md#token-files-and-hashes).
 
 ### `[[controller.repos]]`
 
@@ -78,6 +83,30 @@ Jobs for repositories not in this list are unchanged.
 | `max_running` | yes | — | Integer `1` to `64`. At most this many jobs in the group may be `leased`, `running`, `recovering` or `needs_input`. |
 
 The cap is applied inside the dispatch transaction, so concurrent polls cannot exceed it. A queued job waiting on a full group reports `group limit (<name> <running>/<max>)`. An operator can change a cap at runtime with `PUT /v1/groups/{name}/limit`, including for a group with no configured entry. Runtime caps live in controller memory and return to the configured values on restart. Metrics expose `lu_group_running{group}` and `lu_group_limit{group}` for each configured or runtime-capped group.
+
+## `[schedule]`
+
+Optional controller-side time-aware scheduling. Without it, and without calendar or attachment
+tables, dispatch has no calendar gates. The file may also use top-level `[[calendar]]` (`[[calendars]]`)
+and `[[attach]]` (`[[attachments]]`) tables, or nested `[[schedule.calendars]]` and
+`[[schedule.attachments]]`; setting both names of one alias pair at the same level is rejected.
+
+| Key | Required | Default | Validation |
+| --- | --- | --- | --- |
+| `file` | no | — | Absolute TOML path without `..`, naming another document with the same top-level shape. |
+| `horizon_secs` | no | `31622400` | Positive integer; how far boundary searches look. |
+| `step_budget` | no | `50000` | Positive integer; evaluation steps per dispatch poll. |
+| `staging_secs` | no | `300` | Non-negative integer; staging allowance for `fit`. |
+| `finish_secs` | no | `60` | Non-negative integer; finish allowance for `fit`. |
+| `starvation_secs` | no | `3600` | Positive integer; age at which a job outranks all static priorities. |
+| `calendars` | no | `[]` | Nested `[[schedule.calendars]]` alias. |
+| `attachments` | no | `[]` | Nested `[[schedule.attachments]]` alias. |
+
+Inline tuning values override values from `file`; unset keys keep the file or built-in default.
+Calendars and attachments from `file`, inline `[schedule]` and top-level aliases are merged in that
+order. Calendar names are unique and an attachment may name only defined calendars. Unknown keys
+are rejected. Full calendar syntax, aliases, examples and inspection routes are in
+[scheduling.md](scheduling.md#controller-configuration).
 
 ## `[mirror]`
 

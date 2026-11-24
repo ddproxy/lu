@@ -39,7 +39,7 @@ name = "ops"
 token_sha256 = "<sha256 of operator.token>"
 ```
 
-Operator entries accept three optional settings, all safe to omit:
+Operator entries accept four optional settings, all safe to omit:
 
 ```toml
 [[controller.operators]]
@@ -48,6 +48,7 @@ token_sha256 = "<sha256 of dashboard.token>"
 role = "viewer"                    # viewer, operator (default) or admin (reserved)
 expires_at = "2030-01-31T12:00:00Z" # UTC, strict form; the token is refused from this instant
 restrict_fields = true             # refuse job fields that widen what a job may do
+schedule = true                    # allow POST /v1/schedule/reload
 ```
 
 - `viewer` is read-only. It may read `/v1/status`, `/v1/stats`, `/v1/jobs`, `/v1/jobs/{id}`,
@@ -59,6 +60,8 @@ restrict_fields = true             # refuse job fields that widen what a job may
 - `restrict_fields` makes job creation refuse `allow_spawn`, `spawn_inherit`, `spawn_repos`,
   `stack_union_paths`, `stack_base_paths`, `publish.allow_source_branch` and
   `publish.target = "source_branch"` with `403`.
+- `schedule` allows `POST /v1/schedule/reload`. Read-only schedule routes need no extra permission,
+  but a `viewer` token cannot reach them. See [scheduling.md](scheduling.md#inspecting-scheduling).
 - A viewer or `restrict_fields` token requires an `[audit]` path: the controller refuses to start
   without one, so changes made through a UI leave a record.
 
@@ -98,8 +101,8 @@ IPv4-mapped IPv6 addresses count as IPv4. Successes do not reset the count. Sepa
 `cert` and `key` are both required when `[tls]` is present. The certificate chain is public; the
 key is checked with the same private-file rules as a token and must be owned by the account
 running `lu serve`. The listener uses TLS 1.2 or 1.3, HTTP/1.1 only, with no client certificates:
-the token is the only client authentication. Files are loaded at startup; there is no reload, so
-restart the controller after replacing them.
+the token is the only client authentication. These files are loaded at startup, so restart the
+controller after replacing them; the schedule-only reload route does not re-read TLS material.
 
 A `ca_file` adds up to 1 MiB of PEM certificates to the system trust roots. It does not replace
 them and is not a pinning mechanism. Use a certificate whose subject matches the host name in
@@ -114,7 +117,8 @@ For a token:
 1. Generate a new value and hash it as above.
 2. Add or replace its `token_sha256` in the controller config. Hashes must remain unique. To
    overlap old and new clients, keep both hashes for a while; remove the old hash to revoke it.
-3. Restart the controller; config is not reloaded in place.
+3. Restart the controller; token config is not reloaded in place. The schedule-only reload route
+   does not re-read token hashes.
 4. Replace the token file on the agent or operator host. Restart `ting` so it re-reads its
    file; operator commands read the file at each invocation.
 5. Verify with `lu status` (operator scope) and `lu nodes` (agent heartbeats).

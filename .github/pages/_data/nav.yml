@@ -12,6 +12,7 @@
     - { title: Dependencies, url: /docs/dependencies.html }
     - { title: Batch submissions, url: /docs/batch.html }
     - { title: Choosing where a job runs, url: /docs/dispatch.html }
+    - { title: Time-aware scheduling, url: /docs/scheduling.html }
 - title: Install
   items:
     - { title: Install, url: /docs/install.html }
