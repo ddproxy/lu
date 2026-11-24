@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::graph::{self, Graph};
 use crate::sanitize::printable;
 use lu_proto::limits::MAX_VERSION_BYTES;
-use lu_proto::{same_build, HarnessState, JobState, ProviderState};
+use lu_proto::{same_build, HarnessState, JobState, NodeHealth, NodeHealthLevel, ProviderState};
 
 /// Reduces a source repository URL or absolute path to `owner/name`, dropping the scheme,
 /// credentials, host, query, fragment and a trailing `.git`. Unusable values become `-`; none of
@@ -80,6 +80,8 @@ pub struct NodeRow {
     pub name: String,
     /// `idle`, `busy` or `-`.
     pub harness: String,
+    /// Health cell derived from the controller's threshold, shared with `lu nodes`.
+    pub health: NodeHealth,
     pub drained: bool,
     /// Seconds since the node's last heartbeat, when it has sent one.
     pub seen_secs_ago: Option<u64>,
@@ -1236,6 +1238,14 @@ fn node_badge_tone(node: &NodeRow) -> Tone {
     }
 }
 
+fn health_tone(level: NodeHealthLevel) -> Tone {
+    match level {
+        NodeHealthLevel::Ok => Tone::Plain,
+        NodeHealthLevel::Warning => Tone::Warn,
+        NodeHealthLevel::Critical => Tone::Bad,
+    }
+}
+
 fn worst(tones: impl Iterator<Item = Tone>) -> Tone {
     tones.fold(Tone::Good, |acc, tone| match (acc, tone) {
         (Tone::Bad, _) | (_, Tone::Bad) => Tone::Bad,
@@ -1405,6 +1415,11 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>, version_width: us
     // state column (14)
     segments.push(state_badge);
     segments.push(Segment::new(" ", Tone::Plain));
+    segments.push(Segment::new(
+        pad_right(&clip(&node.health.text, 15), 15),
+        health_tone(node.health.level),
+    ));
+    segments.push(Segment::new(" ", Tone::Plain));
     segments.push(Segment::new(pad_right(&seen, 8), Tone::Plain));
     segments.push(Segment::new(" ", Tone::Plain));
     segments.push(Segment::new(pad_left(&load_text, 6), Tone::Plain));
@@ -1447,6 +1462,7 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>, version_width: us
     if let Some(pct) = mem_pct {
         row_tone = worst([row_tone, mem_tone(pct)].into_iter());
     }
+    row_tone = worst([row_tone, health_tone(node.health.level)].into_iter());
     if version_tone == Tone::Warn {
         row_tone = worst([row_tone, Tone::Warn].into_iter());
     }
@@ -1458,10 +1474,11 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>, version_width: us
     let version_cell = clip(&version, version_width);
     if !providers_plain.is_empty() {
         line.text = format!(
-            "{:<12} {:<width$} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}  {}",
+            "{:<12} {:<width$} {:<14} {:<15} {:<8} {:>6} {:>5} {:>12} {:>16}  {}",
             clip(&node.name, 12),
             version_cell,
             clip(&state_plain, 14),
+            clip(&node.health.text, 15),
             seen,
             load_text,
             mem_text,
@@ -1472,10 +1489,11 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>, version_width: us
         );
     } else {
         line.text = format!(
-            "{:<12} {:<width$} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}",
+            "{:<12} {:<width$} {:<14} {:<15} {:<8} {:>6} {:>5} {:>12} {:>16}",
             clip(&node.name, 12),
             version_cell,
             clip(&state_plain, 14),
+            clip(&node.health.text, 15),
             seen,
             load_text,
             mem_text,
@@ -1495,6 +1513,24 @@ fn node_line(node: &NodeRow, controller_version: Option<&str>, version_width: us
     }
     line.tone = row_tone;
     line
+}
+
+const HARNESS_CONTAINER_DOWN: &str = "harness container not running on this node";
+
+/// Recognises the runtime errors a container harness wrapper emits when its container is gone.
+/// The raw error stays on a detail line so operators can still diagnose the exact failure.
+fn harness_container_missing(error: &str) -> bool {
+    let text = error.to_ascii_lowercase();
+    [
+        "no such container",
+        "no container with name or id",
+        "container not running",
+        "container is not running",
+        "container not found",
+        "stopped container",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn process_pane_view(
@@ -1586,10 +1622,18 @@ fn process_pane_view(
             lines.push(Line::new("no stats reported by node", Tone::Dim));
         }
         Some(ProcessPaneState::Error(error)) => {
-            lines.push(Line::new(
-                format!("stats unavailable: {}", clip(error, 120)),
-                Tone::Bad,
-            ));
+            if harness_container_missing(error) {
+                lines.push(Line::new(HARNESS_CONTAINER_DOWN.to_owned(), Tone::Bad));
+                lines.push(Line::new(
+                    format!("detail: {}", clip(error, 200)),
+                    Tone::Dim,
+                ));
+            } else {
+                lines.push(Line::new(
+                    format!("stats unavailable: {}", clip(error, 120)),
+                    Tone::Bad,
+                ));
+            }
         }
         Some(ProcessPaneState::Loading) | None => {
             lines.push(Line::new("loading stats…", Tone::Dim));
@@ -1729,10 +1773,11 @@ impl ViewModel {
             .clamp(10, MAX_VERSION_BYTES);
         let mut lines = vec![Line::new(
             format!(
-                "{:<12} {:<width$} {:<14} {:<8} {:>6} {:>5} {:>12} {:>16}  PROVIDERS",
+                "{:<12} {:<width$} {:<14} {:<15} {:<8} {:>6} {:>5} {:>12} {:>16}  PROVIDERS",
                 "NODE",
                 "VERSION",
                 "STATE",
+                "HEALTH",
                 "SEEN",
                 "LOAD",
                 "MEM",
@@ -1941,6 +1986,7 @@ mod tests {
         NodeRow {
             name: name.to_owned(),
             harness: harness.to_owned(),
+            health: NodeHealth::healthy(),
             drained: false,
             seen_secs_ago: seen,
             providers: vec![
@@ -2328,6 +2374,7 @@ mod tests {
         NodeRow {
             name: name.to_owned(),
             harness: harness.to_owned(),
+            health: NodeHealth::healthy(),
             drained: false,
             seen_secs_ago: seen,
             providers: Vec::new(),
@@ -2363,6 +2410,60 @@ mod tests {
         let text = dashboard.view(t0).plain_text();
         assert!(text.contains("[rust,gpu?[31m]"), "{text}");
         assert!(!text.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn node_health_is_toned_and_hidden_when_healthy() {
+        let mut warning = node_full("warn", "idle", Some(1), None, None, None, None, 0);
+        warning.health = NodeHealth {
+            text: "disk free 7%".to_owned(),
+            level: NodeHealthLevel::Warning,
+        };
+        let mut critical = node_full("crit", "idle", Some(2), None, None, None, None, 0);
+        critical.health = NodeHealth {
+            text: "disk free 3%".to_owned(),
+            level: NodeHealthLevel::Critical,
+        };
+        let mut down = node_full("down", "idle", Some(3), None, None, None, None, 0);
+        down.health = NodeHealth {
+            text: "harness down".to_owned(),
+            level: NodeHealthLevel::Critical,
+        };
+        let ok = node_full("ok", "idle", Some(4), None, None, None, None, 0);
+
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        dashboard.apply(
+            Ok(Snapshot {
+                nodes: vec![warning, critical, down, ok],
+                jobs: Vec::new(),
+                ..Snapshot::default()
+            }),
+            t0,
+        );
+        let view = dashboard.view(t0);
+        let text = view.plain_text();
+        assert!(text.contains("disk free 7%"), "{text}");
+        assert!(text.contains("disk free 3%"), "{text}");
+        assert!(text.contains("harness down"), "{text}");
+        assert!(!text.contains("disk free 20%"), "{text}");
+        let line_for = |name: &str| {
+            view.lines
+                .iter()
+                .find(|line| line.text.starts_with(name))
+                .unwrap_or_else(|| panic!("{name} missing: {text}"))
+        };
+        assert!(line_for("warn").segments.iter().any(|segment| {
+            segment.text.trim() == "disk free 7%" && segment.tone == Tone::Warn
+        }));
+        assert!(line_for("crit")
+            .segments
+            .iter()
+            .any(|segment| { segment.text.trim() == "disk free 3%" && segment.tone == Tone::Bad }));
+        assert!(line_for("down")
+            .segments
+            .iter()
+            .any(|segment| { segment.text.trim() == "harness down" && segment.tone == Tone::Bad }));
     }
 
     #[test]
@@ -2795,6 +2896,37 @@ mod tests {
             "{:?}",
             pane.lines[0].text
         );
+    }
+
+    #[test]
+    fn missing_harness_container_is_a_plain_headline_with_a_raw_detail() {
+        let mut dashboard = Dashboard::new();
+        let t0 = Instant::now();
+        dashboard.apply(Ok(snapshot()), t0);
+        dashboard.toggle_focus();
+        dashboard.toggle_process_pane();
+
+        dashboard.apply_update(Update::ProcessStats {
+            job_id: "01ABC".to_owned(),
+            node: "ct-1".to_owned(),
+            result: Err("podman: no such container: harness-ct-1".to_owned()),
+        });
+        let pane = dashboard.view(t0).process_pane.unwrap();
+        assert_eq!(pane.lines[0].text, HARNESS_CONTAINER_DOWN);
+        assert_eq!(pane.lines[0].tone, Tone::Bad);
+        assert_eq!(
+            pane.lines[1].text,
+            "detail: podman: no such container: harness-ct-1"
+        );
+        assert_eq!(pane.lines[1].tone, Tone::Dim);
+
+        dashboard.apply_update(Update::ProcessStats {
+            job_id: "01ABC".to_owned(),
+            node: "ct-1".to_owned(),
+            result: Err("permission denied".to_owned()),
+        });
+        let pane = dashboard.view(t0).process_pane.unwrap();
+        assert_eq!(pane.lines[0].text, "stats unavailable: permission denied");
     }
 
     #[test]

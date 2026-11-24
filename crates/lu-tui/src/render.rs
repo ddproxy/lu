@@ -267,6 +267,7 @@ fn node_columns(view: &ViewModel) -> Vec<TableColumn> {
             ColWidth::Fixed(14),
             SortKind::Custom(compare_state),
         ),
+        TableColumn::sortable("HEALTH", ColWidth::Fixed(15), SortKind::Text),
         TableColumn::sortable("SEEN", ColWidth::Fixed(8), SortKind::Duration),
         TableColumn::sortable("LOAD", ColWidth::Fixed(6), SortKind::Number).right(),
         TableColumn::sortable("MEM", ColWidth::Fixed(5), SortKind::Number).right(),
@@ -474,7 +475,7 @@ fn draw_table(
     visible
 }
 
-const NODE_WIDTHS: [usize; 8] = [12, 10, 14, 8, 6, 5, 12, 16];
+const NODE_WIDTHS: [usize; 9] = [12, 10, 14, 15, 8, 6, 5, 12, 16];
 
 fn job_widths(view: &ViewModel) -> Vec<usize> {
     let widths = view.job_columns;
@@ -1003,6 +1004,7 @@ mod tests {
 
     use super::*;
     use crate::model::{CordonCell, Dashboard, JobRow, NodeRow, ProviderCell, Snapshot, Update};
+    use lu_proto::NodeHealth;
 
     fn screen(view: &ViewModel, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -1045,6 +1047,7 @@ mod tests {
                 nodes: vec![NodeRow {
                     name: "peer-a".to_owned(),
                     harness: "idle".to_owned(),
+                    health: NodeHealth::healthy(),
                     drained: false,
                     seen_secs_ago: Some(2),
                     providers: Vec::new(),
@@ -1109,6 +1112,7 @@ mod tests {
                 nodes: vec![NodeRow {
                     name: "peer-a".to_owned(),
                     harness: "idle".to_owned(),
+                    health: NodeHealth::healthy(),
                     drained: false,
                     seen_secs_ago: Some(2),
                     providers: vec![
@@ -1155,15 +1159,15 @@ mod tests {
             }),
             Instant::now(),
         );
-        let view = dashboard.view_with_width(Instant::now(), 120);
-        let text = screen(&view, 120, 20);
+        let view = dashboard.view_with_width(Instant::now(), 140);
+        let text = screen(&view, 140, 20);
         assert!(text.contains("!zen"), "{text}");
         assert!(text.contains("!openrouter~"), "{text}");
         assert!(text.contains("cordons peer-a"), "{text}");
         assert!(text.contains("! zen 2m left"), "{text}");
         assert!(text.contains("~ openrouter lifts on 2 healthy"), "{text}");
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
         terminal
             .draw(|frame| {
                 draw_with_theme(frame, &view, Theme::truecolor());
@@ -1321,6 +1325,7 @@ mod tests {
                 nodes: vec![NodeRow {
                     name: "peer-a".to_owned(),
                     harness: "busy".to_owned(),
+                    health: NodeHealth::healthy(),
                     drained: false,
                     seen_secs_ago: Some(1),
                     providers: Vec::new(),

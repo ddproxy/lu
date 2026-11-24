@@ -1054,6 +1054,42 @@ async fn a_zero_disk_threshold_disables_the_disk_gate() {
     let _ = srv.shutdown.send(());
 }
 
+#[tokio::test]
+async fn node_views_report_the_default_disk_threshold() {
+    let srv = start_server().await;
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert!(matches!(status(&r), 200 | 204), "{r}");
+    let r = raw_request(srv.addr, &format!("GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let views: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let node = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "node-a")
+        .expect("node-a in views");
+    assert_eq!(node["min_disk_free_pct"], 8, "{node}");
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn node_views_report_a_configured_disk_threshold() {
+    let srv = start_server_with_disk_limit(12).await;
+    let r = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert!(matches!(status(&r), 200 | 204), "{r}");
+    let r = raw_request(srv.addr, &format!("GET /v1/nodes HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let views: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let node = views
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "node-a")
+        .expect("node-a in views");
+    assert_eq!(node["min_disk_free_pct"], 12, "{node}");
+    let _ = srv.shutdown.send(());
+}
+
 async fn poll_with(addr: SocketAddr, token: &str, hb: &serde_json::Value) -> String {
     let body = json!({"heartbeat": hb, "wait_secs": 0}).to_string();
     let req = format!(

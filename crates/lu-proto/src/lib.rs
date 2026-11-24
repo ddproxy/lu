@@ -68,6 +68,6 @@ pub use stats::{
 };
 pub use version::{same_build, BuildVersion, ParseVersionError};
 pub use view::{
-    AgentSelfView, CordonView, JobView, NodeView, WorkspaceCleanResult, WorkspaceRelease,
-    WorkspaceView,
+    AgentSelfView, CordonView, JobView, NodeHealth, NodeHealthLevel, NodeView,
+    WorkspaceCleanResult, WorkspaceRelease, WorkspaceView,
 };

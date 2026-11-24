@@ -102,6 +102,8 @@ the TTL expires.
 
 Node label, provider, disk and last-seen series come from the controller store's persisted latest heartbeat and survive a restart; `lu_node_last_seen_seconds` keeps growing until a new heartbeat arrives. Workspace series come from the same heartbeat but are kept only in controller memory, so they return to zero on a controller restart and their cumulative agent counters restart with the agent. `lu_nodes_online` uses a monotonic timestamp reset at boot, so it becomes `0` on restart until agents report again. Provider and label series appear only for nodes that report them. Cordon series come from the store; boot clears cordons, so they reappear only when a new failure or Reiki reading sets one. Group series appear for named `[[controller.groups]]` entries and for groups given a runtime cap through `PUT /v1/groups/{name}/limit`. A job in an uncapped group has no group series. Runtime caps return to configured values on restart.
 
+The metrics expose raw heartbeat signals; there is no threshold series. `lu nodes` and `lu top` read the controller's `[schedule] min_disk_free_pct` from the additive `min_disk_free_pct` field of each `NodeView`. They show `harness down` when `harness_ok` is false, `disk free N%` only when it is below the threshold, and a warning tone in `lu top` when it is below twice the threshold. An older controller that omits the threshold leaves disk out of `HEALTH`; the raw percentage stays in `disk_free_pct` and the `DISK_FREE` column.
+
 ## Node contribution statistics
 
 `GET /v1/stats`, `lu stats` and the node series in `/metrics` all read one report computed by the

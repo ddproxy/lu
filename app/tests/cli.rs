@@ -1233,6 +1233,61 @@ async fn nodes_and_drain_render_aligned_text() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nodes_health_uses_the_controller_threshold() {
+    let list = json!([
+        {
+            "name": "low", "harness": "idle", "harness_ok": true,
+            "disk_free_pct": 7, "min_disk_free_pct": 8, "last_seen": 1
+        },
+        {
+            "name": "warn", "harness": "idle", "harness_ok": true,
+            "disk_free_pct": 9, "min_disk_free_pct": 8, "last_seen": 2
+        },
+        {
+            "name": "ok", "harness": "idle", "harness_ok": true,
+            "disk_free_pct": 20, "min_disk_free_pct": 8, "last_seen": 3
+        },
+        {
+            "name": "down", "harness": "busy", "harness_ok": false,
+            "disk_free_pct": 20, "min_disk_free_pct": 8, "last_seen": 4
+        },
+        {
+            "name": "old", "harness": "idle", "harness_ok": true,
+            "disk_free_pct": 7, "last_seen": 5
+        }
+    ]);
+    let server = start(move |record| {
+        if record.path == "/v1/nodes" {
+            Reply::json(&list)
+        } else {
+            Reply::status(404)
+        }
+    })
+    .await;
+    let dir = scratch("node-health");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let envs = env_for(&server, &token);
+
+    let output = run_with_env(&["nodes"], &envs, None, &dir);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("HEALTH"), "{text}");
+    let line_for = |name: &str| {
+        text.lines()
+            .find(|line| line.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} missing: {text}"))
+            .to_owned()
+    };
+    assert!(line_for("low").contains("disk free 7%"), "{text}");
+    assert!(line_for("warn").contains("disk free 9%"), "{text}");
+    assert!(!line_for("ok").contains("disk free"), "{text}");
+    assert!(line_for("down").contains("harness down"), "{text}");
+    assert!(!line_for("down").contains("disk free"), "{text}");
+    assert!(!line_for("old").contains("disk free"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uncordon_sends_the_optional_provider_and_prints_what_was_removed() {
     let server = start(move |record| {
         if record.path == "/v1/nodes/node-a/uncordon" {

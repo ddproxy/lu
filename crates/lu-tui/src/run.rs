@@ -370,6 +370,7 @@ mod tests {
 
     use super::*;
     use crate::model::{JobRow, NodeRow, Snapshot};
+    use lu_proto::NodeHealth;
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
@@ -443,6 +444,7 @@ mod tests {
                 nodes: vec![NodeRow {
                     name: "peer-a".to_owned(),
                     harness: "idle".to_owned(),
+                    health: NodeHealth::healthy(),
                     drained: false,
                     seen_secs_ago: Some(2),
                     providers: Vec::new(),

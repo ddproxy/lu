@@ -2857,15 +2857,9 @@ pub(crate) fn job_title(task: &str) -> String {
     line.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// Why the latest heartbeat makes a node ineligible, without assuming a configured threshold.
+/// Why the latest heartbeat makes a node ineligible, using the controller's own threshold.
 pub(crate) fn node_health_reason(node: &NodeView) -> String {
-    if node.harness_ok == Some(false) {
-        return "harness unhealthy".to_owned();
-    }
-    if let Some(pct) = node.disk_free_pct {
-        return format!("disk free {pct}%");
-    }
-    "-".to_owned()
+    node.health().text
 }
 
 pub(crate) fn harness_name(value: Option<HarnessState>) -> String {
