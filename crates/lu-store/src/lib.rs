@@ -392,6 +392,8 @@ pub enum StoreError {
     Conflict {
         length: Option<u64>,
     },
+    /// A retry was requested for a job that is not terminal.
+    NotRetryable(JobState),
     /// The write names an epoch older than the job's.
     StaleEpoch,
     /// The caller's `If-Match` did not name the job's current representation.
@@ -632,9 +634,10 @@ pub trait Store: Send + Sync + 'static {
         self.cancel_job(id, now)
     }
 
-    /// Creates a fresh terminal retry of `id` from `spec`. When `chain` is set, blocked dependents
-    /// are cloned too, remapped onto the new ids. Returns each `(old, new)` pair created.
-    /// `expected_updated_at` is checked inside the write transaction by stores that support it.
+    /// Requeues terminal `id` in place from `spec`, incrementing its attempt and clearing its
+    /// outcome. Blocked dependents waiting on it are restored after the root, transitively when
+    /// `chain` is set; their ids are returned. `expected_updated_at` is checked inside the write
+    /// transaction by stores that support it.
     fn retry_with_dependents(
         &self,
         id: &JobId,
@@ -642,7 +645,7 @@ pub trait Store: Send + Sync + 'static {
         chain: bool,
         now: Now,
         expected_updated_at: Option<i64>,
-    ) -> Result<(JobRecord, Vec<(JobId, JobId)>), StoreError> {
+    ) -> Result<(JobRecord, Vec<JobId>), StoreError> {
         let _ = (id, spec, chain, now);
         if let Some(expected) = expected_updated_at {
             let rec = self.get_job(id)?;

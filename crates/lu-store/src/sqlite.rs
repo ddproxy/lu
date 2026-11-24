@@ -695,64 +695,6 @@ fn cancel_blocked_dependents_tx(
     Ok(())
 }
 
-fn remap_spec_after(spec: &JobSpec, rename: &BTreeMap<JobId, JobId>) -> JobSpec {
-    let mut next = spec.clone();
-    next.after = next
-        .after
-        .iter()
-        .map(|id| rename.get(id).cloned().unwrap_or_else(|| id.clone()))
-        .collect();
-    next
-}
-
-/// Replaces one dependency id in `job`'s edges, keeping the original ordering.
-fn remap_job_deps(
-    tx: &rusqlite::Transaction<'_>,
-    job: &str,
-    old: &JobId,
-    new: &JobId,
-) -> Result<(), StoreError> {
-    let ords: Vec<i64> = {
-        let mut stmt = tx
-            .prepare("SELECT ord FROM job_deps WHERE job=?1 AND dep=?2 ORDER BY ord")
-            .map_err(internal)?;
-        let rows = stmt
-            .query_map(params![job, old.as_str()], |r| r.get::<_, i64>(0))
-            .map_err(internal)?;
-        let mut v = Vec::new();
-        for row in rows {
-            v.push(row.map_err(internal)?);
-        }
-        v
-    };
-    if ords.is_empty() {
-        return Ok(());
-    }
-    tx.execute(
-        "DELETE FROM job_deps WHERE job=?1 AND dep=?2",
-        params![job, old.as_str()],
-    )
-    .map_err(internal)?;
-    for ord in ords {
-        let exists: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM job_deps WHERE job=?1 AND dep=?2",
-                params![job, new.as_str()],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(internal)?;
-        if exists.is_none() {
-            tx.execute(
-                "INSERT INTO job_deps(job,dep,ord) VALUES (?1,?2,?3)",
-                params![job, new.as_str(), ord],
-            )
-            .map_err(internal)?;
-        }
-    }
-    Ok(())
-}
-
 /// Points an idempotency key at the newest job for it. A retry deliberately overwrites the old
 /// mapping so submitting the same key again does not resurrect the finished job.
 fn put_idempotency(
@@ -771,7 +713,7 @@ fn put_idempotency(
     Ok(())
 }
 
-/// Blocked dependents to clone for a chained retry, in dependency order: a job is only returned
+/// Blocked dependents to restore for a chained retry, in dependency order: a job is only returned
 /// after every predecessor in the captured set has been returned.
 fn chain_dependents_tx(
     tx: &rusqlite::Transaction<'_>,
@@ -816,6 +758,139 @@ fn chain_dependents_tx(
         }
     }
     Ok(ordered)
+}
+
+/// Requeues a terminal job in place for one more attempt. Operator retry is an explicit escape
+/// from the state table: terminal jobs have no normal outgoing edges.
+fn requeue_retry_root_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: &JobId,
+    spec: &JobSpec,
+    now: Now,
+) -> Result<JobRecord, StoreError> {
+    let (mut rec, _, _) = get_job_tx(tx, id.as_str())?;
+    if !rec.state.is_retryable() {
+        return Err(StoreError::NotRetryable(rec.state));
+    }
+
+    let collects_files = spec.collect.collects_files();
+    let mut collected_bytes = 0u64;
+    for dep in &spec.after {
+        let (dep_state, diff_bytes): (Option<String>, Option<i64>) = tx
+            .query_row(
+                "SELECT state, diff_bytes FROM jobs WHERE id=?1",
+                params![dep.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(internal)?
+            .unwrap_or((None, None));
+        match dep_state.as_deref() {
+            Some("done") => {}
+            Some("failed" | "cancelled") if spec.include_failed => {}
+            Some("failed" | "cancelled") => return Err(StoreError::DeadDependency(dep.clone())),
+            Some(_) => {}
+            None => return Err(StoreError::InvalidDependency(dep.clone())),
+        }
+        if collects_files {
+            let bytes = diff_bytes.unwrap_or(0).max(0) as u64;
+            collected_bytes = collected_bytes.saturating_add(bytes);
+            if collected_bytes > MAX_COLLECT_BYTES {
+                return Err(StoreError::InvalidSpec(format!(
+                    "collect: input diffs are {collected_bytes} bytes, over the {MAX_COLLECT_BYTES}-byte cap"
+                )));
+            }
+        }
+        if depends_on(tx, dep.as_str(), id.as_str())? {
+            return Err(StoreError::DependencyCycle);
+        }
+    }
+    tx.execute("DELETE FROM job_deps WHERE job=?1", params![id.as_str()])
+        .map_err(internal)?;
+    for (ord, dep) in spec.after.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO job_deps(job,dep,ord) VALUES (?1,?2,?3)",
+            params![id.as_str(), dep.as_str(), ord as i64],
+        )
+        .map_err(internal)?;
+    }
+    let blocked = !deps_satisfied(tx, id.as_str(), spec.include_failed)?;
+
+    rec.spec = spec.clone();
+    rec.state = if blocked {
+        JobState::Blocked
+    } else {
+        JobState::Queued
+    };
+    rec.attempt = rec.attempt.saturating_add(1);
+    rec.node = None;
+    rec.assigned_provider = None;
+    rec.assigned_model = None;
+    rec.updated_at = now.wall_unix;
+    rec.eligible_since = now.wall_unix;
+    rec.started_at = None;
+    rec.finished_at = None;
+    rec.failure_class = None;
+    rec.summary = None;
+    rec.exit_code = None;
+    rec.artifacts = Vec::new();
+    rec.cancel_requested = false;
+    rec.log_len = 0;
+    rec.diff_bytes = None;
+    rec.expect_failed = false;
+    rec.scrubbed_hits = 0;
+    rec.patch_scrubbed = false;
+    rec.patch_secret_hits = lu_proto::view::PatchSecretHitsView::default();
+    rec.staged_commit = None;
+    rec.blocked_reason = None;
+    rec.blocked_since = None;
+    rec.publish = None;
+    rec.waiting_on = load_waiting(tx, id.as_str())?;
+    update_job_tx(tx, &rec, None, None)?;
+    put_idempotency(tx, spec, id)?;
+    Ok(rec)
+}
+
+/// Restores blocked dependents after the root has been requeued. They keep their ids and edges;
+/// a dependent with all dependencies satisfied leaves `blocked`, while the rest stay blocked until
+/// the retried predecessor finishes. Cancelled or failed dependents are terminal and are untouched.
+fn restore_retry_dependents_tx(
+    tx: &rusqlite::Transaction<'_>,
+    root: &JobId,
+    chain: bool,
+    now: Now,
+) -> Result<Vec<JobId>, StoreError> {
+    let ids: Vec<JobId> = if chain {
+        chain_dependents_tx(tx, root)?
+    } else {
+        blocked_dependents_tx(tx, root.as_str(), true)?
+            .into_iter()
+            .map(|(id, _)| JobId::parse(&id).map_err(internal))
+            .collect::<Result<_, _>>()?
+    };
+    let mut requeued = Vec::new();
+    for id in ids {
+        let (mut rec, lease, recov) = get_job_tx(tx, id.as_str())?;
+        if rec.state != JobState::Blocked
+            || rec.blocked_reason.as_deref() != Some("predecessor failed")
+        {
+            continue;
+        }
+        rec.blocked_reason = None;
+        rec.blocked_since = None;
+        rec.summary = None;
+        rec.failure_class = None;
+        rec.finished_at = None;
+        rec.updated_at = now.wall_unix;
+        if deps_satisfied(tx, id.as_str(), rec.spec.include_failed)? {
+            release_blocked_job(tx, id.as_str(), rec.spec.include_failed, now)?;
+        } else {
+            rec.waiting_on = load_waiting(tx, id.as_str())?;
+            update_job_tx(tx, &rec, lease, recov)?;
+        }
+        requeued.push(id);
+    }
+    Ok(requeued)
 }
 
 /// True when following `job -> dep` edges from `start` can reach `target`. Used to reject an
@@ -2419,7 +2494,7 @@ impl Store for SqliteStore {
         chain: bool,
         now: Now,
         expected_updated_at: Option<i64>,
-    ) -> Result<(JobRecord, Vec<(JobId, JobId)>), StoreError> {
+    ) -> Result<(JobRecord, Vec<JobId>), StoreError> {
         spec.validate()
             .map_err(|e| StoreError::InvalidSpec(e.to_string()))?;
         let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
@@ -2427,50 +2502,11 @@ impl Store for SqliteStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
         check_expected_tx(&tx, id.as_str(), expected_updated_at)?;
-        let (old, _, _) = get_job_tx(&tx, id.as_str())?;
-        if !old.state.is_terminal() {
-            return Err(StoreError::Conflict { length: None });
-        }
-        let mut rename = BTreeMap::new();
-        let root = insert_job_tx(&tx, spec, now, None)?;
-        put_idempotency(&tx, spec, &root.id)?;
-        rename.insert(old.id.clone(), root.id.clone());
-        let mut pairs = vec![(old.id.clone(), root.id.clone())];
-
-        if matches!(old.state, JobState::Failed | JobState::Cancelled) {
-            if chain {
-                for old_dep_id in chain_dependents_tx(&tx, &old.id)? {
-                    let (old_dep, _, _) = get_job_tx(&tx, old_dep_id.as_str())?;
-                    if old_dep.state != JobState::Blocked
-                        || old_dep.blocked_reason.as_deref() != Some("predecessor failed")
-                    {
-                        continue;
-                    }
-                    let next_spec = remap_spec_after(&old_dep.spec, &rename);
-                    let new_dep = insert_job_tx(&tx, &next_spec, now, None)?;
-                    put_idempotency(&tx, &new_dep.spec, &new_dep.id)?;
-                    rename.insert(old_dep_id.clone(), new_dep.id.clone());
-                    pairs.push((old_dep_id, new_dep.id));
-                }
-            } else {
-                for (dep_id, _) in blocked_dependents_tx(&tx, id.as_str(), true)? {
-                    remap_job_deps(&tx, &dep_id, &old.id, &root.id)?;
-                    let (mut dep_rec, lease, recov) = get_job_tx(&tx, &dep_id)?;
-                    dep_rec.spec = remap_spec_after(&dep_rec.spec, &rename);
-                    dep_rec.blocked_reason = None;
-                    dep_rec.blocked_since = None;
-                    dep_rec.summary = None;
-                    dep_rec.updated_at = now.wall_unix;
-                    if deps_satisfied(&tx, &dep_id, dep_rec.spec.include_failed)? {
-                        release_blocked_job(&tx, &dep_id, dep_rec.spec.include_failed, now)?;
-                    } else {
-                        update_job_tx(&tx, &dep_rec, lease, recov)?;
-                    }
-                }
-            }
-        }
+        // The root is written first so dependents only ever see the requeued predecessor.
+        let root = requeue_retry_root_tx(&tx, id, spec, now)?;
+        let requeued = restore_retry_dependents_tx(&tx, id, chain, now)?;
         tx.commit().map_err(internal)?;
-        Ok((root, pairs))
+        Ok((root, requeued))
     }
 
     fn edit_job(&self, id: &JobId, edit: &JobEdit, now: Now) -> Result<JobRecord, StoreError> {

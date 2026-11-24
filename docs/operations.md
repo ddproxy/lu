@@ -195,8 +195,8 @@ count. See [dependencies.md](dependencies.md#waiting-and-promotion).
 ```sh
 lu ls --state blocked
 lu show 01ARZ3NDEKTSV4RRFFQ69G5FAV     # inspect the predecessor and the deadline
-lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV     # reattach waiting dependents to the new job
-lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --chain  # also retry dependents and their references
+lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV     # requeue in place and restore waiting dependents
+lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --chain  # restore blocked dependents transitively
 lu cancel 01ARZ3NDEKTSV4RRFFQ69G5FAV --keep-dependents
 ```
 

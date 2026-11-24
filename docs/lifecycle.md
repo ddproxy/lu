@@ -110,8 +110,9 @@ waiting reason.
 When a dependency finishes `failed` or `cancelled`, its blocked dependents do not fail immediately.
 They stay `blocked` with `blocked_reason: "predecessor failed"` and a `blocked_until` deadline from
 `[controller] blocked_dependent_ttl` (default 24h); `lu ls` prints the same reason. Retrying the
-predecessor reattaches waiting dependents to the new job, while `lu retry --chain` also retries the
-dependents and rewrites their `after` references. `lu cancel --keep-dependents` leaves waiting
+predecessor requeues it in place and restores waiting dependents after it, while `lu retry --chain`
+also restores blocked dependents transitively without changing their ids or `after` references.
+`lu cancel --keep-dependents` leaves waiting
 dependents in place; a plain cancel takes them with the predecessor. At the deadline a still-blocked
 dependent fails with `failure_class: "dependency"` and never retries. `lu top` and the
 `lu_blocked_dependents_total` metric expose the waiting count. See

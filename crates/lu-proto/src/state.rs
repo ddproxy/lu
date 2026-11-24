@@ -127,6 +127,15 @@ impl JobState {
         )
     }
 
+    /// Operator retry requeues these in place. A `done` job is excluded: its dependents may have
+    /// consumed its result.
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Failed | Self::Cancelled | Self::Expired | Self::DeadlineMissed
+        )
+    }
+
     /// Whether the controller may move a job from `from` to `to`. The table test below lists
     /// every allowed edge, and terminal states have none.
     // Running -> Queued is the lease-lost edge, gated by the lease epoch; NeedsInput is reserved and unreachable in this version.

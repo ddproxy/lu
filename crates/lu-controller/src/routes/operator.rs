@@ -1033,8 +1033,8 @@ pub async fn publish_job(
     }
 }
 
-/// Recreates a terminal job from the supplied spec. With `chain=1`, blocked dependents are
-/// recreated too and remapped onto the new dependency ids.
+/// Requeues a terminal job in place from the supplied spec. With `chain=1`, blocked dependents are
+/// restored transitively after the root keeps its id.
 pub async fn retry_job(
     State(state): State<Arc<AppState>>,
     peer: axum::Extension<PeerAddr>,
@@ -1065,16 +1065,16 @@ pub async fn retry_job(
         Err(error) => return with_version(error.into_response()),
     };
     let chain = query_flag(&parse_query(&uri), "chain");
+    let store = Arc::clone(&state.store);
+    let id = job_id.clone();
+    let current = match tokio::task::spawn_blocking(move || store.get_job(&id)).await {
+        Ok(Ok(rec)) => rec,
+        Ok(Err(error)) => return with_version(store_err(error).into_response()),
+        Err(_) => return with_version(ApiError::internal().into_response()),
+    };
     // With no body, reuse the stored spec so a retry needs only the job id.
     let spec = if bytes.is_empty() {
-        let store = Arc::clone(&state.store);
-        let id = job_id.clone();
-        let rec = match tokio::task::spawn_blocking(move || store.get_job(&id)).await {
-            Ok(Ok(rec)) => rec,
-            Ok(Err(error)) => return with_version(store_err(error).into_response()),
-            Err(_) => return with_version(ApiError::internal().into_response()),
-        };
-        rec.spec
+        current.spec.clone()
     } else {
         match serde_json::from_slice(&bytes) {
             Ok(spec) => spec,
@@ -1098,6 +1098,15 @@ pub async fn retry_job(
         Err(error) => return with_version(error.into_response()),
     };
     if dry_run {
+        if !current.state.is_retryable() {
+            return with_version(
+                ApiError::conflict(format!(
+                    "job is {}; retry requires failed, cancelled, expired or deadline_missed",
+                    current.state.as_str()
+                ))
+                .into_response(),
+            );
+        }
         state.record_audit(
             Event::MutationDryRun,
             Some(job_id.as_str()),
@@ -1138,7 +1147,7 @@ pub async fn retry_job(
         move || store.retry_with_dependents(&id, &spec, chain, n, expected)
     })
     .await;
-    let (rec, pairs) = match retried {
+    let (rec, requeued) = match retried {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => {
             if let Some(idempotency_key) = &key {
@@ -1168,37 +1177,34 @@ pub async fn retry_job(
         let lease_ms = state.lease_ms;
         match tokio::task::spawn_blocking(move || store.job_counts(n, lease_ms)).await {
             Ok(Ok(counts)) => counts.waiting_dependents,
-            _ => pairs.len() as u64,
+            _ => requeued.len() as u64,
         }
     };
-    let retry_pairs: Vec<Value> = pairs
-        .iter()
-        .map(|(old, new)| json!({ "old": old.to_string(), "new": new.to_string() }))
-        .collect();
+    let requeued_ids: Vec<String> = requeued.iter().map(|id| id.to_string()).collect();
     state.record_audit(
         Event::Retried,
         Some(rec.id.as_str()),
         None,
         &operator,
         outcome_data(&state, &operator, operation, "applied")
-            .unsigned(Field::Count, pairs.len() as u64)
+            .unsigned(Field::Count, requeued.len() as u64)
             .text(Field::Source, if chain { "chain" } else { "job" }),
     );
     state.waiters.notify_job(rec.id.as_ref());
-    for (_, new) in &pairs {
+    for id in &requeued {
         state.record_audit(
             Event::Retried,
-            Some(new.as_str()),
+            Some(id.as_str()),
             None,
             &operator,
             Data::new().text(Field::Source, "dependent"),
         );
-        state.waiters.notify_job(new.as_ref());
+        state.waiters.notify_job(id.as_ref());
     }
     state.waiters.notify_work();
     let response = json!({
         "job": job_view_with_ttl(&rec, state.blocked_dependent_ttl_secs),
-        "retried": retry_pairs,
+        "requeued": requeued_ids,
         "waiting_dependents": waiting_dependents,
     });
     if let Some(idempotency_key) = &key {
