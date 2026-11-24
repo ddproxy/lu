@@ -505,6 +505,8 @@ fn node_view(
         workspace_reclaimed_bytes_total: stats.map_or(0, |s| s.workspace_reclaimed_bytes_total),
         workspace_evictions_total: stats.map_or(0, |s| s.workspace_evictions_total),
         workspace_delete_errors_total: stats.map_or(0, |s| s.workspace_delete_errors_total),
+        gc_removed_total: stats.map_or(0, |s| s.gc_removed_total),
+        gc_bytes_freed_total: stats.map_or(0, |s| s.gc_bytes_freed_total),
         workspaces: stats.map_or_else(Vec::new, |s| s.workspaces.clone()),
     }
 }

@@ -1021,6 +1021,9 @@ fn default_detect_every_secs() -> u64 {
 pub struct HousekeepingConfig {
     /// Absolute patterns such as `/srv/work/target-*`. Only the last component may use `*` or `?`.
     pub scratch_globs: Vec<String>,
+    /// Extra absolute parents scanned for `target*` children, for build output reached through a
+    /// host path bind-mounted from a harness container.
+    pub extra_roots: Vec<String>,
     /// Only entries whose newest modification time is at least this old are removed.
     pub min_age_hours: u64,
     /// Act only while the parent filesystem is below this percentage of free space.
@@ -1033,6 +1036,7 @@ impl Default for HousekeepingConfig {
     fn default() -> Self {
         Self {
             scratch_globs: Vec::new(),
+            extra_roots: Vec::new(),
             min_age_hours: 6,
             min_free_percent: 15,
             max_remove_per_pass: 10,
@@ -2227,10 +2231,31 @@ impl HousekeepingConfig {
             );
         }
         for (index, pattern) in self.scratch_globs.iter().enumerate() {
-            validate_scratch_glob(
-                &format!("[agent.housekeeping] scratch_globs #{index}"),
-                pattern,
-            )?;
+            let table = format!("[agent.housekeeping] scratch_globs #{index}");
+            validate_scratch_glob(&table, pattern)?;
+            if let Some(parent) = Path::new(pattern).parent() {
+                reject_housekeeping_root(&table, parent)?;
+            }
+        }
+        if self.extra_roots.len() > 4 {
+            return invalid(
+                "[agent.housekeeping]",
+                format!(
+                    "extra_roots must name at most 4 roots (got {})",
+                    self.extra_roots.len()
+                ),
+            );
+        }
+        for (index, root) in self.extra_roots.iter().enumerate() {
+            let table = format!("[agent.housekeeping] extra_roots #{index}");
+            validate_abs_no_dotdot(&table, "root", root)?;
+            if root.chars().any(|ch| ch == '*' || ch == '?') {
+                return invalid(
+                    &table,
+                    format!("root must not contain '*' or '?' (got {root:?})"),
+                );
+            }
+            reject_housekeeping_root(&table, Path::new(root))?;
         }
         if self.min_free_percent > 100 {
             return invalid(
@@ -2282,6 +2307,18 @@ fn validate_scratch_glob(table: &str, pattern: &str) -> Result<(), ConfigError> 
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// Roots this broad must never be swept, even when the operator names them explicitly.
+fn reject_housekeeping_root(table: &str, root: &Path) -> Result<(), ConfigError> {
+    const TOO_BROAD: [&str; 5] = ["/", "/home", "/var", "/tmp", "/srv"];
+    if TOO_BROAD.iter().any(|wide| root == Path::new(wide)) {
+        return invalid(
+            table,
+            format!("housekeeping root is too broad (got {})", root.display()),
+        );
     }
     Ok(())
 }
@@ -3088,12 +3125,13 @@ heartbeat_secs = 15
             .housekeeping
             .unwrap();
         assert_eq!(config.scratch_globs, ["/srv/work/target-*"]);
+        assert!(config.extra_roots.is_empty());
         assert_eq!(config.min_age_hours, 6);
         assert_eq!(config.min_free_percent, 15);
         assert_eq!(config.max_remove_per_pass, 10);
 
         assert!(Config::parse(&format!(
-            "{base}scratch_globs=[\"/srv/work/target-?\", \"/srv/work/build-*\", \"/tmp/x*\"]\n"
+            "{base}scratch_globs=[\"/srv/work/target-?\", \"/srv/work/build-*\", \"/tmp/work/x*\"]\nextra_roots=[\"/srv/work/harness-scratch\"]\n"
         ))
         .is_ok());
 
@@ -3122,6 +3160,40 @@ heartbeat_secs = 15
         );
         expect_table(
             &format!("{base}scratch_globs=[\"/srv/work/target-*\"]\nmax_remove_per_pass=0\n"),
+            "[agent.housekeeping]",
+        );
+    }
+
+    #[test]
+    fn housekeeping_refuses_roots_that_are_too_broad() {
+        let base = "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n[agent.housekeeping]\n";
+        for wide in ["/", "/home", "/var", "/tmp", "/srv"] {
+            expect_table(
+                &format!("{base}scratch_globs=[\"{wide}/target-*\"]\n"),
+                "[agent.housekeeping] scratch_globs #0",
+            );
+            expect_table(
+                &format!("{base}extra_roots=[\"{wide}\"]\n"),
+                "[agent.housekeeping] extra_roots #0",
+            );
+        }
+    }
+
+    #[test]
+    fn housekeeping_extra_roots_stay_absolute_and_literal() {
+        let base = "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n[agent.housekeeping]\n";
+        for root in ["work/scratch", "/srv/../work/scratch", "/srv/work/*"] {
+            expect_table(
+                &format!("{base}extra_roots=[\"{root}\"]\n"),
+                "[agent.housekeeping] extra_roots #0",
+            );
+        }
+        let too_many = (0..5)
+            .map(|index| format!("\"/scratch-{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        expect_table(
+            &format!("{base}extra_roots=[{too_many}]\n"),
             "[agent.housekeeping]",
         );
     }

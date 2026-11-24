@@ -387,6 +387,18 @@ pub async fn metrics(
             "counter",
             4,
         ),
+        (
+            "lu_node_gc_removed_total",
+            "Scratch directories removed by a node's housekeeping",
+            "counter",
+            5,
+        ),
+        (
+            "lu_node_gc_bytes_freed_total",
+            "Bytes freed by a node's housekeeping",
+            "counter",
+            6,
+        ),
     ] {
         out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
         for (node, stats) in &node_stats {
@@ -396,7 +408,9 @@ pub async fn metrics(
                 1 => stats.workspace_count,
                 2 => stats.workspace_reclaimed_bytes_total,
                 3 => stats.workspace_evictions_total,
-                _ => stats.workspace_delete_errors_total,
+                4 => stats.workspace_delete_errors_total,
+                5 => stats.gc_removed_total,
+                _ => stats.gc_bytes_freed_total,
             };
             let line = if kind == "counter" {
                 counter(name, &[("node", &label)], number)

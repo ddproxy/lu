@@ -557,6 +557,16 @@ impl Registry {
         result
     }
 
+    /// Paths the housekeeper must never touch: every tree the registry still owns, including
+    /// running workspaces and those queued for deletion.
+    pub fn protected_paths(&self) -> Vec<PathBuf> {
+        self.lock()
+            .entries
+            .values()
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
     /// Counters for the next heartbeat.
     pub fn stats(&self) -> Stats {
         self.lock().stats
@@ -891,6 +901,28 @@ mod tests {
         r.sweep();
         assert!(path.exists());
         assert_eq!(r.clean(false, Some(&job)).refused_running, 1);
+    }
+
+    #[test]
+    fn protected_paths_cover_running_and_draining_workspaces() {
+        let f = Fixture::new();
+        let r = f.registry();
+        let running = id(12);
+        let draining = id(13);
+        let running_path = f.stub(&running, 4);
+        let draining_path = f.stub(&draining, 4);
+        r.register(&running, 1, WorkspacePolicy::Keep);
+        r.register(&draining, 2, WorkspacePolicy::Ephemeral);
+        r.finish(&draining, Outcome::Done);
+        r.acknowledge(&draining, true, "stored");
+        let protected = r.protected_paths();
+        assert!(protected.contains(&running_path));
+        assert!(protected.contains(&draining_path));
+        assert_eq!(
+            r.list()[1].state,
+            WorkspaceState::Deleting,
+            "acknowledged workspaces are draining until the sweeper removes them"
+        );
     }
 
     #[test]

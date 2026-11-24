@@ -306,6 +306,8 @@ workspace_count              7
 workspace_reclaimed_bytes_total 10737418240
 workspace_evictions_total    3
 workspace_delete_errors_total 0
+gc_removed_total 2
+gc_bytes_freed_total 1073741824
 
 job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
   PID   PPID  STATE  CPU_S  RSS_KB  AGE_S  FILES  COMMAND
@@ -320,7 +322,7 @@ cordons
 
 - `labels` lists the node's current labels; a probed one is followed by ` (probed)`. `lu node <name> --json` includes `labels` and `label_sources` in the stats body.
 - Load, memory and uptime come from the agent's `/proc` sample. `disk_free_bytes`, `disk_total_bytes` and `disk_free_percent` describe the filesystem holding the agent's `work_dir`; each is `-` when the agent cannot read it.
-- The five `workspace_*` rows are the node's latest workspace counters. They describe agent-local workspaces under `work_dir`, not controller artifacts; see [workspaces.md](workspaces.md).
+- The five `workspace_*` rows are the node's latest workspace counters. They describe agent-local workspaces under `work_dir`, not controller artifacts; see [workspaces.md](workspaces.md). `gc_removed_total` and `gc_bytes_freed_total` count scratch directories and bytes removed by housekeeping since the agent started.
 - Each job is a running job owned by that node. `pgid` is the harness process group, and the process table is capped at the 64 busiest members. `COMMAND` is the first 80 characters of the command line with control characters replaced.
 - `output_idle` is seconds since the harness last wrote output; `cpu_idle` is seconds since any process in the job tree last used CPU. `stuck yes` means both are above 300 seconds while the job is still running.
 - The `cordons` section lists each active provider with its source, how long ago it was set and
@@ -382,6 +384,7 @@ Workspaces inside `work_dir` are handled by the separate [workspace lifecycle](#
 ```toml
 [agent.housekeeping]
 scratch_globs = ["/srv/work/target-*"]
+extra_roots = ["/srv/work/harness-scratch"]
 min_age_hours = 6
 min_free_percent = 15
 max_remove_per_pass = 10
@@ -395,15 +398,23 @@ entries old enough by `min_age_hours`.
 
 Safety rules:
 
-- Only directories matching the final path component of a `scratch_globs` pattern are
-  candidates. Only `*` and `?` are supported, and only in that final component.
+- Candidates are directories matching the final path component of a `scratch_globs` pattern,
+  plus `target*` children of each `extra_roots` parent. Only `*` and `?` are supported in
+  patterns, and only in the final component.
 - An entry is removed only if it is a direct child of the pattern's canonical parent and its
   whole tree's newest modification time is at least `min_age_hours` old.
 - Symlinks are never followed or removed, files are never removed, and the pattern's parent
-  is never removed.
-- The agent's `work_dir`, and anything inside it, is never removed.
+  is never removed. A root of `/`, `/home`, `/var`, `/tmp` or `/srv` is refused.
+- A directory containing `.git` or `Cargo.toml` is kept unless the matching rule names build
+  output (`target`, `target-*` or an `extra_roots` child).
+- The agent's `work_dir`, every registered job workspace and every workspace queued for
+  deletion are never removed, including when a workspace sits inside a candidate.
 - Removal is oldest first. Each removal logs the path, a size estimate and the age at info;
-  the pass logs a summary.
+  the pass logs a summary. Cumulative removals are reported as `gc_removed_total` and
+  `gc_bytes_freed_total` in heartbeats, `lu node` and `/metrics`.
+- `CARGO_TARGET_DIR` must stay below a configured root. For harness containers, expose the
+  scratch tree at a host path named by `extra_roots`; Lu does not run commands in containers
+  or read overlay storage.
 - Every error is logged or ignored. Housekeeping never fails a job or stops the agent.
 
 ## Display

@@ -273,6 +273,8 @@ pub async fn poll(
         workspace_reclaimed_bytes_total: body.heartbeat.workspace_reclaimed_bytes_total,
         workspace_evictions_total: body.heartbeat.workspace_evictions_total,
         workspace_delete_errors_total: body.heartbeat.workspace_delete_errors_total,
+        gc_removed_total: body.heartbeat.gc_removed_total,
+        gc_bytes_freed_total: body.heartbeat.gc_bytes_freed_total,
         workspaces: body.heartbeat.workspaces.clone(),
     };
     state

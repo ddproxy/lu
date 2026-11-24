@@ -450,3 +450,60 @@ Claims in the request were checked against the existing script and workflows bef
 
 The checkout has no writable git metadata, so changes remain local and uncommitted. Commit messages
 were kept terse as requested.
+
+## Disk housekeeping verification
+
+### Verified against the code
+
+- `Housekeeper::run` skips a pass while a job is running and enforces `MIN_INTERVAL` (10 minutes)
+  between passes. It is called at agent start and after a finished job, never on the job path.
+- `Housekeeper::pass` canonicalises each configured parent and refuses `/`, `/home`, `/var`,
+  `/tmp` and `/srv`. It probes the filesystem holding that parent only when `min_free_percent > 0`,
+  acts while free space is below the threshold, stops once free space reaches
+  `min_free_percent + 5` (capped at 100), and is bounded by `max_remove_per_pass`.
+- Candidates are direct children matching the final component of a `scratch_globs` pattern, or
+  `target*` children of an `extra_roots` parent. Only real directories whose canonical path is a
+  direct child of the canonical parent are considered. Symlinks are never followed, files are
+  never removed, and a tree with a failed read is not removable.
+- Age is measured from the newest modification time in the whole tree, not the directory entry;
+  candidates are removed oldest first. A tree containing `.git` or `Cargo.toml` is kept unless the
+  matching rule names build output (`target`, `target-*` or an `extra_roots` child).
+- `Registry::protected_paths()` includes every registry state, `Running` and `Deleting` as well as
+  kept trees. The agent passes those paths plus the canonical `work_dir` to the housekeeper, so an
+  active or draining workspace is protected.
+- `extra_roots` entries are absolute, literal paths with no `..` or wildcards, at most four, and
+  none may be one of the refused broad roots. Harness-container scratch is reachable only through
+  a configured host path; no container command or overlay storage path is used.
+- One `Arc<GcCounters>` feeds both idle and busy heartbeat builders. The client emits
+  `gc_removed_total` and `gc_bytes_freed_total` only when non-zero; absent fields decode as zero.
+  The controller exposes them in `NodeStats`, `NodeView`, `lu node` and the two
+  `lu_node_gc_*_total{node}` metrics. In-memory controller views reset on restart, and agent
+  counters reset when the agent restarts.
+
+### Where the report or request disagreed with the code
+
+- A worklog claim said `target-*` directories were removed when older than a day. The code default
+  is `min_age_hours = 6`, and the docs follow the code rather than that claim.
+- `min_free_percent = 0` disables the disk probe and trigger; it does not make a pass ignore the
+  `min_age_hours` grace. The docs state both rules.
+- The request named upstream `src/gc.rs` and `docs/workspace-gc.md` as references. Neither excerpt
+  was available, so the implementation follows the written requirements and the local code.
+
+### Upstream access failure
+
+The upstream repository at `https://code.ddproxy.net/ddproxy/tuishou-ting.git` could not be read.
+Direct `git` and web fetch were denied in this environment; an HTTP probe of the Forgejo
+`info/refs?service=git-upload-pack` endpoint returned `Repository not found`. No `/tmp` file was
+treated as upstream source.
+
+### Verification
+
+- `cargo fmt --all` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — passed.
+- `cargo clippy --workspace --all-targets --features tui -- -D warnings` — passed.
+- `cargo test --workspace` — passed.
+- `cargo test --workspace --features tui` — passed.
+- `scripts/check-docs.sh` — passed (6 docs tests).
+
+Changes remain local and uncommitted: the checkout's git metadata is not writable by the current
+uid, so no commit could be created.

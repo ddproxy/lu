@@ -93,6 +93,8 @@ pub fn hb(name: &str, harness: HarnessState, providers: Vec<(&str, ProviderState
         workspace_reclaimed_bytes_total: 0,
         workspace_evictions_total: 0,
         workspace_delete_errors_total: 0,
+        gc_removed_total: 0,
+        gc_bytes_freed_total: 0,
         workspaces: Vec::new(),
     }
 }

@@ -2603,6 +2603,11 @@ fn print_node_stats(node: &NodeName, stats: &NodeStats) {
             "workspace_delete_errors_total",
             stats.workspace_delete_errors_total.to_string(),
         ),
+        ("gc_removed_total", stats.gc_removed_total.to_string()),
+        (
+            "gc_bytes_freed_total",
+            stats.gc_bytes_freed_total.to_string(),
+        ),
     ]);
     if stats.jobs.is_empty() {
         println!("jobs  -");

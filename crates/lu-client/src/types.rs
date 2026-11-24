@@ -196,6 +196,12 @@ pub struct PollRequest {
     /// Failed deletion attempts; failures are retried and never silently ignored.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub workspace_delete_errors_total: u64,
+    /// Scratch directories removed by housekeeping since the agent started.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gc_removed_total: u64,
+    /// Bytes freed by housekeeping since the agent started.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gc_bytes_freed_total: u64,
     /// Workspaces the agent is tracking, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<WorkspaceView>,
@@ -228,6 +234,8 @@ impl From<Heartbeat> for PollRequest {
             workspace_reclaimed_bytes_total: beat.workspace_reclaimed_bytes_total,
             workspace_evictions_total: beat.workspace_evictions_total,
             workspace_delete_errors_total: beat.workspace_delete_errors_total,
+            gc_removed_total: beat.gc_removed_total,
+            gc_bytes_freed_total: beat.gc_bytes_freed_total,
             workspaces: beat.workspaces,
             wait_secs: None,
         }
@@ -479,6 +487,8 @@ mod tests {
             workspace_reclaimed_bytes_total: 128,
             workspace_evictions_total: 2,
             workspace_delete_errors_total: 3,
+            gc_removed_total: 2,
+            gc_bytes_freed_total: 64,
             workspaces: vec![workspace.clone()],
         };
         let request = PollRequest::from(beat);
@@ -489,6 +499,8 @@ mod tests {
         assert_eq!(request.workspace_reclaimed_bytes_total, 128);
         assert_eq!(request.workspace_evictions_total, 2);
         assert_eq!(request.workspace_delete_errors_total, 3);
+        assert_eq!(request.gc_removed_total, 2);
+        assert_eq!(request.gc_bytes_freed_total, 64);
         assert_eq!(request.workspaces, vec![workspace]);
         let json = serde_json::to_string(&request).unwrap();
         let parsed: PollRequest = serde_json::from_str(&json).unwrap();

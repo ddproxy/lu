@@ -82,7 +82,7 @@ Set `max_bytes` to a value appropriate for the node's disk; omit it when disk wa
 
 ## Observing and cleaning workspaces
 
-Every heartbeat reports `workspace_bytes`, `workspace_count`, `workspace_reclaimed_bytes_total`, `workspace_evictions_total` and `workspace_delete_errors_total`, plus the oldest-first workspace listing. `lu node <name>` prints the counters; `lu top` shows workspace count and bytes and the three cumulative totals. `/metrics` exposes each counter with a `node` label; see [monitoring.md](monitoring.md#series).
+Every heartbeat reports `workspace_bytes`, `workspace_count`, `workspace_reclaimed_bytes_total`, `workspace_evictions_total` and `workspace_delete_errors_total`, plus the oldest-first workspace listing. `lu node <name>` prints those counters and the separate `gc_removed_total` and `gc_bytes_freed_total` from housekeeping outside `work_dir`; `lu top` shows workspace count and bytes and the three cumulative workspace totals. `/metrics` exposes each counter with a `node` label; see [monitoring.md](monitoring.md#series).
 
 ```sh
 lu node node-a --workspaces

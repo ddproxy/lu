@@ -957,6 +957,12 @@ impl Client {
             heartbeat["workspace_delete_errors_total"] =
                 serde_json::json!(request.workspace_delete_errors_total);
         }
+        if request.gc_removed_total != 0 {
+            heartbeat["gc_removed_total"] = serde_json::json!(request.gc_removed_total);
+        }
+        if request.gc_bytes_freed_total != 0 {
+            heartbeat["gc_bytes_freed_total"] = serde_json::json!(request.gc_bytes_freed_total);
+        }
         if !request.workspaces.is_empty() {
             heartbeat["workspaces"] = serde_json::json!(request.workspaces);
         }

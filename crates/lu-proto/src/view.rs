@@ -248,6 +248,12 @@ pub struct NodeView {
     /// Failed deletion attempts, all retried by the agent.
     #[serde(default)]
     pub workspace_delete_errors_total: u64,
+    /// Scratch directories removed by housekeeping since the agent started.
+    #[serde(default)]
+    pub gc_removed_total: u64,
+    /// Bytes freed by housekeeping since the agent started.
+    #[serde(default)]
+    pub gc_bytes_freed_total: u64,
     /// The agent's workspace listing from its latest heartbeat, oldest first.
     #[serde(default)]
     pub workspaces: Vec<WorkspaceView>,
@@ -380,6 +386,8 @@ impl NodeView {
             workspace_reclaimed_bytes_total: 0,
             workspace_evictions_total: 0,
             workspace_delete_errors_total: 0,
+            gc_removed_total: 0,
+            gc_bytes_freed_total: 0,
             workspaces: Vec::new(),
         }
     }
