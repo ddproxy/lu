@@ -380,7 +380,7 @@ Last checked with release 0.6.1, Rust 1.99 and store schema 6.
 | --- | --- | --- |
 | Release | `Cargo.toml` workspace version | The docs check asserts this README's status line matches. |
 | Store schema | `SCHEMA_VERSION = 6` | Forward-only migration from 5; a docs test rejects a different current version. |
-| Wire protocol | Previous stable release | CI runs `scripts/compat-test.sh` in both directions: older agent with new controller, and newer agent with old controller. |
+| Wire protocol | Two previous stable releases | CI runs `scripts/compat-test.sh` in both directions for each: older agent with new controller, and newer agent with old controller. |
 | Release platforms | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | Static archives; CI smoke-builds the musl target before release. |
 | Source build | Rust 1.99 | Workspace `rust-version`; CI installs 1.99 with rustfmt and clippy. |
 | Harness | `opencode` | Default harness; job children use the credential-free `ting mcp` socket. |

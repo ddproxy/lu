@@ -28,15 +28,46 @@ may be newer than its agents.** Neither order needs to be forced.
   release's database. Rolling a controller back to an older release is done from the dated
   database copy, not by running the old binary on a migrated database.
 
-## Checked in CI
+## Running the check
 
 `scripts/compat-test.sh <controller-bin-dir> <agent-bin-dir> [<db-seed-bin-dir>]` starts a
 controller from one build and an agent from another on loopback. It confirms the node registers
 and reports itself, drains and undrains, and with a third directory it starts the controller on a
 database the older release created. It also sends the optional `If-Match`, `Idempotency-Key` and
 `?dry_run=1` controls to both builds: an older controller must ignore them and a newer one must
-accept them. CI runs the previous release's agent against the new controller and the new agent
-against the previous release's controller, so a wire change that breaks either fails the build.
+accept them.
+
+With no binary directories, the script does both directions itself. It selects the latest stable
+tags before the workspace version (two by default), downloads `lu-<tag>-<target>.tar.gz` and its
+`.sha256` from `ddproxy/tuishou-lu` with `gh release download` or curl, compares the digest with
+`sha256sum`, and extracts only a verified archive into
+`target/compat-cache/<target>/<tag>/bin`. The current build comes from `target/debug`, or
+`$CARGO_TARGET_DIR/debug`; the script builds it with `cargo build --locked --bins` when missing.
+For each tag it runs the older agent against the new controller with a database seeded by the older
+controller, then the new agent against the older controller.
+
+| Option | Effect |
+| --- | --- |
+| `--previous N` | Check N preceding stable releases instead of two. |
+| `--target T` | Use a release target instead of the host target. |
+| `--tags-file F` | Select from a local tag list instead of querying GitHub. |
+| `--dry-run` | Print the selection and planned runs without downloading or running binaries. |
+| `--skip-download` | Print a message and exit 0 without running anything. |
+
+A populated cache works offline: the archive digest and checksum file are rechecked locally on
+every run, and cached binaries are reused only when their marker matches that digest. If release
+lookup fails, the cached list at `target/compat-cache/<target>/tags.txt` is used. A failed download
+or checksum fails the run with the asset named in the message; an unverified archive is never
+extracted or executed. Skipping is only possible with an explicit `--skip-download`.
+
+`scripts/test-compat.sh` checks version selection and checksum handling from local fixtures with
+no network. `scripts/compat-test.sh --dry-run --tags-file <file>` previews a selection offline.
+
+## Checked in CI
+
+The `compat` job builds the current binaries and calls the script with no directories. It checks
+both directions for the two latest stable releases before the workspace version, including the
+in-place migration, so a wire change that breaks either direction fails the build.
 
 ## Updating a fleet
 

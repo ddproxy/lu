@@ -76,6 +76,26 @@ install -m 0755 lu /usr/local/bin/lu
 install -m 0755 ting /usr/local/bin/ting
 ```
 
+### Compatibility check from a checkout
+
+`scripts/compat-test.sh` fetches older releases itself, so the wire check does not need binaries
+prepared by hand. With no arguments it uses the latest two stable tags before the workspace
+version, builds the current binaries if needed, verifies each archive against its `.sha256` file
+and caches the extracted binaries under `target/compat-cache/<target>/<tag>/bin`. It then runs an
+older agent against the new controller and a new agent against the older controller.
+
+```sh
+./scripts/compat-test.sh
+./scripts/compat-test.sh --previous 1
+./scripts/compat-test.sh --skip-download
+```
+
+Releases come from `ddproxy/tuishou-lu` via `gh release download` when `gh` is available and via
+curl otherwise. A populated cache works offline because the cached archive is rechecked locally;
+a failed download or checksum stops before any older binary runs. Use `--tags-file` for an offline
+selection and `--dry-run` to preview it. Details are in
+[Compatibility between releases](compatibility.md#running-the-check).
+
 ## Build from source
 
 `make build` runs `cargo build --release --locked -p lu --features tui` and
