@@ -71,6 +71,12 @@ pub enum Event {
     DeadlineMissed,
     /// A validated schedule was installed from the controller config.
     ScheduleReload,
+    /// A dry run inspected a mutation without changing state. `data.outcome` is `dry_run`.
+    MutationDryRun,
+    /// A stored idempotency result was replayed. `data.outcome` is `replayed`.
+    MutationReplay,
+    /// A conditional mutation failed its precondition.
+    MutationPreconditionFailed,
 }
 
 impl Event {
@@ -101,6 +107,9 @@ impl Event {
             Self::RepoSync => "repo_sync",
             Self::DeadlineMissed => "deadline_missed",
             Self::ScheduleReload => "schedule_reload",
+            Self::MutationDryRun => "mutation_dry_run",
+            Self::MutationReplay => "mutation_replay",
+            Self::MutationPreconditionFailed => "mutation_precondition_failed",
         }
     }
 }
@@ -125,10 +134,13 @@ pub enum Field {
     Model,
     Mode,
     Node,
+    Operation,
     Outcome,
+    Principal,
     Provider,
     Remote,
     Result,
+    Role,
     RetryAfterSecs,
     Rules,
     Source,

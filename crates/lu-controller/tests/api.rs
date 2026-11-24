@@ -4027,9 +4027,31 @@ async fn restricted_tokens_cannot_widen_job_fields_and_expired_tokens_are_refuse
     let r = op_request(&srv, RESTRICTED_TOKEN, "POST /v1/jobs", Some(&spawn)).await;
     assert_eq!(status(&r), 403, "{r}");
     assert!(body_str(&r).contains("allow_spawn"), "{r}");
-    // The same body is fine for an unrestricted operator.
+    // The same body is fine for an unrestricted operator, but a restricted token cannot smuggle
+    // the widening fields through retry.
     let r = op_request(&srv, OP_TOKEN, "POST /v1/jobs", Some(&spawn)).await;
     assert_eq!(status(&r), 201, "{r}");
+    let spawned_id = serde_json::from_str::<serde_json::Value>(body_str(&r)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cancelled = op_request(
+        &srv,
+        OP_TOKEN,
+        &format!("POST /v1/jobs/{spawned_id}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(status(&cancelled), 200, "{cancelled}");
+    let retried = op_request(
+        &srv,
+        RESTRICTED_TOKEN,
+        &format!("POST /v1/jobs/{spawned_id}/retry"),
+        Some(&spawn),
+    )
+    .await;
+    assert_eq!(status(&retried), 403, "{retried}");
+    assert!(body_str(&retried).contains("allow_spawn"), "{retried}");
 
     let r = op_request(&srv, EXPIRED_TOKEN, "GET /v1/status", None).await;
     assert_eq!(status(&r), 401, "{r}");
@@ -4429,6 +4451,395 @@ async fn log_reads_bound_the_window_with_offset_and_max() {
         let r = get(query).await;
         assert_eq!(status(&r), 400, "{query}: {r}");
     }
+
+    let _ = srv.shutdown.send(());
+}
+
+fn post_with_headers(path: &str, body_text: &str, extra: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{}",
+        body_text.len(),
+        body_text
+    )
+}
+
+#[tokio::test]
+async fn write_keys_replay_and_reject_a_changed_body() {
+    let srv = start_server().await;
+    let key = format!("submit-{}", std::process::id());
+    let spec = sample_spec(Some(&key));
+    let body = serde_json::to_string(&spec).unwrap();
+    let first = raw_request(
+        srv.addr,
+        &post_with_headers("/v1/jobs", &body, &format!("Idempotency-Key: {key}\r\n")),
+    )
+    .await;
+    assert_eq!(status(&first), 201, "{first}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&first))
+        .unwrap()
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap()
+        .to_owned();
+
+    let replay = raw_request(
+        srv.addr,
+        &post_with_headers("/v1/jobs", &body, &format!("Idempotency-Key: {key}\r\n")),
+    )
+    .await;
+    assert_eq!(status(&replay), 201, "{replay}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body_str(&replay))
+            .unwrap()
+            .get("id")
+            .and_then(serde_json::Value::as_str),
+        Some(id.as_str())
+    );
+
+    let mut changed = spec.clone();
+    changed.task = "a different task".to_owned();
+    let other = serde_json::to_string(&changed).unwrap();
+    let conflict = raw_request(
+        srv.addr,
+        &post_with_headers("/v1/jobs", &other, &format!("Idempotency-Key: {key}\r\n")),
+    )
+    .await;
+    assert_eq!(status(&conflict), 422, "{conflict}");
+    assert!(body_str(&conflict).contains("idempotency_conflict"));
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn write_etag_guards_stale_cancellation() {
+    let srv = start_server().await;
+    let key = format!("etag-{}", std::process::id());
+    let spec = sample_spec(Some(&key));
+    let body = serde_json::to_string(&spec).unwrap();
+    let created = raw_request(srv.addr, &post_with_headers("/v1/jobs", &body, "")).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&created))
+        .unwrap()
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap()
+        .to_owned();
+    let get = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}"))).await;
+    let etag = header_value(&get, "etag").unwrap().to_owned();
+
+    let stale = raw_request(
+        srv.addr,
+        &post_with_headers(
+            &format!("/v1/jobs/{id}/cancel"),
+            "",
+            "If-Match: \"00000000000000000000000000000000\"\r\n",
+        ),
+    )
+    .await;
+    assert_eq!(status(&stale), 412, "{stale}");
+    assert!(body_str(&stale).contains("precondition_failed"));
+
+    let cancel = raw_request(
+        srv.addr,
+        &post_with_headers(
+            &format!("/v1/jobs/{id}/cancel"),
+            "",
+            &format!("If-Match: {etag}\r\n"),
+        ),
+    )
+    .await;
+    assert_eq!(status(&cancel), 200, "{cancel}");
+
+    let after = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}"))).await;
+    let new_etag = header_value(&after, "etag").unwrap().to_owned();
+    assert_ne!(new_etag, etag);
+    let second = raw_request(
+        srv.addr,
+        &post_with_headers(
+            &format!("/v1/jobs/{id}/cancel"),
+            "",
+            &format!("If-Match: {etag}\r\n"),
+        ),
+    )
+    .await;
+    assert_eq!(status(&second), 412, "{second}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn dry_run_does_not_store_a_job() {
+    let srv = start_server().await;
+    let key = format!("dryrun-{}", std::process::id());
+    let body = serde_json::to_string(&sample_spec(Some(&key))).unwrap();
+    let resp = raw_request(
+        srv.addr,
+        &post_with_headers("/v1/jobs?dry_run=1", &body, ""),
+    )
+    .await;
+    assert_eq!(status(&resp), 200, "{resp}");
+    assert!(body_str(&resp).contains("\"dry_run\":true"));
+    let listed = raw_request(srv.addr, &operator_get("/v1/jobs")).await;
+    let value: serde_json::Value = serde_json::from_str(body_str(&listed)).unwrap();
+    assert_eq!(
+        value
+            .get("jobs")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let viewer = format!(
+        "POST /v1/jobs HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {VIEW_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nIdempotency-Key: {key}\r\n\r\n{body}",
+        body.len()
+    );
+    let forbidden = raw_request(srv.addr, &viewer).await;
+    assert_eq!(status(&forbidden), 403, "{forbidden}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn retry_without_a_body_reuses_the_stored_spec() {
+    let srv = start_server().await;
+    let key = format!("retry-body-{}", std::process::id());
+    let spec = sample_spec(Some(&key));
+    let body = serde_json::to_string(&spec).unwrap();
+    let created = raw_request(srv.addr, &post_with_headers("/v1/jobs", &body, "")).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let old_id = serde_json::from_str::<serde_json::Value>(body_str(&created))
+        .unwrap()
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap()
+        .to_owned();
+    let cancelled = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{old_id}/cancel"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&cancelled), 200, "{cancelled}");
+
+    let retried = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{old_id}/retry"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&retried), 200, "{retried}");
+    let value: serde_json::Value = serde_json::from_str(body_str(&retried)).unwrap();
+    let new_id = value
+        .get("job")
+        .and_then(|job| job.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    assert_ne!(new_id, old_id);
+    let new_job = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{new_id}"))).await;
+    let new_value: serde_json::Value = serde_json::from_str(body_str(&new_job)).unwrap();
+    assert_eq!(
+        new_value
+            .get("spec")
+            .and_then(|spec| spec.get("idempotency_key"))
+            .and_then(serde_json::Value::as_str),
+        Some(key.as_str())
+    );
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn write_if_match_star_checks_stored_job_identity() {
+    let srv = start_server().await;
+    let spec_key = format!("if-match-create-{}", std::process::id());
+    let spec = sample_spec(Some(&spec_key));
+    let body = serde_json::to_string(&spec).unwrap();
+    let first = raw_request(
+        srv.addr,
+        &post_with_headers("/v1/jobs", &body, "If-Match: *\r\n"),
+    )
+    .await;
+    assert_eq!(status(&first), 201, "{first}");
+    let duplicate = raw_request(
+        srv.addr,
+        &post_with_headers("/v1/jobs", &body, "If-Match: *\r\n"),
+    )
+    .await;
+    assert_eq!(status(&duplicate), 412, "{duplicate}");
+    assert!(body_str(&duplicate).contains("precondition_failed"));
+
+    let limit = "{\"max_running\":1}";
+    let bogus = format!(
+        "PUT /v1/groups/compat/limit HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nIf-Match: \"deadbeef\"\r\n\r\n{}",
+        limit.len(),
+        limit
+    );
+    let rejected = raw_request(srv.addr, &bogus).await;
+    assert_eq!(status(&rejected), 412, "{rejected}");
+    let star = bogus.replace("If-Match: \"deadbeef\"", "If-Match: *");
+    let accepted = raw_request(srv.addr, &star).await;
+    assert_eq!(status(&accepted), 200, "{accepted}");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn write_keys_replay_across_mutations() {
+    let srv = start_server().await;
+    let pid = std::process::id();
+
+    let cancel_source =
+        submit_spec(srv.addr, &sample_spec(Some(&format!("cancel-src-{pid}")))).await;
+    assert_eq!(status(&cancel_source), 201, "{cancel_source}");
+    let cancel_id = serde_json::from_str::<serde_json::Value>(body_str(&cancel_source)).unwrap()
+        ["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let cancel_key = format!("cancel-key-{pid}");
+    let cancel_headers = format!("Idempotency-Key: {cancel_key}\r\n");
+    let cancel = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{cancel_id}/cancel"), "", &cancel_headers),
+    )
+    .await;
+    let cancel_replay = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{cancel_id}/cancel"), "", &cancel_headers),
+    )
+    .await;
+    assert_eq!(status(&cancel), 200, "{cancel}");
+    assert_eq!(status(&cancel_replay), 200, "{cancel_replay}");
+    let cancel_body: serde_json::Value = serde_json::from_str(body_str(&cancel)).unwrap();
+    let cancel_replay_body: serde_json::Value =
+        serde_json::from_str(body_str(&cancel_replay)).unwrap();
+    assert_eq!(cancel_body, cancel_replay_body);
+
+    let retry_source = submit_spec(srv.addr, &sample_spec(Some(&format!("retry-src-{pid}")))).await;
+    assert_eq!(status(&retry_source), 201, "{retry_source}");
+    let retry_id = serde_json::from_str::<serde_json::Value>(body_str(&retry_source)).unwrap()
+        ["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let terminal = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{retry_id}/cancel"), "", ""),
+    )
+    .await;
+    assert_eq!(status(&terminal), 200, "{terminal}");
+    let retry_key = format!("retry-key-{pid}");
+    let retry_headers = format!("Idempotency-Key: {retry_key}\r\n");
+    let retry = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{retry_id}/retry"), "", &retry_headers),
+    )
+    .await;
+    let retry_replay = raw_request(
+        srv.addr,
+        &post_with_headers(&format!("/v1/jobs/{retry_id}/retry"), "", &retry_headers),
+    )
+    .await;
+    assert_eq!(status(&retry), 200, "{retry}");
+    assert_eq!(status(&retry_replay), 200, "{retry_replay}");
+    let retry_body: serde_json::Value = serde_json::from_str(body_str(&retry)).unwrap();
+    let retry_replay_body: serde_json::Value =
+        serde_json::from_str(body_str(&retry_replay)).unwrap();
+    assert_eq!(retry_body, retry_replay_body);
+
+    let mut draft = sample_spec(Some(&format!("draft-src-{pid}")));
+    draft.draft = true;
+    let draft_created = submit_spec(srv.addr, &draft).await;
+    assert_eq!(status(&draft_created), 201, "{draft_created}");
+    let draft_id = serde_json::from_str::<serde_json::Value>(body_str(&draft_created)).unwrap()
+        ["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let approve_key = format!("approve-key-{pid}");
+    let approve_headers = format!("Idempotency-Key: {approve_key}\r\n");
+    let approve = raw_request(
+        srv.addr,
+        &post_with_headers(
+            &format!("/v1/drafts/{draft_id}/approve"),
+            "",
+            &approve_headers,
+        ),
+    )
+    .await;
+    let approve_replay = raw_request(
+        srv.addr,
+        &post_with_headers(
+            &format!("/v1/drafts/{draft_id}/approve"),
+            "",
+            &approve_headers,
+        ),
+    )
+    .await;
+    assert_eq!(status(&approve), 200, "{approve}");
+    assert_eq!(status(&approve_replay), 200, "{approve_replay}");
+    let approve_body: serde_json::Value = serde_json::from_str(body_str(&approve)).unwrap();
+    let approve_replay_body: serde_json::Value =
+        serde_json::from_str(body_str(&approve_replay)).unwrap();
+    assert_eq!(approve_body, approve_replay_body);
+    let approved = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{draft_id}"))).await;
+    let approved_value: serde_json::Value = serde_json::from_str(body_str(&approved)).unwrap();
+    assert_eq!(approved_value["state"], "queued");
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn write_dry_runs_leave_jobs_and_clean_queue_untouched() {
+    let srv = start_server().await;
+    let spec_key = format!("dry-existing-{}", std::process::id());
+    let created = submit_spec(srv.addr, &sample_spec(Some(&spec_key))).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&created)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let job = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}"))).await;
+    let etag = header_value(&job, "etag").unwrap().to_owned();
+
+    let stale = raw_request(
+        srv.addr,
+        &post_with_headers(
+            &format!("/v1/jobs/{id}/retry?dry_run=1"),
+            "",
+            "If-Match: \"00000000000000000000000000000000\"\r\n",
+        ),
+    )
+    .await;
+    assert_eq!(status(&stale), 412, "{stale}");
+    for path in [
+        format!("/v1/jobs/{id}/retry?dry_run=1"),
+        format!("/v1/jobs/{id}/cancel?dry_run=1"),
+    ] {
+        let dry = raw_request(srv.addr, &post_with_headers(&path, "", "")).await;
+        assert_eq!(status(&dry), 200, "{dry}");
+        assert!(body_str(&dry).contains("\"dry_run\":true"), "{dry}");
+    }
+
+    let listed = raw_request(srv.addr, &operator_get("/v1/jobs")).await;
+    let value: serde_json::Value = serde_json::from_str(body_str(&listed)).unwrap();
+    let jobs = value["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0]["state"], "queued");
+    assert_eq!(header_value(&job, "etag"), Some(etag.as_str()));
+
+    let poll = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert_eq!(status(&poll), 200, "{poll}");
+    let clean = raw_request(
+        srv.addr,
+        &post_with_headers(
+            "/v1/nodes/node-a/workspaces/clean?all=true&dry_run=1",
+            "",
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status(&clean), 200, "{clean}");
+    assert!(body_str(&clean).contains("\"dry_run\":true"), "{clean}");
+    assert!(srv.state.pending_clean.lock().unwrap().is_empty());
 
     let _ = srv.shutdown.send(());
 }

@@ -118,6 +118,24 @@ done
 
 self=$("$agent_dir/ting" status --json --config "$work/ting.toml")
 echo "$self" | grep -q '"online":true' || { echo "agent not online: $self"; exit 1; }
+
+# The write controls are additive. An older controller must ignore the new headers and query
+# parameter; a newer one must accept them. Use a config file so the generated token never appears
+# in a process argument.
+cat > "$work/write-controls.cfg" <<CFG
+header = "Authorization: Bearer $op_token"
+header = "If-Match: *"
+header = "Idempotency-Key: compat-$$"
+CFG
+code=$(curl -sS -o "$work/probe.out" -w '%{http_code}' --config "$work/write-controls.cfg" \
+    -X PUT -H 'Content-Type: application/json' --data '{"max_running":1}' \
+    "$LU_URL/v1/groups/compat/limit?dry_run=1")
+[ "$code" = 200 ] || { echo "optional write controls rejected: $code"; cat "$work/probe.out"; exit 1; }
+code=$(curl -sS -o "$work/probe.out" -w '%{http_code}' --config "$work/write-controls.cfg" \
+    -X POST -H 'Content-Type: application/json' --data '{}' \
+    "$LU_URL/v1/jobs?dry_run=1")
+[ "$code" = 422 ] || { echo "dry-run validation changed: $code"; cat "$work/probe.out"; exit 1; }
+
 "$agent_dir/ting" drain --config "$work/ting.toml" > /dev/null
 "$ctl_dir/lu" nodes --json | grep -q '"draining":true' || { echo "drain not visible to the controller"; exit 1; }
 "$agent_dir/ting" undrain --config "$work/ting.toml" > /dev/null

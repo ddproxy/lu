@@ -18,6 +18,12 @@ may be newer than its agents.** Neither order needs to be forced.
   forms are accepted.
 - Routes are only added. A newer agent that calls a route an older controller does not have gets a
   `404` and must treat that as "not supported", not as a failure of the node.
+- Request headers and query parameters are optional. A client may send `If-Match`,
+  `Idempotency-Key` or `?dry_run=1` to a controller that does not implement them; the older
+  controller ignores unknown headers and query parameters and answers with its original status and
+  body. A newer controller adds no required header or parameter. Dry-run and replay bodies only
+  contain fields that were already allowed, and the stored `request_keys` table is the only new
+  table.
 - The database is migrated in place and only forward: a new controller starts on the previous
   release's database. Rolling a controller back to an older release is done from the dated
   database copy, not by running the old binary on a migrated database.
@@ -27,9 +33,10 @@ may be newer than its agents.** Neither order needs to be forced.
 `scripts/compat-test.sh <controller-bin-dir> <agent-bin-dir> [<db-seed-bin-dir>]` starts a
 controller from one build and an agent from another on loopback. It confirms the node registers
 and reports itself, drains and undrains, and with a third directory it starts the controller on a
-database the older release created. CI runs the previous release's agent against the new controller
-and the new agent against the previous release's controller, so a wire change that breaks either
-fails the build.
+database the older release created. It also sends the optional `If-Match`, `Idempotency-Key` and
+`?dry_run=1` controls to both builds: an older controller must ignore them and a newer one must
+accept them. CI runs the previous release's agent against the new controller and the new agent
+against the previous release's controller, so a wire change that breaks either fails the build.
 
 ## Updating a fleet
 

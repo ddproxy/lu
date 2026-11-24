@@ -9,7 +9,7 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 #[cfg(test)]
 pub mod conformance;
@@ -313,6 +313,8 @@ pub enum StoreError {
     },
     /// The write names an epoch older than the job's.
     StaleEpoch,
+    /// The caller's `If-Match` did not name the job's current representation.
+    Precondition,
     /// `after` names a job that does not exist.
     InvalidDependency(JobId),
     /// `after` names a job that already failed or was cancelled, so the new job could never run.
@@ -338,9 +340,61 @@ pub struct DraftCounts {
     pub oldest_created_at: Option<i64>,
 }
 
+/// Outcome of claiming an HTTP idempotency key. A replay carries the stored response body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestKeyReservation {
+    Reserved,
+    Replayed(String),
+}
+
 pub trait Store: Send + Sync + 'static {
+    /// Claims an HTTP request key for `(operator, key)`. A matching, unexpired key replays its
+    /// stored response; a different operation or body conflicts. Stores without key storage always
+    /// reserve, so no replay is possible there.
+    fn reserve_request_key(
+        &self,
+        operator: &str,
+        key: &str,
+        operation: &str,
+        fingerprint: &str,
+        ttl_secs: u64,
+    ) -> Result<RequestKeyReservation, StoreError> {
+        let _ = (operator, key, operation, fingerprint, ttl_secs);
+        Ok(RequestKeyReservation::Reserved)
+    }
+    /// Stores the successful response for a claimed key.
+    fn complete_request_key(
+        &self,
+        operator: &str,
+        key: &str,
+        response: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let _ = (operator, key, response);
+        Ok(())
+    }
+    /// Drops a claim after a failed mutation so the key can be retried.
+    fn release_request_key(&self, operator: &str, key: &str) -> Result<(), StoreError> {
+        let _ = (operator, key);
+        Ok(())
+    }
+
     /// Creates a job, or returns the existing one for the same key and spec (`false`).
     fn create_job(&self, spec: &JobSpec, now: Now) -> Result<(JobRecord, bool), StoreError>;
+
+    /// Creates a job only when the spec's idempotency key is unused, for `If-Match: *` on submit.
+    /// Stores without transactional key lookup use a check-then-write fallback with a race.
+    fn create_job_if_absent(
+        &self,
+        spec: &JobSpec,
+        now: Now,
+    ) -> Result<(JobRecord, bool), StoreError> {
+        if let Some(key) = &spec.idempotency_key {
+            if self.job_by_key(key).is_some() {
+                return Err(StoreError::Precondition);
+            }
+        }
+        self.create_job(spec, now)
+    }
     /// Creates a draft job while enforcing draft capacity atomically. Evicts oldest drafts as
     /// needed (same origin for per-source overflow, global for total overflow). Returns
     /// `LimitExceeded("max_drafts")` when capacity cannot be freed.
@@ -478,26 +532,43 @@ pub trait Store: Send + Sync + 'static {
 
     /// Cancels a job; by default only the named job. Stores that track dependency waits can also
     /// cancel the blocked dependents that can no longer run.
+    /// `expected_updated_at`, when set, must still be the row's `updated_at` inside the write
+    /// transaction; otherwise `Precondition` is returned without changing state.
     fn cancel_job_with_dependents(
         &self,
         id: &JobId,
         now: Now,
         keep_dependents: bool,
+        expected_updated_at: Option<i64>,
     ) -> Result<JobRecord, StoreError> {
         let _ = keep_dependents;
+        if let Some(expected) = expected_updated_at {
+            let rec = self.get_job(id)?;
+            if rec.updated_at != expected {
+                return Err(StoreError::Precondition);
+            }
+        }
         self.cancel_job(id, now)
     }
 
     /// Creates a fresh terminal retry of `id` from `spec`. When `chain` is set, blocked dependents
     /// are cloned too, remapped onto the new ids. Returns each `(old, new)` pair created.
+    /// `expected_updated_at` is checked inside the write transaction by stores that support it.
     fn retry_with_dependents(
         &self,
         id: &JobId,
         spec: &JobSpec,
         chain: bool,
         now: Now,
+        expected_updated_at: Option<i64>,
     ) -> Result<(JobRecord, Vec<(JobId, JobId)>), StoreError> {
         let _ = (id, spec, chain, now);
+        if let Some(expected) = expected_updated_at {
+            let rec = self.get_job(id)?;
+            if rec.updated_at != expected {
+                return Err(StoreError::Precondition);
+            }
+        }
         Err(StoreError::InvalidSpec(
             "retrying with dependents is not supported by this store".to_owned(),
         ))
@@ -518,6 +589,33 @@ pub trait Store: Send + Sync + 'static {
     fn draft_counts(&self) -> Result<DraftCounts, StoreError> {
         Ok(DraftCounts::default())
     }
+    /// Applies an optional edit and approves a draft as one operation. `expected_updated_at` is
+    /// checked before any write; stores with transactional support check it inside the write
+    /// transaction. The default implementation has a check-then-write race.
+    fn approve_draft_if(
+        &self,
+        id: &JobId,
+        edit: Option<&JobEdit>,
+        target: JobState,
+        now: Now,
+        expected_updated_at: Option<i64>,
+    ) -> Result<JobRecord, StoreError> {
+        let rec = self.get_job(id)?;
+        if let Some(expected) = expected_updated_at {
+            if rec.updated_at != expected {
+                return Err(StoreError::Precondition);
+            }
+        }
+        if rec.state != JobState::Draft {
+            return Err(StoreError::Conflict { length: None });
+        }
+        let _rec = match edit {
+            Some(edit) => self.edit_job(id, edit, now)?,
+            None => rec,
+        };
+        self.approve_draft(id, target, now)
+    }
+
     /// Moves a draft to `queued` or `blocked`. Only those two targets are accepted.
     fn approve_draft(
         &self,

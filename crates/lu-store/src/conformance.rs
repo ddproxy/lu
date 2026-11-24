@@ -791,7 +791,7 @@ fn cancel_with_dependents_keeps_or_cascades<S: Store>(s: &S) {
         )
         .unwrap();
     let cancelled = s
-        .cancel_job_with_dependents(&a.id, now(3, 3), true)
+        .cancel_job_with_dependents(&a.id, now(3, 3), true, None)
         .unwrap();
     assert_eq!(cancelled.state, JobState::Cancelled);
     assert_blocked_on_predecessor(&s.get_job(&b.id).unwrap(), &a.id, 3);
@@ -818,7 +818,7 @@ fn cancel_with_dependents_keeps_or_cascades<S: Store>(s: &S) {
         )
         .unwrap();
     let cancelled = s
-        .cancel_job_with_dependents(&x.id, now(7, 7), false)
+        .cancel_job_with_dependents(&x.id, now(7, 7), false, None)
         .unwrap();
     assert_eq!(cancelled.state, JobState::Cancelled);
     assert_eq!(cancelled.finished_at, Some(7));
@@ -854,13 +854,13 @@ fn retry_with_dependents_reattaches_or_clones<S: Store>(s: &S) {
         .unwrap();
     finish_failed(s, &a.id, "retry-direct-node", 10, 10);
     assert_eq!(
-        s.retry_with_dependents(&b.id, &a_spec, false, now(11, 11)),
+        s.retry_with_dependents(&b.id, &a_spec, false, now(11, 11), None),
         Err(StoreError::Conflict { length: None }),
         "a blocked job is not retryable"
     );
 
     let (root, pairs) = s
-        .retry_with_dependents(&a.id, &a_spec, false, now(12, 12))
+        .retry_with_dependents(&a.id, &a_spec, false, now(12, 12), None)
         .unwrap();
     assert_eq!(pairs, vec![(a.id.clone(), root.id.clone())]);
     assert_eq!(root.state, JobState::Queued);
@@ -888,7 +888,7 @@ fn retry_with_dependents_reattaches_or_clones<S: Store>(s: &S) {
     finish_failed(s, &x.id, "retry-chain-node", 20, 20);
 
     let (new_x, pairs) = s
-        .retry_with_dependents(&x.id, &x_spec, true, now(21, 21))
+        .retry_with_dependents(&x.id, &x_spec, true, now(21, 21), None)
         .unwrap();
     assert_eq!(pairs.len(), 3);
     assert_eq!(pairs[0], (x.id.clone(), new_x.id.clone()));

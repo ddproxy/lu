@@ -161,7 +161,7 @@ The first call is `-32602` because `limit` is at most 100. The second returns a 
 
 ## Recovery and backups
 
-The store expects schema version `6`. Schema 1 to 5 databases are migrated in place at startup; any other version is refused with a message telling the operator to create a new database. `lu restore` is stricter and accepts only schema 4 backups. Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
+The store expects schema version `7`. Schema 1 to 6 databases are migrated in place at startup; any other version is refused with a message telling the operator to create a new database. `lu restore` is stricter and accepts only backups at the current schema version (7). Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
 
 `lu backup` and `lu restore` procedures, including interrupted restores and artifact snapshots, are in [operations.md](operations.md#backup-and-restore).
 

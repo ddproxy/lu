@@ -490,7 +490,8 @@ async fn process(
                 });
             }
             let changed =
-                crate::routes::cancel_job_with_descendants(state, &child.id, false, true).await?;
+                crate::routes::cancel_job_with_descendants(state, &child.id, false, true, None)
+                    .await?;
             for id in &changed {
                 state.waiters.notify_job(id.as_ref());
             }
@@ -522,6 +523,8 @@ fn result_label(code: ErrorCode) -> &'static str {
         ErrorCode::NotFound => "not_found",
         ErrorCode::BadRequest | ErrorCode::Unprocessable | ErrorCode::TooLarge => "bad_request",
         ErrorCode::StaleEpoch => "stale_epoch",
+        ErrorCode::Precondition => "precondition_failed",
+        ErrorCode::IdempotencyConflict => "conflict",
         ErrorCode::Conflict => "conflict",
         ErrorCode::Unauthorized => "unauthorized",
         ErrorCode::Forbidden => "forbidden",
@@ -730,6 +733,8 @@ fn limit_message(error: &ApiError) -> String {
             .unwrap_or_else(|| "limit exceeded".to_owned()),
         ErrorCode::NotFound => NOT_FOUND.to_owned(),
         ErrorCode::StaleEpoch => "stale epoch".to_owned(),
+        ErrorCode::Precondition => "precondition failed".to_owned(),
+        ErrorCode::IdempotencyConflict => "idempotency conflict".to_owned(),
         ErrorCode::Unauthorized => "unauthorized".to_owned(),
         ErrorCode::Forbidden => "forbidden".to_owned(),
         ErrorCode::Conflict => "conflict".to_owned(),

@@ -156,6 +156,7 @@ fn require_lu_database(info: &BackupInfo) -> Result<(), String> {
         "nodes",
         "cordons",
         "idempotency",
+        "request_keys",
         "job_deps",
     ] {
         if !info.tables.iter().any(|table| table == required) {
