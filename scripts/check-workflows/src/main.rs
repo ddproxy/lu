@@ -43,6 +43,7 @@ fn main() -> ExitCode {
         check_top_level_permissions(&name, &doc, &mut problems);
         check_pinned_uses(&name, &text, &mut problems);
         check_job_permissions(&name, &doc, &mut problems);
+        check_release_triggers(&name, &doc, &text, &mut problems);
     }
 
     check_dependabot(root, &mut problems);
@@ -66,6 +67,40 @@ fn check_top_level_permissions(name: &str, doc: &Value, problems: &mut Vec<Strin
     }
 }
 
+/// Dev builds must run release.yml on the tag ref, never as a reusable call.
+fn check_release_triggers(name: &str, doc: &Value, text: &str, problems: &mut Vec<String>) {
+    if text.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("workflow_call:") || line.starts_with("uses: ./.github/workflows/")
+    }) {
+        problems.push(format!(
+            "{name}: reusable workflows change the signing identity; dispatch on the tag ref"
+        ));
+    }
+    let on = doc.get("on").or_else(|| doc.get(Value::Bool(true)));
+    if name == "release.yml" {
+        let tags: Vec<&str> = on
+            .and_then(|on| on.get("push"))
+            .and_then(|push| push.get("tags"))
+            .and_then(Value::as_sequence)
+            .map(|tags| tags.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        if !tags.contains(&"v*") || !tags.contains(&"!v*-dev.*") {
+            problems.push(format!(
+                "{name}: push tags must be v* and exclude dev tags with !v*-dev.*"
+            ));
+        }
+        if on.and_then(|on| on.get("workflow_dispatch")).is_none() {
+            problems.push(format!("{name}: missing workflow_dispatch trigger"));
+        }
+    }
+    if name == "dev-release.yml" && !text.contains("gh workflow run release.yml") {
+        problems.push(format!(
+            "{name}: must start release.yml with gh workflow run"
+        ));
+    }
+}
+
 fn check_pinned_uses(name: &str, text: &str, problems: &mut Vec<String>) {
     for (line_number, line) in text.lines().enumerate() {
         let Some(position) = line.find("uses:") else {
@@ -75,11 +110,6 @@ fn check_pinned_uses(name: &str, text: &str, problems: &mut Vec<String>) {
         let mut fields = rest.splitn(2, '#');
         let action = fields.next().unwrap_or_default().trim();
         let version = fields.next().map(str::trim);
-        // A reusable workflow in this repository has no version to pin.
-        if action.starts_with("./.github/workflows/") {
-            continue;
-        }
-
         let pinned = action.rsplit_once('@').is_some_and(|(repo, sha)| {
             repo.split_once('/').is_some_and(|(owner, name)| {
                 !owner.is_empty()
@@ -148,12 +178,7 @@ fn expected_permissions(workflow: &str, job: &str) -> Option<Permissions> {
     const READ: Permissions = &[("contents", "read")];
     Some(match (workflow, job) {
         ("ci.yml", "test" | "musl" | "compat") => READ,
-        ("dev-release.yml", "tag" | "prune") => &[("contents", "write")],
-        ("dev-release.yml", "release") => &[
-            ("attestations", "write"),
-            ("contents", "write"),
-            ("id-token", "write"),
-        ],
+        ("dev-release.yml", "tag") => &[("actions", "write"), ("contents", "write")],
         ("pages.yml", "build") => READ,
         ("pages.yml", "deploy") => &[("pages", "write"), ("id-token", "write")],
         ("codeql.yml", "analyze") => &[
@@ -171,6 +196,7 @@ fn expected_permissions(workflow: &str, job: &str) -> Option<Permissions> {
         ("fuzz.yml", "fuzz") => READ,
         ("release.yml", "create") => &[("contents", "write")],
         ("release.yml", "build" | "sbom") => READ,
+        ("release.yml", "prune") => &[("contents", "write")],
         ("release.yml", "publish") => &[
             ("attestations", "write"),
             ("contents", "write"),
@@ -244,5 +270,46 @@ fn check_dependabot(root: &Path, problems: &mut Vec<String>) {
         problems.push(format!(
             "dependabot.yml: ecosystems {ecosystems:?}, expected cargo and github-actions"
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(name: &str, text: &str) -> Vec<String> {
+        let doc: Value = serde_yaml::from_str(text).unwrap();
+        let mut problems = Vec::new();
+        check_release_triggers(name, &doc, text, &mut problems);
+        problems
+    }
+
+    const RELEASE: &str = "on:\n  push:\n    tags: [\"v*\", \"!v*-dev.*\"]\n  workflow_dispatch:\n";
+
+    #[test]
+    fn accepts_dispatch_release() {
+        assert!(run("release.yml", RELEASE).is_empty());
+    }
+
+    #[test]
+    fn rejects_reusable_call() {
+        let text = format!("{RELEASE}  workflow_call:\n");
+        assert!(!run("release.yml", &text).is_empty());
+        let caller = "jobs:\n  r:\n    uses: ./.github/workflows/release.yml\n";
+        assert!(!run("dev-release.yml", caller).is_empty());
+    }
+
+    #[test]
+    fn rejects_dev_tags_on_push() {
+        let text = "on:\n  push:\n    tags: [\"v*\"]\n  workflow_dispatch:\n";
+        assert!(!run("release.yml", text).is_empty());
+    }
+
+    #[test]
+    fn dev_release_policy_row() {
+        let want: Permissions = &[("actions", "write"), ("contents", "write")];
+        assert_eq!(expected_permissions("dev-release.yml", "tag"), Some(want));
+        assert_eq!(expected_permissions("dev-release.yml", "release"), None);
+        assert!(expected_permissions("release.yml", "prune").is_some());
     }
 }

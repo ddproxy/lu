@@ -2,23 +2,19 @@ name: release
 
 on:
   push:
-    tags: ["v*"]
-  # The dev-release workflow builds an automatic dev tag through here.
-  workflow_call:
-    inputs:
-      tag:
-        description: Tag to build and publish
-        required: true
-        type: string
+    tags: ["v*", "!v*-dev.*"]
+  # The dev-release workflow dispatches this on the dev tag ref, so the signing
+  # certificate identity is release.yml@refs/tags/<tag> like a stable release.
+  workflow_dispatch:
 
 permissions: {}
 
 env:
-  TAG: ${{ inputs.tag || github.ref_name }}
+  TAG: ${{ github.ref_name }}
 
 jobs:
   create:
-    if: github.server_url == 'https://github.com'
+    if: github.server_url == 'https://github.com' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -39,6 +35,7 @@ jobs:
 
   build:
     needs: create
+    if: github.ref_type == 'tag'
     strategy:
       fail-fast: false
       matrix:
@@ -105,6 +102,7 @@ jobs:
 
   sbom:
     needs: create
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -136,6 +134,7 @@ jobs:
 
   publish:
     needs: [build, sbom]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -160,3 +159,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
+  prune:
+    needs: publish
+    if: github.ref_type == 'tag' && contains(github.ref_name, '-dev.')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Keep the newest ten dev releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.isPrerelease and (.tagName | test("-dev\\.")))] | sort_by(.createdAt) | reverse | .[10:] | .[].tagName' \
+            | while read -r old; do
+                gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+              done

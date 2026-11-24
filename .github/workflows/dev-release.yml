@@ -22,9 +22,8 @@ jobs:
       github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
-    outputs:
-      tag: ${{ steps.next.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -65,31 +64,11 @@ jobs:
           git tag -a "$tag" "$SHA" -m "dev build of $SHA"
           git push origin "refs/tags/$tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-  release:
-    needs: tag
-    if: needs.tag.outputs.tag != ''
-    uses: ./.github/workflows/release.yml
-    with:
-      tag: ${{ needs.tag.outputs.tag }}
-    permissions:
-      attestations: write
-      contents: write
-      id-token: write
-
-  prune:
-    needs: release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Keep the newest ten dev releases
+      - name: Start the release on the tag
+        if: steps.next.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -eu
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,isPrerelease,createdAt \
-            --jq '[.[] | select(.isPrerelease and (.tagName | test("-dev\\.")))] | sort_by(.createdAt) | reverse | .[10:] | .[].tagName' \
-            | while read -r old; do
-                gh release delete "$old" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-              done
+          TAG: ${{ steps.next.outputs.tag }}
+        # Tag pushes made with GITHUB_TOKEN start no workflows, and a reusable call would sign
+        # as the main ref. Dispatching on the tag ref gives the certificate refs/tags/<tag>.
+        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG"
