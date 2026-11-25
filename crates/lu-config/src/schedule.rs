@@ -664,8 +664,8 @@ mod tests {
                 "use [[attach]]",
             ),
         ] {
-            let (table, reason) = error_parts(&text);
-            assert!(reason.contains(expected), "{table}: {reason}");
+            let (_table, reason) = error_parts(&text);
+            assert!(reason.contains(expected));
         }
     }
 
@@ -674,8 +674,8 @@ mod tests {
         let text = format!("{}\n[[calendar]]\nname = \"office\"\ndates = []\n", base());
         let (table, reason) = error_parts(&text);
         assert!(table.contains("[[calendar]] #0"), "{table}");
-        assert!(reason.contains("dates"), "{reason}");
-        assert!(reason.contains("use ranges"), "{reason}");
+        assert!(reason.contains("dates"));
+        assert!(reason.contains("use ranges"));
     }
 
     #[test]
@@ -684,7 +684,7 @@ mod tests {
         let (table, reason) = error_parts(&text);
         assert!(table.contains("[[calendar]] #0"), "{table}");
         assert!(table.contains("windows[0]"), "{table}");
-        assert!(reason.contains("from and to"), "{reason}");
+        assert!(reason.contains("from and to"));
     }
 
     #[test]
@@ -696,8 +696,8 @@ mod tests {
         );
         let (table, reason) = error_parts(&text);
         assert_eq!(table, "[[attach]] #0");
-        assert!(reason.contains("calendars"), "{reason}");
-        assert!(reason.contains("missing"), "{reason}");
+        assert!(reason.contains("calendars"));
+        assert!(reason.contains("missing"));
     }
 
     #[test]
@@ -705,7 +705,7 @@ mod tests {
         let text = format!("{}\n{}", base(), calendar_table("22:00", "06:00", "+15:00"));
         let (table, reason) = error_parts(&text);
         assert!(table.contains("[[calendar]] #0"), "{table}");
-        assert!(reason.contains("offset"), "{reason}");
+        assert!(reason.contains("offset"));
     }
 
     #[test]
@@ -716,13 +716,13 @@ mod tests {
         );
         let (table, reason) = error_parts(&text);
         assert!(table.contains("windows[0]"), "{table}");
-        assert!(reason.contains("days"), "{reason}");
-        assert!(reason.contains("funday"), "{reason}");
+        assert!(reason.contains("days"));
+        assert!(reason.contains("funday"));
 
         let text = format!("{}\n[schedule]\nhorizon_secs = 10\nsurprise = 1\n", base());
         let (table, reason) = error_parts(&text);
         assert_eq!(table, "[schedule]");
-        assert!(reason.contains("surprise"), "{reason}");
+        assert!(reason.contains("surprise"));
     }
 
     #[test]

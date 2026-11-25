@@ -2949,11 +2949,8 @@ mod tests {
     }
 
     fn expect_reason(text: &str, fragment: &str) {
-        let (table, reason) = invalid(Config::parse(text).unwrap_err());
-        assert!(
-            reason.contains(fragment),
-            "table {table}: expected {fragment:?}, got {reason:?}"
-        );
+        let (_table, reason) = invalid(Config::parse(text).unwrap_err());
+        assert!(reason.contains(fragment));
     }
 
     pub(super) fn controller_only() -> String {
@@ -3367,7 +3364,7 @@ heartbeat_secs = 15
 
     fn expect_table(text: &str, table: &str) {
         match Config::parse(text).unwrap_err() {
-            ConfigError::Invalid { table: t, reason } => assert_eq!(t, table, "reason: {reason}"),
+            ConfigError::Invalid { table: t, .. } => assert_eq!(t, table),
             ConfigError::Parse(message) => {
                 assert!(
                     message.contains("unknown field") || message.contains("extra"),
@@ -3665,13 +3662,13 @@ heartbeat_secs = 15
         );
         let (t, r) = invalid(Config::parse(&dup).unwrap_err());
         assert_eq!(t, "[[controller.agents]] #2 (a)");
-        assert!(r.contains("earlier agent"), "{r}");
+        assert!(r.contains("earlier agent"));
         let dup_op = format!(
             "[controller]\nlisten=\"127.0.0.1:1\"\ndb=\"/db\"\nartifacts_dir=\"/a\"\n[[controller.operators]]\nname=\"o\"\ntoken_sha256=\"{HASH_A}\"\n[[controller.operators]]\nname=\"o\"\ntoken_sha256=\"{HASH_B}\"\n"
         );
         let (t, r) = invalid(Config::parse(&dup_op).unwrap_err());
         assert_eq!(t, "[[controller.operators]] #2 (o)");
-        assert!(r.contains("earlier operator"), "{r}");
+        assert!(r.contains("earlier operator"));
     }
 
     #[test]
@@ -3696,7 +3693,7 @@ heartbeat_secs = 15
             "[controller]\nlisten=\"127.0.0.1:1\"\ndb=\"/db\"\nartifacts_dir=\"/a\"\n[[controller.agents]]\nname=\"a\"\ntoken_sha256=\"{HASH_A}\"\n[[controller.operators]]\nname=\"o\"\ntoken_sha256=\"{HASH_A}\"\n"
         );
         let (t, r) = invalid(Config::parse(&text).unwrap_err());
-        assert!(t.starts_with("[[controller.operators]]"), "{t}");
+        assert!(t.starts_with("[[controller.operators]]"));
         assert!(
             r.contains("both scopes") || r.contains("same as one used"),
             "{r}"
@@ -4102,7 +4099,7 @@ heartbeat_secs = 15
         );
         let (table, reason) = invalid(Config::parse(&dup).unwrap_err());
         assert_eq!(table, "[[controller.repos]] #2 (mirror)");
-        assert!(reason.contains("earlier repository"), "{reason}");
+        assert!(reason.contains("earlier repository"));
         expect_table(
             &base("name=\"mirror\"\nurl=\"https://example.net/a.git\"\nrefs=[]\n"),
             "[[controller.repos]] #1 (mirror)",
@@ -4137,7 +4134,7 @@ heartbeat_secs = 15
         );
         let (table, reason) = invalid(Config::parse(&dup).unwrap_err());
         assert_eq!(table, "[[controller.groups]] #2 (nightly)");
-        assert!(reason.contains("earlier group"), "{reason}");
+        assert!(reason.contains("earlier group"));
     }
 
     #[test]
@@ -4258,7 +4255,7 @@ heartbeat_secs = 15
             table.starts_with("[mirror.credentials.repos] #0"),
             "{table}"
         );
-        assert!(reason.contains("A-Z a-z 0-9"), "{reason}");
+        assert!(reason.contains("A-Z a-z 0-9"));
     }
 }
 
