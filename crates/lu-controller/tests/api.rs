@@ -2377,7 +2377,7 @@ async fn node_views_expose_cordon_details_and_uncordon_clears_them() {
     assert_eq!(detail[0]["reason"], "Provider p1 failed: timeout");
     assert_eq!(detail[0]["set_at"], 1_700_000_000);
     assert!(detail[0]["until"].as_i64().is_some());
-    assert_eq!(detail[1]["source"], "reiki");
+    assert_eq!(detail[1]["source"], "health");
     assert_eq!(detail[1]["until"], serde_json::Value::Null);
     assert_eq!(detail[1]["lifts_after_healthy_heartbeats"], 2);
 
@@ -4914,6 +4914,49 @@ async fn write_etag_guards_stale_cancellation() {
     .await;
     assert_eq!(status(&second), 412, "{second}");
 
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn same_second_writes_change_etag_and_reject_stale_match() {
+    let srv = start_server().await;
+    let created = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&created)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let first = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}"))).await;
+    assert_eq!(status(&first), 200, "{first}");
+    let first_etag = header_value(&first, "etag").unwrap().to_owned();
+    let first_body: serde_json::Value = serde_json::from_str(body_str(&first)).unwrap();
+    assert_eq!(first_body["version"], 1, "{first_body}");
+
+    for version in 2..=3 {
+        let edited = edit_job(srv.addr, &id, &JobEdit::default()).await;
+        assert_eq!(status(&edited), 200, "{edited}");
+        let current = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}"))).await;
+        let etag = header_value(&current, "etag").unwrap().to_owned();
+        assert_ne!(etag, first_etag, "version {version} kept the first ETag");
+        let body: serde_json::Value = serde_json::from_str(body_str(&current)).unwrap();
+        assert_eq!(body["version"], version, "{body}");
+    }
+
+    let stale = raw_request(
+        srv.addr,
+        &post_with_headers(
+            &format!("/v1/jobs/{id}/edit"),
+            &serde_json::to_string(&JobEdit::default()).unwrap(),
+            &format!("If-Match: {first_etag}\r\n"),
+        ),
+    )
+    .await;
+    assert_eq!(status(&stale), 412, "{stale}");
+    assert!(body_str(&stale).contains("precondition_failed"));
+
+    let unchanged = raw_request(srv.addr, &operator_get(&format!("/v1/jobs/{id}"))).await;
+    assert_ne!(header_value(&unchanged, "etag"), Some(first_etag.as_str()));
     let _ = srv.shutdown.send(());
 }
 

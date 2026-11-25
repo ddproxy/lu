@@ -15,7 +15,8 @@ may be newer than its agents.** Neither order needs to be forced.
   controller's answer.
 - A new field is optional. A field is never renamed, removed or given a different meaning in a
   release; an incompatible change needs a deprecation period of at least one release in which both
-  forms are accepted.
+  forms are accepted. The 0.8.0 rename below is the deliberate exception that batches those
+  breaking changes into one release.
 - Routes are only added. A newer agent that calls a route an older controller does not have gets a
   `404` and must treat that as "not supported", not as a failure of the node.
 - Request headers and query parameters are optional. A client may send `If-Match`,
@@ -68,6 +69,27 @@ no network. `scripts/compat-test.sh --dry-run --tags-file <file>` previews a sel
 The `compat` job builds the current binaries and calls the script with no directories. It checks
 both directions for the two latest stable releases before the workspace version, including the
 in-place migration, so a wire change that breaks either direction fails the build.
+
+## 0.8.0 breaking rename
+
+From 0.8.0 the controller reads only the neutral names: `[agent] provider_gateway_health_url` and
+`provider_gateway_token_file` in config, `provider_health` in heartbeat, poll and node-view JSON,
+`health` as the cordon source in API answers, audit records and metric labels, and `health_derived`
+as the cordon flag column in a schema-8 database. The former config aliases, wire field name,
+source value and column name are no longer read at runtime or emitted by the current release. A
+schema 1 to 7 database is migrated forward in place, including a rename of that stored column.
+
+Agents on 0.7.x still heartbeat against a 0.8.0 controller: unknown fields are ignored, so their
+provider-health document is not read and those nodes lose provider health until the agents are
+updated. Roll the controller first, then the agents. Refresh provider health before trusting
+provider routing on a node that has not been updated.
+
+Schedule and collect spellings narrow in the same release. Only `[[calendar]]`, `[[attach]]` and
+`ranges` are read in configuration, and only `none`, `files`, `apply` and `both` are read as collect
+modes. The former plural and nested table names, the calendar `dates` field and the six former mode
+aliases are refused with the accepted spelling in the error. Config and jobs that use those
+spellings must be updated before the 0.8.0 controller reads them; unlike the node wire field, they
+are not ignored.
 
 ## Updating a fleet
 

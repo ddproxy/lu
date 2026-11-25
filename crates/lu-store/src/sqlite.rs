@@ -22,8 +22,12 @@ use crate::{
 
 const CURRENT_SCHEMA_VERSION: i64 = crate::SCHEMA_VERSION;
 
+/// Column name in schema 7 and earlier databases. Runtime queries use `health_derived`; this
+/// spelling exists only so the unreleased 7-to-8 step can detect and rename an old column.
+const LEGACY_HEALTH_DERIVED_COLUMN: &str = "reiki_derived";
+
 /// Columns shared by the list/get queries that build a `JobRecord` from positional rows.
-const JOB_SELECT_COLUMNS: &str = "id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since,eligible_since,failure_reason,excluded_nodes_json";
+const JOB_SELECT_COLUMNS: &str = "id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since,eligible_since,failure_reason,excluded_nodes_json,version";
 
 fn internal<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Internal(e.to_string())
@@ -77,6 +81,13 @@ fn exclude_node(rec: &mut JobRecord, node: Option<&NodeName>) {
             rec.excluded_nodes.push(node.clone());
         }
     }
+}
+
+/// Marks a job as changed at `now`. `updated_at` stays wall-clock display data; `version` is the
+/// If-Match revision and advances even when two writes land in the same second.
+fn touch_job(rec: &mut JobRecord, now: Now) {
+    rec.updated_at = now.wall_unix;
+    rec.version = rec.version.saturating_add(1);
 }
 
 /// Whether this node failure can use another attempt. A repeated node, an exhausted node budget
@@ -244,33 +255,7 @@ impl SqliteStore {
             group_limits: Mutex::new(HashMap::new()),
         };
         store.migrate()?;
-        store.ensure_indexes()?;
         Ok(store)
-    }
-
-    /// Priority and group live in the existing JSON spec, so these expression indexes keep
-    /// dispatch ordering and active-group counts off a full scan. Re-running on every open makes
-    /// them present in databases created before this feature without a schema bump.
-    fn ensure_indexes(&self) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
-        conn.execute_batch(
-            "DROP INDEX IF EXISTS jobs_dispatch_order;
-             CREATE INDEX jobs_dispatch_order
-                 ON jobs(COALESCE(json_extract(spec_json, '$.priority'), 5) DESC,
-                         dispatch_seq ASC)
-                 WHERE state='queued';
-             CREATE INDEX IF NOT EXISTS jobs_group_active
-                 ON jobs(json_extract(spec_json, '$.group'))
-                 WHERE state IN ('leased','running','recovering','needs_input');
-             CREATE INDEX IF NOT EXISTS jobs_parent_lineage
-                 ON jobs(parent_job_id)
-                 WHERE parent_job_id IS NOT NULL;
-             CREATE INDEX IF NOT EXISTS jobs_root_lineage
-                 ON jobs(root_job_id)
-                 WHERE root_job_id IS NOT NULL;",
-        )
-        .map_err(internal)?;
-        Ok(())
     }
 
     fn migrate(&self) -> Result<(), StoreError> {
@@ -295,9 +280,11 @@ impl SqliteStore {
                 tx.commit().map_err(internal)?;
                 Ok(())
             }
-            // Schemas 1 through 7 add additive job columns. Fill them with zero/false/NULL so
-            // older jobs keep their history and views stay compatible. Each column is checked
-            // because a database briefly opened by a newer binary may already have some of them.
+            // Schemas 1 through 7 become schema 8 here. The additive job columns are filled with
+            // zero/false/NULL so older jobs keep their history and views stay compatible, and the
+            // cordon health flag column is renamed. Each column is checked because a database
+            // briefly opened by a newer binary may already have some of them. A migrated row starts
+            // at version 0 and advances on its next write.
             Some(1) | Some(2) | Some(3) | Some(4) | Some(5) | Some(6) | Some(7) => {
                 for (name, ddl) in [
                     (
@@ -346,11 +333,16 @@ impl SqliteStore {
                         "excluded_nodes_json",
                         "ALTER TABLE jobs ADD COLUMN excluded_nodes_json TEXT NOT NULL DEFAULT '[]'",
                     ),
+                    (
+                        "version",
+                        "ALTER TABLE jobs ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
+                    ),
                 ] {
                     if !job_column_exists(&tx, name)? {
                         tx.execute(ddl, []).map_err(internal)?;
                     }
                 }
+                migrate_cordon_health_column(&tx)?;
                 tx.execute(
                     "UPDATE jobs SET eligible_since=created_at WHERE eligible_since=0",
                     [],
@@ -358,6 +350,7 @@ impl SqliteStore {
                 .map_err(internal)?;
                 // Additive table for HTTP request keys. Existing rows are untouched.
                 ensure_request_keys(&tx)?;
+                create_indexes(&tx)?;
                 tx.execute(
                     "UPDATE schema_version SET version = ?1",
                     params![CURRENT_SCHEMA_VERSION],
@@ -381,6 +374,28 @@ impl SqliteStore {
             }
         }
     }
+}
+
+/// Priority and group live in the JSON spec, so these expression indexes keep dispatch ordering
+/// and active-group counts off a full scan. They are created only by baseline or migration work;
+/// opening a current database performs no index DDL.
+fn create_indexes(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS jobs_dispatch_order
+             ON jobs(COALESCE(json_extract(spec_json, '$.priority'), 5) DESC,
+                     dispatch_seq ASC)
+             WHERE state='queued';
+         CREATE INDEX IF NOT EXISTS jobs_group_active
+             ON jobs(json_extract(spec_json, '$.group'))
+             WHERE state IN ('leased','running','recovering','needs_input');
+         CREATE INDEX IF NOT EXISTS jobs_parent_lineage
+             ON jobs(parent_job_id)
+             WHERE parent_job_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS jobs_root_lineage
+             ON jobs(root_job_id)
+             WHERE root_job_id IS NOT NULL;",
+    )
+    .map_err(internal)
 }
 
 /// Creates the HTTP request-key table for databases written before schema 7. No existing row is
@@ -408,6 +423,37 @@ fn job_column_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool,
     let count: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('jobs') WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
+    Ok(count > 0)
+}
+
+/// Renames the cordon health flag in the unreleased 7-to-8 step. Values are already `0` or `1`,
+/// so a column rename carries them forward without rewriting rows.
+fn migrate_cordon_health_column(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    if cordon_column_exists(tx, "health_derived")? {
+        return Ok(());
+    }
+    if !cordon_column_exists(tx, LEGACY_HEALTH_DERIVED_COLUMN)? {
+        return Err(internal("cordons table has no health flag column"));
+    }
+    tx.execute(
+        &format!(
+            "ALTER TABLE cordons RENAME COLUMN {} TO health_derived",
+            LEGACY_HEALTH_DERIVED_COLUMN
+        ),
+        [],
+    )
+    .map(|_| ())
+    .map_err(internal)
+}
+
+fn cordon_column_exists(tx: &rusqlite::Transaction<'_>, name: &str) -> Result<bool, StoreError> {
+    let count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('cordons') WHERE name = ?1",
             params![name],
             |row| row.get(0),
         )
@@ -453,7 +499,8 @@ fn apply_baseline(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
             blocked_since INTEGER,
             eligible_since INTEGER NOT NULL DEFAULT 0,
             failure_reason TEXT,
-            excluded_nodes_json TEXT NOT NULL DEFAULT '[]'
+            excluded_nodes_json TEXT NOT NULL DEFAULT '[]',
+            version INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE nodes (
             name TEXT PRIMARY KEY,
@@ -466,7 +513,7 @@ fn apply_baseline(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
             node TEXT NOT NULL,
             provider TEXT NOT NULL,
             until_mono_ms INTEGER NOT NULL,
-            reiki_derived INTEGER NOT NULL DEFAULT 0,
+            health_derived INTEGER NOT NULL DEFAULT 0,
             healthy_hb_count INTEGER NOT NULL DEFAULT 0,
             reason TEXT NOT NULL DEFAULT '',
             set_at_unix INTEGER NOT NULL DEFAULT 0,
@@ -503,7 +550,7 @@ fn apply_baseline(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
             ON jobs(json_extract(spec_json, '$.idempotency_key'));",
     )
     .map_err(internal)?;
-    Ok(())
+    create_indexes(tx)
 }
 
 fn cordon_reason(provider: &str, completion: &Completion, source: CordonSource) -> String {
@@ -624,7 +671,7 @@ fn release_blocked_job(
 ) -> Result<(), StoreError> {
     if deps_satisfied(tx, id, include_failed)? {
         tx.execute(
-            "UPDATE jobs SET state='queued',updated_at=?2,failure_class=NULL,
+            "UPDATE jobs SET state='queued',updated_at=?2,version=version+1,failure_class=NULL,
              summary=NULL,finished_at=NULL,blocked_reason=NULL,blocked_since=NULL,
              eligible_since=?3
              WHERE id=?1 AND state='blocked'",
@@ -667,7 +714,7 @@ fn fail_dependents(
             let summary = format!("dependency {dep_id} {dep_state}; waiting for retry or TTL");
             tx.execute(
                 "UPDATE jobs SET state='blocked',blocked_reason='predecessor failed',
-                 blocked_since=?2,updated_at=?2,summary=?3,failure_class=NULL,
+                 blocked_since=?2,updated_at=?2,version=version+1,summary=?3,failure_class=NULL,
                  finished_at=NULL WHERE id=?1 AND state='blocked'",
                 params![id, now.wall_unix, summary],
             )
@@ -708,7 +755,7 @@ fn cancel_job_tx(
         CancelEffect::Now => {
             check_transition(rec.state, JobState::Cancelled)?;
             rec.state = JobState::Cancelled;
-            rec.updated_at = now.wall_unix;
+            touch_job(&mut rec, now);
             rec.finished_at = Some(now.wall_unix);
             update_job_tx(tx, &rec, None, None)?;
             fail_dependents(tx, rec.id.as_str(), JobState::Cancelled.as_str(), now)?;
@@ -716,7 +763,7 @@ fn cancel_job_tx(
         }
         CancelEffect::Request => {
             rec.cancel_requested = true;
-            rec.updated_at = now.wall_unix;
+            touch_job(&mut rec, now);
             update_job_tx(tx, &rec, lease, recov)?;
             false
         }
@@ -747,7 +794,7 @@ fn cancel_blocked_dependents_tx(
             check_transition(rec.state, JobState::Cancelled)?;
             rec.state = JobState::Cancelled;
             rec.finished_at = Some(now.wall_unix);
-            rec.updated_at = now.wall_unix;
+            touch_job(&mut rec, now);
             rec.blocked_reason = None;
             rec.blocked_since = None;
             update_job_tx(tx, &rec, None, None)?;
@@ -888,7 +935,7 @@ fn requeue_retry_root_tx(
     rec.node = None;
     rec.assigned_provider = None;
     rec.assigned_model = None;
-    rec.updated_at = now.wall_unix;
+    touch_job(&mut rec, now);
     rec.eligible_since = now.wall_unix;
     rec.started_at = None;
     rec.finished_at = None;
@@ -946,7 +993,7 @@ fn restore_retry_dependents_tx(
         rec.failure_class = None;
         rec.failure_reason = None;
         rec.finished_at = None;
-        rec.updated_at = now.wall_unix;
+        touch_job(&mut rec, now);
         if deps_satisfied(tx, id.as_str(), rec.spec.include_failed)? {
             release_blocked_job(tx, id.as_str(), rec.spec.include_failed, now)?;
         } else {
@@ -988,8 +1035,8 @@ fn depends_on(
 }
 
 /// Checks an `If-Match` observation inside the caller's write transaction. The controller derives
-/// the expected value from the same body hash a GET returns; `updated_at` is the row version
-/// observed with that body. The check and the write share one transaction here.
+/// the expected value from the same body hash a GET returns; `version` is the row revision in that
+/// body. The check and the write share one transaction here.
 fn check_expected_tx(
     tx: &rusqlite::Transaction<'_>,
     id: &str,
@@ -999,11 +1046,9 @@ fn check_expected_tx(
         return Ok(());
     };
     let current: Option<i64> = tx
-        .query_row(
-            "SELECT updated_at FROM jobs WHERE id=?1",
-            params![id],
-            |r| r.get(0),
-        )
+        .query_row("SELECT version FROM jobs WHERE id=?1", params![id], |r| {
+            r.get(0)
+        })
         .optional()
         .map_err(internal)?;
     if current != Some(expected) {
@@ -1018,7 +1063,7 @@ fn get_job_tx(
     id: &str,
 ) -> Result<(JobRecord, Option<u64>, Option<u64>), StoreError> {
     let mut stmt = tx
-        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since,eligible_since,failure_reason,excluded_nodes_json FROM jobs WHERE id=?1")
+        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since,eligible_since,failure_reason,excluded_nodes_json,version FROM jobs WHERE id=?1")
         .map_err(internal)?;
     let row = stmt
         .query_row(params![id], |r| {
@@ -1058,6 +1103,7 @@ fn get_job_tx(
                 r.get::<_, i64>("eligible_since")?,
                 r.get::<_, Option<String>>("failure_reason")?,
                 r.get::<_, String>("excluded_nodes_json")?,
+                r.get::<_, i64>("version")?,
             ))
         })
         .optional()
@@ -1100,6 +1146,7 @@ fn get_job_tx(
         eligible_since,
         failure_reason_s,
         excluded_nodes_json,
+        version,
     ) = row;
     let idp = JobId::parse(&id_s).map_err(internal)?;
     let state = parse_state(&state_s)?;
@@ -1124,6 +1171,7 @@ fn get_job_tx(
         epoch: epoch_i as u64,
         created_at,
         updated_at,
+        version,
         eligible_since,
         started_at,
         finished_at,
@@ -1171,7 +1219,7 @@ fn update_job_tx(
     let patch_secret_hits_json = serde_json::to_string(&rec.patch_secret_hits).map_err(internal)?;
     let excluded_nodes_json = encode_excluded_nodes(&rec.excluded_nodes)?;
     tx.execute(
-        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20,diff_bytes=?21,expect_failed=?22,scrubbed_hits=?23,patch_scrubbed=?24,parent_job_id=?25,root_job_id=?26,depth=?27,publish_json=?28,staged_commit=?29,blocked_reason=?30,blocked_since=?31,patch_secret_hits_json=?32,eligible_since=?33,failure_reason=?34,excluded_nodes_json=?35 WHERE id=?1",
+        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20,diff_bytes=?21,expect_failed=?22,scrubbed_hits=?23,patch_scrubbed=?24,parent_job_id=?25,root_job_id=?26,depth=?27,publish_json=?28,staged_commit=?29,blocked_reason=?30,blocked_since=?31,patch_secret_hits_json=?32,eligible_since=?33,failure_reason=?34,excluded_nodes_json=?35,version=?36 WHERE id=?1",
         params![
             rec.id.as_str(),
             state_str(rec.state),
@@ -1208,6 +1256,7 @@ fn update_job_tx(
             rec.eligible_since,
             rec.failure_reason.map(NodeFailureReason::as_str),
             excluded_nodes_json,
+            rec.version,
         ],
     ).map_err(internal)?;
     Ok(())
@@ -1226,7 +1275,7 @@ fn refresh_health_cordons(
     let cordons: Vec<(String, u64)> = {
         let mut stmt = tx
             .prepare(
-                "SELECT provider, healthy_hb_count FROM cordons WHERE node=?1 AND reiki_derived=1",
+                "SELECT provider, healthy_hb_count FROM cordons WHERE node=?1 AND health_derived=1",
             )
             .map_err(internal)?;
         let rows = stmt
@@ -1244,14 +1293,14 @@ fn refresh_health_cordons(
         let healthy = node_offers_provider(hb, &provider);
         if healthy && count.saturating_add(1) >= 2 {
             tx.execute(
-                "DELETE FROM cordons WHERE node=?1 AND provider=?2 AND reiki_derived=1",
+                "DELETE FROM cordons WHERE node=?1 AND provider=?2 AND health_derived=1",
                 params![hb.node.as_str(), provider],
             )
             .map_err(internal)?;
         } else {
             let next = if healthy { count.saturating_add(1) } else { 0 };
             tx.execute(
-                "UPDATE cordons SET healthy_hb_count=?3 WHERE node=?1 AND provider=?2 AND reiki_derived=1",
+                "UPDATE cordons SET healthy_hb_count=?3 WHERE node=?1 AND provider=?2 AND health_derived=1",
                 params![hb.node.as_str(), provider, next as i64],
             )
             .map_err(internal)?;
@@ -1299,7 +1348,7 @@ fn expire_drafts_in_tx(
         let (mut rec, lease, recov) = get_job_tx(tx, id)?;
         check_transition(rec.state, JobState::Expired)?;
         rec.state = JobState::Expired;
-        rec.updated_at = now.wall_unix;
+        touch_job(&mut rec, now);
         rec.finished_at = Some(now.wall_unix);
         update_job_tx(tx, &rec, lease, recov)?;
     }
@@ -1376,6 +1425,7 @@ fn insert_job_tx(
         epoch: 0,
         created_at: now.wall_unix,
         updated_at: now.wall_unix,
+        version: 1,
         eligible_since: now.wall_unix,
         started_at: None,
         finished_at: None,
@@ -1402,8 +1452,8 @@ fn insert_job_tx(
         publish: None,
     };
     tx.execute(
-        "INSERT INTO jobs(id,dispatch_seq,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,lease_until_mono_ms,recovering_since_mono_ms,parent_job_id,root_job_id,depth,eligible_since)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+        "INSERT INTO jobs(id,dispatch_seq,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,lease_until_mono_ms,recovering_since_mono_ms,parent_job_id,root_job_id,depth,eligible_since,version)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
         params![
             rec.id.as_str(), dispatch_seq, state_str(rec.state), canonical, 1i64, Option::<String>::None, 0i64,
             rec.created_at, rec.updated_at, Option::<i64>::None, Option::<i64>::None,
@@ -1413,6 +1463,7 @@ fn insert_job_tx(
             rec.root_job_id.as_ref().map(|id| id.as_str()),
             rec.depth as i64,
             rec.eligible_since,
+            rec.version,
         ],
     ).map_err(internal)?;
     for (ord, dep) in spec.after.iter().enumerate() {
@@ -2034,7 +2085,7 @@ fn commit_dispatch(
     rec.assigned_provider = provider.clone();
     rec.assigned_model = model.clone();
     rec.epoch = rec.epoch.saturating_add(1);
-    rec.updated_at = now.wall_unix;
+    touch_job(&mut rec, now);
     rec.failure_class = None;
     rec.failure_reason = None;
     rec.summary = None;
@@ -2473,7 +2524,7 @@ impl Store for SqliteStore {
             return Err(StoreError::Conflict { length: None });
         }
         rec.staged_commit = Some(commit.to_owned());
-        rec.updated_at = now.wall_unix;
+        touch_job(&mut rec, now);
         update_job_tx(&tx, &rec, lease, recov)?;
         tx.commit().map_err(internal)?;
         Ok(rec)
@@ -2540,7 +2591,7 @@ impl Store for SqliteStore {
                 "dependency {predecessor} failed; retry TTL {ttl_secs}s expired"
             ));
             rec.finished_at = Some(now.wall_unix);
-            rec.updated_at = now.wall_unix;
+            touch_job(&mut rec, now);
             rec.blocked_reason = None;
             rec.blocked_since = None;
             rec.cancel_requested = false;
@@ -2556,13 +2607,13 @@ impl Store for SqliteStore {
         id: &JobId,
         now: Now,
         keep_dependents: bool,
-        expected_updated_at: Option<i64>,
+        expected_version: Option<i64>,
     ) -> Result<JobRecord, StoreError> {
         let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
-        check_expected_tx(&tx, id.as_str(), expected_updated_at)?;
+        check_expected_tx(&tx, id.as_str(), expected_version)?;
         let (mut rec, cancelled_now) = cancel_job_tx(&tx, id, now)?;
         if cancelled_now && !keep_dependents {
             cancel_blocked_dependents_tx(&tx, id, now)?;
@@ -2578,7 +2629,7 @@ impl Store for SqliteStore {
         spec: &JobSpec,
         chain: bool,
         now: Now,
-        expected_updated_at: Option<i64>,
+        expected_version: Option<i64>,
     ) -> Result<(JobRecord, Vec<JobId>), StoreError> {
         spec.validate()
             .map_err(|e| StoreError::InvalidSpec(e.to_string()))?;
@@ -2586,7 +2637,7 @@ impl Store for SqliteStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
-        check_expected_tx(&tx, id.as_str(), expected_updated_at)?;
+        check_expected_tx(&tx, id.as_str(), expected_version)?;
         // The root is written first so dependents only ever see the requeued predecessor.
         let root = requeue_retry_root_tx(&tx, id, spec, now)?;
         let requeued = restore_retry_dependents_tx(&tx, id, chain, now)?;
@@ -2612,7 +2663,7 @@ impl Store for SqliteStore {
         // A future attempt uses the new provider choice, so drop the old assignment.
         rec.assigned_provider = None;
         rec.assigned_model = None;
-        rec.updated_at = now.wall_unix;
+        touch_job(&mut rec, now);
 
         if edit.after.is_some() {
             tx.execute("DELETE FROM job_deps WHERE job=?1", params![id.as_str()])
@@ -2725,7 +2776,7 @@ impl Store for SqliteStore {
         edit: Option<&lu_proto::JobEdit>,
         target: JobState,
         now: Now,
-        expected_updated_at: Option<i64>,
+        expected_version: Option<i64>,
     ) -> Result<JobRecord, StoreError> {
         // The guard and the approval transition are checked in the same store transaction when
         // there is no edit. An edit writes first, so its check-then-write window is documented in
@@ -2735,7 +2786,7 @@ impl Store for SqliteStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(internal)?;
-            check_expected_tx(&tx, id.as_str(), expected_updated_at)?;
+            check_expected_tx(&tx, id.as_str(), expected_version)?;
             tx.commit().map_err(internal)?;
         }
         let rec = self.get_job(id)?;
@@ -2768,7 +2819,7 @@ impl Store for SqliteStore {
         }
         check_transition(rec.state, target)?;
         rec.state = target;
-        rec.updated_at = now.wall_unix;
+        touch_job(&mut rec, now);
         // Clocks on a draft do not start until approval; this is the eligibility stamp.
         rec.eligible_since = now.wall_unix;
         rec.waiting_on = load_waiting(&tx, rec.id.as_str())?;
@@ -2799,7 +2850,7 @@ impl Store for SqliteStore {
             let (mut rec, lease, recov) = get_job_tx(&tx, id)?;
             check_transition(rec.state, JobState::Expired)?;
             rec.state = JobState::Expired;
-            rec.updated_at = now.wall_unix;
+            touch_job(&mut rec, now);
             rec.finished_at = Some(now.wall_unix);
             update_job_tx(&tx, &rec, lease, recov)?;
         }
@@ -2848,7 +2899,7 @@ impl Store for SqliteStore {
             let (mut rec, lease, recov) = get_job_tx(&tx, id)?;
             check_transition(rec.state, JobState::Expired)?;
             rec.state = JobState::Expired;
-            rec.updated_at = now.wall_unix;
+            touch_job(&mut rec, now);
             rec.finished_at = Some(now.wall_unix);
             update_job_tx(&tx, &rec, lease, recov)?;
         }
@@ -3029,7 +3080,7 @@ impl Store for SqliteStore {
             check_transition(rec.state, JobState::DeadlineMissed)?;
             rec.state = JobState::DeadlineMissed;
             rec.finished_at = Some(now.wall_unix);
-            rec.updated_at = now.wall_unix;
+            touch_job(&mut rec, now);
             rec.summary = Some("deadline missed".to_owned());
             update_job_tx(&tx, &rec, lease, recov)?;
             moved.push((rec.id, action));
@@ -3085,7 +3136,7 @@ impl Store for SqliteStore {
         }
         check_transition(rec.state, JobState::Running)?;
         rec.state = JobState::Running;
-        rec.updated_at = now.wall_unix;
+        touch_job(&mut rec, now);
         if rec.started_at.is_none() {
             rec.started_at = Some(now.wall_unix);
         }
@@ -3122,7 +3173,7 @@ impl Store for SqliteStore {
             rec.state = JobState::Running;
             recov = None;
         }
-        rec.updated_at = now.wall_unix;
+        touch_job(&mut rec, now);
         let lease_until = Some(now.mono_ms.saturating_add(lease_ms));
         update_job_tx(&tx, &rec, lease_until, recov)?;
         tx.commit().map_err(internal)?;
@@ -3294,7 +3345,7 @@ impl Store for SqliteStore {
             .map_err(internal)?;
         let (mut rec, lease, recov) = get_job_tx(&tx, id.as_str())?;
         rec.publish = Some(record.clone());
-        rec.updated_at = now.wall_unix;
+        touch_job(&mut rec, now);
         update_job_tx(&tx, &rec, lease, recov)?;
         tx.commit().map_err(internal)?;
         Ok(rec)
@@ -3332,7 +3383,7 @@ impl Store for SqliteStore {
                 check_transition(rec.state, JobState::Done)?;
                 rec.state = JobState::Done;
                 rec.finished_at = Some(now.wall_unix);
-                rec.updated_at = now.wall_unix;
+                touch_job(&mut rec, now);
                 rec.failure_class = None;
                 rec.failure_reason = None;
                 update_job_tx(&tx, &rec, None, None)?;
@@ -3342,7 +3393,7 @@ impl Store for SqliteStore {
                 check_transition(rec.state, JobState::Cancelled)?;
                 rec.state = JobState::Cancelled;
                 rec.finished_at = Some(now.wall_unix);
-                rec.updated_at = now.wall_unix;
+                touch_job(&mut rec, now);
                 rec.failure_reason = None;
                 update_job_tx(&tx, &rec, None, None)?;
                 fail_dependents(&tx, rec.id.as_str(), JobState::Cancelled.as_str(), now)?;
@@ -3376,7 +3427,7 @@ impl Store for SqliteStore {
                     rec.assigned_model = None;
                     rec.cancel_requested = false;
                     rec.finished_at = None;
-                    rec.updated_at = now.wall_unix;
+                    touch_job(&mut rec, now);
                     update_job_tx(&tx, &rec, None, None)?;
                     if class == FailureClass::Provider {
                         if let (Some(node), Some(p)) = (node_for_cordon, provider) {
@@ -3388,10 +3439,10 @@ impl Store for SqliteStore {
                             };
                             let reason = cordon_reason(&p, completion, source);
                             tx.execute(
-                                "INSERT INTO cordons(node,provider,until_mono_ms,reiki_derived,healthy_hb_count,reason,set_at_unix)
+                                "INSERT INTO cordons(node,provider,until_mono_ms,health_derived,healthy_hb_count,reason,set_at_unix)
                                  VALUES(?1,?2,?3,?4,0,?5,?6)
                                  ON CONFLICT(node,provider) DO UPDATE SET until_mono_ms=excluded.until_mono_ms,
-                                 reiki_derived=excluded.reiki_derived, healthy_hb_count=0,
+                                 health_derived=excluded.health_derived, healthy_hb_count=0,
                                  reason=excluded.reason, set_at_unix=excluded.set_at_unix",
                                 params![
                                     node.as_str(),
@@ -3408,7 +3459,7 @@ impl Store for SqliteStore {
                     check_transition(rec.state, JobState::Failed)?;
                     rec.state = JobState::Failed;
                     rec.finished_at = Some(now.wall_unix);
-                    rec.updated_at = now.wall_unix;
+                    touch_job(&mut rec, now);
                     update_job_tx(&tx, &rec, None, None)?;
                     fail_dependents(&tx, rec.id.as_str(), JobState::Failed.as_str(), now)?;
                 }
@@ -3440,7 +3491,7 @@ impl Store for SqliteStore {
             let (mut rec, _, _) = get_job_tx(&tx, &id)?;
             check_transition(rec.state, JobState::Recovering)?;
             rec.state = JobState::Recovering;
-            rec.updated_at = now.wall_unix;
+            touch_job(&mut rec, now);
             update_job_tx(&tx, &rec, None, Some(now.mono_ms))?;
             moved.push(rec.id);
         }
@@ -3492,7 +3543,7 @@ impl Store for SqliteStore {
                 rec.failure_class = None;
                 rec.failure_reason = None;
                 rec.cancel_requested = false;
-                rec.updated_at = now.wall_unix;
+                touch_job(&mut rec, now);
                 rec.finished_at = None;
                 update_job_tx(&tx, &rec, None, None)?;
             } else {
@@ -3500,7 +3551,7 @@ impl Store for SqliteStore {
                 rec.state = JobState::Failed;
                 rec.failure_class = Some(FailureClass::Node);
                 rec.failure_reason = None;
-                rec.updated_at = now.wall_unix;
+                touch_job(&mut rec, now);
                 rec.finished_at = Some(now.wall_unix);
                 update_job_tx(&tx, &rec, None, None)?;
                 fail_dependents(&tx, rec.id.as_str(), JobState::Failed.as_str(), now)?;
@@ -3532,7 +3583,7 @@ impl Store for SqliteStore {
         // The monotonic clock restarts with the process, so a stamp from the last run means
         // nothing now: start the grace over for jobs already recovering.
         tx.execute(
-            "UPDATE jobs SET recovering_since_mono_ms=?1 WHERE state='recovering'",
+            "UPDATE jobs SET recovering_since_mono_ms=?1,version=version+1 WHERE state='recovering'",
             params![now.mono_ms as i64],
         )
         .map_err(internal)?;
@@ -3549,7 +3600,7 @@ impl Store for SqliteStore {
             let (mut rec, _, _) = get_job_tx(&tx, &id)?;
             check_transition(rec.state, JobState::Recovering)?;
             rec.state = JobState::Recovering;
-            rec.updated_at = now.wall_unix;
+            touch_job(&mut rec, now);
             update_job_tx(&tx, &rec, None, Some(now.mono_ms))?;
             count += 1;
         }
@@ -3721,7 +3772,7 @@ impl Store for SqliteStore {
     fn cordons(&self, node: Option<&NodeName>) -> Result<Vec<Cordon>, StoreError> {
         let conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let sql =
-            "SELECT node,provider,reiki_derived,reason,set_at_unix,until_mono_ms FROM cordons";
+            "SELECT node,provider,health_derived,reason,set_at_unix,until_mono_ms FROM cordons";
         let mut out = Vec::new();
         if let Some(node) = node {
             let mut stmt = conn
@@ -3756,10 +3807,10 @@ impl Store for SqliteStore {
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         conn.execute(
-            "INSERT INTO cordons(node,provider,until_mono_ms,reiki_derived,healthy_hb_count,reason,set_at_unix)
+            "INSERT INTO cordons(node,provider,until_mono_ms,health_derived,healthy_hb_count,reason,set_at_unix)
              VALUES(?1,?2,?3,?4,0,?5,?6)
              ON CONFLICT(node,provider) DO UPDATE SET until_mono_ms=excluded.until_mono_ms,
-             reiki_derived=excluded.reiki_derived, healthy_hb_count=0,
+             health_derived=excluded.health_derived, healthy_hb_count=0,
              reason=excluded.reason, set_at_unix=excluded.set_at_unix",
             params![
                 node.as_str(),
@@ -4067,6 +4118,7 @@ type JobTuple = (
     i64,
     Option<String>,
     String,
+    i64,
 );
 
 fn row_to_job_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobTuple> {
@@ -4104,6 +4156,7 @@ fn row_to_job_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobTuple> {
         row.get(30)?,
         row.get(31)?,
         row.get(32)?,
+        row.get(33)?,
     ))
 }
 
@@ -4142,6 +4195,7 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         eligible_since,
         failure_reason_s,
         excluded_nodes_json,
+        version,
     ) = t;
     Ok(JobRecord {
         id: JobId::parse(&id_s).map_err(internal)?,
@@ -4157,6 +4211,7 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         epoch: epoch_i as u64,
         created_at,
         updated_at,
+        version,
         eligible_since,
         started_at,
         finished_at,
@@ -4191,7 +4246,7 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
 mod tests {
     use super::SqliteStore;
     use crate::{Now, Store};
-    use lu_proto::{FailureClass, JobState, NodeName, StatsQuery};
+    use lu_proto::{FailureClass, JobEdit, JobState, NodeName, StatsQuery};
     use rusqlite::params;
     use std::fs;
     use std::path::PathBuf;
@@ -4716,6 +4771,53 @@ mod tests {
     }
 
     #[test]
+    fn opening_an_existing_database_performs_no_index_ddl() {
+        let p = temp_db("indexes.sqlite");
+        {
+            let _s = SqliteStore::open(&p).unwrap();
+            let conn = rusqlite::Connection::open(&p).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN
+                     ('jobs_dispatch_order','jobs_group_active','jobs_parent_lineage','jobs_root_lineage')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 4);
+        }
+        let schema_version = |path: &std::path::Path| -> i64 {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.query_row("PRAGMA schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = schema_version(&p);
+        {
+            let _s = SqliteStore::open(&p).unwrap();
+        }
+        assert_eq!(schema_version(&p), before);
+    }
+
+    #[test]
+    fn same_second_mutations_advance_the_row_version() {
+        let store = SqliteStore::open(temp_db("version.sqlite")).unwrap();
+        let now = Now {
+            wall_unix: 10,
+            mono_ms: 10,
+        };
+        let spec = crate::conformance::spec("https://example.net/team/repo.git", None);
+        let (job, _) = store.create_job(&spec, now).unwrap();
+        assert_eq!(job.version, 1);
+        assert_eq!(job.updated_at, 10);
+        for expected in 2..=3 {
+            let edited = store.edit_job(&job.id, &JobEdit::default(), now).unwrap();
+            assert_eq!(edited.version, expected);
+            assert_eq!(edited.updated_at, 10);
+        }
+        assert_eq!(store.get_job(&job.id).unwrap().version, 3);
+    }
+
+    #[test]
     fn refuses_unsupported_schema_version() {
         let p = temp_db("unsupported.sqlite");
         {
@@ -4938,7 +5040,7 @@ mod tests {
         {
             let conn = store.conn.lock().unwrap();
             conn.execute(
-                "INSERT INTO cordons(node,provider,until_mono_ms,reiki_derived,healthy_hb_count) \
+                "INSERT INTO cordons(node,provider,until_mono_ms,health_derived,healthy_hb_count) \
                  VALUES('node-old','zen',70000000,0,0),('node-old','openrouter',90000000,1,0)",
                 [],
             )
@@ -5156,5 +5258,66 @@ mod tests {
             .unwrap();
         assert_eq!(reason, None);
         assert_eq!(exclusions, "[]");
+    }
+
+    #[test]
+    fn schema_seven_database_renames_the_cordon_health_column() {
+        let path = temp_db("v7-cordon-column.sqlite");
+        let node = NodeName::parse("node-cordon").unwrap();
+        let now = Now {
+            wall_unix: 1_700_000_000,
+            mono_ms: 1_000,
+        };
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            store
+                .heartbeat(
+                    &crate::conformance::hb("node-cordon", lu_proto::HarnessState::Idle, vec![]),
+                    now,
+                )
+                .unwrap();
+            store
+                .set_cordon(
+                    &node,
+                    "p1",
+                    crate::CordonSource::Health,
+                    "Provider gateway cooldown for p1",
+                    now.wall_unix,
+                    5_000,
+                )
+                .unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "ALTER TABLE cordons RENAME COLUMN health_derived TO {};
+                 UPDATE schema_version SET version = 7;",
+                super::LEGACY_HEALTH_DERIVED_COLUMN
+            ))
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            let (version, renamed, old): (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT version FROM schema_version),
+                         (SELECT COUNT(*) FROM pragma_table_info('cordons') WHERE name='health_derived'),
+                         (SELECT COUNT(*) FROM pragma_table_info('cordons') WHERE name=?1)",
+                    params![super::LEGACY_HEALTH_DERIVED_COLUMN],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(version, crate::SCHEMA_VERSION);
+            assert_eq!(renamed, 1);
+            assert_eq!(old, 0);
+        }
+        let cordons = store.cordons(None).unwrap();
+        assert_eq!(cordons.len(), 1);
+        assert_eq!(cordons[0].node, node);
+        assert_eq!(cordons[0].provider, "p1");
+        assert_eq!(cordons[0].source, crate::CordonSource::Health);
+        assert_eq!(cordons[0].reason, "Provider gateway cooldown for p1");
     }
 }

@@ -213,6 +213,174 @@ token_sha256 = "{HASH_A}"
 }
 
 #[test]
+fn check_reports_intake_bounds_and_path_errors() {
+    let dir = scratch("validation-bugs");
+    let port = free_port();
+    let base = controller_text(&dir, port);
+    let intake = |field: &str, value: &str| {
+        format!(
+            "{base}\n[intake]\n[[intake.sources]]\nname = \"events\"\nsecret_file = \"/etc/lu/events.key\"\n[[intake.sources.rules]]\nrepo = \"https://example.net/a.git\"\nref = \"refs/heads/main\"\n{field} = {value}\n"
+        )
+    };
+    let agent = |extra: &str| {
+        format!(
+            "[agent]\nname = \"peer-a\"\ncontroller_url = \"https://lu.example.net:7600\"\ntoken_file = \"/etc/ting/ting.token\"\nwork_dir = \"/srv/work/lu\"\nharness = \"opencode\"\n{extra}"
+        )
+    };
+    let cases = [
+        (
+            "priority",
+            intake("priority", "10"),
+            "priority must be 0 to 9",
+        ),
+        (
+            "timeout",
+            intake("timeout", "0"),
+            "timeout must be 1 to 86400 seconds",
+        ),
+        (
+            "log-file",
+            format!("[log]\nfile = \"relative.log\"\n\n{base}"),
+            "file must be an absolute path",
+        ),
+        (
+            "tls-cert",
+            format!("{base}\n[tls]\ncert = \"relative.pem\"\nkey = \"/etc/lu/key.pem\"\n"),
+            "cert must be an absolute path",
+        ),
+        (
+            "intake-secret",
+            format!(
+                "{base}\n[intake]\n[[intake.sources]]\nname = \"events\"\nsecret_file = \"/etc/lu/../events.key\"\n[[intake.sources.rules]]\nrepo = \"https://example.net/a.git\"\nref = \"refs/heads/main\"\n"
+            ),
+            "secret_file must not contain '..'",
+        ),
+        (
+            "repo-credential",
+            format!(
+                "{base}\n[[controller.repos]]\nname = \"mirror\"\nurl = \"https://example.net/a.git\"\ncredential_file = \"relative.credential\"\n"
+            ),
+            "credential_file must be an absolute path",
+        ),
+        (
+            "mirror-token",
+            format!(
+                "{base}\n[mirror.credentials]\n[[mirror.credentials.repos]]\nname = \"mirror\"\ntoken_file = \"relative.token\"\n"
+            ),
+            "token_file must be an absolute path",
+        ),
+        (
+            "agent-token",
+            "[agent]\nname = \"peer-a\"\ncontroller_url = \"https://lu.example.net:7600\"\ntoken_file = \"relative.token\"\nwork_dir = \"/srv/work/lu\"\nharness = \"opencode\"\n".to_owned(),
+            "token_file must be an absolute path",
+        ),
+        (
+            "agent-ca",
+            agent("ca_file = \"/etc/lu/../ca.pem\"\n"),
+            "ca_file must not contain '..'",
+        ),
+        (
+            "agent-password",
+            agent("opencode_password_file = \"relative.password\"\n"),
+            "opencode_password_file must be an absolute path",
+        ),
+        (
+            "gateway-token",
+            agent("provider_gateway_health_url = \"http://127.0.0.1:4100/v1/health\"\nprovider_gateway_token_file = \"relative.token\"\n"),
+            "provider_gateway_token_file must be an absolute path",
+        ),
+        (
+            "controller-url",
+            "[agent]\nname = \"peer-a\"\ncontroller_url = \"https://lu.example.net/a/../b\"\ntoken_file = \"/etc/ting/ting.token\"\nwork_dir = \"/srv/work/lu\"\nharness = \"opencode\"\n".to_owned(),
+            "controller_url path must not contain . or .. segments",
+        ),
+        (
+            "file-url",
+            format!(
+                "{base}\n[[controller.repos]]\nname = \"mirror\"\nurl = \"file:///srv/../repo.git\"\nallow_file_urls = true\n"
+            ),
+            "file url must not contain '..'",
+        ),
+    ];
+    for (label, text, expected) in cases {
+        let case_dir = dir.join(label);
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let config = case_dir.join("c.toml");
+        std::fs::write(&config, text).unwrap();
+        let out = bin()
+            .args(["--config", config.to_str().unwrap(), "check"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{label}: check passed");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expected), "{label}: {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_accepts_only_canonical_schedule_tables() {
+    let dir = scratch("schedule-tables");
+    let base = controller_text(&dir, free_port());
+    let canonical = format!(
+        "{base}\n[[calendar]]\nname = \"office\"\n[[attach]]\nscope = \"global\"\ncalendars = [\"office\"]\n"
+    );
+    let good = dir.join("canonical.toml");
+    std::fs::write(&good, canonical).unwrap();
+    let out = bin()
+        .args(["--config", good.to_str().unwrap(), "check"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "canonical tables refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cases = [
+        (
+            "calendars",
+            "[[calendars]]\nname = \"office\"\n",
+            "use [[calendar]]",
+        ),
+        (
+            "attachments",
+            "[[attachments]]\nscope = \"global\"\ncalendars = []\n",
+            "use [[attach]]",
+        ),
+        (
+            "nested-calendars",
+            "[schedule]\n[[schedule.calendars]]\nname = \"office\"\n",
+            "use [[calendar]]",
+        ),
+        (
+            "nested-attachments",
+            "[schedule]\n[[schedule.attachments]]\nscope = \"global\"\ncalendars = []\n",
+            "use [[attach]]",
+        ),
+        (
+            "dates",
+            "[[calendar]]\nname = \"office\"\ndates = []\n",
+            "use ranges",
+        ),
+    ];
+    for (label, extra, expected) in cases {
+        let case_dir = dir.join(label);
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let config = case_dir.join("c.toml");
+        std::fs::write(&config, format!("{base}\n{extra}")).unwrap();
+        let out = bin()
+            .args(["--config", config.to_str().unwrap(), "check"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{label}: check passed");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expected), "{label}: {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn check_rejects_an_invalid_scrub_pattern() {
     let dir = scratch("scrub-pattern");
     let token = write_token(&dir, "agent.token");

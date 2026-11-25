@@ -180,7 +180,7 @@ pub async fn cancel_job_with_descendants(
     id: &lu_proto::JobId,
     keep_children: bool,
     keep_dependents: bool,
-    expected_updated_at: Option<i64>,
+    expected_version: Option<i64>,
 ) -> Result<Vec<lu_proto::JobId>, ApiError> {
     let store = std::sync::Arc::clone(&state.store);
     let mut targets = vec![id.clone()];
@@ -245,7 +245,7 @@ pub async fn cancel_job_with_descendants(
         let mut seen = std::collections::HashSet::new();
         for target in targets {
             let expected = if target == guarded_id {
-                expected_updated_at
+                expected_version
             } else {
                 None
             };

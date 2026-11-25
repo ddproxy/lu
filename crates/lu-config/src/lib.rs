@@ -10,6 +10,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 
+use lu_proto::limits::{MAX_PRIORITY, MAX_TIMEOUT_SECS, MIN_PRIORITY, MIN_TIMEOUT_SECS};
 use serde::Deserialize;
 
 pub use error::ConfigError;
@@ -153,12 +154,12 @@ pub struct Config {
     /// Controller-side time-aware scheduling. Absent means no calendar gating.
     #[serde(default)]
     pub schedule: Option<ScheduleConfig>,
-    /// Calendar definitions. The TOML table is `[[calendar]]` (`[[calendars]]` also works).
-    #[serde(default, rename = "calendar", alias = "calendars")]
-    pub calendars: Vec<lu_schedule::Calendar>,
-    /// Calendar attachments. The TOML table is `[[attach]]` (`[[attachments]]` also works).
-    #[serde(default, rename = "attach", alias = "attachments")]
-    pub attachments: Vec<lu_schedule::Attachment>,
+    /// Calendar definitions. The TOML table is `[[calendar]]`.
+    #[serde(default)]
+    pub calendar: Vec<lu_schedule::Calendar>,
+    /// Calendar attachments. The TOML table is `[[attach]]`.
+    #[serde(default)]
+    pub attach: Vec<lu_schedule::Attachment>,
     /// The validated schedule built from the fields above and any referenced file.
     #[serde(default, skip)]
     pub schedule_built: Option<lu_schedule::Schedule>,
@@ -972,13 +973,11 @@ pub struct AgentConfig {
     /// Default continuous stuck interval for jobs that do not set `stuck_after_secs`.
     #[serde(default = "default_stuck_after_secs")]
     pub stuck_after_secs: u64,
-    /// Loopback URL of the local provider gateway health endpoint. The legacy spelling remains
-    /// accepted so existing agent configs keep working.
-    #[serde(alias = "reiki_health_url")]
+    /// Loopback URL of the local provider gateway health endpoint. From 0.8.0 this is the only
+    /// accepted spelling.
     pub provider_gateway_health_url: Option<String>,
-    /// Private file holding the provider gateway bearer token. The legacy spelling remains
-    /// accepted so existing agent configs keep working.
-    #[serde(alias = "reiki_token_file")]
+    /// Private file holding the provider gateway bearer token. From 0.8.0 this is the only
+    /// accepted spelling.
     pub provider_gateway_token_file: Option<String>,
     /// Case-insensitive body substrings that classify a `503` from the configured gateway health
     /// endpoint as a node-side gateway fault. Empty by default: without a marker match, a `503`
@@ -1114,11 +1113,8 @@ impl Config {
     /// inputs are the text supplied here.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let mut config = Self::parse_structure(text)?;
-        config.schedule_built = schedule::build(
-            config.schedule.as_ref(),
-            &config.calendars,
-            &config.attachments,
-        )?;
+        config.schedule_built =
+            schedule::build(config.schedule.as_ref(), &config.calendar, &config.attach)?;
         config.validate()?;
         Ok(config)
     }
@@ -1183,11 +1179,14 @@ impl Config {
                 ),
             );
         }
-        if self.log.file.as_deref() == Some("") {
-            return invalid(
-                "[log]",
-                "file must not be empty; leave it out to log without a file".to_owned(),
-            );
+        if let Some(file) = &self.log.file {
+            if file.is_empty() {
+                return invalid(
+                    "[log]",
+                    "file must not be empty; leave it out to log without a file".to_owned(),
+                );
+            }
+            validate_abs_no_dotdot("[log]", "file", file)?;
         }
         Ok(())
     }
@@ -1223,7 +1222,11 @@ impl Config {
             Some(tls) if tls.cert.is_empty() || tls.key.is_empty() => {
                 invalid("[tls]", "cert and key must both be set".to_owned())
             }
-            _ => Ok(()),
+            Some(tls) => {
+                validate_abs_no_dotdot("[tls]", "cert", &tls.cert)?;
+                validate_abs_no_dotdot("[tls]", "key", &tls.key)
+            }
+            None => Ok(()),
         }
     }
 
@@ -1468,6 +1471,7 @@ impl Config {
                         format!("remote {name} test_file_url must be an absolute file:// path"),
                     );
                 }
+                validate_abs_no_dotdot("[publish.remotes]", "test_file_url", path)?;
             }
         }
         for (pattern, remote) in &publish.redirects {
@@ -1551,6 +1555,7 @@ impl Config {
             if source.secret_file.is_empty() {
                 return invalid(&table, "secret_file must not be empty".to_owned());
             }
+            validate_abs_no_dotdot(&table, "secret_file", &source.secret_file)?;
             if source.header.is_empty()
                 || source.header.len() > 128
                 || source
@@ -1677,15 +1682,20 @@ impl Config {
                     );
                 }
                 if let Some(priority) = rule.priority {
-                    if !(1..=9).contains(&priority) {
-                        return invalid(&rule_table, "priority must be between 1 and 9".to_owned());
+                    if !(MIN_PRIORITY..=MAX_PRIORITY).contains(&priority) {
+                        return invalid(
+                            &rule_table,
+                            format!("priority must be {MIN_PRIORITY} to {MAX_PRIORITY}"),
+                        );
                     }
                 }
                 if let Some(timeout) = rule.timeout {
-                    if timeout == 0 || timeout > 30 * 24 * 60 * 60 {
+                    if !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&timeout) {
                         return invalid(
                             &rule_table,
-                            "timeout must be between 1 and 2592000 seconds".to_owned(),
+                            format!(
+                                "timeout must be {MIN_TIMEOUT_SECS} to {MAX_TIMEOUT_SECS} seconds"
+                            ),
                         );
                     }
                 }
@@ -1729,6 +1739,7 @@ impl Config {
             if cred.token_file.is_empty() {
                 return invalid(&table, "token_file must not be empty".to_owned());
             }
+            validate_abs_no_dotdot(&table, "token_file", &cred.token_file)?;
         }
         Ok(())
     }
@@ -1950,6 +1961,7 @@ impl ControllerConfig {
                 if file.is_empty() {
                     return invalid(&table, "credential_file must not be empty".to_owned());
                 }
+                validate_abs_no_dotdot(&table, "credential_file", file)?;
             }
             if repo.refs.is_empty() {
                 return invalid(&table, "refs must not be empty; use [\"*\"]".to_owned());
@@ -2000,10 +2012,12 @@ impl AgentConfig {
         if self.token_file.is_empty() {
             return invalid("[agent]", "token_file must not be empty".to_owned());
         }
+        validate_abs_no_dotdot("[agent]", "token_file", &self.token_file)?;
         if let Some(ca) = &self.ca_file {
             if ca.is_empty() {
                 return invalid("[agent]", "ca_file must not be empty".to_owned());
             }
+            validate_abs_no_dotdot("[agent]", "ca_file", ca)?;
         }
         validate_abs_no_dotdot("[agent]", "work_dir", &self.work_dir)?;
         if self.harness.is_empty() {
@@ -2021,6 +2035,7 @@ impl AgentConfig {
                     "opencode_password_file must not be empty".to_owned(),
                 );
             }
+            validate_abs_no_dotdot("[agent]", "opencode_password_file", file)?;
         }
         if self
             .harness_wrapper
@@ -2236,6 +2251,7 @@ impl AgentConfig {
                         "provider_gateway_token_file must not be empty".to_owned(),
                     );
                 }
+                validate_abs_no_dotdot("[agent]", "provider_gateway_token_file", file)?;
             }
             (Some(_), None) => return invalid(
                 "[agent]",
@@ -2574,6 +2590,12 @@ pub fn parse_http_url(url: &str) -> Result<ParsedUrl, ConfigError> {
     if authority.is_empty() {
         return url_err("URL must include a host".to_owned());
     }
+    if rest[authority_end..]
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return url_err("URL path must not contain . or .. segments".to_owned());
+    }
     let (host, port) = if let Some(after) = authority.strip_prefix('[') {
         let close = after.find(']').ok_or_else(|| ConfigError::Invalid {
             table: "[url]".to_owned(),
@@ -2703,6 +2725,7 @@ fn validate_repo_url(table: &str, url: &str, allow_file_urls: bool) -> Result<()
         {
             return invalid(table, "file url must name an absolute path".to_owned());
         }
+        validate_abs_no_dotdot(table, "file url", path)?;
         return Ok(());
     }
     let parsed = parse_http_url(url).map_err(|e| map_url_error(table, "url", e, url))?;
@@ -2753,6 +2776,10 @@ pub fn load_operator(path: &Path) -> Result<OperatorConfig, ConfigError> {
         return Err(ConfigError::Parse(
             "token_file must not be empty".to_owned(),
         ));
+    }
+    validate_abs_no_dotdot("[operator]", "token_file", &config.token_file)?;
+    if let Some(ca) = &config.ca_file {
+        validate_abs_no_dotdot("[operator]", "ca_file", ca)?;
     }
     Ok(config)
 }
@@ -2858,11 +2885,8 @@ pub fn check_secrets(config: &Config) -> Result<(), ConfigError> {
 /// commands that only print a summary and do not use the secrets.
 pub fn load_structure(path: &Path) -> Result<Config, ConfigError> {
     let mut config = Config::parse_structure(&read_config_text(path)?)?;
-    config.schedule_built = schedule::build(
-        config.schedule.as_ref(),
-        &config.calendars,
-        &config.attachments,
-    )?;
+    config.schedule_built =
+        schedule::build(config.schedule.as_ref(), &config.calendar, &config.attach)?;
     Ok(config)
 }
 
@@ -2922,6 +2946,14 @@ mod tests {
             ConfigError::Invalid { table, reason } => (table, reason),
             other => panic!("expected invalid, got {other}"),
         }
+    }
+
+    fn expect_reason(text: &str, fragment: &str) {
+        let (table, reason) = invalid(Config::parse(text).unwrap_err());
+        assert!(
+            reason.contains(fragment),
+            "table {table}: expected {fragment:?}, got {reason:?}"
+        );
     }
 
     pub(super) fn controller_only() -> String {
@@ -3695,6 +3727,11 @@ heartbeat_secs = 15
         expect_table(&base("https://user:pw@example.net"), "[agent]");
         expect_table(&base("https://example.net?q=1"), "[agent]");
         expect_table(&base("https://example.net#f"), "[agent]");
+        expect_reason(
+            &base("https://example.net/a/../b"),
+            "controller_url path must not contain . or .. segments",
+        );
+        assert!(Config::parse(&base("https://example.net/a/b")).is_ok());
     }
 
     #[test]
@@ -3837,18 +3874,147 @@ heartbeat_secs = 15
             &format!("{base}provider_gateway_token_file=\"/rt\"\n"),
             "[agent]",
         );
+        for file in ["relative/token", "/srv/../token"] {
+            expect_reason(
+                &format!("{base}provider_gateway_health_url=\"http://127.0.0.1:4100/v1/health\"\nprovider_gateway_token_file=\"{file}\"\n"),
+                "provider_gateway_token_file must",
+            );
+        }
     }
 
     #[test]
-    fn legacy_provider_gateway_keys_are_accepted() {
-        let base = "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n";
-        let legacy = format!("{base}reiki_health_url=\"http://127.0.0.1:4100/v1/health\"\nreiki_token_file=\"/rt\"\n");
-        let agent = Config::parse(&legacy).unwrap().agent.unwrap();
-        assert_eq!(
-            agent.provider_gateway_health_url.as_deref(),
-            Some("http://127.0.0.1:4100/v1/health")
+    fn intake_rule_bounds_match_the_job_spec() {
+        let rule = |field: &str, value: u64| {
+            format!(
+                "{}\n[intake]\n[[intake.sources]]\nname=\"events\"\nsecret_file=\"/etc/lu/events.key\"\n[[intake.sources.rules]]\nrepo=\"https://example.net/a.git\"\nref=\"refs/heads/main\"\n{field}={value}\n",
+                controller_only()
+            )
+        };
+        expect_reason(&rule("priority", 10), "priority must be 0 to 9");
+        expect_reason(&rule("timeout", 0), "timeout must be 1 to 86400 seconds");
+        expect_reason(
+            &rule("timeout", 86_401),
+            "timeout must be 1 to 86400 seconds",
         );
-        assert_eq!(agent.provider_gateway_token_file.as_deref(), Some("/rt"));
+        assert!(Config::parse(&rule("priority", 0)).is_ok());
+        assert!(Config::parse(&rule("priority", 9)).is_ok());
+        assert!(Config::parse(&rule("timeout", 1)).is_ok());
+        assert!(Config::parse(&rule("timeout", 86_400)).is_ok());
+    }
+
+    #[test]
+    fn every_configured_path_is_validated() {
+        for file in ["relative/file", "/srv/../file"] {
+            expect_reason(
+                &format!("[log]\nfile=\"{file}\"\n\n{}", controller_only()),
+                "file must",
+            );
+            expect_reason(
+                &format!(
+                    "{}\n[tls]\ncert=\"{file}\"\nkey=\"/key\"\n",
+                    controller_only()
+                ),
+                "cert must",
+            );
+            expect_reason(
+                &format!(
+                    "{}\n[[controller.repos]]\nname=\"mirror\"\nurl=\"https://example.net/a.git\"\ncredential_file=\"{file}\"\n",
+                    controller_only()
+                ),
+                "credential_file must",
+            );
+            expect_reason(
+                &format!(
+                    "{}\n[mirror.credentials]\n[[mirror.credentials.repos]]\nname=\"mirror\"\ntoken_file=\"{file}\"\n",
+                    controller_only()
+                ),
+                "token_file must",
+            );
+            expect_reason(
+                &format!(
+                    "{}\n[intake]\n[[intake.sources]]\nname=\"events\"\nsecret_file=\"{file}\"\n[[intake.sources.rules]]\nrepo=\"https://example.net/a.git\"\nref=\"refs/heads/main\"\n",
+                    controller_only()
+                ),
+                "secret_file must",
+            );
+            let agent = |field: &str| {
+                format!(
+                    "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n{field}=\"{file}\"\n"
+                )
+            };
+            expect_reason(
+                &format!(
+                    "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"{file}\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n"
+                ),
+                "token_file must",
+            );
+            expect_reason(&agent("ca_file"), "ca_file must");
+            expect_reason(
+                &agent("opencode_password_file"),
+                "opencode_password_file must",
+            );
+        }
+        expect_reason(
+            &format!(
+                "{}\n[[controller.repos]]\nname=\"mirror\"\nurl=\"file:///srv/../repo.git\"\nallow_file_urls=true\n",
+                controller_only()
+            ),
+            "file url must not contain '..'",
+        );
+    }
+
+    #[test]
+    fn operator_config_paths_and_url_are_validated() {
+        let path = std::env::temp_dir().join(format!("lu-operator-{}", std::process::id()));
+        let cases = [
+            (
+                "url = \"https://example.net\"\ntoken_file = \"relative\"\n",
+                "token_file must be an absolute path",
+            ),
+            (
+                "url = \"https://example.net\"\ntoken_file = \"/t\"\nca_file = \"/srv/../ca.pem\"\n",
+                "ca_file must not contain '..'",
+            ),
+            (
+                "url = \"https://example.net/a/../b\"\ntoken_file = \"/t\"\n",
+                "path must not contain . or .. segments",
+            ),
+        ];
+        for (text, expected) in cases {
+            std::fs::write(&path, text).unwrap();
+            let err = load_operator(&path).unwrap_err();
+            match err {
+                ConfigError::Invalid { reason, .. } => assert!(
+                    reason.contains(expected),
+                    "expected {expected:?}, got {reason:?}"
+                ),
+                ConfigError::Parse(message) => assert!(
+                    message.contains(expected),
+                    "expected {expected:?}, got {message:?}"
+                ),
+                other => panic!("expected config error, got {other}"),
+            }
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn former_provider_gateway_keys_are_refused() {
+        let base = "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n";
+        for key in [
+            "reiki_health_url=\"http://127.0.0.1:4100/v1/health\"",
+            "reiki_token_file=\"/rt\"",
+        ] {
+            let text = format!("{base}{key}\n");
+            match Config::parse(&text) {
+                Err(ConfigError::Parse(message)) => assert!(
+                    message.contains("unknown field")
+                        && message.contains(key.split_once('=').unwrap().0),
+                    "expected an unknown-field error, got {message}"
+                ),
+                other => panic!("expected a parse error, got {other:?}"),
+            }
+        }
     }
 
     #[test]

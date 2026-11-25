@@ -82,7 +82,7 @@ const REQUEST_KEY_TTL_SECS: u64 = 24 * 60 * 60;
 /// transaction. The ETag comes from the same body a GET would return.
 #[derive(Debug, Clone, Copy)]
 struct JobGuard {
-    updated_at: i64,
+    version: i64,
     has_dependencies: bool,
 }
 
@@ -153,7 +153,7 @@ async fn job_if_match_guard(
         ));
     }
     Ok(Some(JobGuard {
-        updated_at: rec.updated_at,
+        version: rec.version,
         has_dependencies: !rec.waiting_on.is_empty(),
     }))
 }
@@ -304,6 +304,7 @@ fn job_view_with(r: &JobRecord, reason: Option<String>, ttl_secs: u64) -> JobVie
         epoch: r.epoch,
         created_at: seconds(r.created_at),
         updated_at: seconds(r.updated_at),
+        version: r.version.max(0) as u64,
         started_at: r.started_at.map(seconds),
         finished_at: r.finished_at.map(seconds),
         failure_class: r.failure_class,
@@ -1148,7 +1149,7 @@ pub async fn retry_job(
         let store = Arc::clone(&state.store);
         let id = job_id.clone();
         let spec = spec.clone();
-        let expected = guard.map(|g| g.updated_at);
+        let expected = guard.map(|g| g.version);
         move || store.retry_with_dependents(&id, &spec, chain, n, expected)
     })
     .await;
@@ -1288,7 +1289,7 @@ pub async fn cancel_job(
             Err(error) => return with_version(error.into_response()),
         }
     }
-    let expected = guard.map(|g| g.updated_at);
+    let expected = guard.map(|g| g.version);
     let changed = match crate::routes::cancel_job_with_descendants(
         &state,
         &job_id,
@@ -1563,7 +1564,7 @@ pub async fn approve_draft(
     };
     let store = Arc::clone(&state.store);
     let id_for_write = job_id.clone();
-    let expected = guard.map(|g| g.updated_at);
+    let expected = guard.map(|g| g.version);
     let result = tokio::task::spawn_blocking(move || {
         store.approve_draft_if(&id_for_write, edit.as_ref(), target, now(), expected)
     })
@@ -2305,6 +2306,7 @@ mod tests {
             epoch: 1,
             created_at: 1,
             updated_at: 2,
+            version: 1,
             eligible_since: 1,
             started_at: None,
             finished_at: None,

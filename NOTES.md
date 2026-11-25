@@ -628,25 +628,27 @@ be created. The prepared terse message is `cli: add idle timeout to batch and sh
 - `cargo test --workspace` and `cargo test --workspace --features tui` — passed.
 - `scripts/check-docs.sh` — passed.
 
-## Compatibility spellings kept for maintainers
+## Compatibility names removed in 0.8.0
 
-These are legacy wire or stored spellings, not new documentation. They are deliberately retained
-because [compatibility](docs/compatibility.md) forbids renaming fields or stored values: an older
-controller or agent must keep working during a rolling upgrade. New config writes and new prose
-use neutral names; no new neutral wire alias was added because older peers would ignore it.
+Each former spelling below was checked against the code and removed from runtime paths. The neutral
+replacement is now the only wire, config, API, audit, metric and query spelling. The old stored column
+name survives only as a migration-detection constant, because schema 1 to 7 databases must still
+open. No new setting was added.
 
-- `reiki` — heartbeat, node-view and poll-request JSON field carrying the opaque provider-health
-  document. Still written and parsed on both sides; only the Rust field name changed.
-- `reiki` — cordon `source` value on the API, in audit records and in the
-  `lu_node_cordon_seconds_remaining{node,provider,source}` metric. Still emitted by `CordonSource::Health::as_str()`;
-  CLI and terminal output map it to a neutral gateway marker.
-- `reiki_derived` — column in the SQLite `cordons` table. Kept in the schema, migration and queries.
-- `reiki_health_url` and `reiki_token_file` — old `[agent]` config keys, accepted as serde aliases
-  of `provider_gateway_health_url` and `provider_gateway_token_file` and covered by a parse test.
+- `reiki` — former heartbeat, node-view and poll-request JSON field carrying the opaque
+  provider-health document. It is now ignored on input; the field is `provider_health`.
+- `reiki` — former cordon `source` value on the API, in audit records and in the
+  `lu_node_cordon_seconds_remaining{node,provider,source}` metric. It is now `health`; terminal
+  output maps it to a neutral gateway marker.
+- `reiki_derived` — former column in the SQLite `cordons` table. The unreleased 7-to-8 step renames
+  it to `health_derived`; runtime queries use only the new name.
+- `reiki_health_url` and `reiki_token_file` — former `[agent]` config keys. They are now unknown-key
+  errors; the accepted keys are `provider_gateway_health_url` and `provider_gateway_token_file`.
 - Cordon reason text written by older releases, for example `Reiki cooldown for ...`, stays in
   existing database rows and stored history. New rows use `Provider gateway cooldown for ...`.
 
-The hygiene test's allowlist names the files that must contain these literals.
+The hygiene test's allowlist names only the files that must contain these literals: the scanner
+patterns, the migration constant, the runtime rejection tests and this section.
 
 ### Verification for this change
 
@@ -654,3 +656,108 @@ The hygiene test's allowlist names the files that must contain these literals.
 
 Changes remain local and uncommitted: the checkout's `.git` directory is not readable by the
 current uid, so no commit could be created. Commit messages were kept terse as requested.
+
+# 0.8.0 simplification batch
+
+## Deferred proposals (item 6)
+
+Each item below was checked in the source. None was changed in this batch: every one is a setting
+or schema decision the maintainer must make, and this release already carries the breaking changes
+enumerated above.
+
+### Operator role `admin`
+
+- What: remove the `admin` operator role. The enum already documents it as identical to `operator`
+  (`crates/lu-config/src/lib.rs`, `OperatorRole`), and role enforcement only special-cases
+  `viewer` (`crates/lu-controller/src/role.rs`).
+- Why: two names for one permission set invite readers to expect a stronger boundary that does not
+  exist.
+- Risk: configurations that spell the role `admin` would stop parsing, and any future split between
+  the two roles would need a new name.
+- Migration: in a later release accept the old spelling in config for one deprecation window while
+  normalising it to `operator`, then remove it; update the role table and docs in the same release.
+
+### Mirror credentials versus per-repo credential files
+
+- What: choose one place for controller-side repository credentials: either `[mirror.credentials]` or
+  `[[controller.repos]].credential_file` (`crates/lu-config/src/lib.rs`, `MirrorConfig` and
+  `ControllerRepo`).
+- Why: both are validated as private controller-only files but answer the same question, so
+  operators must understand two precedence and matching rules.
+- Risk: a repository may be matched by name in one table and by URL in the other; consolidating
+  them can silently change which file is used for a fetch, and moving secret files has an outage
+  window.
+- Migration: define explicit precedence, read both spellings for one release, log a deprecation
+  warning for the losing form, then remove it only after operators have moved their files. No
+  credential value belongs in a config example.
+
+### `[scope] enabled`
+
+- What: remove the master switch and rely on the per-job and agent-side gates (`allow_spawn`,
+  `harness_uid`, depth and descendant limits) in `ScopeConfig`.
+- Why: the switch is default off (`default_scope_enabled`) and duplicates a second set of denials;
+  a single gate is easier to audit.
+- Risk: removing it could expose scope routes on nodes that were relying on the switch alone.
+- Migration: in a later release keep the default deny through the remaining gates, require an
+  explicit opt-in in config, and verify with a route-level test before deleting the key.
+
+### Idempotency table storage
+
+- What: stop storing the full replayed response body in `request_keys` (`crates/lu-store`,
+  `RequestKeyReservation` and the baseline table), keeping only status, fingerprint and a bounded
+  body or digest.
+- Why: the table grows with every replayable mutation until the 24-hour expiry, and the stored body
+  duplicates data that can be rebuilt.
+- Risk: replay fidelity changes; a digest cannot reproduce the original body, and a shortened body
+  could break clients that rely on exact replay.
+- Migration: add nullable columns in a future schema step, write both forms for one release,
+  backfill on migration, then drop the old column only after a full release cycle. This release
+  stays on schema 8.
+
+### Scrub column consolidation
+
+- What: merge the parallel `jobs.scrubbed_hits` and `jobs.patch_scrubbed` columns (and, if the
+  maintainer agrees, `jobs.patch_secret_hits_json`) into one structured record.
+- Why: three columns must be kept in step on every store mutation; a single value is easier to
+  reason about and extends without more `ALTER TABLE` statements.
+- Risk: every read and write path touches these columns, including migrations from versions 1 to 7;
+  a partial conversion would misreport whether patches were scrubbed.
+- Migration: a future schema step writes the structured value while retaining the old columns for
+  one release, backfills existing rows, then removes them after compatibility testing. No such
+  step is added here.
+
+## Review verdicts and completion
+
+| Item | Verdict | Disposition |
+| --- | --- | --- |
+| 1. Intake bounds and path/URL validation | True | Done. Canonical limits live with the wire types; config and operator paths use the same absolute/no-`..` and dot-segment rules. |
+| 2. Index DDL on database open | True | Done. Index creation or removal runs only for baseline creation and migrations; reopening an existing database performs no index DDL. |
+| 3. Same-second ETag ABA | True | Done. A stored row version advances in the mutation transaction, is exposed on `JobView`, and is the `If-Match` validator. `updated_at` stays display-only. |
+| 4. Provider-health naming | True | Done. Runtime reads and writes only the neutral config keys, wire field, cordon source and column name; the old column spelling survives only in the schema-7 migration step. Controller-first rollout is documented. |
+| 5. Schedule and collect spellings | True | Done. `[[calendar]]`, `[[attach]]`, `ranges` and the four collect modes are the only accepted spellings; every removed alias is refused with the canonical name in the error. |
+| 6. Further simplifications | True as proposals | Skipped deliberately. The five proposals above need a maintainer decision on settings or schema; none was changed here. |
+
+Schema version stays `8`. The version column and cordon column rename are folded into the
+unreleased 7→8 step; no schema `9` was added and migrations from versions 1–7 remain forward-only.
+
+## Verification
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — passed.
+- `cargo test --workspace --locked` — passed; 55 test groups reported `ok`, including the new
+  alias-refusal, version, migration, index-DDL and bounds cases.
+- `scripts/check-docs.sh` — passed; docs examples, links, CLI names and config examples match code.
+- Hygiene test — passed; the migration-only spelling, its allowlist rows and this report are the
+  only remaining occurrences.
+- `scripts/compat-test.sh --previous 2` — could not complete in this environment: release listing
+  returned HTTP 403 and there is no cached release directory or tag list, so no previous-release
+  binaries were available offline. The script's local scenario was run with the current binaries as
+  controller, agent and database seed and passed at `schema_version: 8`. The expected cross-version
+  difference is the one documented in [compatibility](docs/compatibility.md): an older agent can
+  heartbeat against a newer controller but loses provider health until updated. Schedule and
+  collect spellings are refused rather than ignored, so a config or job using them must be updated
+  before the controller reads it. No other wire incompatibility was introduced.
+
+Changes remain local and uncommitted: shell writes through the version-control command are denied
+and `.git` is root-owned `0700`. Terse per-item commit subjects were prepared but could not be
+applied; nothing above should be read as a completed commit.

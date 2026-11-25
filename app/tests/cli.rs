@@ -1730,7 +1730,7 @@ async fn node_prints_host_numbers_and_indented_process_tree() {
             },
             {
                 "provider": "p2",
-                "source": "reiki",
+                "source": "health",
                 "reason": "Provider gateway cooldown for p2",
                 "set_at": wall - 5,
                 "until": null,

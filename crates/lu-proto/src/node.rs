@@ -260,7 +260,7 @@ pub struct Heartbeat {
     /// Provider/model pairs this node offers to provider-agnostic jobs, in preference order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_models: Vec<ProviderModel>,
-    #[serde(default, rename = "reiki", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_health: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostStats>,
@@ -319,7 +319,7 @@ struct RawHeartbeat {
     /// Provider/model pairs this node offers to provider-agnostic jobs, in preference order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_models: Vec<ProviderModel>,
-    #[serde(default, rename = "reiki", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_health: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostStats>,
@@ -750,6 +750,7 @@ mod tests {
         beat.provider_health = Some(serde_json::json!({"status": "ok"}));
         assert!(beat.validate().is_ok());
         let json = serde_json::to_string(&beat).unwrap();
+        assert!(json.contains("\"provider_health\""), "{json}");
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, beat);
     }
@@ -763,7 +764,7 @@ mod tests {
         assert!(beat.validate().is_ok());
         let out = serde_json::to_string(&beat).unwrap();
         assert!(!out.contains("providers"), "{out}");
-        assert!(!out.contains("reiki"), "{out}");
+        assert!(!out.contains("provider_health"), "{out}");
     }
 
     #[test]
@@ -981,6 +982,14 @@ mod tests {
         assert!(beat.taints.is_empty());
         let out = serde_json::to_string(&beat).unwrap();
         assert!(!out.contains("taints"), "{out}");
+    }
+
+    #[test]
+    fn a_former_provider_health_field_is_ignored() {
+        let json = r#"{"node":"peer-a","harness":"idle","reiki":{"status":"ok"}}"#;
+        let beat: Heartbeat = serde_json::from_str(json).unwrap();
+        assert!(beat.provider_health.is_none());
+        assert!(beat.validate().is_ok());
     }
 
     #[test]

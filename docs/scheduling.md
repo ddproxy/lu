@@ -73,18 +73,17 @@ calendar gates. Unknown keys are rejected everywhere.
 | `finish_secs` | `60` | Non-negative integer. Finish allowance used by `fit`. |
 | `starvation_secs` | `3600` | Positive integer. Age at which a job outranks all static priorities. |
 | `min_disk_free_pct` | `8` | Integer `0` to `100`. Minimum free work-filesystem percentage for dispatch; `0` disables the check. Read at controller start; `POST /v1/schedule/reload` does not change it. |
-| `calendars` | `[]` | Nested `[[schedule.calendars]]` alias. |
-| `attachments` | `[]` | Nested `[[schedule.attachments]]` alias. |
 
 An inline value overrides the same tuning key from `file`; unset keys keep the file or built-in
-default. Calendars and attachments from the file, inline `schedule` table and top-level aliases are
-merged in that order. Calendar names are unique; an attachment may name only defined calendars.
+default. Calendars and attachments from the file, inline `[schedule]` and top-level `[[calendar]]`/
+`[[attach]]` tables are merged in that order. Calendar names are unique; an attachment may name only
+defined calendars. Former nested and plural table names are refused with the canonical spelling.
 
 ### Calendars
 
 A calendar has `name`, optional `offset` (`Z`, `UTC`, `+HH:MM`, `-HH:MM`, `+HHMM`, `-HHMM` or integer
-minutes within ±14:00), optional `default` (`open` or `closed`), `windows`, `ranges` (alias `dates`)
-and `exceptions`. Names are 1–64 characters from `A-Z a-z 0-9 . _ -`.
+minutes within ±14:00), optional `default` (`open` or `closed`), `windows`, `ranges` and `exceptions`.
+Names are 1–64 characters from `A-Z a-z 0-9 . _ -`. A former `dates` field is refused; use `ranges`.
 
 | Table | Keys |
 | --- | --- |
@@ -162,8 +161,8 @@ scope = "global"
 calendars = ["nightly"]
 ```
 
-A provider-specific calendar using the nested aliases, with a one-off outage. The `except` window
-is unavailable and therefore wins over the otherwise open calendar:
+A provider-specific calendar with a one-off outage. The exception is unavailable and therefore wins
+over the otherwise open calendar:
 
 ```toml
 [controller]
@@ -186,27 +185,26 @@ token_file = "/etc/ting/ting.token"
 work_dir = "/var/lib/ting/work"
 harness = "opencode"
 
-[[schedule.calendars]]
+[[calendar]]
 name = "provider-maintenance"
 offset = "Z"
 default = "open"
 
-[[schedule.calendars.exceptions]]
+[[calendar.exceptions]]
 id = "outage"
 kind = "unavailable"
 from = "2026-11-25T22:00Z"
 to = "2026-11-25T23:30Z"
 reason = "provider maintenance"
 
-[[schedule.attachments]]
+[[attach]]
 scope = "provider"
 name = "anthropic"
 calendars = ["provider-maintenance"]
 ```
 
-Top-level `[[calendar]]`/`[[calendars]]` and `[[attach]]`/`[[attachments]]` are aliases; nested
-`[[schedule.calendars]]`/`[[schedule.attachments]]` are accepted too. Setting both names of one
-alias pair at the same level is rejected.
+The only table names are top-level `[[calendar]]` and `[[attach]]`; `[[calendars]]`,
+`[[attachments]]`, `[[schedule.calendars]]` and `[[schedule.attachments]]` are refused.
 
 ## Admission, deadlines and queue order
 

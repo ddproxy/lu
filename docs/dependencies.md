@@ -141,8 +141,8 @@ fail closed; see [SECURITY.md](../SECURITY.md) for the overall trust model.
 ## Collecting inputs
 
 `--collect <mode>` controls dependency inputs. The modes are `none`, `files`, `apply` and `both`;
-default is `apply`. Aliases `off`, `false`, `diffs`, `diff`, `patches` and `patch` are accepted.
-`files` and `both` stage dependency artifacts under `.lu/inputs` before the harness starts;
+default is `apply`; other spellings are refused with the accepted list. `files` and `both` stage
+dependency artifacts under `.lu/inputs` before the harness starts;
 `apply` and `both` apply each input's `diff.patch` in `after` order.
 
 Inputs are the job's `after` dependencies. A `done` dependency is always an input. A `failed` or
