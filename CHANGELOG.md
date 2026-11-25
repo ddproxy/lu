@@ -17,9 +17,11 @@ uses semantic versioning once it reaches 1.0.
 ### Added
 - Infrastructure faults are now recognized as node-class failures with fixed `failure_reason`
   codes: `harness_unreachable`, `container_start`, `container_wait_timeout`,
-  `reiki_gateway_503` and `workspace_enospc`. Classifiers require explicit harness, Podman,
-  overlay-storage, Reiki-gateway or workspace-preparation markers, so ordinary task output is not
-  mistaken for a host fault.
+  `gateway_unavailable` and `workspace_enospc`. Classifiers require explicit harness, Podman,
+  overlay-storage, operator-configured gateway or workspace-preparation markers, so ordinary task
+  output is not mistaken for a host fault. A new optional agent-side key
+  `[agent] gateway_fault_markers` holds at most 16 case-insensitive body substrings; with an empty
+  list a gateway health `503` is not classified as a node fault.
 - `[controller] node_attempts` (default `2`, allowed `1` to `4`) caps how many different nodes a
   job may try after node-class failures. The effective cap is `min(max_retries + 1, node_attempts)`;
   `max_retries` stays the hard cap on retries of every class.

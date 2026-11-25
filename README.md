@@ -209,6 +209,7 @@ Config is TOML. `lu --config` defaults to `lu.toml`; `ting --config` defaults to
 | `[agent] heartbeat_secs` | `15` | Heartbeat interval, 2 to 300. |
 | `[agent] base_source` | `"auto"` | Checkout source: `clone`, `controller` or `auto`. |
 | `[agent] on_stuck`, `stuck_after_secs` | `"none"`, `1800` | Stuck policy and continuous-stuck threshold, 60 to 86400. |
+| `[agent] gateway_fault_markers` | `[]` | Optional, agent-side body markers that classify a gateway health `503` as `gateway_unavailable`; up to 16 substrings of 1 to 64 bytes. |
 | `[artifacts] scrub`, `scrub_patch` | `true`, `false` | Scrub logs and artifacts; leave patches byte-for-byte by default. |
 | `[audit] path` | unset | JSON Lines audit file; auditing is off when omitted. |
 | `[workspace] default`, `failed_ttl`, `keep_ttl` | `"ephemeral"`, `"6h"`, `"48h"` | Workspace policy and retention. |

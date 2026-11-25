@@ -29,9 +29,9 @@ pub enum NodeFailureReason {
     ContainerStart,
     /// The agent timed out waiting for the container's storage file.
     ContainerWaitTimeout,
-    /// Reiki answered 503 with a gateway-store or per-stream-counters fault.
-    #[serde(rename = "reiki_gateway_503")]
-    ReikiGateway503,
+    /// The configured gateway health endpoint answered 503 with an operator marker.
+    #[serde(rename = "gateway_unavailable")]
+    GatewayUnavailable,
     /// Preparing the workspace ran out of disk space.
     WorkspaceEnospc,
 }
@@ -43,7 +43,7 @@ impl NodeFailureReason {
             Self::HarnessUnreachable => "harness_unreachable",
             Self::ContainerStart => "container_start",
             Self::ContainerWaitTimeout => "container_wait_timeout",
-            Self::ReikiGateway503 => "reiki_gateway_503",
+            Self::GatewayUnavailable => "gateway_unavailable",
             Self::WorkspaceEnospc => "workspace_enospc",
         }
     }
@@ -53,7 +53,7 @@ impl NodeFailureReason {
         Self::HarnessUnreachable,
         Self::ContainerStart,
         Self::ContainerWaitTimeout,
-        Self::ReikiGateway503,
+        Self::GatewayUnavailable,
         Self::WorkspaceEnospc,
     ];
 
@@ -63,7 +63,7 @@ impl NodeFailureReason {
             "harness_unreachable" => Self::HarnessUnreachable,
             "container_start" => Self::ContainerStart,
             "container_wait_timeout" => Self::ContainerWaitTimeout,
-            "reiki_gateway_503" => Self::ReikiGateway503,
+            "gateway_unavailable" => Self::GatewayUnavailable,
             "workspace_enospc" => Self::WorkspaceEnospc,
             _ => return Err(ParseFailureClassError),
         })
@@ -276,7 +276,7 @@ mod tests {
                 "harness_unreachable",
                 "container_start",
                 "container_wait_timeout",
-                "reiki_gateway_503",
+                "gateway_unavailable",
                 "workspace_enospc"
             ]
         );

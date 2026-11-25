@@ -163,12 +163,23 @@ The `[agent]` table describes an agent host. Operator commands never read it: th
 | `stuck_after_secs` | no | `1800` | Integer `60` to `86400`. Default continuous stuck interval for jobs whose spec omits `stuck_after_secs`. |
 | `reiki_health_url` | no | — | Loopback `http` or `https` URL with no credentials, query or fragment. Requires `reiki_token_file`. The agent reads the local Reiki's peer health (`GET /v1/health`) every 10 seconds and sends each upstream as a provider (`ok`, `cooling` with seconds left, `disabled` or `unknown`) with every heartbeat, plus the document itself. A job that names a `provider` goes only to nodes that report it. After three failed reads the node reports no providers. |
 | `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set, and rejected when set alone. Checked like `token_file` on `load`; the agent reads at most 4 KiB. |
+| `gateway_fault_markers` | no | `[]` | At most 16 case-insensitive body substrings, each 1 to 64 bytes, validated when the config loads. Optional and agent-side; it needs no health URL. A `503` from the node's configured gateway health endpoint is a node-class `gateway_unavailable` fault only when its body contains a marker. With an empty list, a `503` is an ordinary failed health read. |
 | `provider_models` | no | `[]` | Up to 64 `[[agent.provider_models]]` pairs, in preference order. Each provider is 1 to 64 characters from `A-Z a-z 0-9 . _ -`; each model is 1 to 128 bytes; provider names are unique. See below. |
 | `labels` | no | `[]` | At most 32 labels. Each is 1 to 64 characters from `A-Z a-z 0-9 . _ - /`, with at most one `=`. Lu never interprets them; a job's `requires` must match every label exactly. |
 | `label_files` | no | `[]` | At most 8 absolute paths without `..`. Each file is read again before every heartbeat; a missing or unreadable file contributes nothing. Each file is capped at 4 KiB, must be UTF-8, and holds one label per line; blank lines and lines starting with `#` are ignored. Invalid labels are dropped with one warning per label. File labels are merged with `labels`, then sorted and de-duplicated. |
 | `detect` | no | `[]` | Up to 16 `[[agent.detect]]` entries; labels must be valid and unique. See below. |
 | `taints` | no | `[]` | At most 8 taints. Each is a label with the same syntax as `labels`. A tainted node takes only jobs that tolerate every taint. Sent with every heartbeat and replaced on change. |
 | `housekeeping` | no | — | Optional `[agent.housekeeping]` table. Without it the agent removes nothing. |
+
+Gateway fault markers are ordinary substrings, chosen by the operator; Lu does not ship a
+built-in list. For example, a health `503` whose body says `store offline` is a node fault, while
+the same body with an empty marker list is only a failed health read.
+
+```toml
+[agent]
+# ...
+gateway_fault_markers = ["store OFFLINE", "capacity exhausted"]
+```
 
 An explicit job spec field overrides both stuck defaults. Stuck uses the same output/CPU
 observation as `lu node`: both idle counters must exceed 300 seconds, and that observation must

@@ -103,11 +103,12 @@ A running job whose provider stops being usable is stopped by the agent, not by 
 | 5 | The job requeues while `attempt <= 100`; `max_retries` does not apply. The assigned `(node, provider)` pair is cordoned. |
 | 6 | The cordon lasts for `retry_after_secs`, clamped to 5 seconds–24 hours. Without that estimate it lasts `provider_cooldown_secs`, default 1800 seconds. |
 
-A Reiki `503` whose body names `gateway_store_unavailable` or `per-stream counters` is different:
-it is a node-side gateway fault, not a provider key outage. It stops the running job as
-`Failed(node)` with `failure_reason: "reiki_gateway_503"`, excludes that node from the job and
-requeues within `[controller] node_attempts`; it creates no provider cordon. An unnamed `503` is
-only a failed health read and does not classify the job. See
+A `503` from the node's health endpoint is different when its body contains a marker configured
+in `[agent] gateway_fault_markers`: it is a node-side gateway fault, not a provider key outage. It
+stops the running job as `Failed(node)` with `failure_reason: "gateway_unavailable"`, excludes that
+node from the job and requeues within `[controller] node_attempts`; it creates no provider cordon.
+An unmarked `503` is only a failed health read and does not classify the job. With no markers
+configured, no `503` is classified. See
 [Node infrastructure failures](lifecycle.md#node-infrastructure-failures).
 
 A Reiki-derived cordon lifts at expiry or after two consecutive healthy provider heartbeats. A

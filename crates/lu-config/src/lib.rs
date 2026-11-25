@@ -53,6 +53,10 @@ const MAX_MODEL_BYTES: usize = 128;
 const MAX_GROUP_BYTES: usize = 64;
 const MAX_GROUP_RUNNING: usize = 64;
 
+/// Operator-defined body markers for classifying a gateway health `503` as a node fault.
+pub const MAX_GATEWAY_FAULT_MARKERS: usize = 16;
+pub const MAX_GATEWAY_FAULT_MARKER_BYTES: usize = 64;
+
 const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
 
 const MIN_STUCK_AFTER_SECS: u64 = 60;
@@ -970,6 +974,11 @@ pub struct AgentConfig {
     pub stuck_after_secs: u64,
     pub reiki_health_url: Option<String>,
     pub reiki_token_file: Option<String>,
+    /// Case-insensitive body substrings that classify a `503` from the configured gateway health
+    /// endpoint as a node-side gateway fault. Empty by default: without a marker match, a `503`
+    /// stays an ordinary failed health read.
+    #[serde(default)]
+    pub gateway_fault_markers: Vec<String>,
     /// Provider/model pairs this node offers to jobs that request `provider = "any"`.
     #[serde(default)]
     pub provider_models: Vec<ProviderModelConfig>,
@@ -2229,6 +2238,27 @@ impl AgentConfig {
                 )
             }
             (None, None) => {}
+        }
+        if self.gateway_fault_markers.len() > MAX_GATEWAY_FAULT_MARKERS {
+            return invalid(
+                "[agent]",
+                format!(
+                    "gateway_fault_markers must name at most {MAX_GATEWAY_FAULT_MARKERS} markers (got {})",
+                    self.gateway_fault_markers.len()
+                ),
+            );
+        }
+        for (index, marker) in self.gateway_fault_markers.iter().enumerate() {
+            let table = format!("[agent] gateway_fault_markers #{index}");
+            let bytes = marker.len();
+            if bytes == 0 || bytes > MAX_GATEWAY_FAULT_MARKER_BYTES {
+                return invalid(
+                    &table,
+                    format!(
+                        "marker must be 1 to {MAX_GATEWAY_FAULT_MARKER_BYTES} bytes (got {bytes})"
+                    ),
+                );
+            }
         }
         if let Some(housekeeping) = &self.housekeeping {
             housekeeping.validate()?;
@@ -3786,6 +3816,57 @@ heartbeat_secs = 15
         assert!(Config::parse(&format!("{base}reiki_health_url=\"http://127.0.0.1:4100/v1/health\"\nreiki_token_file=\"/rt\"\n")).is_ok());
         expect_table(&format!("{base}reiki_health_url=\"http://example.net:4100/v1/health\"\nreiki_token_file=\"/rt\"\n"), "[agent]");
         expect_table(&format!("{base}reiki_token_file=\"/rt\"\n"), "[agent]");
+    }
+
+    #[test]
+    fn gateway_fault_marker_rules() {
+        let base = "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n";
+        let default = Config::parse(base).unwrap().agent.unwrap();
+        assert!(default.gateway_fault_markers.is_empty());
+
+        let ok = Config::parse(&format!(
+            "{base}gateway_fault_markers=[\"Store Offline\", \"capacity exhausted\"]\n"
+        ))
+        .unwrap()
+        .agent
+        .unwrap();
+        assert_eq!(
+            ok.gateway_fault_markers,
+            ["Store Offline", "capacity exhausted"]
+        );
+
+        let at_limit = format!(
+            "{base}gateway_fault_markers=[{}]\n",
+            (0..MAX_GATEWAY_FAULT_MARKERS)
+                .map(|i| format!("\"m{i}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(Config::parse(&at_limit).is_ok());
+        let too_many = format!(
+            "{base}gateway_fault_markers=[{}]\n",
+            (0..=MAX_GATEWAY_FAULT_MARKERS)
+                .map(|i| format!("\"m{i}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        expect_table(&too_many, "[agent]");
+        assert!(Config::parse(&too_many)
+            .unwrap_err()
+            .to_string()
+            .contains("at most 16"));
+
+        let max_bytes = "x".repeat(MAX_GATEWAY_FAULT_MARKER_BYTES);
+        assert!(Config::parse(&format!("{base}gateway_fault_markers=[\"{max_bytes}\"]\n")).is_ok());
+        let too_long = "x".repeat(MAX_GATEWAY_FAULT_MARKER_BYTES + 1);
+        expect_table(
+            &format!("{base}gateway_fault_markers=[\"{too_long}\"]\n"),
+            "[agent] gateway_fault_markers #0",
+        );
+        expect_table(
+            &format!("{base}gateway_fault_markers=[\"\"]\n"),
+            "[agent] gateway_fault_markers #0",
+        );
     }
 
     #[test]

@@ -5613,12 +5613,12 @@ async fn node_attempts_caps_node_failure_retries() {
         .unwrap()
         .to_owned();
     let epoch = assign_start_on(&srv, &id, "node-a", AGENT_A_TOKEN).await;
-    let completed = complete_node_as(&srv, AGENT_A_TOKEN, &id, epoch, "reiki_gateway_503").await;
+    let completed = complete_node_as(&srv, AGENT_A_TOKEN, &id, epoch, "gateway_unavailable").await;
     assert_eq!(status(&completed), 200, "{completed}");
     let view = job_value(&srv, &id).await;
     assert_eq!(view["state"], "failed");
     assert_eq!(view["attempt"], 1);
-    assert_eq!(view["failure_reason"], "reiki_gateway_503");
+    assert_eq!(view["failure_reason"], "gateway_unavailable");
     assert_eq!(view["excluded_nodes"], json!(["node-a"]));
     let _ = srv.shutdown.send(());
 }

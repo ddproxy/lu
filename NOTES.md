@@ -588,14 +588,14 @@ be created. The prepared terse message is `cli: add idle timeout to batch and sh
 
 ### Verified against the code
 
-- `lu_proto::NodeFailureReason` has five fixed wire codes. Serde needed an explicit rename for
-  `ReikiGateway503`; derived snake_case produced `reiki_gateway503`, which broke the completion
-  route for `reiki_gateway_503`. The code and its tests now agree on the wire spelling.
+- `lu_proto::NodeFailureReason` has five fixed wire codes. `GatewayUnavailable` keeps an explicit
+  serde rename to `gateway_unavailable`; round-trip tests in the completion route and the store
+  conformance suite assert the spelling on the wire.
 - `tuishou-ting` recognizes a harness-server connection failure, Podman start/create failures,
-  the full overlay-storage wait timeout and a Reiki `503` body naming a gateway-store or
-  per-stream-counters fault from the running job. Workspace preparation and staging add
+  the full overlay-storage wait timeout and a gateway health `503` whose body contains one of the
+  operator-configured `[agent] gateway_fault_markers`. Workspace preparation and staging add
   `workspace_enospc` only when a disk-full marker has a preparation context. Bare socket,
-  `ENOSPC` and unnamed `503` text stay unclassified.
+  `ENOSPC` and unmarked `503` text stay unclassified.
 - `[controller] node_attempts` defaults to `2` and validates `1..=4`. The store computes
   `min(max_retries + 1, node_attempts)`; `max_retries` remains a hard cap on all retry classes.
   Dispatch in the SQLite transaction skips a job's stored exclusions, and `commit_dispatch`
@@ -616,8 +616,8 @@ be created. The prepared terse message is `cli: add idle timeout to batch and sh
   release entries are left as history.
 - The canonical queued-job explanation is `JobView.waiting_reason`, not `blocked_reason`; the new
   all-nodes-excluded message uses that field.
-- Reiki `503` is a node fault only with a named gateway body. Other `503`s are failed health reads
-  and do not stop the job as a node failure.
+- A gateway health `503` is a node fault only when its body matches a configured marker. Other
+  `503`s are failed health reads and do not stop the job as a node failure.
 - The request described a "container wait timeout"; the code matches the full
   `/var/lib/containers/storage/overlay-containers/` path so a generic wait message in task output
   cannot classify a node failure.

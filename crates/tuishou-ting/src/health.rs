@@ -25,7 +25,8 @@ const STALE_AFTER_FAILURES: u32 = 3;
 pub struct Health {
     pub providers: Vec<ProviderStatus>,
     pub reiki: Option<Value>,
-    /// A node fault reported by Reiki itself, never inferred from harness output.
+    /// A node fault reported by the configured gateway health endpoint, never inferred from
+    /// harness output.
     pub infra_reason: Option<NodeFailureReason>,
     /// Counts successful reads, so a watcher can tell a new reading from a repeated one.
     pub seq: u64,
@@ -115,14 +116,14 @@ async fn read_body(response: &mut reqwest::Response) -> Option<Vec<u8>> {
     Some(body)
 }
 
-async fn fetch(client: &reqwest::Client, url: &str, token: &str) -> Fetch {
+async fn fetch(client: &reqwest::Client, url: &str, token: &str, markers: &[String]) -> Fetch {
     let mut response = match client.get(url).bearer_auth(token).send().await {
         Ok(response) => response,
         Err(_) => return Fetch::Failed,
     };
     if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
         return match read_body(&mut response).await {
-            Some(body) if crate::infra::reiki_gateway_503(&String::from_utf8_lossy(&body)) => {
+            Some(body) if crate::infra::gateway_fault(&String::from_utf8_lossy(&body), markers) => {
                 Fetch::GatewayFault
             }
             _ => Fetch::Failed,
@@ -141,7 +142,12 @@ async fn fetch(client: &reqwest::Client, url: &str, token: &str) -> Fetch {
 }
 
 /// Reads the local Reiki every few seconds into `shared` until the task is aborted.
-pub fn spawn_refresher(url: String, token: Arc<str>, shared: Shared) -> JoinHandle<()> {
+pub fn spawn_refresher(
+    url: String,
+    token: Arc<str>,
+    markers: Arc<Vec<String>>,
+    shared: Shared,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
@@ -156,7 +162,7 @@ pub fn spawn_refresher(url: String, token: Arc<str>, shared: Shared) -> JoinHand
         };
         let mut failures = 0u32;
         loop {
-            match fetch(&client, &url, &token).await {
+            match fetch(&client, &url, &token, &markers).await {
                 Fetch::Health(doc) => {
                     failures = 0;
                     let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
@@ -169,7 +175,7 @@ pub fn spawn_refresher(url: String, token: Arc<str>, shared: Shared) -> JoinHand
                     let seq = guard.seq.wrapping_add(1);
                     *guard = Health {
                         seq,
-                        infra_reason: Some(NodeFailureReason::ReikiGateway503),
+                        infra_reason: Some(NodeFailureReason::GatewayUnavailable),
                         ..Health::default()
                     };
                 }
@@ -267,7 +273,11 @@ mod tests {
         assert!(parse(&big).reiki.is_none());
     }
 
-    async fn fetch_with_reply(body: &'static [u8]) -> Fetch {
+    async fn fetch_with_reply(
+        status: &'static str,
+        body: &'static [u8],
+        markers: &[String],
+    ) -> Fetch {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -275,27 +285,60 @@ mod tests {
             let mut request = [0u8; 1024];
             let _ = socket.read(&mut request).await.unwrap();
             let response = format!(
-                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             socket.write_all(response.as_bytes()).await.unwrap();
             socket.write_all(body).await.unwrap();
         });
         let client = reqwest::Client::new();
-        let fetched = fetch(&client, &format!("http://{addr}/health"), "test").await;
+        let fetched = fetch(&client, &format!("http://{addr}/health"), "test", markers).await;
         server.await.unwrap();
         fetched
     }
 
     #[tokio::test]
-    async fn a_named_reiki_503_is_a_gateway_fault() {
-        let fetched = fetch_with_reply(br#"{"error":"gateway_store_unavailable"}"#).await;
+    async fn a_configured_marker_in_a_503_body_is_a_gateway_fault() {
+        let markers = ["Store Offline".to_owned()];
+        let fetched = fetch_with_reply(
+            "503 Service Unavailable",
+            b"{\"error\":\"store offline\"}",
+            &markers,
+        )
+        .await;
         assert!(matches!(fetched, Fetch::GatewayFault), "{fetched:?}");
     }
 
     #[tokio::test]
-    async fn an_unnamed_503_is_not_a_node_fault() {
-        let fetched = fetch_with_reply(b"service unavailable").await;
+    async fn a_marker_matches_case_insensitively() {
+        let markers = ["CAPACITY EXHAUSTED".to_owned()];
+        let fetched = fetch_with_reply(
+            "503 Service Unavailable",
+            b"shard capacity exhausted",
+            &markers,
+        )
+        .await;
+        assert!(matches!(fetched, Fetch::GatewayFault), "{fetched:?}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_marker_list_never_classifies_a_503() {
+        let fetched = fetch_with_reply("503 Service Unavailable", b"store offline", &[]).await;
         assert!(matches!(fetched, Fetch::Failed), "{fetched:?}");
+    }
+
+    #[tokio::test]
+    async fn a_503_without_a_configured_marker_is_not_a_node_fault() {
+        let markers = ["store offline".to_owned()];
+        let fetched =
+            fetch_with_reply("503 Service Unavailable", b"service unavailable", &markers).await;
+        assert!(matches!(fetched, Fetch::Failed), "{fetched:?}");
+    }
+
+    #[tokio::test]
+    async fn a_marker_in_a_non_503_reply_is_not_a_gateway_fault() {
+        let markers = ["store offline".to_owned()];
+        let fetched = fetch_with_reply("200 OK", b"{\"error\":\"store offline\"}", &markers).await;
+        assert!(matches!(fetched, Fetch::Health(_)), "{fetched:?}");
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Harness output is untrusted task text: a test may print almost anything. These classifiers
 //! therefore match short, specific bootstrap messages, never a bare socket or disk error. Health
-//! signals that come from the node itself (Reiki status codes) are checked separately.
+//! signals that come from the node's gateway health endpoint are checked separately.
 
 use lu_proto::NodeFailureReason;
 
@@ -90,12 +90,17 @@ pub fn workspace_enospc(text: &str) -> bool {
     disk_full && preparing
 }
 
-/// A Reiki 503 body that names a gateway-store or per-stream-counter fault.
-pub fn reiki_gateway_503(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    lower.contains("gateway_store_unavailable")
-        || lower.contains("per-stream counters")
-        || lower.contains("per stream counters")
+/// A gateway health response body that matches an operator-configured marker.
+///
+/// Markers are matched case-insensitively. An empty marker list classifies nothing: a `503` then
+/// stays an ordinary failed health read. Empty markers are ignored defensively; config validation
+/// rejects them.
+pub fn gateway_fault(body: &str, markers: &[String]) -> bool {
+    let lower = body.to_lowercase();
+    markers
+        .iter()
+        .filter(|marker| !marker.is_empty())
+        .any(|marker| lower.contains(&marker.to_lowercase()))
 }
 
 #[cfg(test)]
@@ -187,13 +192,24 @@ mod tests {
     }
 
     #[test]
-    fn reiki_gateway_503_needs_a_named_fault() {
-        assert!(reiki_gateway_503(
-            "{\"error\":\"gateway_store_unavailable\"}"
-        ));
-        assert!(reiki_gateway_503("per-stream counters are unavailable"));
-        assert!(!reiki_gateway_503("service unavailable"));
-        assert!(!reiki_gateway_503("429 rate limited"));
-        assert!(!reiki_gateway_503(""));
+    fn gateway_fault_uses_only_configured_markers() {
+        let markers = ["Store Offline".to_owned(), "capacity exhausted".to_owned()];
+        assert!(gateway_fault("{\"error\":\"STORE OFFLINE\"}", &markers));
+        assert!(gateway_fault("shard capacity EXHAUSTED", &markers));
+        assert!(!gateway_fault("service unavailable", &markers));
+        assert!(!gateway_fault("429 rate limited", &markers));
+        assert!(!gateway_fault("", &markers));
+    }
+
+    #[test]
+    fn an_empty_marker_list_never_matches() {
+        assert!(!gateway_fault("store offline", &[]));
+        assert!(!gateway_fault("an unmarked gateway failure", &[]));
+        assert!(!gateway_fault("", &[]));
+    }
+
+    #[test]
+    fn empty_markers_are_ignored() {
+        assert!(!gateway_fault("store offline", &["".to_owned()]));
     }
 }

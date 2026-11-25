@@ -149,6 +149,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     held_jobs_lists_the_nodes_active_jobs(&make());
     completion_persists_expect_failure(&make());
     node_failure_requeues_on_a_different_node(&make());
+    gateway_unavailable_reason_round_trips(&make());
     node_attempts_cap_retries(&make());
     node_failure_never_retries_after_a_diff_or_cancel(&make());
     retry_clears_node_exclusions(&make());
@@ -2173,6 +2174,36 @@ fn node_failure_requeues_on_a_different_node<S: Store>(s: &S) {
     assert_eq!(rec.attempt, 2);
     assert_eq!(rec.failure_reason, Some(NodeFailureReason::ContainerStart));
     assert_eq!(rec.excluded_nodes, vec![a, b]);
+}
+
+fn gateway_unavailable_reason_round_trips<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (job, _) = s
+        .create_job(&spec("https://x/gateway-unavailable.git", None), now(1, 1))
+        .unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    s.start_job(&job.id, a.epoch, now(3, 3)).unwrap();
+    let rec = s
+        .complete(
+            &node_completion(&job.id, a.epoch, NodeFailureReason::GatewayUnavailable),
+            None,
+            now(4, 4),
+            3,
+            1,
+            1000,
+        )
+        .unwrap();
+    assert_eq!(rec.state, JobState::Failed);
+    assert_eq!(
+        rec.failure_reason,
+        Some(NodeFailureReason::GatewayUnavailable)
+    );
+    assert_eq!(
+        s.get_job(&job.id).unwrap().failure_reason,
+        Some(NodeFailureReason::GatewayUnavailable)
+    );
 }
 
 fn node_attempts_cap_retries<S: Store>(s: &S) {

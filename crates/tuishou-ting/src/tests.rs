@@ -494,6 +494,7 @@ fn make_agent(
         opencode_password: None,
         workspaces,
         reiki_probe: None,
+        gateway_fault_markers: Arc::new(Vec::new()),
         health: Default::default(),
         provider_models: Arc::new(Vec::new()),
         harness: "opencode".to_owned(),
