@@ -3694,10 +3694,7 @@ heartbeat_secs = 15
         );
         let (t, r) = invalid(Config::parse(&text).unwrap_err());
         assert!(t.starts_with("[[controller.operators]]"));
-        assert!(
-            r.contains("both scopes") || r.contains("same as one used"),
-            "{r}"
-        );
+        assert!(r.contains("both scopes") || r.contains("same as one used"));
     }
 
     #[test]
