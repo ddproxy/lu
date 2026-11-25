@@ -145,6 +145,10 @@ dropped and counted as `invalid`. An allow rule that fails drops the event witho
 | `publish` | `PublishSpec` object | no | Omitted when absent. If present, the job has a publish step that only runs when an operator calls the publish route. See [PublishSpec](#publishspec) and [publish.md](publish.md). |
 | `schedule` | `JobSchedule` object | no | Omitted when absent. Time gates for the job; see [JobSchedule](#jobschedule) and [scheduling.md](scheduling.md). |
 
+Both timeouts are bounded independently. A value of `0` or above `86400` is refused. The API does
+not compare `idle_timeout_secs` with `timeout_secs`: a longer idle timeout is accepted without a
+warning, and the wall-clock timeout still ends the job.
+
 ### `SourceSpec`
 
 | Field | Type | Required | Rule |

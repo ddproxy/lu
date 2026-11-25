@@ -13,7 +13,8 @@ use lu_client::{Client, JobView};
 use lu_proto::{
     printable, valid_group, validate_idempotency_key, ExpectMode, ExpectSpec, JobSpec,
     WorkspacePolicy, DEFAULT_PRIORITY, DEFAULT_TIMEOUT_SECS, MAX_AFTER_JOBS, MAX_GROUP_BYTES,
-    MAX_GROUP_RUNNING, MAX_PRIORITY, MAX_TASK_BYTES, MAX_TIMEOUT_SECS, MIN_TIMEOUT_SECS,
+    MAX_GROUP_RUNNING, MAX_IDLE_TIMEOUT_SECS, MAX_PRIORITY, MAX_TASK_BYTES, MAX_TIMEOUT_SECS,
+    MIN_TIMEOUT_SECS,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -87,6 +88,8 @@ struct SharedFields {
     #[serde(default)]
     timeout: Option<u64>,
     #[serde(default)]
+    idle_timeout: Option<u64>,
+    #[serde(default)]
     expect: Option<ExpectFields>,
     #[serde(default)]
     workspace: Option<String>,
@@ -111,6 +114,7 @@ impl SharedFields {
         take!(priority);
         take!(group);
         take!(timeout);
+        take!(idle_timeout);
         take!(expect);
         take!(workspace);
         take!(require);
@@ -138,6 +142,13 @@ impl SharedFields {
                 ));
             }
         }
+        if let Some(idle_timeout) = self.idle_timeout {
+            if !(MIN_TIMEOUT_SECS..=MAX_IDLE_TIMEOUT_SECS).contains(&idle_timeout) {
+                return Err(format!(
+                    "idle_timeout must be {MIN_TIMEOUT_SECS} to {MAX_IDLE_TIMEOUT_SECS} seconds (got {idle_timeout})"
+                ));
+            }
+        }
         let workspace = self
             .workspace
             .as_deref()
@@ -151,6 +162,7 @@ impl SharedFields {
             priority: self.priority.unwrap_or(DEFAULT_PRIORITY),
             group: self.group,
             timeout: self.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            idle_timeout: self.idle_timeout,
             expect,
             workspace,
             require: self.require.unwrap_or_default(),
@@ -165,6 +177,7 @@ struct ResolvedFields {
     priority: u8,
     group: Option<String>,
     timeout: u64,
+    idle_timeout: Option<u64>,
     expect: Option<ExpectSpec>,
     workspace: Option<WorkspacePolicy>,
     require: Vec<String>,
@@ -189,6 +202,8 @@ struct DefaultsFile {
     #[serde(default)]
     timeout: Option<u64>,
     #[serde(default)]
+    idle_timeout: Option<u64>,
+    #[serde(default)]
     expect: Option<ExpectFields>,
     #[serde(default)]
     workspace: Option<String>,
@@ -206,6 +221,7 @@ impl DefaultsFile {
             priority: self.priority,
             group: self.group.clone(),
             timeout: self.timeout,
+            idle_timeout: self.idle_timeout,
             expect: self.expect.clone(),
             workspace: self.workspace.clone(),
             require: self.require.clone(),
@@ -621,14 +637,20 @@ pub fn plan(opts: &BatchOptions<'_>) -> Result<BatchPlan, Vec<String>> {
         if let Err(error) = validate_idempotency_key(&key) {
             push_error(&mut errors, &raw.source, error);
         }
-        let fields = shared_defaults
+        let fields = match shared_defaults
             .clone()
             .overlay(raw.sidecar.clone())
-            .resolve();
-        let Ok(fields) = fields else {
-            // `resolve` already reports the offending field; add the source without its text.
-            errors.push(format!("{}: invalid batch settings", raw.source));
-            continue;
+            .resolve()
+        {
+            Ok(fields) => fields,
+            Err(error) => {
+                push_error(
+                    &mut errors,
+                    &raw.source,
+                    format!("invalid batch settings: {error}"),
+                );
+                continue;
+            }
         };
         let spec = JobSpec {
             source: lu_proto::SourceSpec {
@@ -657,7 +679,7 @@ pub fn plan(opts: &BatchOptions<'_>) -> Result<BatchPlan, Vec<String>> {
             publish: None,
             model: fields.model,
             timeout_secs: fields.timeout,
-            idle_timeout_secs: None,
+            idle_timeout_secs: fields.idle_timeout,
             on_stuck: None,
             stuck_after_secs: None,
             idempotency_key: Some(key.clone()),
@@ -1404,6 +1426,45 @@ mod tests {
         assert!(spec.requires.is_empty());
         assert_eq!(spec.repo, "https://example.net/repo.git");
         assert_eq!(spec.git_ref, "main");
+    }
+
+    #[test]
+    fn idle_timeout_defaults_sidecars_and_bounds_are_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let defaults = write(
+            root,
+            "defaults.toml",
+            "repo = \"https://example.net/repo.git\"\nref = \"main\"\nidle_timeout = 60\n",
+        );
+        write(root, "build.md", "go");
+        let batch = || {
+            plan(&BatchOptions {
+                path: root,
+                key_prefix: "batch",
+                defaults: Some(&defaults),
+                ..options(root, "")
+            })
+        };
+        assert_eq!(
+            batch().unwrap().entries()[0].spec.idle_timeout_secs,
+            Some(60)
+        );
+
+        write(root, "build.toml", "idle_timeout = 90\n");
+        assert_eq!(
+            batch().unwrap().entries()[0].spec.idle_timeout_secs,
+            Some(90)
+        );
+
+        write(root, "build.toml", "idle_timeout = 0\n");
+        let errors = batch().err().expect("expected input errors");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("idle_timeout must be 1 to 86400 seconds")),
+            "{errors:?}"
+        );
     }
 
     #[test]

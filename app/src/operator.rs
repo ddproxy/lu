@@ -77,11 +77,22 @@ pub struct SubmitArgs {
     /// Alternative provider[:model] to try in order (repeatable).
     #[arg(long = "fallback", value_parser = parse_fallback)]
     pub fallbacks: Vec<lu_proto::Choice>,
-    /// Job timeout in seconds.
-    #[arg(long, default_value_t = lu_proto::DEFAULT_TIMEOUT_SECS)]
+    /// Job timeout: seconds, or a value with an s, m or h suffix.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value_t = lu_proto::DEFAULT_TIMEOUT_SECS,
+        value_parser = parse_wall_timeout,
+        allow_negative_numbers = true
+    )]
     pub timeout: u64,
-    /// Stop the harness after this many seconds with no output.
-    #[arg(long, value_parser = parse_idle_timeout)]
+    /// Stop the harness after this long with no output, using the same syntax as --timeout.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = parse_idle_timeout,
+        allow_negative_numbers = true
+    )]
     pub idle_timeout: Option<u64>,
     /// Action when the job is continuously stuck: none, cancel or retry.
     #[arg(long, value_parser = parse_stuck_policy)]
@@ -2215,6 +2226,14 @@ fn print_job(view: &JobView) {
                 .map(display_field)
                 .unwrap_or_else(|| "-".to_owned()),
         ),
+        ("timeout_secs", view.spec.timeout_secs.to_string()),
+        (
+            "idle_timeout_secs",
+            view.spec
+                .idle_timeout_secs
+                .map(|secs| secs.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
         (
             "node",
             view.node
@@ -3020,18 +3039,44 @@ fn parse_state(value: &str) -> Result<JobState, String> {
     })
 }
 
-fn parse_idle_timeout(value: &str) -> Result<u64, String> {
-    let secs: u64 = value
+/// Accepts plain seconds or one `s`, `m` or `h` suffix, matching `ting wait-idle --timeout`.
+/// Zero, negative and out-of-range values are refused before a request reaches the controller.
+fn parse_timeout_secs(value: &str, label: &str, max: u64) -> Result<u64, String> {
+    if value.starts_with('-') {
+        return Err(format!("{label} must be greater than zero (got {value:?})"));
+    }
+    let (amount, multiplier) = match value.as_bytes().last().copied() {
+        Some(b's' | b'S') => (&value[..value.len() - 1], 1u64),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 60u64),
+        Some(b'h' | b'H') => (&value[..value.len() - 1], 3600u64),
+        _ => (value, 1u64),
+    };
+    if amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "{label} must be a positive integer with an optional s, m or h suffix (got {value:?})"
+        ));
+    }
+    let amount: u64 = amount
         .parse()
-        .map_err(|_| format!("idle timeout must be a whole number of seconds (got {value:?})"))?;
-    let max = lu_proto::MAX_IDLE_TIMEOUT_SECS;
+        .map_err(|_| format!("{label} value is too large"))?;
+    let secs = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("{label} value is too large"))?;
     if !(lu_proto::MIN_TIMEOUT_SECS..=max).contains(&secs) {
         return Err(format!(
-            "idle timeout must be {} to {max} seconds (got {secs})",
+            "{label} must be {} to {max} seconds (got {secs})",
             lu_proto::MIN_TIMEOUT_SECS
         ));
     }
     Ok(secs)
+}
+
+fn parse_wall_timeout(value: &str) -> Result<u64, String> {
+    parse_timeout_secs(value, "timeout", lu_proto::MAX_TIMEOUT_SECS)
+}
+
+fn parse_idle_timeout(value: &str) -> Result<u64, String> {
+    parse_timeout_secs(value, "idle timeout", lu_proto::MAX_IDLE_TIMEOUT_SECS)
 }
 
 fn parse_limit(value: &str) -> Result<u32, String> {
@@ -3211,6 +3256,65 @@ mod collect_cli_tests {
         assert_eq!(args.collect, None);
         assert!(!args.include_failed);
         assert_eq!(args.on_conflict, OnConflict::Fail);
+    }
+
+    #[test]
+    fn submit_parses_timeout_durations_and_refuses_bad_idle_timeouts() {
+        let cli = Cli::try_parse_from([
+            "lu",
+            "submit",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+            "--timeout",
+            "2m",
+            "--idle-timeout",
+            "45s",
+        ])
+        .unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit");
+        };
+        assert_eq!(args.timeout, 120);
+        assert_eq!(args.idle_timeout, Some(45));
+
+        let cli = Cli::try_parse_from([
+            "lu",
+            "submit",
+            "--repo",
+            "/srv/git/r",
+            "--ref",
+            "main",
+            "--task",
+            "go",
+        ])
+        .unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit");
+        };
+        assert_eq!(args.timeout, lu_proto::DEFAULT_TIMEOUT_SECS);
+        assert_eq!(args.idle_timeout, None);
+
+        for value in ["0", "-1", "86401", "nope", ""] {
+            let error = Cli::try_parse_from([
+                "lu",
+                "submit",
+                "--repo",
+                "/srv/git/r",
+                "--ref",
+                "main",
+                "--task",
+                "go",
+                "--idle-timeout",
+                value,
+            ])
+            .unwrap_err();
+            let text = error.to_string();
+            assert!(text.contains("idle timeout"), "{value:?}: {text}");
+        }
     }
 
     #[test]

@@ -63,6 +63,7 @@ model = "gpt"
 priority = 3
 group = "release"
 timeout = 120
+idle_timeout = 60
 workspace = "keep"
 require = ["linux"]
 after_keys = ["prepare"]
@@ -82,6 +83,7 @@ fields:
 | `priority` | `0` to `9`; higher dispatches first. |
 | `group` | A `1` to `64` character concurrency group. |
 | `timeout` | `1` to `86400` seconds. |
+| `idle_timeout` | `1` to `86400` seconds with no harness output; omitted when absent. |
 | `expect` | A table with `files`, `changed`, `forbid_changed`, `min_diff_bytes`, `max_diff_bytes` and `mode`. |
 | `workspace` | `ephemeral`, `keep_on_failure` or `keep`. |
 | `require` | Node labels. An empty array clears a default list. |

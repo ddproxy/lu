@@ -1024,6 +1024,100 @@ async fn submit_sends_idle_timeout_and_rejects_zero() {
         1,
         "a usage error must not reach the controller"
     );
+
+    let negative = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+            "--idle-timeout",
+            "-1",
+        ],
+        &env_for(&server, &token),
+        Some("run the tests\n"),
+        &dir,
+    );
+    assert_eq!(negative.status.code(), Some(2), "{}", stderr(&negative));
+    assert!(
+        stderr(&negative).contains("idle timeout must be greater than zero"),
+        "{}",
+        stderr(&negative)
+    );
+    assert_eq!(server.records.lock().unwrap().len(), 1);
+
+    let absent = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "https://example.net/repo.git",
+            "--ref",
+            "main",
+        ],
+        &env_for(&server, &token),
+        Some("run the tests\n"),
+        &dir,
+    );
+    assert!(absent.status.success(), "{}", stderr(&absent));
+    let records = server.records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    let spec: Value = serde_json::from_slice(&records[1].body).unwrap();
+    assert!(spec.get("idle_timeout_secs").is_none(), "{spec}");
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_and_show_round_trip_the_idle_timeout() {
+    let id = job_id();
+    let job_key = id.clone();
+    let stored: Arc<Mutex<Value>> = Arc::new(Mutex::new(job_json(&id, "queued")));
+    let reply = Arc::clone(&stored);
+    let server = start(move |record| {
+        if record.method == "POST" {
+            let spec: Value = serde_json::from_slice(&record.body).unwrap();
+            let mut job = job_json(&job_key, "queued");
+            job["spec"] = spec;
+            *reply.lock().unwrap() = job.clone();
+            Reply::json(&job)
+        } else {
+            Reply::json(&reply.lock().unwrap().clone())
+        }
+    })
+    .await;
+    let dir = scratch("submit-idle-round-trip");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let submit = run_with_env(
+        &[
+            "submit",
+            "--repo",
+            "/srv/repo",
+            "--ref",
+            "main",
+            "--timeout",
+            "10m",
+            "--idle-timeout",
+            "90s",
+        ],
+        &env_for(&server, &token),
+        Some("round trip\n"),
+        &dir,
+    );
+    assert!(submit.status.success(), "{}", stderr(&submit));
+    let shown = run_with_env(&["show", &id], &env_for(&server, &token), None, &dir);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let text = stdout(&shown);
+    for (key, value) in [("timeout_secs", "600"), ("idle_timeout_secs", "90")] {
+        let line = text
+            .lines()
+            .find(|line| line.trim_start().starts_with(key))
+            .unwrap_or_else(|| panic!("missing {key} in {text}"));
+        assert_eq!(
+            line.split_whitespace().collect::<Vec<_>>(),
+            vec![key, value]
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

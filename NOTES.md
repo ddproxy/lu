@@ -540,3 +540,46 @@ uid, so no commit could be created.
 
 The checkout's `.git` directory is root-owned and unwritable, so no commit was created. The terse
 change labels prepared are `check: share serve validation` and `operator: reject agent credentials`.
+
+## Idle timeout CLI and batch verification
+
+Claims in the request were checked against the source before editing; the source won where they
+disagreed.
+
+- **The flag already existed.** `SubmitArgs.idle_timeout` was present in `app/src/operator.rs` with
+  a whole-seconds parser and was already copied to `JobSpec.idle_timeout_secs`. No second flag was
+  added. `lu submit --help` now labels both timeout values `DURATION`.
+- **Duration syntax was absent on submit.** `lu submit --timeout` was a plain `u64` of seconds;
+  only `ting wait-idle --timeout` accepted an `s`/`m`/`h` suffix. Both submit timeout flags now
+  share one parser that accepts plain seconds or one suffix, so the request's "same syntax" holds
+  after this change. Plain seconds and all existing bounds are unchanged.
+- **Only `mcp.rs` passed the field.** `app/src/batch.rs` hard-coded `idle_timeout_secs: None`. It
+  now reads `idle_timeout` from `--defaults` and sidecars through the existing overlay rules, with
+  the same `1..=86400` check the API uses.
+- **`lu show` had no timeout row at all.** Both `timeout_secs` and `idle_timeout_secs` are now
+  adjacent rows in `print_job`; absent idle timeouts print `-`. The longest key was already 18
+  characters, so alignment of existing rows is unchanged.
+- **Batch resolve errors were swallowed.** `plan` reported only `invalid batch settings` even
+  though `resolve` built a field-specific message. The reason is now included so an invalid
+  `idle_timeout` (or any other shared field) is refused with a clear CLI error.
+- **The controller has no cross-field rule.** `JobSpec::validate` checks each timeout only against
+  its own range and never compares them. An idle timeout longer than the wall-clock timeout is
+  accepted without a warning, matching the API; the wall-clock timeout still ends the job.
+  `docs/api.md` now states this. Zero and out-of-range values are refused by the CLI parser and by
+  the API with `422 unprocessable`; negative CLI values are refused by the parser before a request.
+- **There is no `docs/cli.md` in this repository.** The CLI reference lives in the `README.md`
+  command table, with batch fields in `docs/batch.md`; those files and `docs/api.md` were updated.
+
+### Verification
+
+- `cargo fmt --all --check` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean.
+- `cargo test --workspace` — passed on rerun. The first run hit a timing failure in the unrelated
+  `tuishou-ting` test `job_override_wins_over_the_agent_default`; it passed alone and in the full rerun.
+- `scripts/check-docs.sh` — passed.
+- The `tui` feature cannot be compiled in this checkout: the pinned local `fw-tui` patch lacks
+  `render_table_sorted`, `SortKind`, `TableColumn`, `sort_column_at`, `with_key`, `sorted_indices`,
+  `handle_sort_key` and `cycle_sort`. This is independent of the timeout changes.
+
+The checkout's `.git` directory is root-owned and unreadable by the current uid, so no commit could
+be created. The prepared terse message is `cli: add idle timeout to batch and show`.
