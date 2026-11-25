@@ -21,7 +21,7 @@ flowchart TD
 | Symptom | Check | Action |
 | --- | --- | --- |
 | `lu serve` exits with a config error | `lu check --config …` | The error names the table. Fix that table before starting. |
-| `no controller URL: set LU_URL …` | Environment, then operator files | Set `LU_URL` and `LU_TOKEN_FILE`, or write `~/.config/lu/operator.toml` or `/etc/lu/operator.toml`. `--config` never supplies operator credentials. See [client guide](client-guide.md). |
+| `no controller URL: set LU_URL …` | Environment, then operator files | Set `LU_URL` and `LU_TOKEN_FILE` (optional `LU_CA_FILE`), or write `url` and `token_file` (optional `ca_file`) in `~/.config/lu/operator.toml` or `/etc/lu/operator.toml`. `--config` never supplies operator credentials and has no `[agent]` fallback. See [client guide](client-guide.md). |
 | Token file refused | Owner, mode, type | Regular file, owned by the effective user, mode `0600` or tighter, no symlink or FIFO; at most 64 KiB for an agent token, 8 KiB for an operator token. |
 | `401 unauthorized` | Token value, scope, hash | Missing, unknown and wrong-scope tokens all return `401`. Use an operator token for CLI/MCP and an agent token for agent routes. |
 | `403 forbidden` | Node binding | A valid agent token is bound to one node; another node's job or heartbeat is refused. |

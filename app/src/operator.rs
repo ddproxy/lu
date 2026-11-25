@@ -1971,7 +1971,10 @@ fn settings(_config: &Path) -> Result<Settings, String> {
             let token_file = std::env::var("LU_TOKEN_FILE")
                 .ok()
                 .filter(|path| !path.is_empty())
-                .ok_or_else(|| "LU_TOKEN_FILE must be set when LU_URL is set".to_owned())?;
+                .ok_or_else(|| {
+                    "LU_TOKEN_FILE must be set when LU_URL is set (LU_CA_FILE is optional)"
+                        .to_owned()
+                })?;
             let ca_file = std::env::var("LU_CA_FILE")
                 .ok()
                 .filter(|path| !path.is_empty())
@@ -1998,7 +2001,7 @@ fn settings(_config: &Path) -> Result<Settings, String> {
                 .map(PathBuf::from),
         });
     }
-    Err("no controller URL: set LU_URL and LU_TOKEN_FILE, or write ~/.config/lu/operator.toml or /etc/lu/operator.toml".to_owned())
+    Err("no controller URL: set LU_URL and LU_TOKEN_FILE (LU_CA_FILE is optional), or write url and token_file (optional ca_file) in ~/.config/lu/operator.toml or /etc/lu/operator.toml; --config never supplies operator credentials".to_owned())
 }
 
 fn read_task(args: &SubmitArgs) -> Result<String, String> {

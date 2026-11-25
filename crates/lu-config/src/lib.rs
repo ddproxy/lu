@@ -2729,7 +2729,14 @@ pub(crate) fn read_config_text(path: &Path) -> Result<String, ConfigError> {
 
 /// Reads and validates a config file, including the secret files it names.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
-    let config = Config::parse(&read_config_text(path)?)?;
+    let config = load_values(path)?;
+    check_secrets(&config)?;
+    Ok(config)
+}
+
+/// Checks the secret files named by an already validated config. `lu check` deliberately does
+/// not call this: it runs as a different user from the service that owns the secret files.
+pub fn check_secrets(config: &Config) -> Result<(), ConfigError> {
     if let Some(tls) = &config.tls {
         secret::read_private_file("[tls] key", Path::new(&tls.key), MAX_CONFIG_BYTES)?;
     }
@@ -2781,7 +2788,7 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
             }
         }
     }
-    Ok(config)
+    Ok(())
 }
 
 /// Parses a config file without checking values or reading the secret files it names. For

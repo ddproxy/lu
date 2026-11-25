@@ -1,6 +1,8 @@
+use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -351,5 +353,156 @@ harness = "opencode"
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("tls on"), "{stdout}");
     assert!(stdout.contains("checks: config values"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn controller_text(dir: &Path, listen: u16) -> String {
+    format!(
+        r#"[controller]
+listen = "127.0.0.1:{listen}"
+db = "{db}"
+artifacts_dir = "{artifacts}"
+
+[[controller.agents]]
+name = "peer-a"
+token_sha256 = "{HASH_A}"
+
+[[controller.operators]]
+name = "ops"
+token_sha256 = "{HASH_B}"
+"#,
+        db = dir.join("lu.db").display(),
+        artifacts = dir.join("artifacts").display(),
+    )
+}
+
+/// Starts `lu serve` long enough to prove it passed startup validation, then stops it.
+fn serve_starts(config: &Path, listen: u16) -> Result<(), String> {
+    let mut child = bin()
+        .args(["--config", config.to_str().unwrap(), "serve"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            let out = child.wait_with_output().unwrap();
+            return Err(format!(
+                "serve exited before binding: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        if TcpStream::connect(("127.0.0.1", listen)).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let out = child.wait_with_output().unwrap();
+    if ready {
+        Ok(())
+    } else {
+        Err(format!(
+            "serve did not bind: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
+}
+
+#[test]
+fn check_and_serve_agree_on_config_validation() {
+    let dir = scratch("agreement");
+    let listen = free_port();
+    let case_dir = dir.join("valid");
+    std::fs::create_dir_all(&case_dir).unwrap();
+    let good = case_dir.join("c.toml");
+    std::fs::write(&good, controller_text(&case_dir, listen)).unwrap();
+
+    let checked = bin()
+        .args(["--config", good.to_str().unwrap(), "check"])
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert!(
+        !case_dir.join("lu.db").exists(),
+        "check must not create the database"
+    );
+    serve_starts(&good, listen).expect("valid config should serve");
+
+    let base = controller_text(&case_dir, listen);
+    let cases = [
+        ("unknown-key", "[nope]\nvalue = 1\n".to_owned(), "unknown field"),
+        (
+            "log-level",
+            format!("[log]\nlevel = \"loud\"\n\n{base}"),
+            "level must be one of",
+        ),
+        (
+            "token-scope",
+            format!(
+                "{base}\n[[controller.operators]]\nname = \"ops2\"\ntoken_sha256 = \"{HASH_A}\"\n"
+            ),
+            "a token must not work in both scopes",
+        ),
+        (
+            "scrub-pattern",
+            format!(
+                "{base}\n[artifacts]\nscrub = true\n\n[[artifacts.extra_rules]]\nname = \"broken\"\npattern = \"([\"\n"
+            ),
+            "invalid pattern",
+        ),
+        (
+            "schedule",
+            format!("{base}\n[schedule]\nhorizon_secs = 0\n"),
+            "[schedule]",
+        ),
+        (
+            "db-path",
+            base.replace(
+                &format!("db = \"{}\"", case_dir.join("lu.db").display()),
+                "db = \"relative.db\"",
+            ),
+            "db must be an absolute path",
+        ),
+    ];
+    for (label, text, expected) in cases {
+        let case_dir = dir.join(label);
+        std::fs::create_dir_all(&case_dir).unwrap();
+        let config = case_dir.join("c.toml");
+        std::fs::write(&config, text).unwrap();
+
+        let checked = bin()
+            .args(["--config", config.to_str().unwrap(), "check"])
+            .output()
+            .unwrap();
+        let served = bin()
+            .args(["--config", config.to_str().unwrap(), "serve"])
+            .output()
+            .unwrap();
+        let check_stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+        let serve_stderr = String::from_utf8_lossy(&served.stderr).into_owned();
+        assert!(
+            !checked.status.success(),
+            "{label}: check passed: {check_stderr}"
+        );
+        assert!(
+            !served.status.success(),
+            "{label}: serve passed: {serve_stderr}"
+        );
+        assert_eq!(check_stderr, serve_stderr, "{label}: messages differ");
+        assert!(check_stderr.contains(expected), "{label}: {check_stderr}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

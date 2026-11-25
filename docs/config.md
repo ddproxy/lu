@@ -1,6 +1,6 @@
 # Configuration
 
-`lu` reads one TOML file. `--config <path>` selects it; the default is `lu.toml` in the current directory. `lu check` parses and validates the values, prints a summary, database health and the checks it ran, but does not read secret files, load the TLS certificate or bind a port. `lu serve` and `ting` validate the whole file and check its secret files; `lu backup` and `lu restore` read only `[controller] db`.
+`lu` reads one TOML file. `--config <path>` selects it; the default is `lu.toml` in the current directory. `lu check` runs the same value validation as `lu serve` (parsing, token and role rules, schedule and limits sections, paths and scrub rules), prints a summary, read-only database health and the checks it ran, but does not read secret files, load TLS material, bind a port or open the database for write. `lu serve` additionally checks its secret files and loads TLS material before binding; `ting` checks its secret files; `lu backup` and `lu restore` read only `[controller] db`.
 
 The file is UTF-8 and limited to 64 KiB. `lu check`, `lu serve` and `ting` reject unknown keys and tables rather than ignoring them; `lu backup` and `lu restore` read only `[controller] db` and do not validate unrelated keys. Every validation error names the table at fault, for example:
 

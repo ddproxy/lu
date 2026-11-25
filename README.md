@@ -248,7 +248,7 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 
 | Command | What it does |
 | --- | --- |
-| `lu check` | Read the config file's structure and print a controller or agent summary. When `[controller] db` exists, it prints the database's `quick_check`, schema, size and consistency counts. It does not read TLS keys or token files. |
+| `lu check` | Run the same value validation as `lu serve` and print a controller or agent summary. When `[controller] db` exists, it prints the database's `quick_check`, schema, size and consistency counts. It does not read TLS keys or token files, bind a port or open the database for write. |
 | `lu backup --out <file> [--force]` | Copy the live controller database into `<file>` with `VACUUM INTO`, verify it and set mode `0600`. Existing files need `--force`. |
 | `lu restore <file>` | Install a backup as the controller database after stopping the controller. The previous file is moved to `<db>.pre-restore-<unix seconds>`. |
 | `lu audit verify <path> [--head <hash>]` | Walk a hash-chained audit JSON Lines file and report the first break. `--head` also checks a trusted head hash recorded elsewhere, detecting removed trailing records. |
@@ -334,7 +334,7 @@ Common failures, with the exact message and fix:
 
 | Message | Fix |
 | --- | --- |
-| `no controller URL: set LU_URL …` | Set `LU_URL` and `LU_TOKEN_FILE`, or write an operator file; `--config` does not supply operator credentials. |
+| `no controller URL: set LU_URL …` | Set `LU_URL` and `LU_TOKEN_FILE` (optional `LU_CA_FILE`), or write `url` and `token_file` in an operator file; `--config` does not supply operator credentials and has no `[agent]` fallback. |
 | `401 unauthorized` | Use an operator token for CLI and MCP calls, or an agent token on agent routes. Missing, unknown and wrong-scope tokens all return `401`. |
 | `403 forbidden` | The agent token is bound to one node; use the node it belongs to. |
 | `429 rate_limited` | Honour `Retry-After` and reduce failed token checks or sync requests. |

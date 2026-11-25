@@ -11,6 +11,16 @@ use lu_serve::{serve, shutdown_signal, ServeOptions};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
+/// Value checks shared by `lu check` and `lu serve`: parsing, token and role rules, schedule
+/// and limits sections, paths, and compiled scrub rules. No port is bound, no database is opened
+/// and no secret file is read here. `lu serve` calls [`lu_config::check_secrets`] after this.
+pub fn validate(path: &Path) -> Result<Config, String> {
+    let config = lu_config::load_values(path).map_err(|error| error.to_string())?;
+    lu_controller::Scrubber::validate_config(config.artifacts.as_ref())
+        .map_err(|error| format!("invalid [artifacts] config: {error}"))?;
+    Ok(config)
+}
+
 /// Binds the listener and serves until a shutdown signal.
 pub async fn run(config: &Config, config_path: &Path) -> Result<(), String> {
     let controller = config
