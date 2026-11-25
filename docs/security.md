@@ -67,6 +67,13 @@ A valid token used on the other scope's route is also `401`, so a probe cannot d
 failures. A valid agent token that names a different node, or an agent write for another node's
 job, is `403 forbidden`.
 
+Operator credentials never come from `--config`. The operator CLI reads only `LU_URL` with
+`LU_TOKEN_FILE` (optional `LU_CA_FILE`) or an operator file with `url` and `token_file` (optional
+`ca_file`); when none are present it exits non-zero and names those settings and files. There is
+no fallback to `[agent].controller_url` or `[agent].token_file`, so an agent token is never
+attached to an operator request. If one were presented, the controller would refuse it with the
+same wrong-scope `401` as any other agent call on an operator route.
+
 Token hashes must be unique across agents and operators, so one token can never hold both
 scopes. An agent name is also the node identity; two agents cannot share a name or a token hash.
 

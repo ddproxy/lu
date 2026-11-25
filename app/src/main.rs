@@ -150,13 +150,10 @@ async fn main() -> ExitCode {
 }
 
 fn check(path: &std::path::Path) -> ExitCode {
-    let config = match lu_config::load_values(path) {
+    let config = match service::validate(path) {
         Ok(config) => config,
-        Err(error) => return fail(&error.to_string()),
+        Err(error) => return fail(&error),
     };
-    if let Err(error) = lu_controller::Scrubber::validate_config(config.artifacts.as_ref()) {
-        return fail(&format!("invalid [artifacts] config: {error}"));
-    }
     let mut checks = vec!["config values".to_owned()];
     let tls_on = config.tls.is_some();
     if let Some(c) = &config.controller {
@@ -207,10 +204,13 @@ fn check(path: &std::path::Path) -> ExitCode {
 }
 
 async fn serve(path: &std::path::Path) -> ExitCode {
-    let config = match lu_config::load(path) {
+    let config = match service::validate(path) {
         Ok(config) => config,
-        Err(error) => return fail(&error.to_string()),
+        Err(error) => return fail(&error),
     };
+    if let Err(error) = lu_config::check_secrets(&config) {
+        return fail(&error.to_string());
+    }
     if let Err(error) = logging::init(&config.log) {
         return fail(&error);
     }

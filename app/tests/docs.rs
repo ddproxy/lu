@@ -250,3 +250,35 @@ fn check_proof_lines_match_the_binary() {
         "unexpected controller summary: {stdout}"
     );
 }
+
+#[test]
+fn connection_and_validation_docs_state_the_behaviour() {
+    let guide = read("docs/client-guide.md");
+    assert!(
+        guide.contains("There is no fallback to `[agent]` in `--config`"),
+        "client guide must rule out the agent credential fallback"
+    );
+    for setting in ["LU_URL", "LU_TOKEN_FILE", "LU_CA_FILE", "operator.toml"] {
+        assert!(
+            guide.contains(setting),
+            "client guide must name {setting} when credentials are missing"
+        );
+    }
+    let install = read("docs/install.md");
+    let security = read("docs/security.md");
+    for text in [&install, &security] {
+        assert!(
+            text.contains("no `[agent]` fallback") || text.contains("no fallback to `[agent]"),
+            "docs must rule out the agent credential fallback"
+        );
+    }
+    assert!(
+        install.contains("same value validation") && install.contains("opens no secret files"),
+        "install docs must describe the check/serve split"
+    );
+    let changelog = read("CHANGELOG.md");
+    assert!(
+        changelog.contains("no `[agent]`-table credential fallback"),
+        "changelog must record the operator credential behaviour"
+    );
+}

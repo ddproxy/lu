@@ -255,6 +255,121 @@ harness = "opencode"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_operator_settings_name_the_settings_to_provide() {
+    let id = job_id();
+    let body = job_json(&id, "running");
+    let server = start(move |_| Reply::json(&body)).await;
+    let dir = scratch("missing-operator-settings");
+    let agent_value = lu_proto::JobId::new().to_string();
+    let agent_token = write_token(&dir, "agent.token", &agent_value);
+    let config = dir.join("lu.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"[agent]
+name = "agent"
+controller_url = "{}"
+token_file = "{}"
+work_dir = "/srv/work/lu"
+harness = "opencode"
+"#,
+            server.url,
+            agent_token.display()
+        ),
+    )
+    .unwrap();
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let output = run(
+        &["--config", config.to_str().unwrap(), "show", &id],
+        &[("HOME", home.to_str().unwrap())],
+        None,
+        &dir,
+    );
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let message = stderr(&output);
+    for setting in ["LU_URL", "LU_TOKEN_FILE", "LU_CA_FILE", "operator.toml"] {
+        assert!(message.contains(setting), "missing {setting}: {message}");
+    }
+    assert!(
+        server.records.lock().unwrap().is_empty(),
+        "an agent token must never reach an operator route"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operator_requests_never_carry_the_agent_token() {
+    let id = job_id();
+    let body = job_json(&id, "running");
+    let operator_server = start(move |_| Reply::json(&body)).await;
+    let agent_server = start(move |_| Reply::status(500)).await;
+    let dir = scratch("operator-not-agent");
+    let operator_token = write_token(&dir, "operator.token", TOKEN);
+    let agent_value = lu_proto::JobId::new().to_string();
+    let agent_token = write_token(&dir, "agent.token", &agent_value);
+    let config = dir.join("lu.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"[agent]
+name = "agent"
+controller_url = "{}"
+token_file = "{}"
+work_dir = "/srv/work/lu"
+harness = "opencode"
+"#,
+            agent_server.url,
+            agent_token.display()
+        ),
+    )
+    .unwrap();
+
+    let output = run_with_env(
+        &["--config", config.to_str().unwrap(), "show", &id],
+        &env_for(&operator_server, &operator_token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let xdg = dir.join("xdg");
+    std::fs::create_dir_all(xdg.join("lu")).unwrap();
+    std::fs::write(
+        xdg.join("lu").join("operator.toml"),
+        format!(
+            "url = \"{}\"\ntoken_file = \"{}\"\n",
+            operator_server.url,
+            operator_token.display()
+        ),
+    )
+    .unwrap();
+    let output = run(
+        &["--config", config.to_str().unwrap(), "show", &id],
+        &[("XDG_CONFIG_HOME", xdg.to_str().unwrap())],
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let expected = format!("Bearer {TOKEN}");
+    let agent_header = format!("Bearer {agent_value}");
+    let records = operator_server.records.lock().unwrap();
+    assert_eq!(records.len(), 2, "one request per credential source");
+    for record in records.iter() {
+        assert_eq!(record.header("authorization"), Some(expected.as_str()));
+        assert_ne!(record.header("authorization"), Some(agent_header.as_str()));
+    }
+    drop(records);
+    assert!(
+        agent_server.records.lock().unwrap().is_empty(),
+        "the agent URL must never be used by an operator command"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_passes_after_dependencies() {
     let id = job_id();
     let dep1 = job_id();

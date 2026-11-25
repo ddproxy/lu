@@ -21,6 +21,11 @@ flowchart TD
 
 The token file is read once. It must be a regular file owned by the effective user, with no group or other permission bits, no symlink or FIFO, and at most 8 KiB; trailing CR/LF is trimmed. `ca_file` adds up to 1 MiB of PEM certificates to the system roots. Plain `http` is accepted only on loopback; use `https` for any other host. Redirects are refused.
 
+There is no fallback to `[agent]` in `--config`: an agent token is never attached to an operator
+request. With neither source set, the CLI exits non-zero and names `LU_URL`, `LU_TOKEN_FILE`,
+optional `LU_CA_FILE`, and the `url` and `token_file` keys of an operator file. An agent token on
+an operator route gets the ordinary wrong-scope `401`.
+
 Worked example — environment connection:
 
 ```sh
@@ -36,7 +41,7 @@ Global flags: `--config <path>` (default `lu.toml`) and `--json` (raw controller
 
 | Command | Worked example | Result |
 | --- | --- | --- |
-| `lu check` | `lu check --config /etc/lu/lu.toml` | Validates config values, prints the summary, database health and checks it ran; no secret files are opened and no port is bound. |
+| `lu check` | `lu check --config /etc/lu/lu.toml` | Runs the same value validation as `lu serve`, then prints the summary, read-only database health and the checks it ran; no secret files or TLS material are opened, no port is bound and the database is not opened for write. |
 | `lu serve` | `lu serve --config /etc/lu/lu.toml` | Runs the HTTP listener; default when no subcommand is given. |
 | `lu status` | `lu status --json` | Uptime, schema, db size, queue and node counts. |
 | `lu submit` | `lu submit --repo /srv/app --ref main --task-file task.txt --wait` | Submits a job and waits for a terminal state. |

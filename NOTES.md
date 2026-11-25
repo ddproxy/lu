@@ -496,6 +496,31 @@ Direct `git` and web fetch were denied in this environment; an HTTP probe of the
 `info/refs?service=git-upload-pack` endpoint returned `Repository not found`. No `/tmp` file was
 treated as upstream source.
 
+## Check/serve validation and operator settings verification
+
+The stale open item asked `lu check` to run `lu serve` validation without binding and to remove an
+`[agent]` fallback for operator settings. Both claims were checked against the tree before the
+edits.
+
+- **Operator fallback claim.** False in the current code. `app/src/operator.rs` already resolved
+  operator settings only from `LU_URL`, `LU_TOKEN_FILE` and `LU_CA_FILE`, or `url`, `token_file` and
+  `ca_file` from the operator config; it never read `[agent]` and the ignored `--config` argument
+  never supplied credentials. `ting` continues to use `[agent].token_file`, which is a separate
+  node scope. The error text now names the settings and the two operator config files, and says
+  explicitly that `--config` never supplies operator credentials. A regression test builds both an
+  operator config with only `[agent]` credentials and one with an agent token under
+  `[controller]`, then asserts each request carries only the configured operator token. No
+  `[agent]` fallback was reintroduced.
+- **Check/serve claim.** Partly true. `lu check` already validated values without binding a port,
+  but it used a separate validation path, so the two commands could disagree. It also deliberately
+  opened no secret files or TLS material and never opened the database for write. `lu check` and
+  `lu serve` now share `service::validate`, which parses the config and validates tokens, roles,
+  schedules, limits, paths and scrub rules with identical messages. `lu serve` then performs the
+  startup-only work `lu check` must not do: `lu_config::check_secrets` opens token and credential
+  files, TLS material is loaded, the database is opened for write and the listener is bound.
+  `lu check` still reports read-only database health. An agreement test feeds equivalent bad values
+  to both commands and compares stderr, while asserting `check` creates no database.
+
 ### Verification
 
 - `cargo fmt --all` — clean.
@@ -507,3 +532,11 @@ treated as upstream source.
 
 Changes remain local and uncommitted: the checkout's git metadata is not writable by the current
 uid, so no commit could be created.
+
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` — passed, with and without
+  `--features tui`.
+- `cargo test --workspace --locked` — passed, with and without `--features tui`.
+- `scripts/check-docs.sh` — passed.
+
+The checkout's `.git` directory is root-owned and unwritable, so no commit was created. The terse
+change labels prepared are `check: share serve validation` and `operator: reject agent credentials`.

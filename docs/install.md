@@ -169,7 +169,14 @@ systemctl enable --now lu-controller.service
 curl -fsS https://lu.example.net:7600/v1/health
 ```
 
-`lu check` validates config values, reports database health and lists the checks it ran. It opens no secret files and binds no port. `lu serve` validates the whole file and its secret files before binding. A non-loopback `listen` requires `[tls]`; there is no general config reload, so restart after editing config, TLS files or token hashes. The schedule alone can be swapped with `POST /v1/schedule/reload`; see [Time-aware scheduling](scheduling.md#inspecting-scheduling).
+`lu check` and `lu serve` run the same value validation: parsing, token and role rules, schedule and
+limits sections, paths and scrub rules fail with the same message. `lu check` reports read-only
+database health and lists the checks it ran; it deliberately opens no secret files or TLS
+material, binds no port and never opens the database for write, so it can run as root against a
+service account's secrets. `lu serve` additionally reads its secret files, loads TLS material and
+opens the database before binding. A non-loopback `listen` requires `[tls]`; there is no general
+config reload, so restart after editing config, TLS files or token hashes. The schedule alone can
+be swapped with `POST /v1/schedule/reload`; see [Time-aware scheduling](scheduling.md#inspecting-scheduling).
 
 ### Running the controller under systemd
 
@@ -223,6 +230,6 @@ The scoped MCP server for a harness inside a job is `ting mcp`; see
 
 ## After install
 
-Operator commands use `LU_URL` with `LU_TOKEN_FILE` (optional `LU_CA_FILE`) or the first existing operator file at `$XDG_CONFIG_HOME/lu/operator.toml` (or `~/.config/lu/operator.toml`) or `/etc/lu/operator.toml`. Use an operator token: agent tokens get `401` on operator routes, and `--config` never supplies operator credentials. `lu backup`, `lu restore` and `lu check` use only the config's `[controller] db` key for database access and never open TLS keys or tokens, so they run as root or as the service account even when that account owns the secrets.
+Operator commands use `LU_URL` with `LU_TOKEN_FILE` (optional `LU_CA_FILE`) or the first existing operator file at `$XDG_CONFIG_HOME/lu/operator.toml` (or `~/.config/lu/operator.toml`) or `/etc/lu/operator.toml`. The operator file uses `url`, `token_file` and optional `ca_file`. There is no `[agent]` fallback: `--config` never supplies operator credentials, and the missing-settings error names every setting and file to provide. An agent token on an operator route gets `401`. `lu backup`, `lu restore` and `lu check` use only the config's `[controller] db` key for database access and never open TLS keys or tokens, so they run as root or as the service account even when that account owns the secrets.
 
 Use the [client guide](client-guide.md) to submit and follow jobs, [monitoring.md](monitoring.md) to scrape metrics, and [troubleshooting.md](troubleshooting.md) for failures. Upgrade and backup steps are in [operations.md](operations.md); moving an older agent host is in [migration-ting.md](migration-ting.md).

@@ -5,6 +5,11 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- `lu check` and `lu serve` now call one shared value-validation path, so config parsing, token and role rules, schedule and limits sections, database paths and scrub rules fail with the same message. `lu check` still opens no secret files or TLS material, binds no port and never opens the database for write; `lu serve` alone reads secret files, loads TLS material and opens the database before binding.
+- Operator commands have no `[agent]`-table credential fallback. Regression tests prove an agent token is never attached to an operator request, and the missing-settings error names `LU_URL`, `LU_TOKEN_FILE`, optional `LU_CA_FILE` and the operator file's `url` and `token_file` keys. See [docs/client-guide.md](docs/client-guide.md), [docs/install.md](docs/install.md) and [docs/security.md](docs/security.md).
+
 ## [0.7.0]
 
 ### Added
