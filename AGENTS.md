@@ -61,4 +61,4 @@ cargo test --locked -p lu --test docs
 
 Never paste a token, key or other credential into a task, a config example or a test fixture.
 Token files must stay outside version control with private file modes. See `SECURITY.md` and
-`docs/limits.md` for the boundaries Lu does and does not provide.
+`docs/security.md` for the boundaries Lu does and does not provide.

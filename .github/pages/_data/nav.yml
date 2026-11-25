@@ -3,48 +3,43 @@
     - { title: Overview, url: / }
     - { title: Quickstart, url: /docs/quickstart.html }
     - { title: Worked examples, url: /docs/examples.html }
-- title: Concepts
+- title: Using Lu
   items:
-    - { title: Concepts, url: /docs/concepts.html }
-    - { title: Job Lifecycle, url: /docs/lifecycle.html }
-    - { title: Drafts, url: /docs/drafts.html }
+    - { title: Job lifecycle, url: /docs/lifecycle.html }
     - { title: Failure classes, url: /docs/lifecycle.html#failure-classes-and-retries }
+    - { title: Submitting work, url: /docs/submitting.html }
     - { title: Dependencies, url: /docs/dependencies.html }
-    - { title: Batch submissions, url: /docs/batch.html }
-    - { title: Choosing where a job runs, url: /docs/dispatch.html }
+    - { title: Publishing, url: /docs/publish.html }
+    - { title: Node workspaces, url: /docs/workspaces.html }
+    - { title: Dispatch, url: /docs/dispatch.html }
     - { title: Time-aware scheduling, url: /docs/scheduling.html }
+    - { title: Scope, url: /docs/scope.html }
 - title: Install
   items:
     - { title: Install, url: /docs/install.html }
     - { title: Running under systemd, url: /docs/install.html#running-the-controller-under-systemd }
-    - { title: Migrating an agent to Ting, url: /docs/migration-ting.html }
 - title: Configuration
   items:
     - { title: Configuration, url: /docs/config.html }
     - { title: Webhook intake, url: /docs/intake.html }
-    - { title: Running the opencode harness, url: /docs/opencode-harness.html }
 - title: Operate
   items:
     - { title: Operations, url: /docs/operations.html }
-    - { title: Adding a node safely, url: /docs/onboarding-nodes.html }
+    - { title: Adding a node safely, url: /docs/operations.html#node-onboarding }
     - { title: Backup and restore, url: /docs/operations.html#backup-and-restore }
-    - { title: Drains and cordons, url: /docs/operations.html#provider-cordons-and-node-drains }
+    - { title: Node drains, url: /docs/operations.html#node-drains }
     - { title: Monitoring, url: /docs/monitoring.html }
     - { title: Troubleshooting, url: /docs/troubleshooting.html }
-    - { title: What Lu does not protect against, url: /docs/limits.html }
+    - { title: What Lu does not protect against, url: /docs/security.html#what-lu-does-not-protect-against }
 - title: Security
   items:
     - { title: Tokens and TLS, url: /docs/tokens-and-tls.html }
     - { title: Token rotation, url: /docs/tokens-and-tls.html#rotation }
     - { title: Security, url: /docs/security.html }
-    - { title: Security scanning, url: /docs/security-scanning.html }
+    - { title: Audit record, url: /docs/security.html#audit-record }
 - title: Reference
   items:
     - { title: Documentation index, url: /docs/README.html }
     - { title: HTTP API, url: /docs/api.html }
-    - { title: ting reference, url: /docs/ting.html }
-    - { title: Audit record, url: /docs/audit.html }
+    - { title: CLI and MCP, url: /docs/cli.html }
     - { title: Compatibility between releases, url: /docs/compatibility.html }
-    - { title: Client guide, url: /docs/client-guide.html }
-    - { title: MCP server, url: /docs/mcp.html }
-    - { title: FAQ, url: /docs/faq.html }

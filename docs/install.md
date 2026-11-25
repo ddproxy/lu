@@ -4,8 +4,8 @@ Release archives contain statically linked `lu` and `ting` binaries, built for m
 plain `make build` produces release binaries for the host toolchain; they are not necessarily
 statically linked. Build from source or use a release archive, then write a controller config,
 start the controller and add agent hosts. Config keys are in [config.md](config.md); service
-details are in [operations.md](operations.md). Existing agent hosts must follow the
-[Ting migration note](migration-ting.md); there is no compatibility shim.
+details are in [operations.md](operations.md). Upgrade the controller before replacing agent
+binaries; see [Upgrade](operations.md#upgrade).
 
 ```mermaid
 flowchart LR
@@ -223,13 +223,13 @@ ting --config /etc/ting/ting.toml
 The command defaults to `/etc/ting/ting.toml` for `ting --config`, matching the unit. The same
 config and token file drive the self-service commands `ting status --json`, `ting drain`,
 `ting undrain` and `ting wait-idle --timeout <duration>`; they need no operator token. See
-[the `ting` reference](ting.md) and [Updating a node](../README.md#updating-a-node).
+[the `ting` reference](cli.md#ting-reference) and [Updating a node](../README.md#updating-a-node).
 
 The scoped MCP server for a harness inside a job is `ting mcp`; see
-[the MCP server](mcp.md#scoped-mcp-ting-mcp).
+[the MCP server](cli.md#scoped-mcp-ting-mcp).
 
 ## After install
 
 Operator commands use `LU_URL` with `LU_TOKEN_FILE` (optional `LU_CA_FILE`) or the first existing operator file at `$XDG_CONFIG_HOME/lu/operator.toml` (or `~/.config/lu/operator.toml`) or `/etc/lu/operator.toml`. The operator file uses `url`, `token_file` and optional `ca_file`. There is no `[agent]` fallback: `--config` never supplies operator credentials, and the missing-settings error names every setting and file to provide. An agent token on an operator route gets `401`. `lu backup`, `lu restore` and `lu check` use only the config's `[controller] db` key for database access and never open TLS keys or tokens, so they run as root or as the service account even when that account owns the secrets.
 
-Use the [client guide](client-guide.md) to submit and follow jobs, [monitoring.md](monitoring.md) to scrape metrics, and [troubleshooting.md](troubleshooting.md) for failures. Upgrade and backup steps are in [operations.md](operations.md); moving an older agent host is in [migration-ting.md](migration-ting.md).
+Use the [client guide](cli.md#client-guide) to submit and follow jobs, [monitoring.md](monitoring.md) to scrape metrics, and [troubleshooting.md](troubleshooting.md) for failures. Upgrade and backup steps are in [operations.md](operations.md).

@@ -1,6 +1,6 @@
 # Webhook intake
 
-Intake turns signed HTTP events into jobs, normally [drafts](drafts.md), without giving the sender
+Intake turns signed HTTP events into jobs, normally [drafts](submitting.md#drafts), without giving the sender
 an operator token. A controller listens on one unauthenticated route per configured source. The
 route verifies an HMAC-SHA256 signature, applies operator-authored rules to the JSON body, and
 either creates a draft or drops the event. An operator reviews and approves the draft through the
@@ -165,7 +165,7 @@ with the value in the configured header. Signatures are checked before size or p
   and no operator token is needed to read the intake route.
 - A draft refused because `[drafts]` capacity is exhausted gets `429 limit_exceeded` and is counted
   as `invalid`; it is a different outcome from a rule drop. See
-  [drafts.md](drafts.md#limits-and-expiry).
+  [Drafts](submitting.md#limits-expiry-and-observability).
 
 ## Transport and secrets
 

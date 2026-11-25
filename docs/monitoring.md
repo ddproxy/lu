@@ -153,7 +153,7 @@ The per-node contribution series come from one all-time store report. They are m
 
 ## `lu status`
 
-`GET /v1/status` and `lu status` return the same fields: `version`, `uptime_secs`, `schema_version`, `db_bytes`, `recovered_on_boot`, `jobs` (twelve zero-filled counts, including `draft`, `expired` and `deadline_missed`), `waiting_dependents`, `oldest_queued_secs`, `drafts`, `oldest_draft_secs`, `nodes`, `nodes_online`, `lease_secs`, `audit_write_errors`, `scope_enabled`, `scope_max_depth`, `scope_max_children_per_job` and `scope_max_descendants_per_root`. `audit_write_errors` is the same counter as `lu_audit_write_errors_total`; `lu show <id>` also prints it in the job view. Draft counts and the oldest draft age are visible in `lu top`; see [drafts.md](drafts.md#observing-drafts).
+`GET /v1/status` and `lu status` return the same fields: `version`, `uptime_secs`, `schema_version`, `db_bytes`, `recovered_on_boot`, `jobs` (twelve zero-filled counts, including `draft`, `expired` and `deadline_missed`), `waiting_dependents`, `oldest_queued_secs`, `drafts`, `oldest_draft_secs`, `nodes`, `nodes_online`, `lease_secs`, `audit_write_errors`, `scope_enabled`, `scope_max_depth`, `scope_max_children_per_job` and `scope_max_descendants_per_root`. `audit_write_errors` is the same counter as `lu_audit_write_errors_total`; `lu show <id>` also prints it in the job view. Draft counts and the oldest draft age are visible in `lu top`; see [Drafts](submitting.md#limits-expiry-and-observability).
 
 Worked example:
 
@@ -187,14 +187,19 @@ lu status --json
 
 ## Per-node monitoring assets
 
-Two ready-to-use assets live in `contrib/monitoring/`:
+Ready-to-use assets live in `contrib/monitoring/`: a generated dashboard file and
+`lu-alerts.yml`, a Prometheus rule file with `LuNodeIdleWhileJobsQueued`, `LuNodeFailureRateHigh` and
+`LuControllerMetricsMissing`. Load the rule file with `rule_files:` in `prometheus.yml`. The idle
+rule treats `0` as never finished, the failure rule groups by `node` and `class`, and the controller
+rule fires when `up{job="lu"}` is down or controller metrics are absent.
 
-- `grafana-lu-nodes.json` — a Grafana dashboard with a `node` variable sourced from `lu_node_jobs_total`. It has panels for utilisation per node (`rate(lu_node_busy_seconds_total[5m])`), failure rate by node and class, busy share of the fleet, p50/p90 runtime and queue wait (`histogram_quantile` over the fixed buckets), and time since the last finished job. Nodes whose finish timestamp is `0` are omitted from the last panel because they have never finished a job.
-- `lu-alerts.yml` — a Prometheus rule file with `LuNodeIdleWhileJobsQueued`, `LuNodeFailureRateHigh` and `LuControllerMetricsMissing`. Load it with `rule_files:` in `prometheus.yml`. The idle rule treats `0` as never finished, the failure rule groups by `node` and `class`, and the controller rule fires when `up{job="lu"}` is down or controller metrics are absent.
+Both assets use only the series in the table above and only configured node names as label values.
+They contain no credentials, repository text or job text. The alert thresholds are starting points:
+tune the idle window, failure rate and `for` durations against `lease_secs`, the normal failure rate
+and the expected backlog.
 
-Both files use only the series in the table above and only configured node names as label values. They contain no credentials, repository text, job names or operator names. The alert thresholds are starting points: tune the idle window, failure rate and `for` durations against the fleet's `lease_secs`, normal failure rate and expected backlog.
-
-`scripts/check-monitoring.sh` parses both files (JSON and YAML) and checks that the dashboard has panels and the rule file has the three alerts. CI runs it alongside the other repository checks.
+`scripts/check-monitoring.sh` parses both files (JSON and YAML) and checks that the dashboard has
+panels and the rule file has the three alerts. CI runs it alongside the other repository checks.
 
 ## Alerts
 

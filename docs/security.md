@@ -214,7 +214,7 @@ behind a reverse proxy or tunnel that terminates TLS and keeps the direct listen
 networks. Per-source rate limits, bounded dedupe and `[drafts]` caps make a hostile sender noisy but
 not able to exhaust other sources or displace existing drafts. Outcomes are counted in
 `lu_intake_total{source,result}` and `lu_drafts{state}`; see
-[monitoring.md](monitoring.md#series) and [drafts.md](drafts.md#security-boundary).
+[monitoring.md](monitoring.md#series) and [Submitting work](submitting.md#drafts).
 
 ## Publishing
 
@@ -347,6 +347,75 @@ These are per-request, per-connection and per-principal limits. Disk use follows
 submits and the artifacts an agent uploads within the per-file caps. Filesystem quotas, a
 dedicated volume and monitoring bound that growth. The login throttle works per source address
 alongside network access control.
+
+## What Lu does not protect against
+
+Lu protects the controller boundary: bearer tokens with two scopes, SHA-256 hashes, TLS on
+non-loopback listeners, epoch fencing, private file modes and capped request bodies. It does not
+provide the boundaries below.
+
+| Limit | What the code does | What follows | Do this |
+| --- | --- | --- | --- |
+| Harness runs as the agent user | `ting` launches the harness as its own OS user; there is no `setuid`, namespace, container or VM switch in the launcher. | A harness can open every file that account can, including the agent token and any controller TLS key readable by it. | Run the agent as a dedicated account; use `harness_wrapper` with `workspace_group` for tree access. |
+| Token file is readable by that user | A token file must be a regular file owned by the reader, mode `0600` or tighter, with no symlink or FIFO. | Mode `0600` protects against other accounts, not against the agent user or a harness running as that user. | Treat the agent account as holding the token; rotate on suspicion, see [Tokens and TLS](tokens-and-tls.md#rotation). |
+| Artifacts and backups carry source and secrets | `diff.patch`, `run.log` and `report.json` report what the harness printed; `lu backup` copies SQLite as ordinary files. | Downloads and backups are as sensitive as every repository and credential the jobs used. | Store them with the same care as the live artifact directory; see [Operations](operations.md#backup-and-restore). |
+| Provider keys live on the node | The controller stores provider and model names, not keys. `OPENCODE_SERVER_PASSWORD` is an opencode server password, not a provider-key channel. | A node, its harness or its logs can expose keys; the controller cannot audit or revoke them. | Keep provider credentials on dedicated nodes and out of task text. |
+| No per-job isolation | One agent runs one job at a time in a process group with run, idle and output limits; `workspace_group` is group sharing, not a separate user or filesystem. | Jobs on a node share the agent account, environment and files. | Use `harness_wrapper` with a container or VM when jobs must not share a trust domain; see [Configuration](config.md). |
+| Cordons are dispatch hints | A provider cordon blocks one `(node, provider)` pair; a job with no provider is not blocked. | A cordon is not access control or proof that a provider is safe. | Use labels and taints for placement and read `lu nodes --json`; see [Dispatch](dispatch.md#cordons). |
+| No general live reload | Config, token hashes, TLS material and agent secrets are read at start; `SIGHUP` is not handled. Only `POST /v1/schedule/reload` swaps in a schedule. | Other file changes, including a mid-job agent change, take effect after a restart. | Restart the affected process; see [Time-aware scheduling](scheduling.md#inspecting-scheduling). |
+| Runtime group caps are memory-only | `PUT /v1/groups/{name}/limit` changes the active controller-process cap; `[[controller.groups]]` is durable. | A runtime cap returns to its configured value, or disappears, on restart. | Put a required cap in config as well; see [Dispatch](dispatch.md#priority-and-groups). |
+
+Fail-open cases leave a job waiting rather than failing: an unmatched label, an untolerated taint or
+no healthy pair for `--provider any` appears as a `waiting` reason in `lu show`. A drain or a cordon
+on a named provider can leave a job `queued` without a reason. A failing `[[agent.detect]]` probe
+removes its label without stopping the agent. Cordons and drains are not access control.
+
+## Audit record
+
+With `[audit] path` set, the controller appends a small JSON Lines record of lifecycle events to
+that file. Without the table no file is opened and no audit work is performed; see
+[Configuration](config.md#audit) and [Monitoring](monitoring.md#series).
+
+```json
+{"seq":4,"time":"2026-11-21T12:34:56.789Z","event":"started","job":"01ARZ3NDEKTSV4RRFFQ69G5FAV","node":"node-a","actor":"node-a","data":{"attempt":1,"epoch":9},"prev":"9a…","hash":"b3…"}
+```
+
+- `seq` increases by exactly one; `time` is controller-generated UTC with millisecond precision.
+- `event` is one of `submitted`, `leased`, `started`, `finished`, `failed`, `retried`, `cancelled`,
+  `node_excluded`, `cordon_set`, `cordon_cleared`, `drain`, `agent_self`, `collect_applied`,
+  `scope_action`, `intake`, `draft_approved`, `draft_rejected`, `draft_expired`, `publish`,
+  `job_edited`, `group_limit`, `workspace_clean`, `repo_sync`, `mutation_dry_run`,
+  `mutation_replay` and `mutation_precondition_failed`. Operator mutations record the operator and
+  role; the `mutation_*` events also carry `data.principal`, `data.role`, `data.operation` and
+  `data.outcome`.
+- `job`, `node` and `actor` identify the change; `actor` is the operator token name or the node
+  name.
+- `data` is an allow-list of scalar fields such as `attempt`, `epoch`, `outcome`, `class`, `reason`,
+  `excluded_node`, `provider`, `model`, `source`, `state`, `target`, `result`, `remote` and counts.
+  It never contains task text, prompts, artifact content or tokens. `node_excluded` records a newly
+  excluded node in `data.excluded_node`; a completion adds a fixed node-failure `reason`, while a
+  lease-recovery timeout uses actor `maintenance` and no reason.
+- `prev` is the hex SHA-256 of the previous line's bytes (64 zeroes for the first line); `hash` is
+  the hex SHA-256 of this line's canonical bytes with `hash` omitted.
+
+`collect_applied` records the request at submission, not proof of a later apply. `cordon_set` covers
+provider failures and `cordon_cleared` an explicit uncordon; store expiry has no separate line.
+`publish` records each outcome with a configured remote name, never a URL or credential.
+Agent self-drain records `drain` with `source: "agent"`. The writer appends in mode `0600` where
+supported, calls `sync_data` per line, and resumes the verified chain on restart.
+
+`lu audit verify <path>` checks shape, sequence, `prev` links and hashes, reporting the first break
+or `ok: N record(s), head <hash>`. With a trusted head recorded outside the file, this proves that
+no later edit, insertion or deletion inside the file goes unnoticed: `verify --head <hash>` also
+detects a truncated file. `lu audit tail <path> [-l <lines>]` prints the last records (default 20)
+and `lu audit head <path>` prints the head hash; `verify --json` prints machine-readable output.
+
+The chain is unkeyed, so someone who can rewrite the whole file can recompute it; it does not prove
+an event happened, is not a trusted timestamp, and is not a transaction with job state. Anchor the
+head in a place an attacker cannot rewrite and ship lines to an append-only log host. Write errors
+and a full bounded channel increment `lu_audit_write_errors_total` (also `audit_write_errors` in
+`lu status` and `lu show`) and log an error; no job fails because of one. A startup open failure
+stops `lu serve`.
 
 ## Reporting
 

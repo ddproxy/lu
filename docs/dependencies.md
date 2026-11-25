@@ -39,7 +39,7 @@ lu submit --key ship --after-key test --after-key lint \
   which keeps its id. The job must be failed, cancelled, expired or deadline-missed first.
 - `lu submit --batch ... --chain` depends each job on all earlier jobs in the batch. Checklist
   `after:` hints and sidecar `after_keys` add dependencies; hints may name earlier batch slugs or
-  existing job keys. See [Batch submissions](batch.md#dependencies).
+  existing job keys. See [Batch submissions](submitting.md#dependencies-and-parallelism).
 
 ## Waiting and promotion
 

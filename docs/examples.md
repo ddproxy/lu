@@ -1,6 +1,6 @@
 # Worked examples
 
-These examples assume the operator connection from [client guide](client-guide.md). Job ids are
+These examples assume the operator connection from the [client guide](cli.md#client-guide). Job ids are
 illustrative; output shapes are the ones the CLI and MCP server print.
 
 ## Build, test, collect
@@ -77,7 +77,7 @@ controller. The real call adds a runtime cap of two to the `release` group befor
 key is `release-1-<slug>`, so a retry with the same prefix returns the same jobs. All input errors
 are reported before the first request.
 
-Full input rules are in [Batch submissions](batch.md).
+Full input rules are in [Batch submissions](submitting.md#batch-submissions).
 
 ## Retry with a provider override
 
@@ -189,4 +189,4 @@ after= waiting_on=
 Without `key`, the server derives `mcp-` plus 16 hex characters of the spec's SHA-256. Repeating the
 same arguments targets the same job. A different spec with the same key is `409 conflict`. More than
 30 submissions in a rolling minute return `isError` with the seconds to wait; that limit is not an
-HTTP 429. Full tool arguments are in [mcp.md](mcp.md).
+HTTP 429. Full tool arguments are in the [MCP server](cli.md#mcp-tools).

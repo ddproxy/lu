@@ -300,7 +300,7 @@ Optional top-level table for the Ting agent's CI-style workspace retention and d
 rules. Omitting the table keeps all documented defaults. Unknown keys are rejected; a
 `[agent] workspace` key is also unknown, because this table is not nested under `[agent]`.
 The workspace root is `[agent] work_dir`. See [workspaces.md](workspaces.md) for the policy
-semantics and an Ansible example.
+semantics.
 
 | Key | Required | Default | Validation |
 | --- | --- | --- | --- |
@@ -399,7 +399,7 @@ Optional append-only, hash-chained JSON Lines record of job lifecycle events wri
 | --- | --- | --- | --- |
 | `path` | yes | — | Absolute path; must not contain `..`. The controller appends to this file and creates it with mode `0600` where supported. A startup open error stops `lu serve` with a clear message. |
 
-Events written are `submitted`, `leased`, `started`, `finished`, `failed`, `retried`, `cancelled`, `cordon_set`, `cordon_cleared`, `drain`, `collect_applied`, `scope_action`, `intake`, `draft_approved`, `draft_rejected`, `draft_expired`, `publish`, `mutation_dry_run`, `mutation_replay` and `mutation_precondition_failed`. Each line has a sequence number, UTC time, event, job id (where applicable), node, actor (operator token name, node name or `job:<id>` for a scoped action), a small data object of allow-listed scalar fields, `prev` (hex SHA-256 of the previous line's bytes, 64 zeroes for the first line) and `hash` (hex SHA-256 of the line without `hash`). The data object never contains task text, prompts, artifact content or tokens. A `publish` event carries `target`, `result`, `remote` and `state`. See [Audit record](audit.md) for the guarantees and for `lu audit verify|tail|head`.
+Events written are `submitted`, `leased`, `started`, `finished`, `failed`, `retried`, `cancelled`, `cordon_set`, `cordon_cleared`, `drain`, `collect_applied`, `scope_action`, `intake`, `draft_approved`, `draft_rejected`, `draft_expired`, `publish`, `mutation_dry_run`, `mutation_replay` and `mutation_precondition_failed`. Each line has a sequence number, UTC time, event, job id (where applicable), node, actor (operator token name, node name or `job:<id>` for a scoped action), a small data object of allow-listed scalar fields, `prev` (hex SHA-256 of the previous line's bytes, 64 zeroes for the first line) and `hash` (hex SHA-256 of the line without `hash`). The data object never contains task text, prompts, artifact content or tokens. A `publish` event carries `target`, `result`, `remote` and `state`. See the [Audit record](security.md#audit-record) for the guarantees and for `lu audit verify|tail|head`.
 
 ## `[publish]`
 
@@ -496,7 +496,7 @@ When either draft cap is full, the oldest drafts are moved to `expired` first re
 TTL; expired drafts remain stored. If that does not free room under both caps, a new draft is
 refused: intake answers `429 limit_exceeded` with `limit: max_drafts` and counts the event as
 `invalid`. `lu drafts` shows the inventory and `lu top` shows the draft count and oldest draft age.
-See [drafts.md](drafts.md#limits-and-expiry).
+See [Drafts](submitting.md#limits-expiry-and-observability).
 
 ```toml
 [drafts]
@@ -597,7 +597,8 @@ unsafe_inline = false
 
 ## Examples
 
-The repository's root `lu.toml` is a loopback controller example with demo token hashes. `contrib/lu-controller.toml` is a deployment sample for `/etc/lu/lu.toml`, and `contrib/ting.toml` is the agent sample for `/etc/ting/ting.toml`. Worked intake rules are in [intake.md](intake.md#example), and draft retention examples are in [drafts.md](drafts.md#limits-and-expiry).
+The repository's root `lu.toml` is a loopback controller example with demo token hashes. `contrib/lu-controller.toml` is a deployment sample for `/etc/lu/lu.toml`, and `contrib/ting.toml` is the agent sample for `/etc/ting/ting.toml`. Worked intake rules are in [intake.md](intake.md#example), and draft retention examples are in
+[Drafts](submitting.md#limits-expiry-and-observability).
 
 Minimal controller:
 
