@@ -78,8 +78,8 @@ The checkout's `.git` directory is not writable, so no commit could be created. 
 were kept terse as requested; report this limitation rather than claiming a commit exists.
 # Verification notes
 
-The referenced report was readable through the worklog vault. Claims relevant to this work were
-checked against the tree before editing; the results follow.
+The referenced report was available during review. Claims relevant to this work were checked
+against the tree before editing; the results follow.
 
 ## Confirmed in code
 
@@ -482,7 +482,7 @@ were kept terse as requested.
 
 ### Where the report or request disagreed with the code
 
-- A worklog claim said `target-*` directories were removed when older than a day. The code default
+- An earlier claim said `target-*` directories were removed when older than a day. The code default
   is `min_age_hours = 6`, and the docs follow the code rather than that claim.
 - `min_free_percent = 0` disables the disk probe and trigger; it does not make a pass ignore the
   `min_age_hours` grace. The docs state both rules.
@@ -491,10 +491,9 @@ were kept terse as requested.
 
 ### Upstream access failure
 
-The upstream repository at `https://code.ddproxy.net/ddproxy/tuishou-ting.git` could not be read.
-Direct `git` and web fetch were denied in this environment; an HTTP probe of the Forgejo
-`info/refs?service=git-upload-pack` endpoint returned `Repository not found`. No `/tmp` file was
-treated as upstream source.
+The upstream agent repository could not be read. Direct `git` and web fetch were denied in this
+environment, and an HTTP probe of the Git smart-HTTP endpoint returned `Repository not found`.
+No temporary file was treated as upstream source.
 
 ## Check/serve validation and operator settings verification
 
@@ -628,6 +627,30 @@ be created. The prepared terse message is `cli: add idle timeout to batch and sh
 - `cargo clippy --workspace --all-targets -- -D warnings` — passed.
 - `cargo test --workspace` and `cargo test --workspace --features tui` — passed.
 - `scripts/check-docs.sh` — passed.
+
+## Compatibility spellings kept for maintainers
+
+These are legacy wire or stored spellings, not new documentation. They are deliberately retained
+because [compatibility](docs/compatibility.md) forbids renaming fields or stored values: an older
+controller or agent must keep working during a rolling upgrade. New config writes and new prose
+use neutral names; no new neutral wire alias was added because older peers would ignore it.
+
+- `reiki` — heartbeat, node-view and poll-request JSON field carrying the opaque provider-health
+  document. Still written and parsed on both sides; only the Rust field name changed.
+- `reiki` — cordon `source` value on the API, in audit records and in the
+  `lu_node_cordon_seconds_remaining{node,provider,source}` metric. Still emitted by `CordonSource::Health::as_str()`;
+  CLI and terminal output map it to a neutral gateway marker.
+- `reiki_derived` — column in the SQLite `cordons` table. Kept in the schema, migration and queries.
+- `reiki_health_url` and `reiki_token_file` — old `[agent]` config keys, accepted as serde aliases
+  of `provider_gateway_health_url` and `provider_gateway_token_file` and covered by a parse test.
+- Cordon reason text written by older releases, for example `Reiki cooldown for ...`, stays in
+  existing database rows and stored history. New rows use `Provider gateway cooldown for ...`.
+
+The hygiene test's allowlist names the files that must contain these literals.
+
+### Verification for this change
+
+- `cargo fmt --all --check`, `make lint`, `make test`, `make docs-check` and the hygiene test — passed.
 
 Changes remain local and uncommitted: the checkout's `.git` directory is not readable by the
 current uid, so no commit could be created. Commit messages were kept terse as requested.

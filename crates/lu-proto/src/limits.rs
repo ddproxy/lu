@@ -114,8 +114,8 @@ pub const MAX_LABEL_FILES: usize = 8;
 /// One label file's largest accepted size.
 pub const MAX_LABEL_FILE_BYTES: u64 = 4 * 1024;
 
-/// The forwarded Reiki health document, serialized.
-pub const MAX_REIKI_BYTES: usize = 64 * 1024;
+/// The forwarded provider-health document, serialized.
+pub const MAX_PROVIDER_HEALTH_BYTES: usize = 64 * 1024;
 
 /// Host and job stats in one heartbeat, serialized. Processes are dropped before jobs when
 /// the combined document would exceed this.

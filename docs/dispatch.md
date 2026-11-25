@@ -31,7 +31,7 @@ Dispatch first applies the label rule, then gives the job to the first choice th
 
 ## Provider from the node
 
-Use `--provider any` to choose from the node's `[[agent.provider_models]]` pairs, tried in agent configuration order. The job names no model or fallback; either with `--provider any` is a validation error. Each agent publishes a pair with its heartbeat when Reiki reports that provider healthy. Dispatch skips cordoned providers and gives the job to the first healthy pair on an otherwise eligible node. The job records that pair as `assigned_provider`/`assigned_model`, so the agent runs that provider's model. With no healthy pair on any eligible node the job stays `queued` and `lu show` reports `no node has a healthy provider for provider "any"`.
+Use `--provider any` to choose from the node's `[[agent.provider_models]]` pairs, tried in agent configuration order. The job names no model or fallback; either with `--provider any` is a validation error. Each agent publishes a pair with its heartbeat when the provider gateway reports that provider healthy. Dispatch skips cordoned providers and gives the job to the first healthy pair on an otherwise eligible node. The job records that pair as `assigned_provider`/`assigned_model`, so the agent runs that provider's model. With no healthy pair on any eligible node the job stays `queued` and `lu show` reports `no node has a healthy provider for provider "any"`.
 
 For a controller on a non-loopback address, add a `[tls]` table with `cert` and `key`; plain HTTP is accepted only on loopback. See [config.md](config.md).
 
@@ -39,10 +39,10 @@ For a controller on a non-loopback address, add a `[tls]` table with `cert` and 
 
 A cordon is a `(node, provider)` block. Dispatch skips that pair on that node, so fallbacks, other nodes and other providers remain available. A job with no provider is not affected.
 
-- **Reiki-derived**: the agent reports two consecutive unhealthy Reiki readings and completes the job as `Failed(Provider)` with `retry_after_secs`. The cordon has source `reiki`, records Reiki's estimated return time in its reason, and lifts after two consecutive healthy provider heartbeats. Its API `until` is null because the end time is not fixed.
+- **Health-derived**: the agent reports two consecutive unhealthy gateway readings and completes the job as `Failed(Provider)` with `retry_after_secs`. The cordon uses a distinct health-derived source value, records the gateway's estimated return time in its reason, and lifts after two consecutive healthy provider heartbeats. Its API `until` is null because the end time is not fixed.
 - **Failure-derived**: any other retryable provider failure uses `provider_cooldown_secs`. The cordon has source `failure`, a reason naming the provider and failure summary, and a fixed wall-clock expiry.
 
-`lu nodes` shows cordoned providers in the `CORDONS` column as `!provider`; `lu top` marks the provider chip with `!` and a `~` suffix for Reiki-derived cordons, then lists both kinds with their reason and remaining time or lift count. `lu node <name>` prints the same details with the age of each cordon. An operator can clear a cordon early with `lu uncordon <node> [<provider>]`, which calls `POST /v1/nodes/{name}/uncordon`; omitting the provider clears every cordon on that node. Boot still clears all stored cordons, so a controller restart never blocks dispatch with stale deadlines.
+`lu nodes` shows cordoned providers in the `CORDONS` column as `!provider`; `lu top` marks the provider chip with `!` and a `~` suffix for health-derived cordons, then lists both kinds with their reason and remaining time or lift count. `lu node <name>` prints the same details with the age of each cordon. An operator can clear a cordon early with `lu uncordon <node> [<provider>]`, which calls `POST /v1/nodes/{name}/uncordon`; omitting the provider clears every cordon on that node. Boot still clears all stored cordons, so a controller restart never blocks dispatch with stale deadlines.
 
 ## Node exclusions
 
@@ -65,7 +65,7 @@ automatic requeues before any node is excluded. See
 A node can refuse work unless a job opts in. An agent lists up to 8 opaque taints in `[agent].taints`; a job names up to 8 with `--tolerate`. Dispatch gives a job only to a node whose every taint the job tolerates, so a node reserved for one kind of work never receives anything else. A taint is compared exactly and never interpreted. `lu nodes` shows taints first with a `!` prefix.
 
 ```sh
-lu submit --repo /path/to/repository --ref main --task "build the homelab image" --tolerate homelab
+lu submit --repo /path/to/repository --ref main --task "build the lab image" --tolerate lab
 ```
 
 ## Detecting labels

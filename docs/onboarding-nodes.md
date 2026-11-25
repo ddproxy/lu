@@ -43,7 +43,7 @@ model = "claude-sonnet-4-5"
 
 `labels` and `taints` are opaque to Lu. A tainted node takes only jobs that tolerate every taint.
 A probe publishes its label while `command` exits `0`; a failure withdraws it. `provider_models`
-are offered only while Reiki reports that provider healthy. Keys and validation rules are in
+are offered only while the gateway health feed reports that provider healthy. Keys and validation rules are in
 [Configuration](config.md).
 
 ```sh
@@ -89,7 +89,7 @@ lu node node-b
 | Identity and state | `lu nodes` | `NAME`, `VERSION` (agent version, `-` if unknown), `HARNESS` (`idle`, `busy` or `-`), `LAST_SEEN`, `DRAINED`. There is no `ONLINE` column in the text table. |
 | Labels and taints | `lu nodes` `LABELS` | Taints come first with `!`, so `!onboarding,canary/node-b,opencode/cli (probed)`. A long list ends with `+N`. |
 | Probe labels | `lu nodes`, `lu node`, `--json` | A probed label is followed by ` (probed)`; JSON carries it in `label_sources` as `"opencode/cli": "probed"`. |
-| Provider models | `lu nodes --json` | `provider_models` holds the configured pairs that Reiki currently reports healthy. `providers` holds each provider's state (`ok`, `cooling`, `disabled`, `unknown`). |
+| Provider models | `lu nodes --json` | `provider_models` holds the configured pairs that the gateway health feed currently reports healthy. `providers` holds each provider's state (`ok`, `cooling`, `disabled`, `unknown`). |
 | Cordons | `lu nodes --json` | `cordon_details` lists active `(node, provider)` cordons with their source, reason and expiry or healthy-lift count. |
 | Host and process stats | `lu node node-b` | `labels`, load, memory, disk for the `work_dir` filesystem and any running job tree. Stats are sampled at heartbeat time and are lost on controller restart until the next heartbeat. |
 
@@ -98,7 +98,7 @@ lu node node-b
 cordons. See [Reading `lu nodes`](operations.md#reading-lu-nodes).
 
 If a probe label is missing, check the command on the node with only the agent's `PATH`, `HOME` and
-`LANG`. If a provider model is missing, check Reiki's health first: an agent publishes pairs only
+`LANG`. If a provider model is missing, check the gateway health feed first: an agent publishes pairs only
 while that provider is healthy, and stops publishing all providers after three failed reads.
 
 ## 3. Submit a canary while the node is drained
@@ -149,7 +149,7 @@ heartbeat replaces the taint set; verify `!onboarding` is gone in `lu nodes` and
 4. Fix the host or config, restart the agent and repeat from step 2.
 
 Clear a provider cordon early with `lu uncordon node-b [<provider>]` (omit the provider to clear
-all of that node's cordons). Otherwise it expires at its deadline, a Reiki-derived cordon clears
+all of that node's cordons). Otherwise it expires at its deadline, a health-derived cordon clears
 after two consecutive healthy provider heartbeats, and a controller restart deletes all cordons.
 A drain is cleared with `lu undrain`. See
 [Provider cordons and node drains](operations.md#provider-cordons-and-node-drains) and

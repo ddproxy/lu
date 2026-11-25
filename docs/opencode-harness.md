@@ -43,8 +43,8 @@ harness = "opencode"
 opencode_server = "http://127.0.0.1:4096"
 opencode_password_file = "/etc/lu/opencode.password"
 workspace_group = "lu-harness"
-reiki_health_url = "http://127.0.0.1:9000/health"
-reiki_token_file = "/etc/lu/reiki.token"
+provider_gateway_health_url = "http://127.0.0.1:9000/health"
+provider_gateway_token_file = "/etc/lu/provider-gateway.token"
 
 [[agent.provider_models]]
 provider = "anthropic"
@@ -63,10 +63,10 @@ every_secs = 300
 - `workspace_group` gives each job's tree to that group with group read, write and the setgid bit;
   `.git` is left as git made it. It supports a harness running as another account. An unknown
   group stops the agent. It is group sharing, not per-job user isolation.
-- `reiki_health_url` must be loopback and is paired with `reiki_token_file`. The agent reads peer
-  health every 10 seconds and sends providers with each heartbeat. `provider_models` are offered
-  only while Reiki reports that provider healthy; after three failed reads the node reports no
-  providers.
+- `provider_gateway_health_url` must be loopback and is paired with `provider_gateway_token_file`.
+  The agent reads peer health every 10 seconds and sends providers with each heartbeat.
+  `provider_models` are offered only while the gateway reports that provider healthy; after three
+  failed reads the node reports no providers.
 - Config is read at start. Restart `ting` after changing any of these settings.
 
 ## Server password file
@@ -87,7 +87,7 @@ chmod 0600 /etc/ting/opencode.password
 ```
 
 The value is not passed as an argument and is not a general provider-key channel. Keys belong to
-the harness or a local Reiki on the node; see [What Lu does not protect against](limits.md).
+the harness or a local provider gateway on the node; see [What Lu does not protect against](limits.md).
 
 ## Container wrapper
 
@@ -153,7 +153,7 @@ Two detectors can stop a running job:
 
 | Detector | Trigger | Result |
 | --- | --- | --- |
-| Reiki health | Two consecutive fresh readings from the local Reiki show the job's provider `cooling` or `disabled`. The watch ticks every 5 seconds but counts only new health snapshots, which refresh every 10 seconds. | Job completes as `Failed(Provider)` with a summary naming the provider and the soonest return time. With a reported time, the cordon uses it plus a 60-second buffer; otherwise `provider_cooldown_secs` applies. |
+| Provider gateway health | Two consecutive fresh readings from the local provider gateway show the job's provider `cooling` or `disabled`. The watch ticks every 5 seconds but counts only new health snapshots, which refresh every 10 seconds. | Job completes as `Failed(Provider)` with a summary naming the provider and the soonest return time. With a reported time, the cordon uses it plus a 60-second buffer; otherwise `provider_cooldown_secs` applies. |
 | Harness output | The newest line matches an opencode "every key in this stream's chain is unavailable", quota, `HTTP 429` or rate-limit message, and the harness then produces no output for 120 seconds. Any other output disarms the watch. | Job completes as `Failed(Provider)` with a summary naming the marker. The cordon uses `provider_cooldown_secs`. |
 
 Provider failures requeue while `attempt <= 100`; `max_retries` is not consulted. A stored
@@ -164,7 +164,7 @@ remain, `lu show` can therefore show a queued job that still carries the failure
 state              queued
 failure            provider
 attempt            2
-summary            Reiki reports provider anthropic has no usable key; the soonest returns in 120s
+summary            Provider gateway reports provider anthropic has no usable key; the soonest returns in 120s
 waiting            -
 ```
 
@@ -173,12 +173,15 @@ these fields among others:
 
 ```json
 {"providers":[{"name":"anthropic","state":"cooling","soonest_secs":60}],
- "cordon_details":[{"provider":"anthropic","source":"reiki","reason":"Reiki cooldown for anthropic",
+ "cordon_details":[{"provider":"anthropic","source":"reiki","reason":"Provider gateway cooldown for anthropic",
                     "set_at":1763750000,"until":null,"lifts_after_healthy_heartbeats":2}]}
 ```
 
+The health-derived `source` value above is a compatibility spelling kept for older controllers and
+agents; clients display it as a neutral gateway marker. See [Compatibility](compatibility.md).
+
 A job with no provider is not blocked by that cordon; a job with fallbacks may run on another
 provider or node. An operator can clear a cordon early with `lu uncordon <node> [<provider>]`;
-otherwise it expires, a Reiki-derived cordon clears after two consecutive healthy provider
+otherwise it expires, a health-derived cordon clears after two consecutive healthy provider
 heartbeats, and a controller restart deletes all cordons. See
 [Provider cordons and node drains](operations.md#provider-cordons-and-node-drains).

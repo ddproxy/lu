@@ -55,7 +55,7 @@ struct CordonModel {
     source: CordonSource,
     reason: String,
     set_at_unix: i64,
-    /// Consecutive healthy heartbeats seen since the Reiki cordon was set; the store lifts it at
+    /// Consecutive healthy heartbeats seen since the health-derived cordon was set; the store lifts it at
     /// two. Failure cordons ignore this counter.
     healthy_hb_count: u64,
 }
@@ -853,13 +853,13 @@ impl<S: Store> Model<S> {
         self.nodes.insert(name.clone(), heartbeat.clone());
         let generation = self.node_generation.entry(name).or_insert(0);
         *generation = generation.saturating_add(1);
-        self.refresh_reiki_cordons(&heartbeat);
+        self.refresh_health_cordons(&heartbeat);
     }
 
-    /// Mirror `SqliteStore::refresh_reiki_cordons`: a Reiki cordon lifts after two consecutive
+    /// Mirror `SqliteStore::refresh_health_cordons`: a health-derived cordon lifts after two consecutive
     /// healthy readings for its provider, and any unhealthy reading restarts the streak. Without
     /// this the model can keep excluding a provider the store has already uncordoned.
-    fn refresh_reiki_cordons(&mut self, heartbeat: &Heartbeat) {
+    fn refresh_health_cordons(&mut self, heartbeat: &Heartbeat) {
         let healthy: BTreeSet<&str> = heartbeat
             .providers
             .iter()
@@ -868,7 +868,7 @@ impl<S: Store> Model<S> {
             .collect();
         let mut lift = Vec::new();
         for ((node, provider), cordon) in &mut self.cordons {
-            if node != &heartbeat.node || cordon.source != CordonSource::Reiki {
+            if node != &heartbeat.node || cordon.source != CordonSource::Health {
                 continue;
             }
             if healthy.contains(provider.as_str()) {
@@ -1346,7 +1346,7 @@ impl<S: Store> Model<S> {
                             (record.node.clone(), record.spec.provider.clone())
                         {
                             let source = if completion.retry_after_secs.is_some() {
-                                CordonSource::Reiki
+                                CordonSource::Health
                             } else {
                                 CordonSource::Failure
                             };
@@ -1355,8 +1355,8 @@ impl<S: Store> Model<S> {
                                 .as_deref()
                                 .unwrap_or("no failure summary");
                             let reason = match source {
-                                CordonSource::Reiki => format!(
-                                    "Reiki cooldown for provider {provider}{}: {detail}",
+                                CordonSource::Health => format!(
+                                    "Provider gateway cooldown for {provider}{}: {detail}",
                                     completion
                                         .retry_after_secs
                                         .map(|s| format!(" (retry after {s}s)"))
@@ -1881,11 +1881,11 @@ mod tests {
         SqliteStore::open(dir.join("db.sqlite")).unwrap()
     }
 
-    /// Reiki cordons are a store behaviour the model must mirror: two consecutive healthy
+    /// health-derived cordons are a store behaviour the model must mirror: two consecutive healthy
     /// heartbeats lift them. A stale model cordon makes an otherwise eligible job look blocked and
     /// produces the `store assigned ... model expected none` panic.
     #[test]
-    fn reiki_cordon_lifts_in_the_model_after_two_healthy_heartbeats() {
+    fn health_cordon_lifts_in_the_model_after_two_healthy_heartbeats() {
         let log: SharedLog = Arc::new(Mutex::new(Vec::new()));
         let store = fresh_store();
         let mut model = Model::new(1, 10, store, log);
@@ -1897,8 +1897,8 @@ mod tests {
             .set_cordon(
                 &name,
                 "prov-a",
-                CordonSource::Reiki,
-                "Reiki cooldown for provider prov-a",
+                CordonSource::Health,
+                "Provider gateway cooldown for prov-a",
                 model.now.wall_unix,
                 i64::MAX,
             )
@@ -1907,8 +1907,8 @@ mod tests {
             key.clone(),
             CordonModel {
                 until: u64::MAX,
-                source: CordonSource::Reiki,
-                reason: "Reiki cooldown for provider prov-a".to_owned(),
+                source: CordonSource::Health,
+                reason: "Provider gateway cooldown for prov-a".to_owned(),
                 set_at_unix: model.now.wall_unix,
                 healthy_hb_count: 0,
             },
@@ -1927,7 +1927,7 @@ mod tests {
 
         assert!(
             !model.cordons.contains_key(&key),
-            "model kept a Reiki cordon the store lifted"
+            "model kept a health-derived cordon the store lifted"
         );
         assert!(model.store.cordons(None).unwrap().is_empty());
     }

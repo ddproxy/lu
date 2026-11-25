@@ -9,10 +9,13 @@ uses semantic versioning once it reaches 1.0.
 
 - `lu check` and `lu serve` now call one shared value-validation path, so config parsing, token and role rules, schedule and limits sections, database paths and scrub rules fail with the same message. `lu check` still opens no secret files or TLS material, binds no port and never opens the database for write; `lu serve` alone reads secret files, loads TLS material and opens the database before binding.
 - Operator commands have no `[agent]`-table credential fallback. Regression tests prove an agent token is never attached to an operator request, and the missing-settings error names `LU_URL`, `LU_TOKEN_FILE`, optional `LU_CA_FILE` and the operator file's `url` and `token_file` keys. See [docs/client-guide.md](docs/client-guide.md), [docs/install.md](docs/install.md) and [docs/security.md](docs/security.md).
+- Provider health settings use neutral names: `[agent] provider_gateway_health_url` and `provider_gateway_token_file`. The earlier spellings are still accepted, and wire field names and stored column names keep their existing spellings for rolling upgrades; see [compatibility](docs/compatibility.md) and NOTES.md.
+- Cordon reasons and provider-failure summaries now name the provider gateway instead of a product. Operator and terminal output maps the health-derived cordon source to a neutral gateway marker. Stored reasons written by older releases still display unchanged.
 
 ### Added
 
 - `lu submit --timeout` and `--idle-timeout` accept plain seconds or an `s`/`m`/`h` suffix; batch defaults and sidecars accept `idle_timeout`, and `lu show` prints both timeouts.
+- A hygiene test scans tracked docs, sources and tests for retired product names, internal domains and development hostnames, with a small allowlist for compatibility spellings.
 
 ### Added
 - Infrastructure faults are now recognized as node-class failures with fixed `failure_reason`
@@ -29,6 +32,11 @@ uses semantic versioning once it reaches 1.0.
   1 to 7 migrate forward in place; backups and restores require version `8`.
 - `JobView` exposes `failure_reason` and `excluded_nodes` when set. New exclusions write a
   `node_excluded` audit record with the node and, for agent completions, the fixed reason code.
+
+### Removed
+
+- The provider-gateway integration page and its navigation links were removed. Its behaviour is
+  covered by the configuration, dispatch, operations and harness integration pages.
 
 ### Changed
 - A node-class failure requeues only on a different node: the failed node is excluded from that
@@ -214,15 +222,15 @@ Requires: a new controller database (the schema was reset; recreate it before up
 - Expected outputs. `JobSpec.expect` declares relative `files`, `changed` and `forbid_changed` globs, `min_diff_bytes`/`max_diff_bytes` bounds and a `mode` of `suspect` (default) or `fail`. The agent evaluates them after a successful harness against the uploaded diff, excluding `.lu/`, and records unmet expectations in `report.json` under `expect_failures`. Suspect failures keep the job `done` with `outcome_note: expect_failed` and increment `lu_jobs_expect_failed_total`; fail-mode failures end in `failed` with class `execution`. A `no_changes` note takes precedence over `expect_failed`. CLI adds the expect flags to `submit`, `retry` and `edit`, and MCP adds matching arguments. Schema 8 includes the suspect flag.
 - Job priority and concurrency groups. `JobSpec.priority` (0 to 9, default 5) dispatches higher values first, then creation time. `JobSpec.group` (1 to 64 characters from `A-Z a-z 0-9 . _ -`) and `[[controller.groups]]` entries with `name` and `max_running` (1 to 64) cap concurrent `leased`, `running`, `recovering` and `needs_input` jobs per group; unconfigured groups are unlimited, and a blocked job stays `queued` with `group limit (<name> <running>/<max>)` as its waiting reason. `lu submit`, `lu retry` and `lu edit` gain `--priority` and `--group`, with `--no-group` on retry and edit; MCP submissions accept `priority` and `group`. `lu show` prints both fields, `lu ls --json` exposes them in `spec`, and metrics add `lu_group_running{group}` and `lu_group_limit{group}`. Provider, label and taint rules still apply first. No schema change: both fields live in the existing JSON spec, with expression indexes created on open.
 - Stuck-job policy. `JobSpec.on_stuck` (`none`, `cancel`, `retry`; default from `[agent]`) and `stuck_after_secs` (60–86400, default 1800) let the agent stop a job after the `lu node` output/CPU observation has stayed stuck for the configured interval. `cancel` fails as `execution`; `retry` fails as `node` and follows `max_retries`; `none` is unchanged. The CLI adds `--on-stuck` and `--stuck-after` to `submit`, `retry` and `edit`; MCP adds `on_stuck` and `stuck_after`/`stuck_after_secs` to `lu_submit`, `lu_submit_many` and `lu_retry`. Completions carry optional `stuck_mode`, and `lu_jobs_stuck_stopped_total{mode}` counts stops by mode since process start. No schema change: fields live in the stored spec JSON and in-memory counters.
-- Provider cordons now record their source, reason and set time in schema 8. `NodeView.cordon_details` exposes `{provider, source, reason, set_at, until, lifts_after_healthy_heartbeats}`; the old bare `cordons` name list is no longer emitted. Reiki-derived cordons report `source: "reiki"`, a null `until` and a two-heartbeat lift count; failure-derived cordons report `source: "failure"` and a wall-clock expiry.
-- `lu node <name>` prints each cordon's source, age, reason and remaining time or lift count. `lu nodes` adds a `CORDONS` column, and `lu top` marks cordoned provider chips with `!` (orange) and shows cordon details under the tables, with Reiki `~` markers in yellow.
+- Provider cordons now record their source, reason and set time in schema 8. `NodeView.cordon_details` exposes `{provider, source, reason, set_at, until, lifts_after_healthy_heartbeats}`; the old bare `cordons` name list is no longer emitted. Health-derived cordons report a dedicated source, a null `until` and a two-heartbeat lift count; failure-derived cordons report `source: "failure"` and a wall-clock expiry.
+- `lu node <name>` prints each cordon's source, age, reason and remaining time or lift count. `lu nodes` adds a `CORDONS` column, and `lu top` marks cordoned provider chips with `!` (orange) and shows cordon details under the tables, with health-derived `~` markers in yellow.
 - `lu uncordon <node> [<provider>]` and `POST /v1/nodes/{name}/uncordon` clear one provider cordon or every cordon on a node, returning the providers actually removed. The MCP tool `lu_uncordon` does the same and is marked destructive.
-- `lu_node_cordon_seconds_remaining{node,provider,source}` exports the remaining seconds of each active cordon; Reiki cordons that lift on healthy heartbeats export `0`.
+- `lu_node_cordon_seconds_remaining{node,provider,source}` exports the remaining seconds of each active cordon; health-derived cordons that lift on healthy heartbeats export `0`.
 - `lu top` keyboard and mouse selection for the dependency graph. `Tab`/`Shift+Tab` cycle focus through Nodes, Jobs and Graph with a highlighted border; the Jobs table and graph share one selected job. In Graph focus, `h`/`l` move to a parent or child, `j`/`k` move between siblings and components, `Home`/`End` jump to the ends, and `Enter` opens the job's log. The graph panel's bottom border shows the selected job's full id, state and clipped title, and the footer lists the keys for the focused pane. Left clicks select rows or nodes, double clicks open logs, and the wheel scrolls the focused pane by three rows. Mouse capture is enabled only while the TUI runs and is restored on exit, error and panic.
 
 ### Changed
 
-- Cordons created from Reiki retry estimates and fixed provider failures are now distinguishable in APIs, CLI output and the dashboard. Existing cordons upgrade to `source: "failure"` with reason `Cordoned before upgrade` and the upgrade time as their set time. The controller still clears all cordons at boot.
+- Cordons created from provider health retry estimates and fixed provider failures are now distinguishable in APIs, CLI output and the dashboard. Existing cordons upgrade to `source: "failure"` with reason `Cordoned before upgrade` and the upgrade time as their set time. The controller still clears all cordons at boot.
 - Dependency graphs are compact horizontal chains, prerequisites first: `lu top` draws them in a
   bordered `Graph` panel with a fixed height share, and `lu graph` keeps clipped task titles.
   Chains share one row; only real fan-outs and fan-ins use `├─▶`/`└─▶` branches and `┐`/`┘` joins.
@@ -235,7 +243,7 @@ Requires: a new controller database (the schema was reset; recreate it before up
 
 ### Fixed
 
-- Provider cordons no longer outlive a controller restart. Their expiry is on the process's monotonic clock, so a restart made rows from the previous run look hours in the future and blocked dispatch to a healthy provider; boot recovery now clears them and Reiki health and new failures set them again.
+- Provider cordons no longer outlive a controller restart. Their expiry is on the process's monotonic clock, so a restart made rows from the previous run look hours in the future and blocked dispatch to a healthy provider; boot recovery now clears them and provider gateway health and new failures set them again.
 
 ### Added
 
@@ -247,7 +255,7 @@ Requires: a new controller database (the schema was reset; recreate it before up
 ### Added
 
 - Dependency input collection. `JobSpec.collect` accepts `none`, `files`, `apply` or `both` (aliases `off`, `false`, `diffs`, `diff`, `patches`, `patch`) and overrides `stack_dependencies`; `files` and `both` stage `INDEX.md`, `diff.patch`, `report.json`, `run.log` and `meta.json` under `.lu/inputs` before the harness starts, with a 16-input/64 MiB cap, private modes, symlink refusal and a 256 KiB log tail. `JobSpec.include_failed` accepts failed or cancelled dependencies, releases their dependents instead of cascading a `dependency` failure, and makes their stored diffs available as inputs. The CLI adds `--collect` and `--include-failed` to `submit`, `retry` and `edit`; MCP adds `collect` and `include_failed` to `lu_submit`, `lu_submit_many` and `lu_retry`. `.lu` is excluded from exported diffs and is a staging error when tracked. No schema change: both fields live in the existing JSON spec.
-- Provider-agnostic jobs. `lu submit --provider any` picks a provider from the node's `[[agent.provider_models]]` pairs, tried in configuration order. Agents publish each pair with their heartbeat while Reiki reports that provider healthy; dispatch skips cordoned providers and records the chosen pair as `assigned_provider`/`assigned_model`, which the agent runs. `any` with `--model` or `--fallback` is a validation error. With no healthy pair on any eligible node the job stays `queued` with a waiting reason. Node views expose `provider_models`; no schema change, since pairs live in the stored heartbeat.
+- Provider-agnostic jobs. `lu submit --provider any` picks a provider from the node's `[[agent.provider_models]]` pairs, tried in configuration order. Agents publish each pair with their heartbeat while the provider gateway reports that provider healthy; dispatch skips cordoned providers and records the chosen pair as `assigned_provider`/`assigned_model`, which the agent runs. `any` with `--model` or `--fallback` is a validation error. With no healthy pair on any eligible node the job stays `queued` with a waiting reason. Node views expose `provider_models`; no schema change, since pairs live in the stored heartbeat.
 - `lu edit <job>` changes provider, model, fallbacks, requirements, tolerations and dependencies of a `queued` or `blocked` job in place through `POST /v1/jobs/{id}/edit` (operator scope). The job keeps its id and dependents; its assignment is cleared. Edited dependencies respect the 16-dependency limit, reject cycles with `400 bad_request` and move the job between `blocked` and `queued`. Other states get `409 conflict`. No schema change.
 - `lu mcp` write tools now accept the CLI's scheduling fields: `require`, `fallbacks`, `after_keys`, `no_stack`, `harness`, `timeout`/`timeout_secs` and `idle_timeout`/`idle_timeout_secs` on `lu_submit`, `lu_submit_many` and `lu_retry`. Bounds appear in `tools/list` and are enforced by the shared `JobSpec::validate`, so MCP returns the CLI's validation text.
 - `lu_nodes` and the new `lu_node` tool report node labels, version and disk-free stats from each node's stats endpoint.
@@ -307,7 +315,7 @@ Requires: a new controller database (the schema was reset; recreate it before up
 
 ### Fixed
 
-- A provider failure cordon created from Reiki's `retry_after_secs` now clears after two consecutive healthy provider heartbeats, so a stale outage estimate no longer leaves jobs queued for hours. Non-healthy readings reset the streak; output-marker cordons still wait out their timer. Store schema version is 3; older databases upgrade with their existing cordons unchanged.
+- A provider failure cordon created from the gateway's `retry_after_secs` now clears after two consecutive healthy provider heartbeats, so a stale outage estimate no longer leaves jobs queued for hours. Non-healthy readings reset the streak; output-marker cordons still wait out their timer. Store schema version is 3; older databases upgrade with their existing cordons unchanged.
 - `lu check`, `lu backup` and `lu restore` read only `[controller] db` and no longer check or load TLS keys and token files, so they work when run as root against a service account's secrets. `lu serve` still validates the whole config and its secret files.
 
 ### Added
@@ -456,8 +464,8 @@ Requires: a new controller database (the schema was reset; recreate it before up
 
 ### Fixed
 
-- A provider failure reports when the provider returns (`Completion.retry_after_secs`, Reiki's estimate plus 60 seconds); the controller cordons the provider on the node for that long, within 5 seconds and 24 hours. An older controller refuses completions that carry the field, so roll controllers first.
-- A job that names a provider fails as a provider failure, and moves to another node, as soon as the node's Reiki reports no usable key for that provider on two readings in a row. The signal comes from Reiki, not from harness output.
+- A provider failure reports when the provider returns (`Completion.retry_after_secs`, the gateway's estimate plus 60 seconds); the controller cordons the provider on the node for that long, within 5 seconds and 24 hours. An older controller refuses completions that carry the field, so roll controllers first.
+- A job that names a provider fails as a provider failure, and moves to another node, as soon as the node's provider gateway reports no usable key for that provider on two readings in a row. The signal comes from the gateway, not from harness output.
 - A harness that prints a provider-unavailable marker and then goes silent is stopped after 120
   seconds and completes as a `provider` failure, so the controller cordons that provider and
   retries the job elsewhere instead of waiting for the wall-clock timeout.
@@ -505,7 +513,7 @@ Requires: a new controller database (the schema was reset; recreate it before up
 ### Added
 
 - `[agent] harness_wrapper`: a command that wraps the harness, such as `podman exec` into a container, so no harness binary runs on the host. `{cwd}` becomes the job's working tree.
-- The agent sends its local Reiki's key health with each heartbeat when `reiki_health_url` and `reiki_token_file` are set, so the controller knows which providers a node can use.
+- The agent sends its local provider gateway's key health with each heartbeat when the health URL and token-file settings are set, so the controller knows which providers a node can use.
 
 ### Fixed
 

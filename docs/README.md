@@ -45,7 +45,7 @@ proof. For a condensed index, see [llms.txt](../llms.txt).
 - [Client guide](client-guide.md)
 - [MCP server](mcp.md)
 - [opencode harness](opencode-harness.md)
-- [Reiki](reiki.md)
+- [Provider cordons](dispatch.md#cordons)
 - [Signed intake](intake.md)
 - [Worked examples](examples.md)
 - [FAQ](faq.md)

@@ -1137,8 +1137,8 @@ mod tests {
                         },
                         CordonCell {
                             provider: "openrouter".to_owned(),
-                            source: "reiki".to_owned(),
-                            reason: "Reiki cooldown".to_owned(),
+                            source: crate::model::HEALTH_CORDON_SOURCE.to_owned(),
+                            reason: "Provider gateway cooldown".to_owned(),
                             remaining_secs: None,
                             lifts_after_healthy_heartbeats: Some(2),
                         },

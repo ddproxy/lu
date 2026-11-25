@@ -100,7 +100,7 @@ state: done
 ```
 
 `--provider any` cannot be combined with `--model` or `--fallback`. Provider outages do not consume
-`max_retries`; see [Reiki](reiki.md).
+`max_retries`; see [provider cordons](dispatch.md#cordons).
 
 ## Edit a blocked job
 

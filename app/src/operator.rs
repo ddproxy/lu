@@ -2705,7 +2705,12 @@ fn print_cordons(node: &NodeView) {
             (None, Some(count)) => format!("lifts on {count} healthy"),
             (None, None) => "lifts on healthy".to_owned(),
         };
-        println!("  {} [{}] {ago}; {state}", c.provider, c.source);
+        let source = if c.lifts_after_healthy_heartbeats.is_some() {
+            "gateway"
+        } else {
+            c.source.as_str()
+        };
+        println!("  {} [{}] {ago}; {state}", c.provider, source);
         println!("      {}", printable(&c.reason));
     }
 }

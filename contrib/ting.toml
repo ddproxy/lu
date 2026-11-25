@@ -26,8 +26,8 @@ heartbeat_secs = 15
 # Optional harness endpoint and health check. The health URL must be loopback,
 # and its token file follows the same private-file rules as token_file.
 # opencode_server = "http://127.0.0.1:4096"
-# reiki_health_url = "http://127.0.0.1:9000/health"
-# reiki_token_file = "/etc/ting/reiki.token"
+# provider_gateway_health_url = "http://127.0.0.1:9000/health"
+# provider_gateway_token_file = "/etc/ting/provider-gateway.token"
 
 [log]
 level = "info"

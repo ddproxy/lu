@@ -921,8 +921,8 @@ impl Client {
         if !request.provider_models.is_empty() {
             heartbeat["provider_models"] = serde_json::json!(request.provider_models);
         }
-        if let Some(reiki) = &request.reiki {
-            heartbeat["reiki"] = reiki.clone();
+        if let Some(provider_health) = &request.provider_health {
+            heartbeat["reiki"] = provider_health.clone();
         }
         if let Some(host) = &request.host {
             heartbeat["host"] = serde_json::json!(host);

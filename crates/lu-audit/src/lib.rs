@@ -728,7 +728,7 @@ mod tests {
     #[test]
     fn data_cannot_carry_task_text_or_secrets() {
         let data = Data::new()
-            .text(Field::Provider, "reiki")
+            .text(Field::Provider, "provider-x")
             .text(Field::Model, "fix the bug with secret ABCDEFGH")
             .text(Field::Source, "line one\nline two")
             .unsigned(Field::Attempt, 2);

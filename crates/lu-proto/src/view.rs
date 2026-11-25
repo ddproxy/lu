@@ -174,7 +174,7 @@ impl JobView {
 }
 
 /// Why a provider on a node is cordoned. `until` is a wall-clock Unix time for a failure cordon,
-/// and null for a Reiki cordon that lifts after healthy heartbeats.
+/// and null for a health-derived cordon that lifts after healthy heartbeats.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CordonView {
     pub provider: String,
@@ -188,7 +188,7 @@ pub struct CordonView {
 }
 
 /// One node's heartbeat and drain state. Nullable fields stay explicit nulls, as the controller
-/// has always sent them; only `reiki` is an opaque forwarded document.
+/// has always sent them; the provider-health field is an opaque forwarded document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeView {
     pub name: NodeName,
@@ -231,8 +231,8 @@ pub struct NodeView {
     pub current_job: Option<JobId>,
     #[serde(default)]
     pub cordon_details: Vec<CordonView>,
-    #[serde(default)]
-    pub reiki: Option<serde_json::Value>,
+    #[serde(default, rename = "reiki")]
+    pub provider_health: Option<serde_json::Value>,
     #[serde(default)]
     pub load1: Option<f64>,
     #[serde(default)]
@@ -384,7 +384,7 @@ impl NodeView {
             taints: Vec::new(),
             current_job: None,
             cordon_details: Vec::new(),
-            reiki: None,
+            provider_health: None,
             load1: None,
             mem_available_kb: None,
             mem_total_kb: None,

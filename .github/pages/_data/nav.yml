@@ -25,7 +25,6 @@
     - { title: Running the opencode harness, url: /docs/opencode-harness.html }
 - title: Operate
   items:
-    - { title: Lu with Reiki, url: /docs/reiki.html }
     - { title: Operations, url: /docs/operations.html }
     - { title: Adding a node safely, url: /docs/onboarding-nodes.html }
     - { title: Backup and restore, url: /docs/operations.html#backup-and-restore }
