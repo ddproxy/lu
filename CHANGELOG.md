@@ -5,17 +5,25 @@ uses semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Upgrade note
+
+- 0.8.0 deliberately removes the former provider-health config aliases, wire field names, cordon source value and stored column name. It also removes the former schedule table names, calendar `dates` spelling and collect-mode aliases. Roll the controller first, then the agents: 0.7.x agents can still heartbeat but their provider-health document is ignored until they are updated. See [compatibility](docs/compatibility.md).
+
 ### Changed
 
+- Intake priority (`0` to `9`) and timeout (`1` to `86400` seconds) bounds, absolute no-`..` secret and file paths, and dot-segment-free URLs are enforced at intake and in operator config. Errors name the accepted range or path form.
+- Opening an existing SQLite database is a read-only schema handshake: index creation and removal happen only when the baseline is created or a migration runs.
+- Every job row has a `version` advanced by each mutation in the same transaction. `JobView` exposes it, body-hash validators change on same-second writes, and `If-Match` compares the expected version.
+- Schedule configuration and collect modes accept one spelling each: `[[calendar]]`, `[[attach]]`, `ranges` and the modes `none`, `files`, `apply`, `both`. Former aliases and nested table names are refused with the canonical spelling in the error.
 - `lu check` and `lu serve` now call one shared value-validation path, so config parsing, token and role rules, schedule and limits sections, database paths and scrub rules fail with the same message. `lu check` still opens no secret files or TLS material, binds no port and never opens the database for write; `lu serve` alone reads secret files, loads TLS material and opens the database before binding.
 - Operator commands have no `[agent]`-table credential fallback. Regression tests prove an agent token is never attached to an operator request, and the missing-settings error names `LU_URL`, `LU_TOKEN_FILE`, optional `LU_CA_FILE` and the operator file's `url` and `token_file` keys. See [docs/client-guide.md](docs/client-guide.md), [docs/install.md](docs/install.md) and [docs/security.md](docs/security.md).
-- Provider health settings use neutral names: `[agent] provider_gateway_health_url` and `provider_gateway_token_file`. The earlier spellings are still accepted, and wire field names and stored column names keep their existing spellings for rolling upgrades; see [compatibility](docs/compatibility.md) and NOTES.md.
+- Provider health settings and wire fields use neutral names: `[agent] provider_gateway_health_url`, `provider_gateway_token_file`, `provider_health`, `health` and `health_derived`. The former spellings are no longer accepted at runtime; schema 1 to 7 databases migrate forward in place. See [compatibility](docs/compatibility.md) and NOTES.md.
 - Cordon reasons and provider-failure summaries now name the provider gateway instead of a product. Operator and terminal output maps the health-derived cordon source to a neutral gateway marker. Stored reasons written by older releases still display unchanged.
 
 ### Added
 
 - `lu submit --timeout` and `--idle-timeout` accept plain seconds or an `s`/`m`/`h` suffix; batch defaults and sidecars accept `idle_timeout`, and `lu show` prints both timeouts.
-- A hygiene test scans tracked docs, sources and tests for retired product names, internal domains and development hostnames, with a small allowlist for compatibility spellings.
+- A hygiene test scans tracked docs, sources and tests for retired product names, internal domains and development hostnames, with a small allowlist for migration-only spellings and the scanner's own patterns.
 
 ### Added
 - Infrastructure faults are now recognized as node-class failures with fixed `failure_reason`

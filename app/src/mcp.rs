@@ -1427,7 +1427,7 @@ mod tests {
             (
                 "lu_submit",
                 json!({"collect": "nope"}),
-                "invalid collect mode \"nope\"; expected one of none, files, apply, both (aliases: off, false, diffs, diff, patches, patch)",
+                "invalid collect mode \"nope\"; expected one of none, files, apply, both",
             ),
             (
                 "lu_submit",
@@ -1480,7 +1480,7 @@ mod tests {
             (
                 "lu_retry",
                 json!({"id": done, "collect": "nope"}),
-                "invalid collect mode \"nope\"; expected one of none, files, apply, both (aliases: off, false, diffs, diff, patches, patch)",
+                "invalid collect mode \"nope\"; expected one of none, files, apply, both",
             ),
             (
                 "lu_retry",

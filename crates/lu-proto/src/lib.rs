@@ -56,9 +56,8 @@ pub use spec::{
     Choice, CollectMode, CollectModeError, ExpectEdit, ExpectMode, ExpectModeError, ExpectSpec,
     GateFailureMode, GateFailureModeError, JobEdit, JobSpec, JobSpecError, OnConflict,
     OnConflictError, PublishSpec, PublishTarget, SourceSpec, StuckPolicy, StuckPolicyError,
-    WorkspacePolicy, WorkspacePolicyError, ANY_PROVIDER, COLLECT_ALIASES, COLLECT_MODES,
-    DEFAULT_PUBLISH_BRANCH, EXPECT_MODES, GATE_FAILURE_MODES, ON_CONFLICT_MODES, STUCK_POLICIES,
-    WORKSPACE_POLICIES,
+    WorkspacePolicy, WorkspacePolicyError, ANY_PROVIDER, COLLECT_MODES, DEFAULT_PUBLISH_BRANCH,
+    EXPECT_MODES, GATE_FAILURE_MODES, ON_CONFLICT_MODES, STUCK_POLICIES, WORKSPACE_POLICIES,
 };
 pub use state::{CancelEffect, JobState, ParseJobStateError};
 pub use stats::{

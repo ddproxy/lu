@@ -73,18 +73,8 @@ pub enum CollectMode {
 /// The canonical spellings accepted by [`CollectMode::parse`], in help-text order.
 pub const COLLECT_MODES: [&str; 4] = ["none", "files", "apply", "both"];
 
-/// Alternate spellings accepted by [`CollectMode::parse`]. Each maps to a canonical mode.
-pub const COLLECT_ALIASES: [(&str, CollectMode); 6] = [
-    ("off", CollectMode::None),
-    ("false", CollectMode::None),
-    ("diffs", CollectMode::Files),
-    ("diff", CollectMode::Files),
-    ("patches", CollectMode::Files),
-    ("patch", CollectMode::Files),
-];
-
 impl CollectMode {
-    /// Parses a canonical or alias spelling, case-insensitively.
+    /// Parses a canonical spelling, case-insensitively.
     pub fn parse(value: &str) -> Result<Self, CollectModeError> {
         let text = value.trim();
         for name in COLLECT_MODES {
@@ -95,11 +85,6 @@ impl CollectMode {
                     "apply" => Self::Apply,
                     _ => Self::Both,
                 });
-            }
-        }
-        for (alias, mode) in COLLECT_ALIASES {
-            if text.eq_ignore_ascii_case(alias) {
-                return Ok(mode);
             }
         }
         Err(CollectModeError {
@@ -488,7 +473,7 @@ impl fmt::Display for CollectMode {
     }
 }
 
-/// A `collect` value that is neither a canonical mode nor an alias.
+/// A `collect` value that is not a canonical mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectModeError {
     value: String,
@@ -505,14 +490,9 @@ impl fmt::Display for CollectModeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "invalid collect mode {:?}; expected one of {} (aliases: {})",
+            "invalid collect mode {:?}; expected one of {}",
             self.value,
-            COLLECT_MODES.join(", "),
-            COLLECT_ALIASES
-                .iter()
-                .map(|(alias, _)| *alias)
-                .collect::<Vec<_>>()
-                .join(", ")
+            COLLECT_MODES.join(", ")
         )
     }
 }
@@ -1101,7 +1081,7 @@ struct RawJobSpec {
     #[serde(default)]
     after: Vec<JobId>,
     /// Kept as text so an invalid value is reported as a `collect` field error, with the same
-    /// aliases the CLI and MCP accept.
+    /// spellings the CLI and MCP accept.
     #[serde(default)]
     collect: Option<String>,
     #[serde(default)]
@@ -2420,21 +2400,27 @@ mod tests {
     }
 
     #[test]
-    fn collect_modes_and_aliases_parse_to_the_expected_modes() {
+    fn collect_modes_parse_to_the_expected_modes() {
         for (text, mode) in [
             ("none", CollectMode::None),
             ("files", CollectMode::Files),
             ("apply", CollectMode::Apply),
             ("both", CollectMode::Both),
-            ("OFF", CollectMode::None),
-            ("False", CollectMode::None),
-            ("diffs", CollectMode::Files),
-            ("DIFF", CollectMode::Files),
-            ("patches", CollectMode::Files),
-            ("patch", CollectMode::Files),
+            ("NONE", CollectMode::None),
+            ("Apply", CollectMode::Apply),
         ] {
             assert_eq!(CollectMode::parse(text).unwrap(), mode, "{text}");
             assert_eq!(text.parse::<CollectMode>().unwrap(), mode, "{text}");
+        }
+        for text in ["off", "false", "diffs", "diff", "patches", "patch"] {
+            let error = CollectMode::parse(text).unwrap_err();
+            assert_eq!(error.value(), text);
+            assert!(
+                error
+                    .to_string()
+                    .contains("expected one of none, files, apply, both"),
+                "{error}"
+            );
         }
         assert_eq!(CollectMode::parse("nope").unwrap_err().value(), "nope");
         assert!(CollectMode::parse(" nope ").is_err());
@@ -2488,13 +2474,17 @@ mod tests {
     }
 
     #[test]
-    fn collect_aliases_are_accepted_on_the_wire_and_reported_by_field() {
+    fn former_collect_aliases_are_refused_on_the_wire() {
         for alias in ["off", "false", "diffs", "diff", "patches", "patch"] {
             let json = format!(
                 r#"{{"source": {{"repo": "https://example.net/r.git", "ref": "main"}},"task":"go","collect":"{alias}"}}"#
             );
-            let spec: JobSpec = serde_json::from_str(&json).unwrap();
-            assert!(spec.validate().is_ok(), "{alias}");
+            let error = serde_json::from_str::<JobSpec>(&json).unwrap_err();
+            assert!(error.to_string().contains("collect"), "{alias}: {error}");
+            assert!(
+                error.to_string().contains("none, files, apply, both"),
+                "{alias}: {error}"
+            );
         }
         let json = r#"{"source": {"repo": "https://example.net/r.git", "ref": "main"},"task":"go","collect":"nope"}"#;
         let error = serde_json::from_str::<JobSpec>(json).unwrap_err();
@@ -2505,7 +2495,7 @@ mod tests {
     fn include_failed_round_trips_through_job_edit() {
         let spec = sample();
         let edit: JobEdit =
-            serde_json::from_str(r#"{"collect":"diffs","include_failed":true}"#).unwrap();
+            serde_json::from_str(r#"{"collect":"files","include_failed":true}"#).unwrap();
         let next = edit.apply(&spec).unwrap();
         assert_eq!(next.collect, CollectMode::Files);
         assert!(next.include_failed);

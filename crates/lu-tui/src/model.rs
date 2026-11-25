@@ -8,9 +8,8 @@ use crate::sanitize::printable;
 use lu_proto::limits::MAX_VERSION_BYTES;
 use lu_proto::{same_build, HarnessState, JobState, NodeHealth, NodeHealthLevel, ProviderState};
 
-/// Legacy wire value for a health-derived cordon. Older controllers send this string; newer ones
-/// keep it so mixed-version fleets agree on the source.
-pub(crate) const HEALTH_CORDON_SOURCE: &str = "reiki";
+/// Wire value for a health-derived cordon.
+pub(crate) const HEALTH_CORDON_SOURCE: &str = "health";
 
 /// Reduces a source repository URL or absolute path to `owner/name`, dropping the scheme,
 /// credentials, host, query, fragment and a trailing `.git`. Unusable values become `-`; none of

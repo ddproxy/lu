@@ -204,7 +204,7 @@ pub struct Calendar {
     pub default: Option<DefaultState>,
     #[serde(default)]
     pub windows: Vec<WeeklyWindow>,
-    #[serde(default, alias = "dates")]
+    #[serde(default)]
     pub ranges: Vec<DateRange>,
     #[serde(default)]
     pub exceptions: Vec<DateRange>,
@@ -474,6 +474,15 @@ mod tests {
             to: ClockTime::parse(to).unwrap(),
             days: Days::parse(days).unwrap(),
         }
+    }
+
+    #[test]
+    fn former_dates_field_is_not_an_alias_for_ranges() {
+        let calendar: Calendar = serde_json::from_str(r#"{"name":"office","ranges":[]}"#).unwrap();
+        assert!(calendar.ranges.is_empty());
+        let error =
+            serde_json::from_str::<Calendar>(r#"{"name":"office","dates":[]}"#).unwrap_err();
+        assert!(error.to_string().contains("dates"), "{error}");
     }
 
     #[test]

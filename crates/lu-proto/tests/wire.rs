@@ -310,6 +310,7 @@ fn job_and_node_views_match_the_documented_json() {
         epoch: 7,
         created_at: 1_700_000_000,
         updated_at: 1_700_000_010,
+        version: 4,
         started_at: Some(1_700_000_020),
         finished_at: None,
         failure_class: None,
@@ -366,6 +367,7 @@ fn job_and_node_views_match_the_documented_json() {
         "epoch": 7,
         "created_at": 1_700_000_000u64,
         "updated_at": 1_700_000_010u64,
+        "version": 4u64,
         "started_at": 1_700_000_020u64,
         "finished_at": null,
         "failure_class": null,
@@ -419,7 +421,7 @@ fn job_and_node_views_match_the_documented_json() {
             },
             CordonView {
                 provider: "peer-d".to_owned(),
-                source: "reiki".to_owned(),
+                source: "health".to_owned(),
                 reason: "Provider gateway cooldown for peer-d (retry after 300s)".to_owned(),
                 set_at: 1_700_000_025,
                 until: None,
@@ -473,14 +475,14 @@ fn job_and_node_views_match_the_documented_json() {
             },
             {
                 "provider": "peer-d",
-                "source": "reiki",
+                "source": "health",
                 "reason": "Provider gateway cooldown for peer-d (retry after 300s)",
                 "set_at": 1_700_000_025,
                 "until": null,
                 "lifts_after_healthy_heartbeats": 2
             }
         ],
-        "reiki": {"status": "ok"},
+        "provider_health": {"status": "ok"},
         "load1": 1.5,
         "mem_available_kb": 8192,
         "mem_total_kb": 16_384,

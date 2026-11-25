@@ -1764,6 +1764,7 @@ mod poll_renewal_tests {
                 epoch,
                 created_at: 1,
                 updated_at: 2,
+                version: 1,
                 eligible_since: 1,
                 started_at: Some(2),
                 finished_at: None,

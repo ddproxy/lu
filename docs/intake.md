@@ -61,7 +61,7 @@ rule is dropped.
 | `task_template` | Operator-authored task text. Literal by default; `{{pointer}}` substitutions require `unsafe_inline = true`. |
 | `task_vars` | Pointers allowed in `task_template` and `key_template`. Each value is length-capped and has control characters stripped. |
 | `context_from` | Pointers copied into the job's external `context`, never into `task` unless `unsafe_inline` is set. |
-| `provider`, `model`, `priority`, `group`, `timeout` | Defaults applied to the drafted job's spec. |
+| `provider`, `model`, `priority`, `group`, `timeout` | Defaults applied to the drafted job's spec. `priority` is `0` to `9`; `timeout` is `1` to `86400` seconds. |
 | `publish` | Publish settings applied to the drafted job. |
 | `key_template` | Template for the source's idempotency/dedupe key and the job's `origin_ref`. |
 | `auto_approve` | Default `false`. When true, an event that passes the rule is created as `queued` (or `blocked` if dependencies are unmet) instead of `draft`. |

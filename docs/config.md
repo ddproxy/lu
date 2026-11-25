@@ -61,7 +61,7 @@ A token must not work in both scopes. Reusing a hash across the two arrays is re
 | --- | --- | --- | --- |
 | `url` | yes | — | `https` URL with a host and no userinfo (no `user:password@`). `http` is refused. A `file://` URL is accepted only with `allow_file_urls = true`. Jobs whose `repo` equals this string are pinned. |
 | `name` | yes | — | 1 to 64 characters from `A-Z a-z 0-9 . _ -`; unique among repositories. It also names the mirror directory. |
-| `credential_file` | no | — | Non-empty path when set. A private file holding `username:password` or a single token line, checked like `token_file` on `load` (regular file, owner-only, no symlink or FIFO, at most 64 KiB). The controller reads it only while fetching, when it is capped at 8 KiB. The value never enters the git command line, a log or an error. |
+| `credential_file` | no | — | Non-empty absolute path without `..` when set. A private file holding `username:password` or a single token line, checked like `token_file` on `load` (regular file, owner-only, no symlink or FIFO, at most 64 KiB). The controller reads it only while fetching, when it is capped at 8 KiB. The value never enters the git command line, a log or an error. |
 | `refs` | no | `["*"]` | Non-empty glob allow-list of branches and tags, using `*` and `?`. A ref outside the list resolves as unknown. |
 | `allow_file_urls` | no | `false` | Test-only. Allows `file://` repository URLs; do not enable it in production. |
 
@@ -88,9 +88,8 @@ The cap is applied inside the dispatch transaction, so concurrent polls cannot e
 ## `[schedule]`
 
 Optional controller-side time-aware scheduling. Without it, and without calendar or attachment
-tables, dispatch has no calendar gates. The file may also use top-level `[[calendar]]` (`[[calendars]]`)
-and `[[attach]]` (`[[attachments]]`) tables, or nested `[[schedule.calendars]]` and
-`[[schedule.attachments]]`; setting both names of one alias pair at the same level is rejected.
+tables, dispatch has no calendar gates. Calendar and attachment tables are spelled `[[calendar]]` and
+`[[attach]]` at the top level. Former plural and nested table names are refused.
 
 | Key | Required | Default | Validation |
 | --- | --- | --- | --- |
@@ -101,13 +100,11 @@ and `[[attach]]` (`[[attachments]]`) tables, or nested `[[schedule.calendars]]` 
 | `finish_secs` | no | `60` | Non-negative integer; finish allowance for `fit`. |
 | `starvation_secs` | no | `3600` | Positive integer; age at which a job outranks all static priorities. |
 | `min_disk_free_pct` | no | `8` | Integer `0` to `100`; minimum free work-filesystem percentage for dispatch. `0` disables the disk check. |
-| `calendars` | no | `[]` | Nested `[[schedule.calendars]]` alias. |
-| `attachments` | no | `[]` | Nested `[[schedule.attachments]]` alias. |
 
 Inline tuning values override values from `file`; unset keys keep the file or built-in default.
-Calendars and attachments from `file`, inline `[schedule]` and top-level aliases are merged in that
-order. Calendar names are unique and an attachment may name only defined calendars. Unknown keys
-are rejected. Full calendar syntax, aliases, examples and inspection routes are in
+Calendars and attachments from `file`, inline `[schedule]` and top-level `[[calendar]]`/`[[attach]]`
+tables are merged in that order. Calendar names are unique and an attachment may name only defined
+calendars. Unknown keys are rejected. Full calendar syntax, examples and inspection routes are in
 [scheduling.md](scheduling.md#controller-configuration).
 
 ## `[mirror]`
@@ -131,7 +128,7 @@ mirror and a token file.
 | Key | Required | Default | Validation |
 | --- | --- | --- | --- |
 | `name` | yes | — | A `[[controller.repos]]` name, its URL, or a normalized repo id (`host/owner/repo`); 1 to 512 characters from `A-Z a-z 0-9 . _ - / :`. A configured entry takes precedence over that repo's `credential_file`. |
-| `token_file` | yes | — | Non-empty path, checked like other secret files: regular file, owned by the effective user, mode `0600` or tighter, no symlink or FIFO. The token is passed to git through a private helper and scrubbed from errors. |
+| `token_file` | yes | — | Non-empty absolute path without `..`, checked like other secret files: regular file, owned by the effective user, mode `0600` or tighter, no symlink or FIFO. The token is passed to git through a private helper and scrubbed from errors. |
 
 ```toml
 [mirror.credentials]
@@ -145,9 +142,9 @@ The `[agent]` table describes an agent host. Operator commands never read it: th
 | Key | Required | Default | Validation |
 | --- | --- | --- | --- |
 | `name` | yes | — | 1 to 64 characters from `A-Z a-z 0-9 . _ -`. It must match the controller's agent entry. |
-| `controller_url` | yes | — | `http` or `https` URL with a host. No credentials, query or fragment. `http` is allowed only for `localhost` or a loopback IP. A path is allowed; the client rejects `.` or `..` path segments. |
-| `token_file` | yes | — | Non-empty path. On `load`, it must be a regular file, owned by the effective user, with no group or other permission bits, no symlink and no FIFO; at most 64 KiB. The CLI trims trailing CR/LF from the token text. |
-| `ca_file` | no | — | Non-empty path when set. On `load`, the client reads up to 1 MiB of PEM certificates and adds them to the system trust roots; it does not replace the system roots. `lu check` does not read it. |
+| `controller_url` | yes | — | `http` or `https` URL with a host. No credentials, query, fragment or `.`/`..` path segments. `http` is allowed only for `localhost` or a loopback IP. A path is allowed. |
+| `token_file` | yes | — | Non-empty absolute path without `..`. On `load`, it must be a regular file, owned by the effective user, with no group or other permission bits, no symlink and no FIFO; at most 64 KiB. The CLI trims trailing CR/LF from the token text. |
+| `ca_file` | no | — | Non-empty absolute path without `..` when set. On `load`, the client reads up to 1 MiB of PEM certificates and adds them to the system trust roots; it does not replace the system roots. `lu check` does not read it. |
 | `work_dir` | yes | — | Absolute path; must not contain `..`. The agent creates it recursively with mode `0700` at start when it is missing. An existing path must be a real directory, not a symlink; staging rejects `/` and bare top-level directories such as `/srv`. It is also the root for the job workspaces described in [workspaces.md](workspaces.md). |
 | `harness` | yes | — | Non-empty. The agent runs `opencode` job specs only; a spec naming another harness fails with `execution`. A non-`opencode` configured value is ignored with a warning. |
 | `base_source` | no | `auto` | `clone`, `controller` or `auto`. For a job with `base_commit`, `controller` fetches a pack from the controller and fails the job on `404`; `auto` falls back to cloning the spec's `repo` on `404`; `clone` never asks. Local bases come from paths under `local_repo_roots`; roots and candidates are canonicalised so symlinks cannot escape. |
@@ -156,13 +153,13 @@ The `[agent]` table describes an agent host. Operator commands never read it: th
 | `harness_uid` | no | — | Numeric uid of the account the harness runs as. When set, the agent chowns the per-job socket root and each private socket directory/socket to this account and checks `SO_PEERCRED` against it. Unset means the harness shares the agent's uid. The agent needs `CAP_CHOWN` (or root) to use a different uid. |
 | `allow_shared_uid_scope` | no | `false` | Lets a job with `allow_spawn` start while `harness_uid` is unset, so the harness shares the agent's uid and can read what the agent can. Off by default: the job is refused with a `conflict`. |
 | `harness_gid` | no | `workspace_group` or `harness_uid` | Numeric gid for the per-job socket files and directories. Requires `harness_uid`. |
-| `opencode_password_file` | no | — | A private file (a regular file owned by the agent's account, no group or other access) whose single line is the opencode server's password. The agent reads up to 4 KiB at start, trims trailing CR/LF, rejects control characters and passes it to the harness as `OPENCODE_SERVER_PASSWORD`. It is checked at agent start, not by config validation. |
+| `opencode_password_file` | no | — | Absolute path without `..` naming a private file (a regular file owned by the agent's account, no group or other access) whose single line is the opencode server's password. The agent reads up to 4 KiB at start, trims trailing CR/LF, rejects control characters and passes it to the harness as `OPENCODE_SERVER_PASSWORD`. Its contents are checked at agent start, not by config validation. |
 | `harness_wrapper` | no | `[]` | A command that wraps the harness, for example `["podman", "exec", "-i", "--workdir", "{cwd}", "--env", "OPENCODE_SERVER_PASSWORD", "opencode-agent"]`, so it runs inside a container. `{cwd}` becomes the job's working tree. Entries must be non-empty text without control characters. The wrapper runs directly, never through a shell. |
 | `heartbeat_secs` | no | `15` | Integer `2` to `300`. When a `[controller]` table is also present, `heartbeat_secs * 2` must be strictly less than `lease_secs`. |
 | `on_stuck` | no | `none` | One of `none`, `cancel`, `retry`. Default response for jobs whose spec omits `on_stuck`; `none` leaves stuck jobs running. |
 | `stuck_after_secs` | no | `1800` | Integer `60` to `86400`. Default continuous stuck interval for jobs whose spec omits `stuck_after_secs`. |
 | `provider_gateway_health_url` | no | — | Loopback `http` or `https` URL with no credentials, query or fragment. Requires `provider_gateway_token_file`. The agent reads the local provider gateway's health (`GET /v1/health`) every 10 seconds and sends each upstream as a provider (`ok`, `cooling` with seconds left, `disabled` or `unknown`) with every heartbeat, plus the document itself. A job that names a `provider` goes only to nodes that report it. After three failed reads the node reports no providers. |
-| `provider_gateway_token_file` | no | — | Non-empty when set; required when `provider_gateway_health_url` is set, and rejected when set alone. Checked like `token_file` on `load`; the agent reads at most 4 KiB. |
+| `provider_gateway_token_file` | no | — | Non-empty absolute path without `..` when set; required when `provider_gateway_health_url` is set, and rejected when set alone. Checked like `token_file` on `load`; the agent reads at most 4 KiB. |
 | `gateway_fault_markers` | no | `[]` | At most 16 case-insensitive body substrings, each 1 to 64 bytes, validated when the config loads. Optional and agent-side; it needs no health URL. A `503` from the node's configured gateway health endpoint is a node-class `gateway_unavailable` fault only when its body contains a marker. With an empty list, a `503` is an ordinary failed health read. |
 | `provider_models` | no | `[]` | Up to 64 `[[agent.provider_models]]` pairs, in preference order. Each provider is 1 to 64 characters from `A-Z a-z 0-9 . _ -`; each model is 1 to 128 bytes; provider names are unique. See below. |
 | `labels` | no | `[]` | At most 32 labels. Each is 1 to 64 characters from `A-Z a-z 0-9 . _ - /`, with at most one `=`. Lu never interprets them; a job's `requires` must match every label exactly. |
@@ -372,7 +369,7 @@ A `[tls]` table makes the controller serve HTTPS. It is required when `listen` i
 | `level` | no | `info` | One of `error`, `warn`, `info`, `debug`, `trace`. `RUST_LOG` overrides it at runtime when set. |
 | `format` | no | `text` | `text` or `json`. |
 | `stderr` | no | `true` | Boolean. Logging also goes to stderr when `file` is unset, even if this is `false`. |
-| `file` | no | — | Non-empty path when set. Opened append-only; created with mode `0640` when absent, while existing permissions are left unchanged. A symlink at the path is refused. |
+| `file` | no | — | Non-empty absolute path without `..` when set. Opened append-only; created with mode `0640` when absent, while existing permissions are left unchanged. A symlink at the path is refused. |
 
 ## `[artifacts]`
 
@@ -524,7 +521,7 @@ at least one rule. Configuration details, the event format and the trust model a
 | Key | Required | Default | Validation |
 | --- | --- | --- | --- |
 | `name` | yes | — | 1 to 64 characters from `A-Z a-z 0-9 . _ -`; unique among sources. It is the path segment of `POST /v1/intake/<source>`. |
-| `secret_file` | yes | — | Secret file holding the HMAC-SHA256 key; checked like other secret files and read with `O_NOFOLLOW`. |
+| `secret_file` | yes | — | Absolute path without `..` naming a file that holds the HMAC-SHA256 key; checked like other secret files and read with `O_NOFOLLOW`. |
 | `header` | no | `X-Hub-Signature-256` | Header carrying the signature. |
 | `max_body_bytes` | no | `1048576` | Raw body cap, 1 to 16777216 bytes; oversized or malformed bodies get `400 invalid delivery` and are counted as `invalid`. |
 | `rate_per_minute` | no | `60` | Per-source budget, 1 to 100000; excess gets `429 rate_limited` and is counted as `rate_limited`. |
@@ -554,7 +551,7 @@ becomes a draft, even with `auto_approve`.
 | `task_template` | no | `""` | Operator-authored task text. Literal by default; `{{pointer}}` substitution requires `unsafe_inline = true` and a pointer in `task_vars`. |
 | `task_vars` | no | `[]` | Pointers usable in `task_template` and `key_template`; values are length-capped and stripped of control characters. |
 | `context_from` | no | `[]` | Pointers copied into the job's external `context`, capped at 32 KiB with a truncation marker. |
-| `provider`, `model`, `priority`, `group`, `timeout` | no | — | Defaults applied to the drafted job's spec. |
+| `provider`, `model`, `priority`, `group`, `timeout` | no | — | Defaults applied to the drafted job's spec. `priority` is `0` to `9`; `timeout` is `1` to `86400` seconds. |
 | `publish` | no | — | Publish settings applied to the drafted job. |
 | `key_template` | no | — | Template for the dedupe/idempotency key and the job's `origin_ref`; may substitute `task_vars`. |
 | `auto_approve` | no | `false` | When true, a passing event is created `queued` (or `blocked` if dependencies are unmet) instead of `draft`. |
@@ -593,8 +590,8 @@ unsafe_inline = false
 
 ## Paths and secret files
 
-- `db`, `artifacts_dir`, `work_dir`, `[audit] path`, each `local_repo_roots` entry, each `label_files` entry, each `scratch_globs` pattern and each `extra_roots` entry must be absolute and must not contain a `..` component.
-- `[tls] cert`, `[tls] key`, `token_file`, `ca_file`, `provider_gateway_token_file`, `credential_file`, `[mirror.credentials]` token files, `[publish.remotes.<name>]` token files, each `[[intake.sources]].secret_file`, `opencode_password_file` and `[log] file` need not be absolute. Publish token files are the exception: their own table requires an absolute path.
+- Every configured file path, including `db`, `artifacts_dir`, `work_dir`, `[audit] path`, `[log] file`, `[tls] cert`, `[tls] key`, every `token_file`, `ca_file`, `provider_gateway_token_file`, `credential_file`, `[mirror.credentials]` token file, `[publish.remotes.<name>]` token file, `[[intake.sources]].secret_file`, `opencode_password_file`, `local_repo_roots` entry, `label_files` entry, `scratch_globs` pattern and `extra_roots` entry, must be absolute and must not contain a `..` component.
+- `file://` repository and publish test URLs must name an absolute path without `..`, and controller URLs must not contain `.` or `..` path segments. `lu check` applies these rules without opening the files.
 - Each secret read opens the path once with `O_NOFOLLOW` and `O_NONBLOCK`, then checks the open handle; a startup check and later use may open the same file separately. Secret files must be regular files, owned by the effective user, with no group or other permission bits (mode `0600` or tighter). A file with mode `0640` is refused for a secret. `lu serve` and `ting` check `[tls] key`, `token_file`, `provider_gateway_token_file`, `credential_file`, publish token files and intake signing keys on load; `opencode_password_file` is checked when the agent starts.
 - The config file itself has no secret-file mode check; it normally contains only hashes and paths. Protect it anyway because it names the token and TLS key locations.
 

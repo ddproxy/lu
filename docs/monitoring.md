@@ -69,7 +69,7 @@ If Prometheus supports only inline `credentials`, protect that file with the sam
 | `lu_node_disk_free_pct{node}` | gauge | Free work-filesystem percentage from the heartbeat's `disk_free_pct`. Older agents without the field report `100`. |
 | `lu_node_providers{node,provider,state}` | gauge | `1` per reported provider; `state` is `ok`, `cooling`, `disabled` or `unknown`. |
 | `lu_audit_write_errors_total` | counter | Audit record enqueue or write failures since this controller process started. Always present, `0` when auditing is off. A non-zero value means one or more events were not recorded; the job still completed. |
-| `lu_node_cordon_seconds_remaining{node,provider,source}` | gauge | Seconds left on a failure cordon; `0` for health-derived cordons that lift on healthy heartbeats. |
+| `lu_node_cordon_seconds_remaining{node,provider,source}` | gauge | Seconds left on a failure cordon; `0` for health-derived cordons that lift on healthy heartbeats. `source` is `health` or `failure`. |
 | `lu_node_workspace_bytes{node}` | gauge | Bytes in job workspaces from the node's latest heartbeat. |
 | `lu_node_workspace_count{node}` | gauge | Number of job workspaces from the node's latest heartbeat. |
 | `lu_node_workspace_reclaimed_bytes_total{node}` | counter | Bytes reclaimed by workspace deletion since the agent started. |

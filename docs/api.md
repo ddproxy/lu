@@ -48,7 +48,7 @@ These apply to the operator GET routes: `/v1/jobs` (list and `key`), `/v1/jobs/{
 
 **Budget.** Each operator may make `[controller] read_per_minute` GET requests per 60-second window (default `1200`). The budget is counted per operator name, after the token is checked, so unauthenticated or wrong-token requests do not use it. It is separate from the login failure throttle. An exhausted budget is `429 rate_limited` with `Retry-After` in whole seconds. Writes do not use this budget.
 
-**Validators.** JSON reads of a single job, the job list, node views and node stats send a strong `ETag`: the first 128 bits of the SHA-256 of the exact response body, quoted. Send it back as `If-None-Match` (a list, a weak `W/` form and `*` are accepted). A match returns `304 Not Modified` with the same `ETag`, no body, and the usual `Cache-Control: no-store`. A mismatch returns `200` with the new body and `ETag`. Any change to the body, including a job moving state, changes the tag.
+**Validators.** JSON reads of a single job, the job list, node views and node stats send a strong `ETag`: the first 128 bits of the SHA-256 of the exact response body, quoted. Send it back as `If-None-Match` (a list, a weak `W/` form and `*` are accepted). A match returns `304 Not Modified` with the same `ETag`, no body, and the usual `Cache-Control: no-store`. A mismatch returns `200` with the new body and `ETag`. Any change to the body, including a job moving state, changes the tag. A job view carries its per-row `version`, so the tag changes on every mutation even when `updated_at` stays in the same second.
 
 ```
 GET /v1/jobs/{id}                       -> 200  ETag: "3f9c…"
@@ -125,7 +125,7 @@ dropped and counted as `invalid`. An allow rule that fails drops the event witho
 | `stuck_after_secs` | integer | no | 60 to 86400; omitted when absent. Continuous stuck time before the agent acts; an absent value uses the agent default. |
 | `idempotency_key` | string | no | Omitted when absent. |
 | `after` | array of job ids | no | At most 16 unique ids; omitted when empty. |
-| `collect` | string | no | One of `none`, `files`, `apply` or `both`; aliases `off`, `false`, `diffs`, `diff`, `patches` and `patch` are accepted case-insensitively. Defaults to `apply` and is omitted when `apply`. `files`/`both` stage `.lu/inputs`; `apply`/`both` apply dependency diffs in `after` order before the harness starts. |
+| `collect` | string | no | One of `none`, `files`, `apply` or `both`, case-insensitive; other spellings are refused with the accepted list. Defaults to `apply` and is omitted when `apply`. `files`/`both` stage `.lu/inputs`; `apply`/`both` apply dependency diffs in `after` order before the harness starts. |
 | `include_failed` | boolean | no | Defaults to `false`; omitted when `false`. When true, failed or cancelled dependencies are accepted and released instead of failing this job; their artifacts become inputs only when a diff was stored. |
 | `on_conflict` | string | no | One of `fail`, `markers` or `skip`, case-insensitive; defaults to `fail` and is omitted when default. Controls input patches that do not apply; explicit values are echoed in `JobView.spec`. |
 | `stack_union_paths` | array of strings | no | At most 16 repo-relative globs of at most 256 bytes each; omitted when empty. Every entry must appear in the agent's `[stack] union_paths`; a conflict on such a path keeps both sides' added lines in order and base deletions. Must not overlap `stack_base_paths`. |
@@ -217,7 +217,8 @@ horizon; use `POST /v1/schedule/explain`. See [scheduling.md](scheduling.md).
 | `node` | string or null | Node holding the job. |
 | `epoch` | integer | Lease epoch used for fencing. |
 | `created_at` | integer | Unix seconds when the job was created. |
-| `updated_at` | integer | Unix seconds of the last state change. |
+| `updated_at` | integer | Unix seconds of the last state change. Display only; conditional writes use `version`. |
+| `version` | integer | Per-row revision, starting at 1 for a new job and advancing on every mutation. The `ETag` and `If-Match` token come from this value, so two writes in one second still produce distinct validators. Migrated rows start at 0 until their first write. |
 | `started_at` | integer or null | Unix seconds when the harness started. |
 | `finished_at` | integer or null | Unix seconds when the job reached a terminal state. |
 | `failure_class` | string or null | `node`, `provider`, `execution`, `dependency` or `conflict`. |
@@ -262,7 +263,7 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `stuck_after_secs` | integer | 60 to 86400; overrides the continuous stuck interval. |
 | `requires` | array of labels | At most 8 labels. |
 | `tolerates` | array of taints | At most 8 taints. |
-| `collect` | string | One of `none`, `files`, `apply` or `both`, or an accepted alias. |
+| `collect` | string | One of `none`, `files`, `apply` or `both`. |
 | `include_failed` | boolean | When true, failed or cancelled dependencies are accepted and their stored diffs are available as inputs. |
 | `on_conflict` | string | One of `fail`, `markers` or `skip`, case-insensitive; replaces the conflict policy. |
 | `priority` | integer | `0` to `9`; higher dispatches first, then `dispatch_seq` ascending and `eligible_since` ascending, after the starvation class. |
@@ -295,6 +296,7 @@ All fields are optional and omitted when absent. Absent fields stay unchanged; a
 | `taints` | array of strings | Taints from the latest heartbeat. |
 | `current_job` | string or null | Job id the node holds. |
 | `cordon_details` | array of `CordonView` | Cordons with their source, reason and timing. |
+| `provider_health` | object or null | Opaque provider-health document from the latest heartbeat. |
 | `load1` | number or null | One-minute load from the latest host stats. |
 | `mem_available_kb` | integer or null | Available memory from the latest host stats. |
 | `mem_total_kb` | integer or null | Total memory from the latest host stats. |
@@ -325,7 +327,7 @@ A client talking to an older controller that omits `min_disk_free_pct` cannot ju
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `provider` | string | Cordoned provider name. |
-| `source` | string | Identifies a cordon with a provider retry estimate or a fixed provider-failure cooldown (`failure`). Treat the value as opaque: clients map the health-derived source to a neutral display label. |
+| `source` | string | `health` for a cordon from a provider retry estimate, or `failure` for a fixed provider-failure cooldown. |
 | `reason` | string | Why the cordon was set, including the summary and retry estimate when that is known. |
 | `set_at` | integer | Unix seconds when the cordon was set. |
 | `until` | integer or null | Unix seconds when a `failure` cordon expires; null for a health-derived cordon that lifts on healthy heartbeats. |
@@ -488,7 +490,7 @@ agent routes; they add no new rate-limit bucket.
 
 `source.base` is a 40-hex commit id. The mirror pins the resolved commit for a configured source ref and records it on the job. The agent fetches a pack for it unless `base_source` is `clone`. With `controller`, a `404` fails the job; with `auto`, the default, a `404` falls back to cloning `source.repo`.
 
-`Heartbeat` may also carry an optional `provider_models` array of `{provider, model}` pairs (at most 64, unique provider names, valid names and models). Agents publish only pairs whose provider the gateway health feed reports healthy; the controller records them on the node and uses them for `provider = "any"` jobs. Older agents that omit the field are accepted. An updated agent sends optional `harness_ok` (boolean) and `disk_free_pct` (integer `0` to `100`, values above `100` are rejected). Absent means healthy; `harness_ok: false` or a `disk_free_pct` below `[schedule] min_disk_free_pct` keeps the node from taking new work until a later heartbeat recovers. `Heartbeat` may also carry optional `version` (at most 32 printable ASCII characters), optional `labels` (at most 32 labels, each 1–64 characters from letters, digits, `.`, `_`, `-`, `/`, with at most one `=`), optional `label_sources` (a map of probed labels to `probed`; keys must also appear in `labels`, at most 32 entries), optional `taints` (at most 8, same label syntax) plus optional `host` and `jobs` stats. The five workspace counters (`workspace_bytes`, `workspace_count`, `workspace_reclaimed_bytes_total`, `workspace_evictions_total`, `workspace_delete_errors_total`) and the `workspaces` listing are also part of the heartbeat; see [workspaces.md](workspaces.md). Housekeeping adds optional `gc_removed_total` and `gc_bytes_freed_total`, cumulative since that agent started; the agent sends them only when non-zero, and an absent value is read as zero. Older agents that omit optional fields are accepted; each heartbeat replaces the controller's previous stats, labels, label sources, taints and workspace listing for that node, so omitting them clears stale state. The combined stats are trimmed to 16 KiB before validation by dropping processes first and then whole jobs. Lu never interprets labels or taints; dispatch compares them exactly.
+`Heartbeat` may also carry an optional `provider_models` array of `{provider, model}` pairs (at most 64, unique provider names, valid names and models). Agents publish only pairs whose provider the gateway health feed reports healthy; the controller records them on the node and uses them for `provider = "any"` jobs. The opaque feed document is carried in optional `provider_health`. Older agents that omit the field are accepted. An updated agent sends optional `harness_ok` (boolean) and `disk_free_pct` (integer `0` to `100`, values above `100` are rejected). Absent means healthy; `harness_ok: false` or a `disk_free_pct` below `[schedule] min_disk_free_pct` keeps the node from taking new work until a later heartbeat recovers. `Heartbeat` may also carry optional `version` (at most 32 printable ASCII characters), optional `labels` (at most 32 labels, each 1–64 characters from letters, digits, `.`, `_`, `-`, `/`, with at most one `=`), optional `label_sources` (a map of probed labels to `probed`; keys must also appear in `labels`, at most 32 entries), optional `taints` (at most 8, same label syntax) plus optional `host` and `jobs` stats. The five workspace counters (`workspace_bytes`, `workspace_count`, `workspace_reclaimed_bytes_total`, `workspace_evictions_total`, `workspace_delete_errors_total`) and the `workspaces` listing are also part of the heartbeat; see [workspaces.md](workspaces.md). Housekeeping adds optional `gc_removed_total` and `gc_bytes_freed_total`, cumulative since that agent started; the agent sends them only when non-zero, and an absent value is read as zero. Older agents that omit optional fields are accepted; each heartbeat replaces the controller's previous stats, labels, label sources, taints and workspace listing for that node, so omitting them clears stale state. The combined stats are trimmed to 16 KiB before validation by dropping processes first and then whole jobs. Lu never interprets labels or taints; dispatch compares them exactly.
 
 ## Job-scoped routes
 

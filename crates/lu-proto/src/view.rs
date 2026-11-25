@@ -46,6 +46,9 @@ pub struct JobView {
     pub created_at: u64,
     #[serde(default)]
     pub updated_at: u64,
+    /// Per-row revision used by `If-Match`; distinct from the display-only `updated_at`.
+    #[serde(default)]
+    pub version: u64,
     #[serde(default)]
     pub started_at: Option<u64>,
     #[serde(default)]
@@ -136,6 +139,7 @@ impl JobView {
             epoch: 0,
             created_at: 0,
             updated_at: 0,
+            version: 0,
             started_at: None,
             finished_at: None,
             failure_class: None,
@@ -231,7 +235,7 @@ pub struct NodeView {
     pub current_job: Option<JobId>,
     #[serde(default)]
     pub cordon_details: Vec<CordonView>,
-    #[serde(default, rename = "reiki")]
+    #[serde(default)]
     pub provider_health: Option<serde_json::Value>,
     #[serde(default)]
     pub load1: Option<f64>,

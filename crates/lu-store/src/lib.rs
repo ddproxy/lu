@@ -96,8 +96,7 @@ pub enum CordonSource {
 impl CordonSource {
     pub fn as_str(self) -> &'static str {
         match self {
-            // Legacy wire value: older controllers and clients compare this exactly.
-            CordonSource::Health => "reiki",
+            CordonSource::Health => "health",
             CordonSource::Failure => "failure",
         }
     }
@@ -168,7 +167,10 @@ pub struct JobRecord {
     pub assigned_model: Option<String>,
     pub epoch: u64,
     pub created_at: i64,
+    /// Wall-clock stamp for display only. Conditional writes use `version`.
     pub updated_at: i64,
+    /// Per-row revision, advanced by every mutation in the same transaction as the write.
+    pub version: i64,
     /// When this job became eligible for dispatch: submission, approval or unblock, whichever is
     /// last. Stored so queue aging and deferral survive a restart.
     pub eligible_since: i64,
@@ -634,19 +636,19 @@ pub trait Store: Send + Sync + 'static {
 
     /// Cancels a job; by default only the named job. Stores that track dependency waits can also
     /// cancel the blocked dependents that can no longer run.
-    /// `expected_updated_at`, when set, must still be the row's `updated_at` inside the write
+    /// `expected_version`, when set, must still be the row's `version` inside the write
     /// transaction; otherwise `Precondition` is returned without changing state.
     fn cancel_job_with_dependents(
         &self,
         id: &JobId,
         now: Now,
         keep_dependents: bool,
-        expected_updated_at: Option<i64>,
+        expected_version: Option<i64>,
     ) -> Result<JobRecord, StoreError> {
         let _ = keep_dependents;
-        if let Some(expected) = expected_updated_at {
+        if let Some(expected) = expected_version {
             let rec = self.get_job(id)?;
-            if rec.updated_at != expected {
+            if rec.version != expected {
                 return Err(StoreError::Precondition);
             }
         }
@@ -655,7 +657,7 @@ pub trait Store: Send + Sync + 'static {
 
     /// Requeues terminal `id` in place from `spec`, incrementing its attempt and clearing its
     /// outcome. Blocked dependents waiting on it are restored after the root, transitively when
-    /// `chain` is set; their ids are returned. `expected_updated_at` is checked inside the write
+    /// `chain` is set; their ids are returned. `expected_version` is checked inside the write
     /// transaction by stores that support it.
     fn retry_with_dependents(
         &self,
@@ -663,12 +665,12 @@ pub trait Store: Send + Sync + 'static {
         spec: &JobSpec,
         chain: bool,
         now: Now,
-        expected_updated_at: Option<i64>,
+        expected_version: Option<i64>,
     ) -> Result<(JobRecord, Vec<JobId>), StoreError> {
         let _ = (id, spec, chain, now);
-        if let Some(expected) = expected_updated_at {
+        if let Some(expected) = expected_version {
             let rec = self.get_job(id)?;
-            if rec.updated_at != expected {
+            if rec.version != expected {
                 return Err(StoreError::Precondition);
             }
         }
@@ -692,7 +694,7 @@ pub trait Store: Send + Sync + 'static {
     fn draft_counts(&self) -> Result<DraftCounts, StoreError> {
         Ok(DraftCounts::default())
     }
-    /// Applies an optional edit and approves a draft as one operation. `expected_updated_at` is
+    /// Applies an optional edit and approves a draft as one operation. `expected_version` is
     /// checked before any write; stores with transactional support check it inside the write
     /// transaction. The default implementation has a check-then-write race.
     fn approve_draft_if(
@@ -701,11 +703,11 @@ pub trait Store: Send + Sync + 'static {
         edit: Option<&JobEdit>,
         target: JobState,
         now: Now,
-        expected_updated_at: Option<i64>,
+        expected_version: Option<i64>,
     ) -> Result<JobRecord, StoreError> {
         let rec = self.get_job(id)?;
-        if let Some(expected) = expected_updated_at {
-            if rec.updated_at != expected {
+        if let Some(expected) = expected_version {
+            if rec.version != expected {
                 return Err(StoreError::Precondition);
             }
         }

@@ -173,12 +173,12 @@ these fields among others:
 
 ```json
 {"providers":[{"name":"anthropic","state":"cooling","soonest_secs":60}],
- "cordon_details":[{"provider":"anthropic","source":"reiki","reason":"Provider gateway cooldown for anthropic",
+ "cordon_details":[{"provider":"anthropic","source":"health","reason":"Provider gateway cooldown for anthropic",
                     "set_at":1763750000,"until":null,"lifts_after_healthy_heartbeats":2}]}
 ```
 
-The health-derived `source` value above is a compatibility spelling kept for older controllers and
-agents; clients display it as a neutral gateway marker. See [Compatibility](compatibility.md).
+The health-derived `source` value above is `health`; clients display it as a neutral gateway marker.
+See [Compatibility](compatibility.md).
 
 A job with no provider is not blocked by that cordon; a job with fallbacks may run on another
 provider or node. An operator can clear a cordon early with `lu uncordon <node> [<provider>]`;

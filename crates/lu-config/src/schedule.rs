@@ -16,7 +16,7 @@ use serde::Deserialize;
 
 use crate::{read_config_text, validate_abs_no_dotdot, ConfigError};
 
-const SCHEDULE_KEYS: [&str; 9] = [
+const SCHEDULE_KEYS: [&str; 7] = [
     "file",
     "min_disk_free_pct",
     "horizon_secs",
@@ -24,8 +24,6 @@ const SCHEDULE_KEYS: [&str; 9] = [
     "staging_secs",
     "finish_secs",
     "starvation_secs",
-    "calendars",
-    "attachments",
 ];
 
 const TUNING_KEYS: [&str; 5] = [
@@ -52,12 +50,6 @@ pub struct ScheduleConfig {
     pub staging_secs: Option<i64>,
     pub finish_secs: Option<i64>,
     pub starvation_secs: Option<i64>,
-    /// Alias form: `[[schedule.calendars]]`. Top-level `[[calendar]]` is also accepted.
-    #[serde(default)]
-    pub calendars: Vec<lu_schedule::Calendar>,
-    /// Alias form: `[[schedule.attachments]]`. Top-level `[[attach]]` is also accepted.
-    #[serde(default)]
-    pub attachments: Vec<lu_schedule::Attachment>,
 }
 
 /// The shape of a standalone `[schedule] file` document.
@@ -66,9 +58,9 @@ pub struct ScheduleConfig {
 struct ScheduleDocument {
     #[serde(default)]
     schedule: Option<ScheduleConfig>,
-    #[serde(default, rename = "calendar", alias = "calendars")]
+    #[serde(default, rename = "calendar")]
     calendars: Vec<lu_schedule::Calendar>,
-    #[serde(default, rename = "attach", alias = "attachments")]
+    #[serde(default, rename = "attach")]
     attachments: Vec<lu_schedule::Attachment>,
 }
 
@@ -162,6 +154,14 @@ pub(crate) fn validate_document(value: &toml::Value) -> Result<(), ConfigError> 
     let root = value
         .as_table()
         .ok_or_else(|| invalid("[config]", "configuration must be a table".to_owned()))?;
+    for (former, canonical) in [("calendars", "[[calendar]]"), ("attachments", "[[attach]]")] {
+        if root.contains_key(former) {
+            return Err(invalid(
+                "[config]",
+                format!("unknown key {former:?} (use {canonical})"),
+            ));
+        }
+    }
     let schedule = match root.get("schedule") {
         None => None,
         Some(value) => Some(
@@ -184,16 +184,7 @@ pub(crate) fn validate_document(value: &toml::Value) -> Result<(), ConfigError> 
         }
     }
 
-    let mut calendar_values =
-        array_field(root, &["calendar", "calendars"], "[config]", "calendar")?;
-    if let Some(table) = schedule {
-        calendar_values.extend(array_field(
-            table,
-            &["calendars"],
-            "[schedule]",
-            "calendars",
-        )?);
-    }
+    let calendar_values = array_field(root, &["calendar"], "[config]", "calendar")?;
     let mut names = HashSet::new();
     for (index, value) in calendar_values.iter().enumerate() {
         let (name, _) = validate_calendar(value, index)?;
@@ -203,16 +194,7 @@ pub(crate) fn validate_document(value: &toml::Value) -> Result<(), ConfigError> 
         }
     }
 
-    let mut attachment_values =
-        array_field(root, &["attach", "attachments"], "[config]", "attach")?;
-    if let Some(table) = schedule {
-        attachment_values.extend(array_field(
-            table,
-            &["attachments"],
-            "[schedule]",
-            "attachments",
-        )?);
-    }
+    let attachment_values = array_field(root, &["attach"], "[config]", "attach")?;
     for (index, value) in attachment_values.iter().enumerate() {
         validate_attachment(value, index, &names)?;
     }
@@ -244,8 +226,6 @@ pub(crate) fn build(
                 ));
             }
             tuning = ScheduleTuning::from_config(file_schedule);
-            calendars.extend(file_schedule.calendars.iter().cloned());
-            attachments.extend(file_schedule.attachments.iter().cloned());
         }
         calendars.extend(document.calendars);
         attachments.extend(document.attachments);
@@ -253,8 +233,6 @@ pub(crate) fn build(
 
     if let Some(config) = inline {
         tuning.overlay(ScheduleTuning::from_config(config));
-        calendars.extend(config.calendars.iter().cloned());
-        attachments.extend(config.attachments.iter().cloned());
     }
     calendars.extend(top_calendars.iter().cloned());
     attachments.extend(top_attachments.iter().cloned());
@@ -279,7 +257,13 @@ fn parse_document(text: &str, path: &str) -> Result<ScheduleDocument, ConfigErro
 fn check_keys(table: &toml::Table, allowed: &[&str], owner: &str) -> Result<(), ConfigError> {
     for key in table.keys() {
         if !allowed.contains(&key.as_str()) {
-            return Err(invalid(owner, format!("unknown key {key:?}")));
+            let hint = match key.as_str() {
+                "calendars" => " (use [[calendar]])",
+                "attachments" => " (use [[attach]])",
+                "dates" => " (use ranges)",
+                _ => "",
+            };
+            return Err(invalid(owner, format!("unknown key {key:?}{hint}")));
         }
     }
     Ok(())
@@ -386,7 +370,6 @@ fn validate_calendar(
             "default",
             "windows",
             "ranges",
-            "dates",
             "exceptions",
         ],
         &owner,
@@ -438,7 +421,7 @@ fn validate_calendar(
         validate_window(window, &owner, window_index)?;
     }
 
-    let ranges = array_field(table, &["ranges", "dates"], &owner, "ranges")?;
+    let ranges = array_field(table, &["ranges"], &owner, "ranges")?;
     let exceptions = array_field(table, &["exceptions"], &owner, "exceptions")?;
     if ranges.len() + exceptions.len() > MAX_EXCEPTIONS_PER_CALENDAR {
         return Err(invalid(
@@ -662,32 +645,37 @@ mod tests {
     }
 
     #[test]
-    fn calendar_and_attachment_aliases_are_accepted() {
-        let window = "[[calendars.windows]]\nkind = \"available\"\nfrom = \"09:00\"\nto = \"17:00\"\ndays = \"mon-fri\"\n";
-        let top_level = format!(
-            "{}\n[[calendars]]\nname = \"office\"\n{}\n[[attachments]]\nscope = \"global\"\ncalendars = [\"office\"]\n",
-            base(),
-            window
-        );
-        assert_eq!(
-            Config::parse(&top_level)
-                .unwrap()
-                .schedule()
-                .unwrap()
-                .calendars
-                .len(),
-            1
-        );
-        let nested_window = window.replace("calendars.windows", "schedule.calendars.windows");
-        let nested = format!(
-            "{}\n[schedule]\n[[schedule.calendars]]\nname = \"office\"\n{}\n[[schedule.attachments]]\nscope = \"global\"\ncalendars = [\"office\"]\n",
-            base(),
-            nested_window
-        );
-        let config = Config::parse(&nested).unwrap();
-        let schedule = config.schedule().unwrap();
-        assert_eq!(schedule.calendars.len(), 1);
-        assert_eq!(schedule.attachments.len(), 1);
+    fn former_schedule_aliases_are_refused() {
+        for (text, expected) in [
+            (
+                format!("{}\n[[calendars]]\nname = \"office\"\n", base()),
+                "use [[calendar]]",
+            ),
+            (
+                format!("{}\n[[attachments]]\nscope = \"global\"\ncalendars = []\n", base()),
+                "use [[attach]]",
+            ),
+            (
+                format!("{}\n[schedule]\n[[schedule.calendars]]\nname = \"office\"\n", base()),
+                "use [[calendar]]",
+            ),
+            (
+                format!("{}\n[schedule]\n[[schedule.attachments]]\nscope = \"global\"\ncalendars = []\n", base()),
+                "use [[attach]]",
+            ),
+        ] {
+            let (table, reason) = error_parts(&text);
+            assert!(reason.contains(expected), "{table}: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_former_dates_field_is_refused_in_favour_of_ranges() {
+        let text = format!("{}\n[[calendar]]\nname = \"office\"\ndates = []\n", base());
+        let (table, reason) = error_parts(&text);
+        assert!(table.contains("[[calendar]] #0"), "{table}");
+        assert!(reason.contains("dates"), "{reason}");
+        assert!(reason.contains("use ranges"), "{reason}");
     }
 
     #[test]

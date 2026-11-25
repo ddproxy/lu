@@ -512,6 +512,7 @@ async fn every_agent_call_uses_the_documented_path_and_epoch() {
     let client = client(&server);
     let mut request = PollRequest::for_node(NodeName::parse("node-a").unwrap());
     request.harness = Some(lu_proto::HarnessState::Idle);
+    request.provider_health = Some(json!({"status": "ok"}));
     let events = client.poll(&request).await.unwrap();
     assert!(matches!(
         events.as_slice(),
@@ -546,6 +547,10 @@ async fn every_agent_call_uses_the_documented_path_and_epoch() {
     let poll: Value = serde_json::from_slice(&records[0].body).unwrap();
     assert_eq!(poll["heartbeat"]["node"], json!("node-a"));
     assert_eq!(poll["heartbeat"]["harness"], json!("idle"));
+    assert_eq!(
+        poll["heartbeat"]["provider_health"],
+        json!({"status": "ok"})
+    );
     assert_eq!(poll["wait_secs"], json!(0));
     let start: Value = serde_json::from_slice(&records[1].body).unwrap();
     assert_eq!(

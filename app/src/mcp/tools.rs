@@ -251,7 +251,7 @@ const IDLE_TIMEOUT_FIELD: Field = idle_timeout_field("idle_timeout");
 const COLLECT_FIELD: Field = optional(
     "collect",
     "string",
-    "Collect dependency inputs into .lu/inputs: none, files, apply or both; aliases: off, false, diffs, diff, patches, patch; defaults to apply",
+    "Collect dependency inputs into .lu/inputs: none, files, apply or both; defaults to apply",
 );
 const INCLUDE_FAILED_FIELD: Field = optional(
     "include_failed",

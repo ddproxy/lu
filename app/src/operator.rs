@@ -3330,7 +3330,7 @@ mod collect_cli_tests {
             "retry",
             &id,
             "--collect",
-            "patch",
+            "files",
             "--include-failed",
             "--on-conflict",
             "skip",

@@ -163,7 +163,7 @@ pub struct PollRequest {
     /// Provider/model pairs the agent can serve for `provider = "any"` jobs.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub provider_models: Vec<ProviderModel>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "reiki")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_health: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<HostStats>,
