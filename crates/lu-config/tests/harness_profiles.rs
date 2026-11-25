@@ -11,12 +11,9 @@ fn refuse(text: &str, fragment: &str) {
     let reason = match error {
         lu_config::ConfigError::Invalid { reason, .. } => reason,
         lu_config::ConfigError::Parse(reason) => reason,
-        other => panic!("unexpected error: {other}"),
+        _ => panic!("unexpected error kind"),
     };
-    assert!(
-        reason.contains(fragment),
-        "expected {fragment:?} in {reason:?}"
-    );
+    assert!(reason.contains(fragment));
 }
 
 fn profile(name: &str, body: &str) -> String {
