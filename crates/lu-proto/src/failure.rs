@@ -18,6 +18,72 @@ impl fmt::Display for ParseFailureClassError {
 
 impl std::error::Error for ParseFailureClassError {}
 
+/// Why an agent called a failure a node fault. Codes are fixed so they can be stored, shown in
+/// job views and written to audit records without carrying task text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeFailureReason {
+    /// The harness server process could not be reached.
+    HarnessUnreachable,
+    /// Podman refused to start or create the harness container.
+    ContainerStart,
+    /// The agent timed out waiting for the container's storage file.
+    ContainerWaitTimeout,
+    /// Reiki answered 503 with a gateway-store or per-stream-counters fault.
+    #[serde(rename = "reiki_gateway_503")]
+    ReikiGateway503,
+    /// Preparing the workspace ran out of disk space.
+    WorkspaceEnospc,
+}
+
+impl NodeFailureReason {
+    /// The wire spelling stored in completions and job views.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HarnessUnreachable => "harness_unreachable",
+            Self::ContainerStart => "container_start",
+            Self::ContainerWaitTimeout => "container_wait_timeout",
+            Self::ReikiGateway503 => "reiki_gateway_503",
+            Self::WorkspaceEnospc => "workspace_enospc",
+        }
+    }
+
+    /// Every reason, in declaration order.
+    pub const ALL: [Self; 5] = [
+        Self::HarnessUnreachable,
+        Self::ContainerStart,
+        Self::ContainerWaitTimeout,
+        Self::ReikiGateway503,
+        Self::WorkspaceEnospc,
+    ];
+
+    /// Parses the wire spelling.
+    pub fn parse(text: &str) -> Result<Self, ParseFailureClassError> {
+        Ok(match text {
+            "harness_unreachable" => Self::HarnessUnreachable,
+            "container_start" => Self::ContainerStart,
+            "container_wait_timeout" => Self::ContainerWaitTimeout,
+            "reiki_gateway_503" => Self::ReikiGateway503,
+            "workspace_enospc" => Self::WorkspaceEnospc,
+            _ => return Err(ParseFailureClassError),
+        })
+    }
+}
+
+impl fmt::Display for NodeFailureReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for NodeFailureReason {
+    type Err = ParseFailureClassError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::parse(text)
+    }
+}
+
 /// The class of a failure, which decides whether the job is retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -176,6 +242,44 @@ mod tests {
             FailureClass::Conflict
         );
         assert!("timeout".parse::<FailureClass>().is_err());
+    }
+
+    #[test]
+    fn every_node_failure_reason_round_trips() {
+        for reason in NodeFailureReason::ALL {
+            let text = reason.as_str();
+            assert_eq!(NodeFailureReason::parse(text).unwrap(), reason, "{text}");
+            assert_eq!(NodeFailureReason::from_str(text).unwrap(), reason, "{text}");
+            assert_eq!(reason.to_string(), text);
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{text}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<NodeFailureReason>(&format!("\"{text}\"")).unwrap(),
+                reason
+            );
+        }
+        assert!("harness timeout".parse::<NodeFailureReason>().is_err());
+        assert!("node".parse::<NodeFailureReason>().is_err());
+    }
+
+    #[test]
+    fn node_failure_reason_strings_are_fixed_codes() {
+        let actual: Vec<&str> = NodeFailureReason::ALL
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                "harness_unreachable",
+                "container_start",
+                "container_wait_timeout",
+                "reiki_gateway_503",
+                "workspace_enospc"
+            ]
+        );
     }
 
     #[test]

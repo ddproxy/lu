@@ -233,6 +233,7 @@ fn completion(id: JobId) -> Completion {
         outcome: Outcome::Failed(FailureClass::Execution),
         exit_code: Some(2),
         summary: Some("bad".to_owned()),
+        failure_reason: None,
         retry_after_secs: None,
         expect_failed: false,
     }

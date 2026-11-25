@@ -5,7 +5,7 @@ task. It is meant for repeating a known set of jobs safely: every job gets a det
 idempotency key, the whole input is validated before the first request, and a dry run prints the
 plan without connecting to a controller or reading an operator token.
 
-The store schema version is `4`. Batch inputs only populate fields that `JobSpec` already has and do not change the store schema. With `--chain`, each job depends on all earlier jobs and inherits their staged base; see [One base per chain](dependencies.md#one-base-per-chain).
+The store schema version is `8`. Batch inputs only populate fields that `JobSpec` already has and do not change the store schema. With `--chain`, each job depends on all earlier jobs and inherits their staged base; see [One base per chain](dependencies.md#one-base-per-chain).
 
 ## Inputs
 

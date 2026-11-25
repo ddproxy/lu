@@ -10,9 +10,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use lu_proto::{
     normalize_repository, ArtifactName, CancelEffect, Completion, DurationSummary, FailureClass,
-    Heartbeat, JobEdit, JobId, JobSpec, JobState, NodeContribution, NodeName, Outcome,
-    RepoContribution, StatsAggregate, StatsQuery, StatsReport, MAX_COLLECT_BYTES, MAX_LOG_BYTES,
-    STATS_BUCKETS_SECS, STATS_BUCKET_LABELS, TOP_REPOSITORIES,
+    Heartbeat, JobEdit, JobId, JobSpec, JobState, NodeContribution, NodeFailureReason, NodeName,
+    Outcome, RepoContribution, StatsAggregate, StatsQuery, StatsReport, MAX_COLLECT_BYTES,
+    MAX_LOG_BYTES, STATS_BUCKETS_SECS, STATS_BUCKET_LABELS, TOP_REPOSITORIES,
 };
 
 use crate::{
@@ -23,7 +23,7 @@ use crate::{
 const CURRENT_SCHEMA_VERSION: i64 = crate::SCHEMA_VERSION;
 
 /// Columns shared by the list/get queries that build a `JobRecord` from positional rows.
-const JOB_SELECT_COLUMNS: &str = "id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since,eligible_since";
+const JOB_SELECT_COLUMNS: &str = "id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since,eligible_since,failure_reason,excluded_nodes_json";
 
 fn internal<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Internal(e.to_string())
@@ -45,6 +45,58 @@ fn failure_str(f: FailureClass) -> &'static str {
 fn parse_failure(s: &str) -> Result<FailureClass, StoreError> {
     s.parse()
         .map_err(|_| internal(format!("unknown failure class {s}")))
+}
+
+fn parse_failure_reason(s: Option<String>) -> Result<Option<NodeFailureReason>, StoreError> {
+    match s {
+        None => Ok(None),
+        Some(text) => text
+            .parse()
+            .map(Some)
+            .map_err(|_| internal(format!("unknown node failure reason {text}"))),
+    }
+}
+
+fn encode_excluded_nodes(nodes: &[NodeName]) -> Result<String, StoreError> {
+    let names: Vec<&str> = nodes.iter().map(NodeName::as_str).collect();
+    serde_json::to_string(&names).map_err(internal)
+}
+
+fn decode_excluded_nodes(text: &str) -> Result<Vec<NodeName>, StoreError> {
+    let names: Vec<String> = serde_json::from_str(text).map_err(internal)?;
+    names
+        .into_iter()
+        .map(|name| NodeName::parse(&name).map_err(internal))
+        .collect()
+}
+
+/// Adds a node to a job's exclusion list without duplicating it.
+fn exclude_node(rec: &mut JobRecord, node: Option<&NodeName>) {
+    if let Some(node) = node {
+        if !rec.excluded_nodes.contains(node) {
+            rec.excluded_nodes.push(node.clone());
+        }
+    }
+}
+
+/// Whether this node failure can use another attempt. A repeated node, an exhausted node budget
+/// or a stored diff/cancellation all make the failure terminal.
+fn node_retry_allowed(rec: &JobRecord, max_retries: u32, node_attempts: u32) -> bool {
+    let cap = crate::node_attempt_cap(max_retries, node_attempts);
+    if rec.attempt >= cap
+        || rec.excluded_nodes.len() >= usize::try_from(cap.saturating_sub(1)).unwrap_or(usize::MAX)
+    {
+        return false;
+    }
+    if rec.artifacts.contains(&ArtifactName::DiffPatch)
+        || rec.diff_bytes.is_some()
+        || rec.cancel_requested
+    {
+        return false;
+    }
+    !rec.node
+        .as_ref()
+        .is_some_and(|node| rec.excluded_nodes.contains(node))
 }
 
 fn parse_cordon(r: &rusqlite::Row<'_>) -> rusqlite::Result<Cordon> {
@@ -243,10 +295,10 @@ impl SqliteStore {
                 tx.commit().map_err(internal)?;
                 Ok(())
             }
-            // Schemas 1 through 4 add additive job columns. Fill them with zero/false/NULL so
+            // Schemas 1 through 7 add additive job columns. Fill them with zero/false/NULL so
             // older jobs keep their history and views stay compatible. Each column is checked
             // because a database briefly opened by a newer binary may already have some of them.
-            Some(1) | Some(2) | Some(3) | Some(4) | Some(5) | Some(6) => {
+            Some(1) | Some(2) | Some(3) | Some(4) | Some(5) | Some(6) | Some(7) => {
                 for (name, ddl) in [
                     (
                         "scrubbed_hits",
@@ -286,6 +338,14 @@ impl SqliteStore {
                         "eligible_since",
                         "ALTER TABLE jobs ADD COLUMN eligible_since INTEGER NOT NULL DEFAULT 0",
                     ),
+                    (
+                        "failure_reason",
+                        "ALTER TABLE jobs ADD COLUMN failure_reason TEXT",
+                    ),
+                    (
+                        "excluded_nodes_json",
+                        "ALTER TABLE jobs ADD COLUMN excluded_nodes_json TEXT NOT NULL DEFAULT '[]'",
+                    ),
                 ] {
                     if !job_column_exists(&tx, name)? {
                         tx.execute(ddl, []).map_err(internal)?;
@@ -324,7 +384,7 @@ impl SqliteStore {
 }
 
 /// Creates the HTTP request-key table for databases written before schema 7. No existing row is
-/// changed, so this is additive and safe to re-run.
+/// changed, so this is additive and safe to re-run. Kept for every older schema migration.
 fn ensure_request_keys(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS request_keys (
@@ -391,7 +451,9 @@ fn apply_baseline(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
             staged_commit TEXT,
             blocked_reason TEXT,
             blocked_since INTEGER,
-            eligible_since INTEGER NOT NULL DEFAULT 0
+            eligible_since INTEGER NOT NULL DEFAULT 0,
+            failure_reason TEXT,
+            excluded_nodes_json TEXT NOT NULL DEFAULT '[]'
         );
         CREATE TABLE nodes (
             name TEXT PRIMARY KEY,
@@ -831,6 +893,8 @@ fn requeue_retry_root_tx(
     rec.started_at = None;
     rec.finished_at = None;
     rec.failure_class = None;
+    rec.failure_reason = None;
+    rec.excluded_nodes.clear();
     rec.summary = None;
     rec.exit_code = None;
     rec.artifacts = Vec::new();
@@ -880,6 +944,7 @@ fn restore_retry_dependents_tx(
         rec.blocked_since = None;
         rec.summary = None;
         rec.failure_class = None;
+        rec.failure_reason = None;
         rec.finished_at = None;
         rec.updated_at = now.wall_unix;
         if deps_satisfied(tx, id.as_str(), rec.spec.include_failed)? {
@@ -953,7 +1018,7 @@ fn get_job_tx(
     id: &str,
 ) -> Result<(JobRecord, Option<u64>, Option<u64>), StoreError> {
     let mut stmt = tx
-        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since,eligible_since FROM jobs WHERE id=?1")
+        .prepare("SELECT id,state,spec_json,attempt,node,epoch,created_at,updated_at,started_at,finished_at,failure_class,summary,exit_code,artifacts_json,cancel_requested,log_len,diff_bytes,lease_until_mono_ms,recovering_since_mono_ms,assigned_provider,assigned_model,expect_failed,scrubbed_hits,patch_scrubbed,patch_secret_hits_json,parent_job_id,root_job_id,depth,publish_json,staged_commit,blocked_reason,blocked_since,eligible_since,failure_reason,excluded_nodes_json FROM jobs WHERE id=?1")
         .map_err(internal)?;
     let row = stmt
         .query_row(params![id], |r| {
@@ -991,6 +1056,8 @@ fn get_job_tx(
                 r.get::<_, Option<String>>("blocked_reason")?,
                 r.get::<_, Option<i64>>("blocked_since")?,
                 r.get::<_, i64>("eligible_since")?,
+                r.get::<_, Option<String>>("failure_reason")?,
+                r.get::<_, String>("excluded_nodes_json")?,
             ))
         })
         .optional()
@@ -1031,6 +1098,8 @@ fn get_job_tx(
         blocked_reason,
         blocked_since,
         eligible_since,
+        failure_reason_s,
+        excluded_nodes_json,
     ) = row;
     let idp = JobId::parse(&id_s).map_err(internal)?;
     let state = parse_state(&state_s)?;
@@ -1059,6 +1128,8 @@ fn get_job_tx(
         started_at,
         finished_at,
         failure_class,
+        failure_reason: parse_failure_reason(failure_reason_s)?,
+        excluded_nodes: decode_excluded_nodes(&excluded_nodes_json)?,
         summary,
         exit_code,
         artifacts,
@@ -1098,8 +1169,9 @@ fn update_job_tx(
         .transpose()
         .map_err(internal)?;
     let patch_secret_hits_json = serde_json::to_string(&rec.patch_secret_hits).map_err(internal)?;
+    let excluded_nodes_json = encode_excluded_nodes(&rec.excluded_nodes)?;
     tx.execute(
-        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20,diff_bytes=?21,expect_failed=?22,scrubbed_hits=?23,patch_scrubbed=?24,parent_job_id=?25,root_job_id=?26,depth=?27,publish_json=?28,staged_commit=?29,blocked_reason=?30,blocked_since=?31,patch_secret_hits_json=?32,eligible_since=?33 WHERE id=?1",
+        "UPDATE jobs SET state=?2,spec_json=?3,attempt=?4,node=?5,epoch=?6,created_at=?7,updated_at=?8,started_at=?9,finished_at=?10,failure_class=?11,summary=?12,exit_code=?13,artifacts_json=?14,cancel_requested=?15,log_len=?16,lease_until_mono_ms=?17,recovering_since_mono_ms=?18,assigned_provider=?19,assigned_model=?20,diff_bytes=?21,expect_failed=?22,scrubbed_hits=?23,patch_scrubbed=?24,parent_job_id=?25,root_job_id=?26,depth=?27,publish_json=?28,staged_commit=?29,blocked_reason=?30,blocked_since=?31,patch_secret_hits_json=?32,eligible_since=?33,failure_reason=?34,excluded_nodes_json=?35 WHERE id=?1",
         params![
             rec.id.as_str(),
             state_str(rec.state),
@@ -1134,6 +1206,8 @@ fn update_job_tx(
             rec.blocked_since,
             patch_secret_hits_json,
             rec.eligible_since,
+            rec.failure_reason.map(NodeFailureReason::as_str),
+            excluded_nodes_json,
         ],
     ).map_err(internal)?;
     Ok(())
@@ -1303,6 +1377,8 @@ fn insert_job_tx(
         started_at: None,
         finished_at: None,
         failure_class: None,
+        failure_reason: None,
+        excluded_nodes: Vec::new(),
         summary: None,
         exit_code: None,
         artifacts: Vec::new(),
@@ -1768,7 +1844,7 @@ fn dispatch_snapshot(
     {
         let mut stmt = tx
             .prepare(
-                "SELECT id,dispatch_seq,spec_json,eligible_since,parent_job_id,root_job_id \
+                "SELECT id,dispatch_seq,spec_json,eligible_since,parent_job_id,root_job_id,excluded_nodes_json \
                  FROM jobs WHERE state='queued'",
             )
             .map_err(internal)?;
@@ -1781,6 +1857,7 @@ fn dispatch_snapshot(
                     r.get::<_, i64>(3)?,
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
                 ))
             })
             .map_err(internal)?;
@@ -1788,7 +1865,10 @@ fn dispatch_snapshot(
         for row in rows {
             raw.push(row.map_err(internal)?);
         }
-        for (id, dispatch_seq, spec_json, eligible_since, parent, root) in raw {
+        for (id, dispatch_seq, spec_json, eligible_since, parent, root, excluded_json) in raw {
+            if decode_excluded_nodes(&excluded_json)?.contains(node) {
+                continue;
+            }
             let spec = decode_spec(&spec_json)?;
             let group = match &spec.group {
                 Some(group) => Some(group.clone()),
@@ -1892,7 +1972,7 @@ fn commit_dispatch(
         }
         Err(error) => return Err(error),
     };
-    if rec.state != JobState::Queued {
+    if rec.state != JobState::Queued || rec.excluded_nodes.contains(node) {
         tx.commit().map_err(internal)?;
         return Ok(None);
     }
@@ -1953,6 +2033,7 @@ fn commit_dispatch(
     rec.epoch = rec.epoch.saturating_add(1);
     rec.updated_at = now.wall_unix;
     rec.failure_class = None;
+    rec.failure_reason = None;
     rec.summary = None;
     rec.exit_code = None;
     rec.finished_at = None;
@@ -2451,6 +2532,7 @@ impl Store for SqliteStore {
                 .unwrap_or_else(|| "unknown predecessor".to_owned());
             rec.state = JobState::Failed;
             rec.failure_class = Some(FailureClass::Dependency);
+            rec.failure_reason = None;
             rec.summary = Some(format!(
                 "dependency {predecessor} failed; retry TTL {ttl_secs}s expired"
             ));
@@ -3221,6 +3303,7 @@ impl Store for SqliteStore {
         failure: Option<(FailureClass, Option<String>)>,
         now: Now,
         max_retries: u32,
+        node_attempts: u32,
         cordon_ms: u64,
     ) -> Result<JobRecord, StoreError> {
         let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
@@ -3248,6 +3331,7 @@ impl Store for SqliteStore {
                 rec.finished_at = Some(now.wall_unix);
                 rec.updated_at = now.wall_unix;
                 rec.failure_class = None;
+                rec.failure_reason = None;
                 update_job_tx(&tx, &rec, None, None)?;
                 release_dependents(&tx, rec.id.as_str(), now)?;
             }
@@ -3256,13 +3340,31 @@ impl Store for SqliteStore {
                 rec.state = JobState::Cancelled;
                 rec.finished_at = Some(now.wall_unix);
                 rec.updated_at = now.wall_unix;
+                rec.failure_reason = None;
                 update_job_tx(&tx, &rec, None, None)?;
                 fail_dependents(&tx, rec.id.as_str(), JobState::Cancelled.as_str(), now)?;
             }
             Outcome::Failed(out_class) => {
                 let (class, provider) = failure.unwrap_or((out_class, None));
                 rec.failure_class = Some(class);
-                if class.retryable(rec.attempt, max_retries) {
+                rec.failure_reason = if class == FailureClass::Node {
+                    completion.failure_reason
+                } else {
+                    None
+                };
+                let has_diff =
+                    rec.artifacts.contains(&ArtifactName::DiffPatch) || rec.diff_bytes.is_some();
+                let retryable = if has_diff || rec.cancel_requested {
+                    false
+                } else if class == FailureClass::Node {
+                    node_retry_allowed(&rec, max_retries, node_attempts)
+                } else {
+                    class.retryable(rec.attempt, max_retries)
+                };
+                if class == FailureClass::Node {
+                    exclude_node(&mut rec, node_for_cordon.as_ref());
+                }
+                if retryable {
                     check_transition(rec.state, JobState::Queued)?;
                     rec.state = JobState::Queued;
                     rec.attempt = rec.attempt.saturating_add(1);
@@ -3348,6 +3450,7 @@ impl Store for SqliteStore {
         now: Now,
         grace_ms: u64,
         max_retries: u32,
+        node_attempts: u32,
     ) -> Result<Vec<JobId>, StoreError> {
         let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
         let tx = conn
@@ -3373,7 +3476,10 @@ impl Store for SqliteStore {
             let (mut rec, _, _) = get_job_tx(&tx, &id)?;
             // double-check grace
             // (query used cutoff; good enough)
-            if FailureClass::Node.retryable(rec.attempt, max_retries) {
+            let lost_node = rec.node.clone();
+            let retryable = node_retry_allowed(&rec, max_retries, node_attempts);
+            exclude_node(&mut rec, lost_node.as_ref());
+            if retryable {
                 check_transition(rec.state, JobState::Queued)?;
                 rec.state = JobState::Queued;
                 rec.attempt = rec.attempt.saturating_add(1);
@@ -3381,6 +3487,7 @@ impl Store for SqliteStore {
                 rec.assigned_provider = None;
                 rec.assigned_model = None;
                 rec.failure_class = None;
+                rec.failure_reason = None;
                 rec.cancel_requested = false;
                 rec.updated_at = now.wall_unix;
                 rec.finished_at = None;
@@ -3389,6 +3496,7 @@ impl Store for SqliteStore {
                 check_transition(rec.state, JobState::Failed)?;
                 rec.state = JobState::Failed;
                 rec.failure_class = Some(FailureClass::Node);
+                rec.failure_reason = None;
                 rec.updated_at = now.wall_unix;
                 rec.finished_at = Some(now.wall_unix);
                 update_job_tx(&tx, &rec, None, None)?;
@@ -3954,6 +4062,8 @@ type JobTuple = (
     Option<String>,
     Option<i64>,
     i64,
+    Option<String>,
+    String,
 );
 
 fn row_to_job_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobTuple> {
@@ -3989,6 +4099,8 @@ fn row_to_job_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobTuple> {
         row.get(28)?,
         row.get(29)?,
         row.get(30)?,
+        row.get(31)?,
+        row.get(32)?,
     ))
 }
 
@@ -4025,6 +4137,8 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
         blocked_reason,
         blocked_since,
         eligible_since,
+        failure_reason_s,
+        excluded_nodes_json,
     ) = t;
     Ok(JobRecord {
         id: JobId::parse(&id_s).map_err(internal)?,
@@ -4047,6 +4161,8 @@ fn tuple_to_job(t: JobTuple) -> Result<JobRecord, StoreError> {
             Some(f) => Some(parse_failure(&f)?),
             None => None,
         },
+        failure_reason: parse_failure_reason(failure_reason_s)?,
+        excluded_nodes: decode_excluded_nodes(&excluded_nodes_json)?,
         summary,
         exit_code,
         artifacts: decode_artifacts(&artifacts_json)?,
@@ -4602,7 +4718,7 @@ mod tests {
         {
             let _s = SqliteStore::open(&p).unwrap();
         }
-        for version in [0i64, 8, 9, 999] {
+        for version in [0i64, 9, 10, 999] {
             let conn = rusqlite::Connection::open(&p).unwrap();
             conn.execute("UPDATE schema_version SET version = ?1", params![version])
                 .unwrap();
@@ -4991,5 +5107,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table, 1);
+    }
+
+    #[test]
+    fn schema_seven_database_gains_node_failure_columns_in_place() {
+        let path = temp_db("v7-node-failures.sqlite");
+        let spec =
+            crate::conformance::spec("https://x/v7-node-failures.git", Some("v7-node-failures"));
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            store
+                .create_job(
+                    &spec,
+                    Now {
+                        wall_unix: 1_700_000_000,
+                        mono_ms: 1_000,
+                    },
+                )
+                .unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE jobs DROP COLUMN failure_reason;
+                 ALTER TABLE jobs DROP COLUMN excluded_nodes_json;
+                 UPDATE schema_version SET version = 7;",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let rec = store.job_by_key("v7-node-failures").unwrap();
+        assert_eq!(rec.failure_reason, None);
+        assert!(rec.excluded_nodes.is_empty());
+        let conn = store.conn.lock().unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, crate::SCHEMA_VERSION);
+        let (reason, exclusions): (Option<String>, String) = conn
+            .query_row(
+                "SELECT failure_reason, excluded_nodes_json FROM jobs WHERE id = ?1",
+                params![rec.id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, None);
+        assert_eq!(exclusions, "[]");
     }
 }

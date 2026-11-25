@@ -157,7 +157,7 @@ rules that create drafts are in [intake.md](intake.md).
 
 | Class | Meaning | Requeue rule |
 | --- | --- | --- |
-| `node` | Agent lost, lease expired, harness spawn failed, harness crashed at launch (a crash banner within 3 seconds and before any harness output), workspace prepare failed, an ordinary staging error, or a stuck job with the retry policy. | Requeue while `attempt <= max_retries` (default 1, allowed 0–3); otherwise fail with `node`. |
+| `node` | Agent lost, lease expired, harness spawn failed, harness crashed at launch (a crash banner within 3 seconds and before any harness output), workspace prepare failed, an ordinary staging error, recognized harness or host infrastructure trouble, or a stuck job with the retry policy. | Requeue on a different node while `attempt < min(max_retries + 1, node_attempts)` (defaults 1 and 2; allowed 0–3 and 1–4); otherwise fail with `node`. |
 | `provider` | All keys unavailable, a model limit, a 429, or a provider-failure marker followed by harness silence. | Requeue while `attempt <= 100`; `max_retries` is not consulted. At `attempt > 100` the job fails with `provider`. |
 | `execution` | Harness exited non-zero, timed out, produced no output, was stopped by the stuck cancel policy, or the task itself was invalid. Staging errors naming a missing ref, authentication failure or unknown repository are also `execution`. | Never requeue. |
 | `dependency` | A dependency finished `failed` or `cancelled` and the dependent's blocked-dependent TTL expired before a retry reattached it. | Never requeue. |
@@ -171,16 +171,41 @@ to 5 seconds–24 hours. Execution and conflict failures are terminal on the fir
 are still waiting also fail; see [Blocked dependents and chain bases](#blocked-dependents-and-chain-bases).
 
 Because node and provider requeues increment `attempt`, the effective budgets are: node failures
-at attempts 1 through `max_retries` are retried, and provider failures at attempts 1 through 100
-are retried. The next failure past the limit ends the job.
+at attempts below `min(max_retries + 1, node_attempts)` are retried, and provider failures at
+attempts 1 through 100 are retried. The next failure past the limit ends the job. No automatic
+retry happens once a `diff.patch` has been stored or cancellation has been requested, so partial
+work is never silently rerun.
+
+### Node infrastructure failures
+
+When the agent recognizes harness or host trouble, it sends a `node` completion with a fixed
+`failure_reason`. The codes are `harness_unreachable`, `container_start`,
+`container_wait_timeout`, `reiki_gateway_503` and `workspace_enospc`. The controller stores the
+code on the job and excludes the failed node from that job's future dispatch. A requeued job
+therefore goes to a different node; when every eligible node has been excluded, it stays `queued`
+with `waiting_reason: "all eligible nodes are excluded for this job"`. An operator `lu retry`
+clears the reason and exclusions; automatic requeues do not.
+
+The agent uses high-confidence signatures so task output is not mistaken for a host fault. It
+recognizes an explicit harness-server connection failure, Podman start/create failures, the full
+overlay-storage wait timeout, a Reiki `503` body naming `gateway_store_unavailable` or
+`per-stream counters`, and a disk-full error while preparing a workspace or staging tree. A bare
+`connection refused`, `ENOSPC`, ordinary `no space left on device` or unnamed `503` in harness
+output is not enough. An ordinary provider outage remains `provider`, not `reiki_gateway_503`.
+
+Every new exclusion writes a `node_excluded` audit record with the node and, when known, the
+reason. A completion records the reporting node as actor; a recovery timeout uses actor
+`maintenance`. See [audit.md](audit.md) and
+[dispatch.md](dispatch.md#node-exclusions). The failure summary also names the reason code.
 
 A failure before the harness produced a verdict is classified by the agent, one row per case:
 
 | Cause | Class | Retried |
 | --- | --- | --- |
-| The harness process could not be started (command not found, exec refused, no pid) | `node` | within `max_retries` |
-| The harness exited or was signalled within 3 seconds with a crash banner (`panic(`, `abort() called`, `Segmentation fault`, `Illegal instruction`, `SIGILL`, `core dumped`) in its output | `node` | within `max_retries` |
-| Staging or preparing the tree failed in a way the node controls (disk, filesystem, clone transport, permissions, leftover directory) | `node` | within `max_retries` |
+| The harness process could not be started (command not found, exec refused, no pid) | `node` | within the node budget, no reason code |
+| The harness exited or was signalled within 3 seconds with a crash banner (`panic(`, `abort() called`, `Segmentation fault`, `Illegal instruction`, `SIGILL`, `core dumped`) in its output | `node` | within the node budget, no reason code |
+| Staging or preparing the tree failed in a way the node controls (disk, filesystem, clone transport, permissions, leftover directory) | `node` | within the node budget; `workspace_enospc` only for an explicit disk-full preparation error |
+| Podman could not create or start the harness container, the harness server could not be reached, or the overlay-storage wait timed out | `node` | within the node budget, with `container_start`, `harness_unreachable` or `container_wait_timeout` |
 | A staging error that names a missing ref, an authentication failure or an unknown repository | `execution` | never |
 | A dependency diff could not be applied: the three-way merge left conflicts, or plain apply and `git apply --3way` all failed (the summary names the file and hunk) | `conflict` | never |
 
@@ -198,7 +223,7 @@ Stuck detection adds no state. It uses the same output/CPU observation as `lu no
 counters must exceed 300 seconds, and the observation must stay continuous for
 `stuck_after_secs` before the agent acts. With `on_stuck = "cancel"`, it stops the harness and
 completes the running job as `execution`, which is terminal. With `on_stuck = "retry"`, it
-completes as `node`, which follows the `max_retries` requeue rule above. `on_stuck = "none"` (the
+completes as `node` with no reason code and follows the node requeue rule above. `on_stuck = "none"` (the
 default) leaves the job running. Both active policies upload the usual artifacts, use the summary
 `stuck for <n>s, stopped`, and send `stuck_mode` in the completion so the controller can export
 `lu_jobs_stuck_stopped_total{mode}`. Absent job fields use the agent defaults. See

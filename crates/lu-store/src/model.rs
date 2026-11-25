@@ -19,9 +19,35 @@ const MAX_JOBS: usize = 24;
 const LEASE_MS: u64 = 1_000;
 const GRACE_MS: u64 = 1_500;
 const MAX_RETRIES: u32 = 1;
+const NODE_ATTEMPTS: u32 = 2;
 const CORDON_MS: u64 = 1_200;
 
 const NODE_NAMES: [&str; 3] = ["node-a", "node-b", "node-c"];
+
+/// A stored diff or a cancellation request stops every automatic retry, whatever the class.
+fn retry_blocked(record: &JobRecord) -> bool {
+    record.artifacts.contains(&ArtifactName::DiffPatch)
+        || record.diff_bytes.is_some()
+        || record.cancel_requested
+}
+
+/// Mirrors the store's node-attempt rule: a different node and a bounded budget.
+fn node_retry_allowed(record: &JobRecord) -> bool {
+    let cap = crate::node_attempt_cap(MAX_RETRIES, NODE_ATTEMPTS);
+    if record.attempt >= cap
+        || record.excluded_nodes.len()
+            >= usize::try_from(cap.saturating_sub(1)).unwrap_or(usize::MAX)
+    {
+        return false;
+    }
+    if retry_blocked(record) {
+        return false;
+    }
+    !record
+        .node
+        .as_ref()
+        .is_some_and(|node| record.excluded_nodes.contains(node))
+}
 
 #[derive(Clone)]
 struct CordonModel {
@@ -905,7 +931,9 @@ impl<S: Store> Model<S> {
             self.records
                 .values()
                 .filter(|record| {
-                    record.state == JobState::Queued && self.provider_eligible(&node_name, record)
+                    record.state == JobState::Queued
+                        && !record.excluded_nodes.contains(&node_name)
+                        && self.provider_eligible(&node_name, record)
                 })
                 .min_by(|a, b| {
                     b.spec.priority.cmp(&a.spec.priority).then(
@@ -1184,13 +1212,21 @@ impl<S: Store> Model<S> {
                 outcome: Outcome::Done,
                 exit_code: Some(0),
                 summary: None,
+                failure_reason: None,
                 retry_after_secs: None,
                 stuck_mode: None,
                 expect_failed: false,
             };
             assert_eq!(
                 self.store
-                    .complete(&completion, None, self.now, MAX_RETRIES, CORDON_MS)
+                    .complete(
+                        &completion,
+                        None,
+                        self.now,
+                        MAX_RETRIES,
+                        NODE_ATTEMPTS,
+                        CORDON_MS
+                    )
                     .unwrap_err(),
                 StoreError::StaleEpoch
             );
@@ -1247,6 +1283,7 @@ impl<S: Store> Model<S> {
                 Outcome::Cancelled => None,
             },
             summary: Some(format!("model completion {roll}")),
+            failure_reason: None,
             retry_after_secs,
             stuck_mode: None,
             expect_failed: false,
@@ -1263,6 +1300,7 @@ impl<S: Store> Model<S> {
                 failure.clone(),
                 self.now,
                 MAX_RETRIES,
+                NODE_ATTEMPTS,
                 CORDON_MS,
             )
             .expect("complete with the current epoch");
@@ -1278,8 +1316,20 @@ impl<S: Store> Model<S> {
             }
             Outcome::Failed(class) => {
                 assert_eq!(got.failure_class, Some(class));
-                if class.retryable(record.attempt, MAX_RETRIES) {
-                    assert_eq!(got.state, JobState::Queued);
+                let retryable = if retry_blocked(&record) {
+                    false
+                } else if class == FailureClass::Node {
+                    node_retry_allowed(&record)
+                } else {
+                    class.retryable(record.attempt, MAX_RETRIES)
+                };
+                if retryable {
+                    assert_eq!(
+                        got.state,
+                        JobState::Queued,
+                        "retry prediction failed for {class:?} on {}",
+                        record.id
+                    );
                     assert_eq!(got.attempt, record.attempt + 1);
                     assert_eq!(got.node, None);
                     assert_eq!(got.finished_at, None);
@@ -1448,14 +1498,14 @@ impl<S: Store> Model<S> {
         self.note(format!("requeue_recovering due={due:?}"));
         let got: BTreeSet<JobId> = self
             .store
-            .requeue_recovering(self.now, GRACE_MS, MAX_RETRIES)
+            .requeue_recovering(self.now, GRACE_MS, MAX_RETRIES, NODE_ATTEMPTS)
             .expect("requeue_recovering")
             .into_iter()
             .collect();
         assert_eq!(got, due, "requeue_recovering moved the wrong jobs");
         for id in &got {
             let record = self.records.get(id).expect("moved job is known");
-            let retry = FailureClass::Node.retryable(record.attempt, MAX_RETRIES);
+            let retry = node_retry_allowed(record);
             let after = self.store.get_job(id).expect("moved job is readable");
             if retry {
                 assert_eq!(after.state, JobState::Queued);

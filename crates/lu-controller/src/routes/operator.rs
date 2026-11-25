@@ -307,6 +307,8 @@ fn job_view_with(r: &JobRecord, reason: Option<String>, ttl_secs: u64) -> JobVie
         started_at: r.started_at.map(seconds),
         finished_at: r.finished_at.map(seconds),
         failure_class: r.failure_class,
+        failure_reason: r.failure_reason,
+        excluded_nodes: r.excluded_nodes.clone(),
         summary: r.summary.clone(),
         exit_code: r.exit_code,
         artifacts: r
@@ -2308,6 +2310,8 @@ mod tests {
             started_at: None,
             finished_at: None,
             failure_class: None,
+            failure_reason: None,
+            excluded_nodes: Vec::new(),
             summary: None,
             exit_code: Some(0),
             artifacts,

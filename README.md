@@ -8,7 +8,7 @@ A job queue and dispatcher for finite coding-agent work against git repositories
 [![Release](https://img.shields.io/github/v/release/ddproxy/tuishou-lu)](https://github.com/ddproxy/tuishou-lu/releases/latest)
 [![License: MIT](https://img.shields.io/github/license/ddproxy/tuishou-lu)](LICENSE)
 
-Status: stable — 0.7.0, store schema 7. Controllers and agents of adjacent releases interoperate;
+Status: stable — 0.7.0, store schema 8. Controllers and agents of adjacent releases interoperate;
 the wire rules are in [Compatibility](docs/compatibility.md).
 
 ## What and why
@@ -199,6 +199,7 @@ Config is TOML. `lu --config` defaults to `lu.toml`; `ting --config` defaults to
 | `[controller] db`, `artifacts_dir` | required | Absolute paths for the SQLite database and artifacts. |
 | `[controller] lease_secs` | `60` | Lease length; must be 5 to 3600. |
 | `[controller] max_retries` | `1` | Automatic retries, 0 to 3. |
+| `[controller] node_attempts` | `2` | Different nodes tried for node-class failures, 1 to 4; bounded by `max_retries`. |
 | `[controller] provider_cooldown_secs` | `1800` | Provider cordon cooldown, 60 to 86400. |
 | `[controller] recovery_grace_secs` | `30` | Time to wait for a late write after a lease is lost. |
 | `[controller] max_connections`, `max_connections_per_addr` | `256`, `64` | Listener connection caps. |
@@ -374,7 +375,7 @@ gh attestation verify "$asset" --repo ddproxy/tuishou-lu
 
 ## Compatibility matrix
 
-Last checked with release 0.7.0, Rust 1.99 and store schema 7.
+Last checked with release 0.7.0, Rust 1.99 and store schema 8.
 
 | Area | Checked against | Notes |
 | --- | --- | --- |

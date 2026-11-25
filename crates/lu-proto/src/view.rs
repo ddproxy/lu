@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    FailureClass, HarnessState, JobId, JobSpec, JobState, NodeName, ProviderModel, ProviderStatus,
-    PublishRecord, WorkspacePolicy, WorkspaceState,
+    FailureClass, HarnessState, JobId, JobSpec, JobState, NodeFailureReason, NodeName,
+    ProviderModel, ProviderStatus, PublishRecord, WorkspacePolicy, WorkspaceState,
 };
 
 /// High-confidence secret hits found in added `diff.patch` lines when patch scrubbing is off.
@@ -52,6 +52,12 @@ pub struct JobView {
     pub finished_at: Option<u64>,
     #[serde(default)]
     pub failure_class: Option<FailureClass>,
+    /// Machine-readable infrastructure reason when the failure class is `node`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<NodeFailureReason>,
+    /// Nodes excluded for this job after node-class infrastructure failures.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_nodes: Vec<NodeName>,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -133,6 +139,8 @@ impl JobView {
             started_at: None,
             finished_at: None,
             failure_class: None,
+            failure_reason: None,
+            excluded_nodes: Vec::new(),
             summary: None,
             exit_code: None,
             artifacts: Vec::new(),

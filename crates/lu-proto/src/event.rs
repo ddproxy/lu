@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::failure::FailureClass;
+use crate::failure::{FailureClass, NodeFailureReason};
 use crate::ids::JobId;
 use crate::limits::{MAX_LOG_CHUNK_BYTES, MAX_SUMMARY_BYTES};
 use crate::spec::{JobSpec, StuckPolicy};
@@ -207,6 +207,10 @@ pub struct Completion {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Machine-readable reason for a `node` failure, set only by the agent when it recognizes
+    /// harness or host infrastructure trouble rather than a task failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<NodeFailureReason>,
     /// For a provider failure: when the provider is expected back, in seconds. The controller
     /// cordons the provider on the node for this long, but clears that cordon after two healthy
     /// provider heartbeats.
@@ -236,6 +240,8 @@ struct RawCompletion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(default)]
+    pub failure_reason: Option<NodeFailureReason>,
+    #[serde(default)]
     pub retry_after_secs: Option<u64>,
     #[serde(default)]
     pub stuck_mode: Option<StuckPolicy>,
@@ -252,6 +258,7 @@ impl TryFrom<RawCompletion> for Completion {
             outcome: raw.outcome,
             exit_code: raw.exit_code,
             summary: raw.summary,
+            failure_reason: raw.failure_reason,
             retry_after_secs: raw.retry_after_secs,
             stuck_mode: raw.stuck_mode,
             expect_failed: raw.expect_failed,
@@ -272,12 +279,15 @@ impl<'de> Deserialize<'de> for Completion {
 }
 
 impl Completion {
-    /// Refuses a summary over [`MAX_SUMMARY_BYTES`].
+    /// Refuses a summary over [`MAX_SUMMARY_BYTES`] or a reason on a non-`node` outcome.
     pub fn validate(&self) -> Result<(), CompletionError> {
         if let Some(summary) = &self.summary {
             if summary.len() > MAX_SUMMARY_BYTES {
                 return Err(CompletionError::SummaryTooLarge { got: summary.len() });
             }
+        }
+        if self.failure_reason.is_some() && self.outcome != Outcome::Failed(FailureClass::Node) {
+            return Err(CompletionError::ReasonOnNonNodeFailure);
         }
         Ok(())
     }
@@ -287,6 +297,7 @@ impl Completion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionError {
     SummaryTooLarge { got: usize },
+    ReasonOnNonNodeFailure,
 }
 
 impl std::fmt::Display for CompletionError {
@@ -296,6 +307,12 @@ impl std::fmt::Display for CompletionError {
                 f,
                 "a completion summary may be at most {MAX_SUMMARY_BYTES} bytes (got {got})"
             ),
+            Self::ReasonOnNonNodeFailure => {
+                write!(
+                    f,
+                    "a node failure reason requires an outcome of failed(node)"
+                )
+            }
         }
     }
 }
@@ -468,6 +485,7 @@ mod tests {
             exit_code: Some(0),
             stuck_mode: None,
             summary: Some("all green".to_owned()),
+            failure_reason: None,
             retry_after_secs: None,
             expect_failed: false,
         };
@@ -481,6 +499,7 @@ mod tests {
             outcome: Outcome::Failed(FailureClass::Execution),
             exit_code: Some(2),
             summary: None,
+            failure_reason: None,
             retry_after_secs: Some(150),
             stuck_mode: None,
             expect_failed: false,
@@ -498,6 +517,7 @@ mod tests {
             outcome: Outcome::Done,
             exit_code: None,
             summary: Some("s".repeat(MAX_SUMMARY_BYTES + 1)),
+            failure_reason: None,
             retry_after_secs: None,
             stuck_mode: None,
             expect_failed: false,
@@ -507,6 +527,40 @@ mod tests {
             CompletionError::SummaryTooLarge {
                 got: MAX_SUMMARY_BYTES + 1
             }
+        );
+    }
+
+    #[test]
+    fn a_node_failure_reason_round_trips_only_on_node_outcomes() {
+        let completion = Completion {
+            job_id: job_id(),
+            epoch: 4,
+            outcome: Outcome::Failed(FailureClass::Node),
+            exit_code: None,
+            summary: Some("harness refused the connection".to_owned()),
+            failure_reason: Some(NodeFailureReason::HarnessUnreachable),
+            retry_after_secs: None,
+            stuck_mode: None,
+            expect_failed: false,
+        };
+        assert!(completion.validate().is_ok());
+        let json = serde_json::to_string(&completion).unwrap();
+        assert!(json.contains("\"failure_reason\":\"harness_unreachable\""));
+        assert_eq!(
+            serde_json::from_str::<Completion>(&json).unwrap(),
+            completion
+        );
+
+        let wrong = Completion {
+            outcome: Outcome::Failed(FailureClass::Execution),
+            ..completion
+        };
+        assert_eq!(
+            wrong.validate().unwrap_err(),
+            CompletionError::ReasonOnNonNodeFailure
+        );
+        assert!(
+            serde_json::from_str::<Completion>(&serde_json::to_string(&wrong).unwrap()).is_err()
         );
     }
 

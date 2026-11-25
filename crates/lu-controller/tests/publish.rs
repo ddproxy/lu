@@ -223,6 +223,7 @@ fn controller_config(source_url: &str, db: &Path, artifacts: &Path) -> Controlle
         artifacts_dir: artifacts.to_string_lossy().into_owned(),
         lease_secs: 6,
         max_retries: 1,
+        node_attempts: 2,
         provider_cooldown_secs: 60,
         recovery_grace_secs: 1,
         max_connections: 16,
