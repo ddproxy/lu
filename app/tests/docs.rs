@@ -1,5 +1,7 @@
 //! Documentation checks: README structure, links, CLI names and config examples.
 
+use lu_config::DEFAULT_NODE_ATTEMPTS;
+use lu_proto::NodeFailureReason;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -281,4 +283,32 @@ fn connection_and_validation_docs_state_the_behaviour() {
         changelog.contains("no `[agent]`-table credential fallback"),
         "changelog must record the operator credential behaviour"
     );
+}
+
+#[test]
+fn documented_node_failure_contract_matches_code() {
+    let config = read("docs/config.md");
+    let readme = read("README.md");
+    let lifecycle = read("docs/lifecycle.md");
+    let api = read("docs/api.md");
+    let audit = read("docs/audit.md");
+    let dispatch = read("docs/dispatch.md");
+
+    assert!(config.contains(&format!(
+        "| `node_attempts` | no | `{DEFAULT_NODE_ATTEMPTS}` | Integer `1` to `4`."
+    )));
+    assert!(readme.contains(&format!(
+        "| `[controller] node_attempts` | `{DEFAULT_NODE_ATTEMPTS}` |"
+    )));
+    for reason in NodeFailureReason::ALL {
+        assert!(
+            lifecycle.contains(reason.as_str()),
+            "lifecycle omits {reason}"
+        );
+        assert!(api.contains(reason.as_str()), "api omits {reason}");
+    }
+    for field in ["node_excluded", "excluded_node"] {
+        assert!(audit.contains(field), "audit omits {field}");
+    }
+    assert!(dispatch.contains("## Node exclusions"));
 }

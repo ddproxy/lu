@@ -9,7 +9,7 @@ pub mod backup;
 pub mod sqlite;
 
 /// Schema version this binary creates and supports.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 #[cfg(test)]
 pub mod conformance;
@@ -21,8 +21,9 @@ mod model;
 use std::collections::HashMap;
 
 use lu_proto::{
-    ArtifactName, Completion, FailureClass, Heartbeat, JobEdit, JobId, JobSpec, JobState, NodeName,
-    ProviderState, PublishRecord, StatsAggregate, StatsQuery, StatsReport,
+    ArtifactName, Completion, FailureClass, Heartbeat, JobEdit, JobId, JobSpec, JobState,
+    NodeFailureReason, NodeName, ProviderState, PublishRecord, StatsAggregate, StatsQuery,
+    StatsReport,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +174,10 @@ pub struct JobRecord {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub failure_class: Option<FailureClass>,
+    /// Machine-readable reason for the last node-class failure.
+    pub failure_reason: Option<NodeFailureReason>,
+    /// Nodes this job must not be dispatched to again after node-class failures.
+    pub excluded_nodes: Vec<NodeName>,
     pub summary: Option<String>,
     pub exit_code: Option<i32>,
     pub artifacts: Vec<ArtifactName>,
@@ -206,6 +211,12 @@ pub struct JobRecord {
     pub depth: u32,
     /// Publish status, set only for jobs with a publish step after an attempt.
     pub publish: Option<PublishRecord>,
+}
+
+/// Largest attempt number a node-class failure may reach. `node_attempts` counts the first try,
+/// while `max_retries` remains the hard cap on retries of any class.
+pub fn node_attempt_cap(max_retries: u32, node_attempts: u32) -> u32 {
+    std::cmp::min(max_retries.saturating_add(1), node_attempts)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +366,13 @@ pub fn waiting_reason_with_limits(
         .iter()
         .filter(|node| node.online && labels_satisfied(&job.spec.requires, &node.heartbeat.labels))
         .collect();
+    if !eligible.is_empty()
+        && eligible
+            .iter()
+            .all(|node| job.excluded_nodes.contains(&node.name))
+    {
+        return Some("all eligible nodes are excluded for this job".to_owned());
+    }
     if !eligible.is_empty()
         && eligible
             .iter()
@@ -842,25 +860,29 @@ pub trait Store: Send + Sync + 'static {
     ) -> Result<JobRecord, StoreError>;
     /// Finishes the attempt. Success is `done`; a node or provider failure with attempts left
     /// returns the job to `queued` (attempt + 1) and cordons `(node, provider)` for a provider
-    /// failure; anything else is `failed`. `cordon_ms` and `max_retries` come from config.
+    /// failure; anything else is `failed`. A retried node failure excludes that node for this job.
+    /// `cordon_ms`, `max_retries` and `node_attempts` come from config. A job with a stored diff
+    /// or a cancellation request is never retried.
     fn complete(
         &self,
         completion: &Completion,
         failure: Option<(FailureClass, Option<String>)>,
         now: Now,
         max_retries: u32,
+        node_attempts: u32,
         cordon_ms: u64,
     ) -> Result<JobRecord, StoreError>;
 
     /// Leases not renewed within their window become `recovering`. Returns the jobs moved.
     fn expire_leases(&self, now: Now) -> Result<Vec<JobId>, StoreError>;
-    /// `recovering` for longer than `grace_ms` returns to `queued` (class `node`, attempt + 1) or
-    /// fails when attempts are exhausted. Returns the jobs moved.
+    /// `recovering` for longer than `grace_ms` returns to `queued` (class `node`, attempt + 1),
+    /// excluding the lost node, or fails when attempts are exhausted. Returns the jobs moved.
     fn requeue_recovering(
         &self,
         now: Now,
         grace_ms: u64,
         max_retries: u32,
+        node_attempts: u32,
     ) -> Result<Vec<JobId>, StoreError>;
     /// At controller start: every `leased` or `running` job becomes `recovering`.
     fn recover_on_boot(&self, now: Now) -> Result<u64, StoreError>;

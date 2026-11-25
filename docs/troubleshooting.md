@@ -103,6 +103,8 @@ The full failure-class table, retry rules and agent-side classification are in
 before applying the checks below. A `dependency` failure now follows a blocked wait of up to
 `[controller] blocked_dependent_ttl`; see [Dependency chains](#dependency-chains).
 
+A `node` failure with a `failure_reason` points to the machine, not the task: `harness_unreachable`, `container_start`, `container_wait_timeout`, `reiki_gateway_503` or `workspace_enospc`. Check the node's harness, Podman storage, Reiki feed or workspace filesystem, then let the job requeue on another node. The failed node is in `excluded_nodes` in `lu show <id> --json`; `lu retry` clears it after the machine is fixed. Ordinary task output that mentions a socket or `ENOSPC` does not produce one of these codes.
+
 A `409 stale_epoch` means the agent write came from an old lease; the controller ignores it. A log append at the wrong offset returns `409 conflict` with `{"error":"conflict","message":"conflict","length":L}`; resume from `L`. A `429` carries `Retry-After` seconds.
 
 Worked example — inspect a failure:
@@ -164,7 +166,7 @@ The first call is `-32602` because `limit` is at most 100. The second returns a 
 
 ## Recovery and backups
 
-The store expects schema version `7`. Schema 1 to 6 databases are migrated in place at startup; any other version is refused with a message telling the operator to create a new database. `lu restore` is stricter and accepts only backups at the current schema version (7). Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
+The store expects schema version `8`. Schema 1 to 7 databases are migrated in place at startup; any other version is refused with a message telling the operator to create a new database. `lu restore` is stricter and accepts only backups at the current schema version (8). Boot recovery moves `leased` and `running` jobs to `recovering` and keeps their node and epoch; see [lifecycle.md](lifecycle.md) for the transitions.
 
 `lu backup` and `lu restore` procedures, including interrupted restores and artifact snapshots, are in [operations.md](operations.md#backup-and-restore).
 

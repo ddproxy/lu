@@ -4,7 +4,9 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use lu_proto::{valid_provider_name, ProviderState, ProviderStatus, MAX_PROVIDERS};
+use lu_proto::{
+    valid_provider_name, NodeFailureReason, ProviderState, ProviderStatus, MAX_PROVIDERS,
+};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -23,6 +25,8 @@ const STALE_AFTER_FAILURES: u32 = 3;
 pub struct Health {
     pub providers: Vec<ProviderStatus>,
     pub reiki: Option<Value>,
+    /// A node fault reported by Reiki itself, never inferred from harness output.
+    pub infra_reason: Option<NodeFailureReason>,
     /// Counts successful reads, so a watcher can tell a new reading from a repeated one.
     pub seq: u64,
 }
@@ -58,6 +62,7 @@ pub fn parse(doc: &Value) -> Health {
     Health {
         providers,
         reiki: forwarded.then(|| doc.clone()),
+        infra_reason: None,
         seq: 0,
     }
 }
@@ -92,15 +97,14 @@ fn provider(upstream: &Value) -> Option<ProviderStatus> {
     })
 }
 
-async fn fetch(client: &reqwest::Client, url: &str, token: &str) -> Option<Value> {
-    let mut response = client
-        .get(url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?;
+#[derive(Debug)]
+enum Fetch {
+    Health(Value),
+    GatewayFault,
+    Failed,
+}
+
+async fn read_body(response: &mut reqwest::Response) -> Option<Vec<u8>> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.ok()? {
         if body.len() + chunk.len() > MAX_REPLY_BYTES {
@@ -108,7 +112,32 @@ async fn fetch(client: &reqwest::Client, url: &str, token: &str) -> Option<Value
         }
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).ok()
+    Some(body)
+}
+
+async fn fetch(client: &reqwest::Client, url: &str, token: &str) -> Fetch {
+    let mut response = match client.get(url).bearer_auth(token).send().await {
+        Ok(response) => response,
+        Err(_) => return Fetch::Failed,
+    };
+    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return match read_body(&mut response).await {
+            Some(body) if crate::infra::reiki_gateway_503(&String::from_utf8_lossy(&body)) => {
+                Fetch::GatewayFault
+            }
+            _ => Fetch::Failed,
+        };
+    }
+    let mut response = match response.error_for_status() {
+        Ok(response) => response,
+        Err(_) => return Fetch::Failed,
+    };
+    match read_body(&mut response).await {
+        Some(body) => serde_json::from_slice(&body)
+            .ok()
+            .map_or(Fetch::Failed, Fetch::Health),
+        None => Fetch::Failed,
+    }
 }
 
 /// Reads the local Reiki every few seconds into `shared` until the task is aborted.
@@ -128,13 +157,23 @@ pub fn spawn_refresher(url: String, token: Arc<str>, shared: Shared) -> JoinHand
         let mut failures = 0u32;
         loop {
             match fetch(&client, &url, &token).await {
-                Some(doc) => {
+                Fetch::Health(doc) => {
                     failures = 0;
                     let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
                     let seq = guard.seq.wrapping_add(1);
                     *guard = Health { seq, ..parse(&doc) };
                 }
-                None => {
+                Fetch::GatewayFault => {
+                    failures = 0;
+                    let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    let seq = guard.seq.wrapping_add(1);
+                    *guard = Health {
+                        seq,
+                        infra_reason: Some(NodeFailureReason::ReikiGateway503),
+                        ..Health::default()
+                    };
+                }
+                Fetch::Failed => {
                     failures = failures.saturating_add(1);
                     debug!(failures, "could not read the local Reiki health");
                     if failures == STALE_AFTER_FAILURES {
@@ -156,6 +195,8 @@ pub fn spawn_refresher(url: String, token: Arc<str>, shared: Shared) -> JoinHand
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn each_upstream_becomes_a_provider_with_the_right_state() {
@@ -224,5 +265,37 @@ mod tests {
         );
         let big = json!({"upstreams": [], "padding": "x".repeat(MAX_FORWARDED_BYTES + 1)});
         assert!(parse(&big).reiki.is_none());
+    }
+
+    async fn fetch_with_reply(body: &'static [u8]) -> Fetch {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let fetched = fetch(&client, &format!("http://{addr}/health"), "test").await;
+        server.await.unwrap();
+        fetched
+    }
+
+    #[tokio::test]
+    async fn a_named_reiki_503_is_a_gateway_fault() {
+        let fetched = fetch_with_reply(br#"{"error":"gateway_store_unavailable"}"#).await;
+        assert!(matches!(fetched, Fetch::GatewayFault), "{fetched:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_503_is_not_a_node_fault() {
+        let fetched = fetch_with_reply(b"service unavailable").await;
+        assert!(matches!(fetched, Fetch::Failed), "{fetched:?}");
     }
 }

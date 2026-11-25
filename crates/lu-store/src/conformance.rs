@@ -5,8 +5,8 @@ use std::str::FromStr;
 
 use lu_proto::{
     ArtifactName, Choice, CollectMode, Completion, FailureClass, HarnessState, Heartbeat, JobEdit,
-    JobId, JobSpec, JobState, NodeName, Outcome, ProviderState, ProviderStatus, HARNESS_OK_FALSE,
-    MAX_COLLECT_BYTES, MAX_LOG_BYTES,
+    JobId, JobSpec, JobState, NodeFailureReason, NodeName, Outcome, ProviderState, ProviderStatus,
+    HARNESS_OK_FALSE, MAX_COLLECT_BYTES, MAX_LOG_BYTES,
 };
 
 use crate::{CordonSource, JobRecord, Now, ScopeLimits, Store, StoreError};
@@ -148,6 +148,11 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     unreserve_log_restores_length_and_is_fenced(&make());
     held_jobs_lists_the_nodes_active_jobs(&make());
     completion_persists_expect_failure(&make());
+    node_failure_requeues_on_a_different_node(&make());
+    node_attempts_cap_retries(&make());
+    node_failure_never_retries_after_a_diff_or_cancel(&make());
+    retry_clears_node_exclusions(&make());
+    recovery_excludes_the_lost_node(&make());
     complete_and_retry_cordon(&make());
     reiki_cordon_yields_to_live_health(&make());
     cordon_details_and_uncordon(&make());
@@ -287,11 +292,12 @@ fn finish_done<S: Store>(s: &S, id: &JobId, node_name: &str, wall: i64, mono: u6
         outcome: Outcome::Done,
         exit_code: Some(0),
         summary: None,
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
     };
-    s.complete(&comp, None, now(wall, mono + 3), 1, 1000)
+    s.complete(&comp, None, now(wall, mono + 3), 1, 2, 1000)
         .unwrap();
 }
 
@@ -311,6 +317,7 @@ fn finish_failed<S: Store>(s: &S, id: &JobId, node_name: &str, wall: i64, mono: 
         outcome: Outcome::Failed(FailureClass::Execution),
         exit_code: Some(1),
         summary: Some("boom".into()),
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
@@ -320,6 +327,7 @@ fn finish_failed<S: Store>(s: &S, id: &JobId, node_name: &str, wall: i64, mono: 
         Some((FailureClass::Execution, None)),
         now(wall, mono + 3),
         1,
+        2,
         1000,
     )
     .unwrap();
@@ -342,6 +350,7 @@ fn conflict_failure_class_round_trips<S: Store>(s: &S) {
         outcome: Outcome::Failed(FailureClass::Conflict),
         exit_code: None,
         summary: Some("dependency dep-1 conflict in a.txt".into()),
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
@@ -351,6 +360,7 @@ fn conflict_failure_class_round_trips<S: Store>(s: &S) {
         Some((FailureClass::Conflict, None)),
         now(5, 5),
         1,
+        2,
         1000,
     )
     .unwrap();
@@ -770,11 +780,12 @@ fn staged_commit_is_recorded_for_active_jobs<S: Store>(s: &S) {
         outcome: Outcome::Done,
         exit_code: Some(0),
         summary: None,
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
     };
-    s.complete(&done, None, now(8, 8), 1, 1000).unwrap();
+    s.complete(&done, None, now(8, 8), 1, 2, 1000).unwrap();
     assert_eq!(
         s.record_staged_commit(&j.id, a.epoch, commit, now(9, 9)),
         Err(StoreError::Conflict { length: None })
@@ -1088,7 +1099,7 @@ fn cancel_recovering_ends_it_cancelled_immediately<S: Store>(s: &S) {
     assert_eq!(cancelled.updated_at, 5);
     // the lease and the recovering marker are released: nothing requeues or renews it
     assert!(s
-        .requeue_recovering(now(60_000, 60_000), 1, 10)
+        .requeue_recovering(now(60_000, 60_000), 1, 10, 2)
         .unwrap()
         .is_empty());
     assert!(s.renew_lease(&dep.id, a.epoch, now(6, 6), 60_000).is_err());
@@ -1225,6 +1236,7 @@ fn fallback_choices_route_and_clear<S: Store>(s: &S) {
         outcome: Outcome::Failed(FailureClass::Provider),
         exit_code: None,
         summary: Some("no key".to_owned()),
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
@@ -1235,6 +1247,7 @@ fn fallback_choices_route_and_clear<S: Store>(s: &S) {
             Some((FailureClass::Provider, Some("p2".to_owned()))),
             now(4, 4),
             1,
+            2,
             10_000,
         )
         .unwrap();
@@ -1328,6 +1341,7 @@ fn any_provider_skips_cordoned_and_unhealthy_pairs<S: Store>(s: &S) {
         outcome: Outcome::Failed(FailureClass::Provider),
         exit_code: None,
         summary: None,
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
@@ -1337,6 +1351,7 @@ fn any_provider_skips_cordoned_and_unhealthy_pairs<S: Store>(s: &S) {
         Some((FailureClass::Provider, Some("p1".to_owned()))),
         now(4, 4),
         1,
+        2,
         10_000,
     )
     .unwrap();
@@ -1577,11 +1592,13 @@ fn edit_job_rejects_terminal_states<S: Store>(s: &S) {
         outcome: Outcome::Done,
         exit_code: Some(0),
         summary: None,
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
     };
-    s.complete(&completion, None, now(4, 4), 1, 1000).unwrap();
+    s.complete(&completion, None, now(4, 4), 1, 2, 1000)
+        .unwrap();
     assert!(matches!(
         s.edit_job(&job.id, &JobEdit::default(), now(5, 5)),
         Err(StoreError::Conflict { .. })
@@ -1935,6 +1952,7 @@ fn broken_harness_taint_excludes_jobs_until_cleared<S: Store>(s: &S) {
             outcome: Outcome::Done,
             exit_code: Some(0),
             summary: None,
+            failure_reason: None,
             retry_after_secs: None,
             stuck_mode: None,
             expect_failed: false,
@@ -1942,6 +1960,7 @@ fn broken_harness_taint_excludes_jobs_until_cleared<S: Store>(s: &S) {
         None,
         now(6, 6),
         1,
+        2,
         1000,
     )
     .unwrap();
@@ -2042,11 +2061,13 @@ fn held_jobs_lists_the_nodes_active_jobs<S: Store>(s: &S) {
         outcome: Outcome::Done,
         exit_code: Some(0),
         summary: None,
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
     };
-    s.complete(&completion, None, now(3, 3), 1, 60_000).unwrap();
+    s.complete(&completion, None, now(3, 3), 1, 2, 60_000)
+        .unwrap();
     assert!(s.held_jobs(&n).unwrap().is_empty());
 }
 
@@ -2067,6 +2088,7 @@ fn completion_persists_expect_failure<S: Store>(s: &S) {
                 outcome: Outcome::Done,
                 exit_code: Some(0),
                 summary: None,
+                failure_reason: None,
                 retry_after_secs: None,
                 stuck_mode: None,
                 expect_failed: true,
@@ -2074,6 +2096,7 @@ fn completion_persists_expect_failure<S: Store>(s: &S) {
             None,
             now(3, 3),
             1,
+            2,
             60_000,
         )
         .unwrap();
@@ -2084,6 +2107,197 @@ fn completion_persists_expect_failure<S: Store>(s: &S) {
         .unwrap()
         .iter()
         .any(|r| r.id == j.id && r.expect_failed));
+}
+
+fn node_completion(id: &JobId, epoch: u64, reason: NodeFailureReason) -> Completion {
+    Completion {
+        job_id: id.clone(),
+        epoch,
+        outcome: Outcome::Failed(FailureClass::Node),
+        exit_code: None,
+        summary: None,
+        failure_reason: Some(reason),
+        retry_after_secs: None,
+        stuck_mode: None,
+        expect_failed: false,
+    }
+}
+
+fn node_failure_requeues_on_a_different_node<S: Store>(s: &S) {
+    let a = node("node-a");
+    let b = node("node-b");
+    for name in ["node-a", "node-b"] {
+        s.heartbeat(&hb(name, HarnessState::Idle, vec![]), now(1, 1))
+            .unwrap();
+    }
+    let (job, _) = s
+        .create_job(&spec("https://x/node-retry.git", None), now(1, 1))
+        .unwrap();
+    let first = s.next_assignment(&a, now(2, 2), 60_000).unwrap().unwrap();
+    assert_eq!(first.job_id, job.id);
+    s.start_job(&job.id, first.epoch, now(3, 3)).unwrap();
+    let rec = s
+        .complete(
+            &node_completion(&job.id, first.epoch, NodeFailureReason::HarnessUnreachable),
+            None,
+            now(4, 4),
+            1,
+            2,
+            1000,
+        )
+        .unwrap();
+    assert_eq!(rec.state, JobState::Queued);
+    assert_eq!(rec.attempt, 2);
+    assert_eq!(
+        rec.failure_reason,
+        Some(NodeFailureReason::HarnessUnreachable)
+    );
+    assert_eq!(rec.excluded_nodes, vec![a.clone()]);
+    assert!(s.next_assignment(&a, now(5, 5), 60_000).unwrap().is_none());
+
+    let second = s.next_assignment(&b, now(6, 6), 60_000).unwrap().unwrap();
+    assert_eq!(second.job_id, job.id);
+    assert!(second.epoch > first.epoch);
+    s.start_job(&job.id, second.epoch, now(7, 7)).unwrap();
+    let rec = s
+        .complete(
+            &node_completion(&job.id, second.epoch, NodeFailureReason::ContainerStart),
+            None,
+            now(8, 8),
+            1,
+            2,
+            1000,
+        )
+        .unwrap();
+    assert_eq!(rec.state, JobState::Failed);
+    assert_eq!(rec.attempt, 2);
+    assert_eq!(rec.failure_reason, Some(NodeFailureReason::ContainerStart));
+    assert_eq!(rec.excluded_nodes, vec![a, b]);
+}
+
+fn node_attempts_cap_retries<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let (job, _) = s
+        .create_job(&spec("https://x/node-cap.git", None), now(1, 1))
+        .unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    s.start_job(&job.id, a.epoch, now(3, 3)).unwrap();
+    let rec = s
+        .complete(
+            &node_completion(&job.id, a.epoch, NodeFailureReason::WorkspaceEnospc),
+            None,
+            now(4, 4),
+            3,
+            1,
+            1000,
+        )
+        .unwrap();
+    assert_eq!(rec.state, JobState::Failed);
+    assert_eq!(rec.attempt, 1);
+    assert_eq!(rec.excluded_nodes, vec![n]);
+}
+
+fn node_failure_never_retries_after_a_diff_or_cancel<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    for case in ["diff", "cancel"] {
+        let (job, _) = s
+            .create_job(
+                &spec(&format!("https://x/node-{case}.git"), None),
+                now(1, 1),
+            )
+            .unwrap();
+        let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+        assert_eq!(a.job_id, job.id);
+        s.start_job(&job.id, a.epoch, now(3, 3)).unwrap();
+        if case == "diff" {
+            s.record_artifact(&job.id, a.epoch, ArtifactName::DiffPatch, 9)
+                .unwrap();
+        } else {
+            s.cancel_job(&job.id, now(3, 3)).unwrap();
+        }
+        let rec = s
+            .complete(
+                &node_completion(&job.id, a.epoch, NodeFailureReason::ContainerStart),
+                None,
+                now(4, 4),
+                3,
+                4,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(rec.state, JobState::Failed, "{case}");
+        assert_eq!(rec.attempt, 1, "{case}");
+        assert_eq!(rec.excluded_nodes, vec![n.clone()], "{case}");
+    }
+}
+
+fn retry_clears_node_exclusions<S: Store>(s: &S) {
+    let n = node("node-a");
+    s.heartbeat(&hb("node-a", HarnessState::Idle, vec![]), now(1, 1))
+        .unwrap();
+    let sp = spec("https://x/node-retry-edit.git", None);
+    let (job, _) = s.create_job(&sp, now(1, 1)).unwrap();
+    let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
+    s.start_job(&job.id, a.epoch, now(3, 3)).unwrap();
+    s.complete(
+        &node_completion(&job.id, a.epoch, NodeFailureReason::HarnessUnreachable),
+        None,
+        now(4, 4),
+        0,
+        2,
+        1000,
+    )
+    .unwrap();
+    assert_eq!(s.get_job(&job.id).unwrap().excluded_nodes, vec![n.clone()]);
+    let (recovered, _) = s
+        .retry_with_dependents(&job.id, &sp, false, now(5, 5), None)
+        .unwrap();
+    assert_eq!(recovered.state, JobState::Queued);
+    assert!(recovered.excluded_nodes.is_empty());
+    assert_eq!(recovered.failure_reason, None);
+    assert_eq!(
+        s.next_assignment(&n, now(6, 6), 60_000)
+            .unwrap()
+            .unwrap()
+            .job_id,
+        job.id
+    );
+}
+
+fn recovery_excludes_the_lost_node<S: Store>(s: &S) {
+    let a = node("node-a");
+    let b = node("node-b");
+    for name in ["node-a", "node-b"] {
+        s.heartbeat(&hb(name, HarnessState::Idle, vec![]), now(1, 1))
+            .unwrap();
+    }
+    let (job, _) = s
+        .create_job(&spec("https://x/node-recover.git", None), now(1, 1))
+        .unwrap();
+    let first = s.next_assignment(&a, now(2, 2), 100).unwrap().unwrap();
+    assert_eq!(first.job_id, job.id);
+    s.expire_leases(now(200, 200)).unwrap();
+    let moved = s.requeue_recovering(now(400, 400), 100, 1, 2).unwrap();
+    assert_eq!(moved, vec![job.id.clone()]);
+    let rec = s.get_job(&job.id).unwrap();
+    assert_eq!(rec.state, JobState::Queued);
+    assert_eq!(rec.attempt, 2);
+    assert_eq!(rec.excluded_nodes, vec![a.clone()]);
+    assert!(s
+        .next_assignment(&a, now(500, 500), 60_000)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        s.next_assignment(&b, now(600, 600), 60_000)
+            .unwrap()
+            .unwrap()
+            .job_id,
+        job.id
+    );
 }
 
 fn complete_and_retry_cordon<S: Store>(s: &S) {
@@ -2109,6 +2323,7 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
         outcome: Outcome::Failed(FailureClass::Provider),
         exit_code: None,
         summary: Some("nope".into()),
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
@@ -2119,6 +2334,7 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
             Some((FailureClass::Provider, Some("p1".into()))),
             now(4, 4),
             1,
+            2,
             10_000,
         )
         .unwrap();
@@ -2171,6 +2387,7 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
         outcome: Outcome::Failed(FailureClass::Execution),
         exit_code: Some(1),
         summary: None,
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
@@ -2181,6 +2398,7 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
             Some((FailureClass::Execution, None)),
             now(3, 3),
             1,
+            2,
             1000,
         )
         .unwrap();
@@ -2201,11 +2419,12 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
         outcome: Outcome::Done,
         exit_code: Some(0),
         summary: None,
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
     };
-    let rec3 = s.complete(&comp3, None, now(4, 4), 1, 1000).unwrap();
+    let rec3 = s.complete(&comp3, None, now(4, 4), 1, 2, 1000).unwrap();
     assert_eq!(rec3.state, JobState::Done);
 }
 
@@ -2230,6 +2449,7 @@ fn reiki_cordon_yields_to_live_health<S: Store>(s: &S) {
         outcome: Outcome::Failed(FailureClass::Provider),
         exit_code: None,
         summary: None,
+        failure_reason: None,
         retry_after_secs: Some(3600),
         stuck_mode: None,
         expect_failed: false,
@@ -2239,6 +2459,7 @@ fn reiki_cordon_yields_to_live_health<S: Store>(s: &S) {
         Some((FailureClass::Provider, Some("p1".into()))),
         now(4, 4),
         1,
+        2,
         10_000,
     )
     .unwrap();
@@ -2322,12 +2543,13 @@ fn stale_epoch_rejected<S: Store>(s: &S) {
         outcome: Outcome::Done,
         exit_code: Some(0),
         summary: None,
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
     };
     assert_eq!(
-        s.complete(&comp, None, now(3, 3), 1, 1000).unwrap_err(),
+        s.complete(&comp, None, now(3, 3), 1, 2, 1000).unwrap_err(),
         StoreError::StaleEpoch
     );
     let unchanged = s.get_job(&j.id).unwrap();
@@ -2348,7 +2570,7 @@ fn expire_and_recover<S: Store>(s: &S) {
     assert_eq!(s.get_job(&j.id).unwrap().state, JobState::Recovering);
 
     // recovering -> queued after grace (retry)
-    let moved2 = s.requeue_recovering(now(400, 400), 100, 1).unwrap();
+    let moved2 = s.requeue_recovering(now(400, 400), 100, 1, 2).unwrap();
     assert_eq!(moved2.len(), 1);
     let rec = s.get_job(&j.id).unwrap();
     assert_eq!(rec.state, JobState::Queued);
@@ -2362,7 +2584,7 @@ fn expire_and_recover<S: Store>(s: &S) {
     let a = s.next_assignment(&nb, now(500, 500), 100).unwrap().unwrap();
     assert_eq!(a.job_id, j.id);
     s.expire_leases(now(700, 700)).unwrap();
-    let moved3 = s.requeue_recovering(now(900, 900), 100, 1).unwrap();
+    let moved3 = s.requeue_recovering(now(900, 900), 100, 1, 2).unwrap();
     assert_eq!(moved3.len(), 1);
     let rec2 = s.get_job(&j.id).unwrap();
     assert_eq!(rec2.state, JobState::Failed);
@@ -2486,10 +2708,10 @@ fn recovery_grace_survives_a_young_clock<S: Store>(s: &S) {
     let a = s.next_assignment(&node, now(1, 1), 1000).unwrap().unwrap();
     s.start_job(&a.job_id, a.epoch, now(2, 2)).unwrap();
     assert_eq!(s.recover_on_boot(now(3, 3)).unwrap(), 1);
-    let moved = s.requeue_recovering(now(3, 3), 30_000, 1).unwrap();
+    let moved = s.requeue_recovering(now(3, 3), 30_000, 1, 2).unwrap();
     assert!(moved.is_empty(), "inside the grace nothing is requeued");
     let moved = s
-        .requeue_recovering(now(31_000, 31_000), 30_000, 1)
+        .requeue_recovering(now(31_000, 31_000), 30_000, 1, 2)
         .unwrap();
     assert_eq!(moved, vec![rec.id]);
 }
@@ -2510,7 +2732,7 @@ fn a_recovering_job_resumes_or_finishes_for_its_holder<S: Store>(s: &S) {
     s.renew_lease(&a.job_id, a.epoch, now(4, 4), 1000).unwrap();
     assert_eq!(s.get_job(&a.job_id).unwrap().state, JobState::Running);
     assert!(s
-        .requeue_recovering(now(90_000, 90_000), 30_000, 1)
+        .requeue_recovering(now(90_000, 90_000), 30_000, 1, 2)
         .unwrap()
         .is_empty());
     // A stale epoch still cannot resume.
@@ -2572,11 +2794,12 @@ fn job_counts<S: Store>(s: &S) {
         outcome: Outcome::Done,
         exit_code: Some(0),
         summary: None,
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
     };
-    s.complete(&comp1, None, now(7, 7), 1, 1000).unwrap();
+    s.complete(&comp1, None, now(7, 7), 1, 2, 1000).unwrap();
 
     let a2 = s.next_assignment(&n, now(8, 8), 60_000).unwrap().unwrap();
     assert_eq!(a2.job_id, j2.id);
@@ -2588,6 +2811,7 @@ fn job_counts<S: Store>(s: &S) {
         outcome: Outcome::Failed(FailureClass::Execution),
         exit_code: Some(1),
         summary: None,
+        failure_reason: None,
         retry_after_secs: None,
         stuck_mode: None,
         expect_failed: false,
@@ -2597,6 +2821,7 @@ fn job_counts<S: Store>(s: &S) {
         Some((FailureClass::Execution, None)),
         now(10, 10),
         1,
+        2,
         1000,
     )
     .unwrap();
@@ -2670,6 +2895,7 @@ fn higher_priority_dispatches_first<S: Store>(s: &S) {
             outcome: Outcome::Done,
             exit_code: Some(0),
             summary: None,
+            failure_reason: None,
             retry_after_secs: None,
             stuck_mode: None,
             expect_failed: false,
@@ -2677,6 +2903,7 @@ fn higher_priority_dispatches_first<S: Store>(s: &S) {
         None,
         now(6, 6),
         1,
+        2,
         1000,
     )
     .unwrap();
@@ -2773,6 +3000,7 @@ fn terminal_and_failed_jobs_free_a_group_slot<S: Store>(s: &S) {
             outcome: Outcome::Cancelled,
             exit_code: None,
             summary: None,
+            failure_reason: None,
             retry_after_secs: None,
             stuck_mode: None,
             expect_failed: false,
@@ -2780,6 +3008,7 @@ fn terminal_and_failed_jobs_free_a_group_slot<S: Store>(s: &S) {
         None,
         now(7, 7),
         1,
+        2,
         1000,
     )
     .unwrap();
@@ -2799,6 +3028,7 @@ fn terminal_and_failed_jobs_free_a_group_slot<S: Store>(s: &S) {
             outcome: Outcome::Failed(FailureClass::Execution),
             exit_code: Some(1),
             summary: None,
+            failure_reason: None,
             retry_after_secs: None,
             stuck_mode: None,
             expect_failed: false,
@@ -2806,6 +3036,7 @@ fn terminal_and_failed_jobs_free_a_group_slot<S: Store>(s: &S) {
         Some((FailureClass::Execution, None)),
         now(10, 10),
         1,
+        2,
         1000,
     )
     .unwrap();

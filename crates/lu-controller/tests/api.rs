@@ -39,6 +39,7 @@ fn controller_cfg(db: &str, artifacts_dir: &str) -> ControllerConfig {
         artifacts_dir: artifacts_dir.to_owned(),
         lease_secs: 6,
         max_retries: 1,
+        node_attempts: 2,
         provider_cooldown_secs: 60,
         recovery_grace_secs: 1,
         max_connections: 64,
@@ -114,11 +115,11 @@ async fn start_server_full(
     pack_cap: Option<usize>,
     repos: Vec<ControllerRepo>,
 ) -> TestServer {
-    start_server_inner(roots, pack_cap, repos, None, None, None).await
+    start_server_inner(roots, pack_cap, repos, None, None, None, None).await
 }
 
 async fn start_server_with_artifacts(artifacts: Option<ArtifactsConfig>) -> TestServer {
-    start_server_inner(Vec::new(), None, Vec::new(), artifacts, None, None).await
+    start_server_inner(Vec::new(), None, Vec::new(), artifacts, None, None, None).await
 }
 
 async fn start_server_with_read_budget(read_per_minute: usize) -> TestServer {
@@ -128,6 +129,7 @@ async fn start_server_with_read_budget(read_per_minute: usize) -> TestServer {
         Vec::new(),
         None,
         Some(read_per_minute),
+        None,
         None,
     )
     .await
@@ -141,6 +143,20 @@ async fn start_server_with_disk_limit(min_disk_free_pct: u8) -> TestServer {
         None,
         None,
         Some(min_disk_free_pct),
+        None,
+    )
+    .await
+}
+
+async fn start_server_with_node_attempts(node_attempts: u32) -> TestServer {
+    start_server_inner(
+        Vec::new(),
+        None,
+        Vec::new(),
+        None,
+        None,
+        None,
+        Some(node_attempts),
     )
     .await
 }
@@ -152,6 +168,7 @@ async fn start_server_inner(
     artifacts: Option<ArtifactsConfig>,
     read_per_minute: Option<usize>,
     min_disk_free_pct: Option<u8>,
+    node_attempts: Option<u32>,
 ) -> TestServer {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("lu.db");
@@ -161,6 +178,9 @@ async fn start_server_inner(
     cfg.repos = repos;
     if let Some(limit) = read_per_minute {
         cfg.read_per_minute = limit;
+    }
+    if let Some(attempts) = node_attempts {
+        cfg.node_attempts = attempts;
     }
     let store = Arc::new(SqliteStore::open(&db).unwrap());
     let mut state =
@@ -1196,6 +1216,59 @@ async fn complete_as(
     let comp = comp.to_string();
     let req = format!("POST /v1/agent/jobs/{id}/complete HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", comp.len(), comp);
     raw_request(srv.addr, &req).await
+}
+
+async fn complete_node_as(
+    srv: &TestServer,
+    token: &str,
+    id: &str,
+    epoch: u64,
+    reason: &str,
+) -> String {
+    let comp = json!({
+        "job_id": id,
+        "epoch": epoch,
+        "outcome": {"failed": "node"},
+        "failure_reason": reason,
+    })
+    .to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/complete HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", comp.len(), comp);
+    raw_request(srv.addr, &req).await
+}
+
+async fn assign_start_on(srv: &TestServer, id: &str, node: &str, token: &str) -> u64 {
+    let r = poll_with(srv.addr, token, &heartbeat_json(node)).await;
+    assert_eq!(status(&r), 200, "{r}");
+    let events: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
+    let epoch = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "assign" && e["job_id"] == id)
+        .unwrap_or_else(|| panic!("no assignment for {id}: {events}"))["epoch"]
+        .as_u64()
+        .unwrap();
+    let body = json!({"epoch": epoch}).to_string();
+    let req = format!("POST /v1/agent/jobs/{id}/start HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+    let r = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&r), 200, "{r}");
+    epoch
+}
+
+async fn audit_lines(path: &Path, event: &str, minimum: usize) -> Vec<serde_json::Value> {
+    for _ in 0..100 {
+        let lines = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter(|line: &serde_json::Value| line["event"] == event)
+            .collect::<Vec<_>>();
+        if lines.len() >= minimum {
+            return lines;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("expected at least {minimum} {event} audit records");
 }
 
 async fn fail_provider(srv: &TestServer, retry_after_secs: Option<u64>) -> (String, u64) {
@@ -5437,5 +5510,115 @@ async fn write_dry_runs_leave_jobs_and_clean_queue_untouched() {
     assert!(body_str(&clean).contains("\"dry_run\":true"), "{clean}");
     assert!(srv.state.pending_clean.lock().unwrap().is_empty());
 
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn node_failures_requeue_on_another_node_and_are_audited() {
+    let srv = start_server().await;
+    let audit_path = srv._tmp.path().join("node-failure-audit.jsonl");
+    let (writer, _task) =
+        lu_audit::Writer::open(&audit_path, Arc::clone(&srv.state.audit_write_errors))
+            .await
+            .unwrap();
+    srv.state.set_audit(writer);
+
+    let created = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&created)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let epoch = assign_start_on(&srv, &id, "node-a", AGENT_A_TOKEN).await;
+    let completed = complete_node_as(&srv, AGENT_A_TOKEN, &id, epoch, "harness_unreachable").await;
+    assert_eq!(status(&completed), 200, "{completed}");
+    let view: serde_json::Value = serde_json::from_str(body_str(&completed)).unwrap();
+    assert_eq!(view["state"], "queued");
+    assert_eq!(view["attempt"], 2);
+    assert_eq!(view["failure_class"], "node");
+    assert_eq!(view["failure_reason"], "harness_unreachable");
+    assert_eq!(view["excluded_nodes"], json!(["node-a"]));
+
+    let records = audit_lines(&audit_path, "node_excluded", 1).await;
+    assert_eq!(records[0]["actor"], "node-a");
+    assert_eq!(records[0]["node"], "node-a");
+    assert_eq!(records[0]["data"]["excluded_node"], "node-a");
+    assert_eq!(records[0]["data"]["reason"], "harness_unreachable");
+
+    let poll = poll_with(srv.addr, AGENT_A_TOKEN, &heartbeat_json("node-a")).await;
+    assert!(matches!(status(&poll), 200 | 204), "{poll}");
+    if status(&poll) == 200 {
+        let events: serde_json::Value = serde_json::from_str(body_str(&poll)).unwrap();
+        assert!(
+            !events
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["kind"] == "assign" && e["job_id"] == id),
+            "{events}"
+        );
+    }
+
+    let second = assign_start_on(&srv, &id, "node-b", AGENT_B_TOKEN).await;
+    assert!(second > epoch);
+    let completed = complete_node_as(&srv, AGENT_B_TOKEN, &id, second, "container_start").await;
+    assert_eq!(status(&completed), 200, "{completed}");
+    let view: serde_json::Value = serde_json::from_str(body_str(&completed)).unwrap();
+    assert_eq!(view["state"], "failed");
+    assert_eq!(view["attempt"], 2);
+    assert_eq!(view["failure_reason"], "container_start");
+    assert_eq!(view["excluded_nodes"], json!(["node-a", "node-b"]));
+
+    let records = audit_lines(&audit_path, "node_excluded", 2).await;
+    assert!(
+        records
+            .iter()
+            .any(|line| line["data"]["excluded_node"] == "node-b"
+                && line["data"]["reason"] == "container_start"),
+        "{records:?}"
+    );
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn a_stored_diff_stops_node_failure_retries() {
+    let srv = start_server().await;
+    let created = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&created)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let epoch = assign_start_on(&srv, &id, "node-a", AGENT_A_TOKEN).await;
+    let req = format!("PUT /v1/agent/jobs/{id}/artifacts/diff.patch?epoch={epoch} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {AGENT_A_TOKEN}\r\nContent-Length: 0\r\n\r\n");
+    let uploaded = raw_request(srv.addr, &req).await;
+    assert_eq!(status(&uploaded), 200, "{uploaded}");
+
+    let completed = complete_node_as(&srv, AGENT_A_TOKEN, &id, epoch, "workspace_enospc").await;
+    assert_eq!(status(&completed), 200, "{completed}");
+    let view = job_value(&srv, &id).await;
+    assert_eq!(view["state"], "failed");
+    assert_eq!(view["attempt"], 1);
+    assert_eq!(view["excluded_nodes"], json!(["node-a"]));
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
+async fn node_attempts_caps_node_failure_retries() {
+    let srv = start_server_with_node_attempts(1).await;
+    let created = submit_spec(srv.addr, &sample_spec(None)).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(body_str(&created)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let epoch = assign_start_on(&srv, &id, "node-a", AGENT_A_TOKEN).await;
+    let completed = complete_node_as(&srv, AGENT_A_TOKEN, &id, epoch, "reiki_gateway_503").await;
+    assert_eq!(status(&completed), 200, "{completed}");
+    let view = job_value(&srv, &id).await;
+    assert_eq!(view["state"], "failed");
+    assert_eq!(view["attempt"], 1);
+    assert_eq!(view["failure_reason"], "reiki_gateway_503");
+    assert_eq!(view["excluded_nodes"], json!(["node-a"]));
     let _ = srv.shutdown.send(());
 }

@@ -20,7 +20,8 @@ At least one of `[controller]` and `[agent]` must be present. A file may contain
 | `db` | yes | — | Absolute path; must not contain `..`. The parent directory must exist at startup. A new database file is created mode `0600`; the store enables WAL, foreign keys, a 5 s busy timeout and `synchronous=NORMAL`. |
 | `artifacts_dir` | yes | — | Absolute path; must not contain `..`. Created at startup if missing; mode is set to `0700` where supported. Job logs and artifacts live under `<artifacts_dir>/<job id>/`. |
 | `lease_secs` | no | `60` | Integer `5` to `3600`. A lease is extended by this many seconds. Maintenance runs every `max(1, lease_secs / 3)` seconds. |
-| `max_retries` | no | `1` | Integer `0` to `3`. Node failures retry while `attempt <= max_retries`; `0` means no retry. Provider failures use a separate 100-attempt limit. Execution failures never retry. |
+| `max_retries` | no | `1` | Integer `0` to `3`. Hard cap on automatic retries of any class; `0` means no retry. Provider failures use a separate 100-attempt limit. Execution failures never retry. |
+| `node_attempts` | no | `2` | Integer `1` to `4`. Different nodes tried for a node-class infrastructure failure, counting the first attempt. A node requeue needs `attempt < min(max_retries + 1, node_attempts)` and a node that has not already been excluded for this job. |
 | `provider_cooldown_secs` | no | `1800` | Integer `60` to `86400`. How long a `(node, provider)` pair is cordoned after a retryable provider failure without `retry_after_secs`. |
 | `recovery_grace_secs` | no | `30` | Integer `0` to `600`. How long a job stays `recovering` before it is requeued or failed. |
 | `blocked_dependent_ttl` | no | `24h` | Duration `1s` to `365d`. How long a dependent blocked by a failed or cancelled predecessor waits for a retry before failing with `failure_class: "dependency"`. |

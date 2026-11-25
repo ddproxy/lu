@@ -131,6 +131,7 @@ mod tests {
             _: Option<(FailureClass, Option<String>)>,
             _: Now,
             _: u32,
+            _: u32,
             _: u64,
         ) -> Result<JobRecord, StoreError> {
             unimplemented!()
@@ -138,7 +139,13 @@ mod tests {
         fn expire_leases(&self, _: Now) -> Result<Vec<JobId>, StoreError> {
             unimplemented!()
         }
-        fn requeue_recovering(&self, _: Now, _: u64, _: u32) -> Result<Vec<JobId>, StoreError> {
+        fn requeue_recovering(
+            &self,
+            _: Now,
+            _: u64,
+            _: u32,
+            _: u32,
+        ) -> Result<Vec<JobId>, StoreError> {
             unimplemented!()
         }
         fn recover_on_boot(&self, _: Now) -> Result<u64, StoreError> {
@@ -190,6 +197,7 @@ mod tests {
             artifacts_dir: tmp.path().join("artifacts").display().to_string(),
             lease_secs: 6,
             max_retries: 1,
+            node_attempts: 2,
             provider_cooldown_secs: 60,
             recovery_grace_secs: 1,
             max_connections: 8,

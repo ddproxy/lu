@@ -32,7 +32,7 @@ undrains with `ting undrain`. That needs only the node's own token.
 4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store uses schema version 7. It creates the schema for a new database and migrates schema 1 to 6 databases in place on startup, adding the scrubbing, lineage, publish and stacked-chain columns (`staged_commit`, `blocked_reason`, `blocked_since`, `eligible_since`) and the additive `request_keys` table for HTTP idempotency. Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly the current schema version (7), so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
+The store uses schema version 8. It creates the schema for a new database and migrates schema 1 to 7 databases in place on startup, adding the scrubbing, lineage, publish, stacked-chain and node-failure columns (`staged_commit`, `blocked_reason`, `blocked_since`, `eligible_since`, `failure_reason`, `excluded_nodes_json`) and the additive `request_keys` table for HTTP idempotency. Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly the current schema version (8), so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
 
 There is no general online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. The exception is `POST /v1/schedule/reload`, which an operator with `schedule = true` can use to swap in the schedule from the controller config file without a restart; see [Time-aware scheduling](scheduling.md#inspecting-scheduling). For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
 
@@ -42,7 +42,7 @@ A controller of a newer release starts on the previous release's database and mi
 
 1. Take a backup with `lu backup --out <file>` (see [Backup and restore](#backup-and-restore)); the rolling-update playbook also keeps a dated copy of the database file.
 2. Stop the controller, replace the binaries, and start it. Agents of the old and the new release can stay connected throughout; see [compatibility](compatibility.md).
-3. Confirm the result with `lu status --json`: `version` is the new release and `schema_version` equals the schema the release notes name (6 for 0.6.0).
+3. Confirm the result with `lu status --json`: `version` is the new release and `schema_version` equals the schema the release notes name (8 for this release).
 
 The migration only moves forward. To go back to an older release, stop the controller and restore the backup taken in step 1 (or the dated database copy); do not start an older binary on a migrated database, which refuses a schema version it does not know.
 
@@ -131,7 +131,7 @@ systemctl start lu-controller.service
 ```
 
 `lu restore` verifies the snapshot, refuses a file that is not a Lu database (an empty or
-foreign SQLite file would replace your data with nothing), requires exactly the current schema version (7) and
+foreign SQLite file would replace your data with nothing), requires exactly the current schema version (8) and
 every table that version creates, and refuses when the database is still in use, so stop the
 controller first.
 Only one restore runs at a time. It stages the copy beside the database with the old file's
@@ -176,10 +176,11 @@ Legal state transitions and the recovery state machine are in [lifecycle.md](lif
 - Every job in `leased` or `running` becomes `recovering`. Its node and epoch are kept.
 - Jobs already in `recovering` stay there, but their grace timer is restarted. Lease and recovery timestamps are based on a monotonic clock that begins again with the process, so the old values are not meaningful after a restart.
 - An agent that still holds the lease and renews the same epoch within `recovery_grace_secs` moves the job back to `running` and continues.
-- If the grace period expires first, a node-class failure is applied. If `attempt <= max_retries`, the job returns to `queued`, the attempt is incremented, the node is cleared, and `failure_class`, `cancel_requested` and `finished_at` are cleared. Otherwise it becomes `failed` with `failure_class: "node"`.
+- If the grace period expires first, a node-class failure is applied: the lost node is added to the job's exclusions. While `attempt < min(max_retries + 1, node_attempts)`, the job returns to `queued`, the attempt is incremented, the node is cleared, and `failure_class`, `cancel_requested`, `failure_reason` and `finished_at` are cleared. Otherwise it becomes `failed` with `failure_class: "node"`. A new exclusion writes a `node_excluded` audit record with actor `maintenance`.
 - `queued`, `blocked`, `done`, `failed` and `cancelled` jobs are not changed by boot recovery.
 
-The listener stops accepting new connections on `SIGTERM` or Ctrl-C and drains in-flight connections for up to 10 seconds. The contributed unit allows 40 seconds before systemd sends `SIGKILL`.
+An excluded node is skipped for that job until an operator retries it; see
+[Node exclusions](dispatch.md#node-exclusions). The listener stops accepting new connections on `SIGTERM` or Ctrl-C and drains in-flight connections for up to 10 seconds. The contributed unit allows 40 seconds before systemd sends `SIGKILL`.
 
 If the controller is down for longer than a lease, agents cannot renew. When it returns, the same recovery path applies; a job can therefore consume a retry even though the harness itself did nothing wrong.
 

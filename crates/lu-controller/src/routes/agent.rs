@@ -977,7 +977,17 @@ pub async fn complete_job(
     let res = tokio::task::spawn_blocking({
         let store = Arc::clone(&state.store);
         let max_retries = state.max_retries;
-        move || store.complete(&completion, failure, n, max_retries, cordon_ms)
+        let node_attempts = state.node_attempts;
+        move || {
+            store.complete(
+                &completion,
+                failure,
+                n,
+                max_retries,
+                node_attempts,
+                cordon_ms,
+            )
+        }
     })
     .await;
     match res {
@@ -1007,6 +1017,9 @@ pub async fn complete_job(
             if let Some(code) = exit_code {
                 data = data.signed(Field::ExitCode, i64::from(code));
             }
+            if let Some(reason) = rec.failure_reason {
+                data = data.text(Field::Reason, reason.as_str());
+            }
             if let Some(secs) = retry_after_secs {
                 data = data.unsigned(Field::RetryAfterSecs, secs);
             }
@@ -1017,6 +1030,19 @@ pub async fn complete_job(
                 node.as_str(),
                 data,
             );
+            if rec.excluded_nodes.contains(&node) && !rec_check.excluded_nodes.contains(&node) {
+                let mut excluded = Data::new().text(Field::ExcludedNode, node.as_str());
+                if let Some(reason) = rec.failure_reason {
+                    excluded = excluded.text(Field::Reason, reason.as_str());
+                }
+                state.record_audit(
+                    Event::NodeExcluded,
+                    Some(rec.id.as_str()),
+                    Some(node.as_str()),
+                    node.as_str(),
+                    excluded,
+                );
+            }
             if let Some(provider) = cordon_provider.as_deref() {
                 state.record_audit(
                     Event::CordonSet,
@@ -1625,6 +1651,7 @@ mod cordon_tests {
             outcome,
             exit_code: None,
             summary: None,
+            failure_reason: None,
             retry_after_secs: retry,
             stuck_mode: None,
             expect_failed: false,
@@ -1741,6 +1768,8 @@ mod poll_renewal_tests {
                 started_at: Some(2),
                 finished_at: None,
                 failure_class: None,
+                failure_reason: None,
+                excluded_nodes: Vec::new(),
                 summary: None,
                 exit_code: None,
                 artifacts: Vec::new(),
@@ -1874,6 +1903,7 @@ mod poll_renewal_tests {
             _failure: Option<(lu_proto::FailureClass, Option<String>)>,
             _now: Now,
             _max_retries: u32,
+            _node_attempts: u32,
             _cordon_ms: u64,
         ) -> Result<JobRecord, StoreError> {
             unimplemented!()
@@ -1886,6 +1916,7 @@ mod poll_renewal_tests {
             _now: Now,
             _grace_ms: u64,
             _max_retries: u32,
+            _node_attempts: u32,
         ) -> Result<Vec<JobId>, StoreError> {
             unimplemented!()
         }
@@ -1951,6 +1982,7 @@ mod poll_renewal_tests {
             artifacts_dir: tmp.path().join("artifacts").display().to_string(),
             lease_secs: 6,
             max_retries: 1,
+            node_attempts: 2,
             provider_cooldown_secs: 60,
             recovery_grace_secs: 1,
             max_connections: 8,
@@ -2009,6 +2041,7 @@ mod poll_renewal_tests {
             artifacts_dir: tmp.path().join("artifacts").display().to_string(),
             lease_secs: 6,
             max_retries: 1,
+            node_attempts: 2,
             provider_cooldown_secs: 60,
             recovery_grace_secs: 1,
             max_connections: 8,

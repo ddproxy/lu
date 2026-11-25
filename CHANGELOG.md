@@ -14,6 +14,27 @@ uses semantic versioning once it reaches 1.0.
 
 - `lu submit --timeout` and `--idle-timeout` accept plain seconds or an `s`/`m`/`h` suffix; batch defaults and sidecars accept `idle_timeout`, and `lu show` prints both timeouts.
 
+### Added
+- Infrastructure faults are now recognized as node-class failures with fixed `failure_reason`
+  codes: `harness_unreachable`, `container_start`, `container_wait_timeout`,
+  `reiki_gateway_503` and `workspace_enospc`. Classifiers require explicit harness, Podman,
+  overlay-storage, Reiki-gateway or workspace-preparation markers, so ordinary task output is not
+  mistaken for a host fault.
+- `[controller] node_attempts` (default `2`, allowed `1` to `4`) caps how many different nodes a
+  job may try after node-class failures. The effective cap is `min(max_retries + 1, node_attempts)`;
+  `max_retries` stays the hard cap on retries of every class.
+- Store schema `8` adds `jobs.failure_reason` and `jobs.excluded_nodes_json`. Databases at versions
+  1 to 7 migrate forward in place; backups and restores require version `8`.
+- `JobView` exposes `failure_reason` and `excluded_nodes` when set. New exclusions write a
+  `node_excluded` audit record with the node and, for agent completions, the fixed reason code.
+
+### Changed
+- A node-class failure requeues only on a different node: the failed node is excluded from that
+  job and dispatch never assigns it again. A lease-recovery timeout excludes the lost node with
+  actor `maintenance`; an operator `lu retry` clears the reason and exclusions.
+- No automatic retry, including a provider retry, happens after a `diff.patch` has been stored or
+  cancellation requested.
+
 ## [0.7.0]
 
 ### Added

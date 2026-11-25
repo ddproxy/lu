@@ -101,6 +101,7 @@ fn a_submission_travels_as_an_assignment_and_comes_back_as_a_completion() {
         outcome: Outcome::Failed(FailureClass::Execution),
         exit_code: Some(101),
         summary: Some("harness exited non-zero".to_owned()),
+        failure_reason: None,
         retry_after_secs: None,
         expect_failed: false,
     };
@@ -312,6 +313,8 @@ fn job_and_node_views_match_the_documented_json() {
         started_at: Some(1_700_000_020),
         finished_at: None,
         failure_class: None,
+        failure_reason: None,
+        excluded_nodes: Vec::new(),
         summary: None,
         exit_code: None,
         artifacts: vec!["diff.patch".to_owned(), "run.log".to_owned()],

@@ -583,3 +583,51 @@ disagreed.
 
 The checkout's `.git` directory is root-owned and unreadable by the current uid, so no commit could
 be created. The prepared terse message is `cli: add idle timeout to batch and show`.
+
+## Node-class infrastructure requeues
+
+### Verified against the code
+
+- `lu_proto::NodeFailureReason` has five fixed wire codes. Serde needed an explicit rename for
+  `ReikiGateway503`; derived snake_case produced `reiki_gateway503`, which broke the completion
+  route for `reiki_gateway_503`. The code and its tests now agree on the wire spelling.
+- `tuishou-ting` recognizes a harness-server connection failure, Podman start/create failures,
+  the full overlay-storage wait timeout and a Reiki `503` body naming a gateway-store or
+  per-stream-counters fault from the running job. Workspace preparation and staging add
+  `workspace_enospc` only when a disk-full marker has a preparation context. Bare socket,
+  `ENOSPC` and unnamed `503` text stay unclassified.
+- `[controller] node_attempts` defaults to `2` and validates `1..=4`. The store computes
+  `min(max_retries + 1, node_attempts)`; `max_retries` remains a hard cap on all retry classes.
+  Dispatch in the SQLite transaction skips a job's stored exclusions, and `commit_dispatch`
+  rechecks them, so a node requeue cannot return to the same node.
+- `Store::complete` and `requeue_recovering` exclude the failed node, persist `failure_reason`,
+  and keep the reason on a requeued job. `lu retry` clears both. A stored `diff.patch` or a
+  cancellation request blocks automatic requeues of any class, not just node failures.
+- Audit `Data` is a strict allowlist. Only fixed reason names and node names are written; raw
+  harness text is never copied into `reason` or `excluded_node`. A completion records the node as
+  actor; recovery uses actor `maintenance`.
+- `SCHEMA_VERSION` is `8`. The forward migration adds `jobs.failure_reason` and
+  `jobs.excluded_nodes_json`, and a schema-7 probe confirms old rows keep their history.
+
+### Where the docs or request disagreed with the code
+
+- Earlier docs named schema `7` or `4`, and an older CHANGELOG entry named schema `8` while the
+  previous baseline was `7`. The current-schema statements now follow `SCHEMA_VERSION`; historical
+  release entries are left as history.
+- The canonical queued-job explanation is `JobView.waiting_reason`, not `blocked_reason`; the new
+  all-nodes-excluded message uses that field.
+- Reiki `503` is a node fault only with a named gateway body. Other `503`s are failed health reads
+  and do not stop the job as a node failure.
+- The request described a "container wait timeout"; the code matches the full
+  `/var/lib/containers/storage/overlay-containers/` path so a generic wait message in task output
+  cannot classify a node failure.
+
+### Verification
+
+- `cargo fmt --all` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` — passed.
+- `cargo test --workspace` and `cargo test --workspace --features tui` — passed.
+- `scripts/check-docs.sh` — passed.
+
+Changes remain local and uncommitted: the checkout's `.git` directory is not readable by the
+current uid, so no commit could be created. Commit messages were kept terse as requested.

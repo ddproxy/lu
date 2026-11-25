@@ -50,6 +50,7 @@ fn controller_cfg(
         artifacts_dir: artifacts.to_owned(),
         lease_secs,
         max_retries: 1,
+        node_attempts: 2,
         provider_cooldown_secs: 60,
         recovery_grace_secs,
         max_connections: 64,

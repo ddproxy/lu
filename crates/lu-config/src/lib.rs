@@ -710,6 +710,10 @@ pub struct ControllerConfig {
     pub lease_secs: u64,
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+    /// Maximum number of different nodes a job may try after node-class infrastructure
+    /// failures. Bounded also by `max_retries`.
+    #[serde(default = "default_node_attempts")]
+    pub node_attempts: u32,
     #[serde(default = "default_provider_cooldown_secs")]
     pub provider_cooldown_secs: u64,
     #[serde(default = "default_recovery_grace_secs")]
@@ -757,6 +761,14 @@ fn default_lease_secs() -> u64 {
 fn default_max_retries() -> u32 {
     1
 }
+
+/// The default maximum number of nodes tried for one job before a node failure is terminal.
+pub const DEFAULT_NODE_ATTEMPTS: u32 = 2;
+
+fn default_node_attempts() -> u32 {
+    DEFAULT_NODE_ATTEMPTS
+}
+
 fn default_provider_cooldown_secs() -> u64 {
     1800
 }
@@ -1822,6 +1834,12 @@ impl ControllerConfig {
             return invalid(
                 "[controller]",
                 format!("max_retries must be 0 to 3 (got {})", self.max_retries),
+            );
+        }
+        if !(1..=4).contains(&self.node_attempts) {
+            return invalid(
+                "[controller]",
+                format!("node_attempts must be 1 to 4 (got {})", self.node_attempts),
             );
         }
         if !(60..=86_400).contains(&self.provider_cooldown_secs) {
@@ -2924,6 +2942,7 @@ heartbeat_secs = 15
             .unwrap();
         assert_eq!(c.lease_secs, 60);
         assert_eq!(c.max_retries, 1);
+        assert_eq!(c.node_attempts, 2);
         assert_eq!(c.provider_cooldown_secs, 1800);
         assert_eq!(c.recovery_grace_secs, 30);
         assert_eq!(c.max_connections, 256);
@@ -3293,6 +3312,9 @@ heartbeat_secs = 15
             expect_table(&base("lease_secs", v), "[controller]");
         }
         expect_table(&base("max_retries", "4"), "[controller]");
+        for v in ["0", "5"] {
+            expect_table(&base("node_attempts", v), "[controller]");
+        }
         for v in ["59", "86401"] {
             expect_table(&base("provider_cooldown_secs", v), "[controller]");
         }
@@ -3308,6 +3330,8 @@ heartbeat_secs = 15
         assert!(Config::parse(&base("lease_secs", "3600")).is_ok());
         assert!(Config::parse(&base("max_retries", "0")).is_ok());
         assert!(Config::parse(&base("max_retries", "3")).is_ok());
+        assert!(Config::parse(&base("node_attempts", "1")).is_ok());
+        assert!(Config::parse(&base("node_attempts", "4")).is_ok());
         assert!(Config::parse(&base("provider_cooldown_secs", "60")).is_ok());
         assert!(Config::parse(&base("provider_cooldown_secs", "86400")).is_ok());
         assert!(Config::parse(&base("recovery_grace_secs", "0")).is_ok());

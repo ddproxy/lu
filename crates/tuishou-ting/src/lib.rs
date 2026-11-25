@@ -8,6 +8,7 @@
 mod collect;
 mod health;
 pub mod housekeeping;
+mod infra;
 mod labels;
 mod logs;
 pub mod mcp;
@@ -28,9 +29,9 @@ use lu_config::{AgentConfig, BaseSource, StackConfig, StuckPolicy as ConfigStuck
 use lu_proto::{
     effective_stuck, printable, truncate_chars, AgentEvent, ArtifactName, Completion, ExpectMode,
     ExpectSpec, FailureClass, HarnessState, Heartbeat, HostStats, JobId, JobSpec, JobStats,
-    NodeName, OnConflict, Outcome, ProviderModel, ProviderState, ProviderStatus, StuckPolicy,
-    WorkspacePolicy, HARNESS_OK_FALSE, MAX_DIFF_BYTES, MAX_NODE_LABELS, MAX_SUMMARY_BYTES,
-    MAX_TAINTS,
+    NodeFailureReason, NodeName, OnConflict, Outcome, ProviderModel, ProviderState, ProviderStatus,
+    StuckPolicy, WorkspacePolicy, HARNESS_OK_FALSE, MAX_DIFF_BYTES, MAX_NODE_LABELS,
+    MAX_SUMMARY_BYTES, MAX_TAINTS,
 };
 use lu_staging::{
     ApplyError, ConflictPolicy, ExportedDiff, Source, StackPolicy, StageRequest, StagedDir, Staging,
@@ -133,6 +134,8 @@ enum JobEnd {
     Stale,
     /// The harness went silent after a provider-unavailable marker.
     Provider,
+    /// The node itself reported an infrastructure fault while the harness ran.
+    Infra { reason: NodeFailureReason },
     /// The stuck watcher stopped the harness under this policy.
     Stuck { policy: StuckPolicy, secs: u64 },
     /// Shutdown arrived while the job was running.
@@ -571,6 +574,7 @@ impl Agent {
                                     | JobEnd::Cancelled
                                     | JobEnd::Stale
                                     | JobEnd::Provider
+                                    | JobEnd::Infra { .. }
                                     | JobEnd::Stuck { .. } => this.housekeep(false),
                                 }
                             }
@@ -897,9 +901,14 @@ impl Agent {
             Ok(staged) => staged,
             Err(error) => {
                 let summary = format!("staging failed: {error}");
-                let class = pre_verdict_class(PreVerdict::Stage(&summary));
-                self.complete_failure(&job_id, epoch, &summary, class, &workspace)
-                    .await?;
+                self.complete_pre_verdict(
+                    &job_id,
+                    epoch,
+                    &summary,
+                    PreVerdict::Stage(&summary),
+                    &workspace,
+                )
+                .await?;
                 return Ok(JobEnd::Finished);
             }
         };
@@ -943,11 +952,11 @@ impl Agent {
 
         if let Err(error) = self.workspaces.create_cache_dirs(&job_id, &spec.cache_dirs) {
             let summary = format!("workspace cache directories failed: {error}");
-            self.complete_failure(
+            self.complete_pre_verdict(
                 &job_id,
                 epoch,
                 &summary,
-                pre_verdict_class(PreVerdict::Prepare),
+                PreVerdict::Prepare(&summary),
                 &workspace,
             )
             .await?;
@@ -1014,6 +1023,7 @@ impl Agent {
                         outcome: Outcome::Failed(FailureClass::Conflict),
                         exit_code: None,
                         summary,
+                        failure_reason: None,
                         cancelled: false,
                         stuck_mode: None,
                         retry_after_secs: None,
@@ -1035,11 +1045,11 @@ impl Agent {
             Err(AgentError::Forbidden) => return Err(AgentError::Forbidden),
             Err(error) => {
                 let summary = format!("input collection failed: {error}");
-                self.complete_failure(
+                self.complete_pre_verdict(
                     &job_id,
                     epoch,
                     &summary,
-                    pre_verdict_class(PreVerdict::Prepare),
+                    PreVerdict::Prepare(&summary),
                     &workspace,
                 )
                 .await?;
@@ -1048,11 +1058,11 @@ impl Agent {
         }
         if let Err(error) = collect::write_context(&spec, &staged) {
             let summary = format!("context file failed: {error}");
-            self.complete_failure(
+            self.complete_pre_verdict(
                 &job_id,
                 epoch,
                 &summary,
-                pre_verdict_class(PreVerdict::Prepare),
+                PreVerdict::Prepare(&summary),
                 &workspace,
             )
             .await?;
@@ -1062,11 +1072,11 @@ impl Agent {
         if let Some(gid) = self.workspace_gid {
             if let Err(error) = self.staging.share_with_group(&staged, gid) {
                 let summary = format!("could not share the workspace with its group: {error}");
-                self.complete_failure(
+                self.complete_pre_verdict(
                     &job_id,
                     epoch,
                     &summary,
-                    pre_verdict_class(PreVerdict::Prepare),
+                    PreVerdict::Prepare(&summary),
                     &workspace,
                 )
                 .await?;
@@ -1088,11 +1098,11 @@ impl Agent {
         });
         if let Err(error) = written {
             let summary = format!("could not write the task file: {error}");
-            self.complete_failure(
+            self.complete_pre_verdict(
                 &job_id,
                 epoch,
                 &summary,
-                pre_verdict_class(PreVerdict::Prepare),
+                PreVerdict::Prepare(&summary),
                 &workspace,
             )
             .await?;
@@ -1169,6 +1179,7 @@ impl Agent {
                 outcome: Outcome::Failed(FailureClass::Execution),
                 exit_code: None,
                 summary,
+                failure_reason: None,
                 cancelled: false,
                 stuck_mode: None,
                 retry_after_secs: None,
@@ -1223,6 +1234,7 @@ impl Agent {
                     outcome: Outcome::Failed(FailureClass::Execution),
                     exit_code: None,
                     summary,
+                    failure_reason: None,
                     cancelled: false,
                     stuck_mode: None,
                     retry_after_secs: None,
@@ -1303,10 +1315,15 @@ impl Agent {
         let mut watch = tokio::time::interval(self.reiki_watch_period);
         watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         watch.tick().await;
-        let mut seen_seq = health::snapshot(&self.health).seq;
+        let first_health = health::snapshot(&self.health);
+        let mut seen_seq = first_health.seq;
         let mut unavailable_reads = 0u32;
         let mut reiki_reason: Option<String> = None;
         let mut reiki_retry_after: Option<u64> = None;
+        if first_health.infra_reason.is_some() {
+            // Force the first watch tick to re-read a fault reported before this job started.
+            seen_seq = first_health.seq.saturating_sub(1);
+        }
 
         loop {
             tokio::select! {
@@ -1396,32 +1413,39 @@ impl Agent {
                         None => break,
                     }
                 }
-                _ = watch.tick(), if provider.is_some() => {
+                _ = watch.tick() => {
                     let current = health::snapshot(&self.health);
                     if current.seq != seen_seq {
                         seen_seq = current.seq;
-                        let wanted = provider.as_deref().unwrap_or_default();
-                        let status = current.providers.iter().find(|p| p.name == wanted);
-                        match status {
-                            Some(p) if matches!(p.state, ProviderState::Cooling | ProviderState::Disabled) => {
-                                unavailable_reads += 1;
-                                if unavailable_reads >= REIKI_UNAVAILABLE_READS {
-                                    reiki_retry_after = p
-                                        .soonest_secs
-                                        .map(|secs| secs.saturating_add(COOLDOWN_BUFFER_SECS));
-                                    reiki_reason = Some(match p.soonest_secs {
-                                        Some(secs) => format!(
-                                            "Reiki reports provider {wanted} has no usable key; the soonest returns in {secs}s"
-                                        ),
-                                        None => format!("Reiki reports provider {wanted} has no usable key"),
-                                    });
-                                    info!(job = %job_id, provider = %wanted, "Reiki reports no usable key; stopping");
-                                    running.stop();
-                                    end = JobEnd::Provider;
-                                    break;
+                        if let Some(reason) = current.infra_reason {
+                            info!(job = %job_id, reason = reason.as_str(), "Reiki gateway fault; stopping");
+                            running.stop();
+                            end = JobEnd::Infra { reason };
+                            break;
+                        }
+                        if let Some(wanted) = provider.as_deref() {
+                            let status = current.providers.iter().find(|p| p.name == wanted);
+                            match status {
+                                Some(p) if matches!(p.state, ProviderState::Cooling | ProviderState::Disabled) => {
+                                    unavailable_reads += 1;
+                                    if unavailable_reads >= REIKI_UNAVAILABLE_READS {
+                                        reiki_retry_after = p
+                                            .soonest_secs
+                                            .map(|secs| secs.saturating_add(COOLDOWN_BUFFER_SECS));
+                                        reiki_reason = Some(match p.soonest_secs {
+                                            Some(secs) => format!(
+                                                "Reiki reports provider {wanted} has no usable key; the soonest returns in {secs}s"
+                                            ),
+                                            None => format!("Reiki reports provider {wanted} has no usable key"),
+                                        });
+                                        info!(job = %job_id, provider = %wanted, "Reiki reports no usable key; stopping");
+                                        running.stop();
+                                        end = JobEnd::Provider;
+                                        break;
+                                    }
                                 }
+                                _ => unavailable_reads = 0,
                             }
-                            _ => unavailable_reads = 0,
                         }
                     }
                 }
@@ -1450,6 +1474,7 @@ impl Agent {
                     outcome: Outcome::Cancelled,
                     exit_code: None,
                     summary: Some(summarise("cancelled by the controller")),
+                    failure_reason: None,
                     retry_after_secs: None,
                     stuck_mode: None,
                     expect_failed: false,
@@ -1476,7 +1501,7 @@ impl Agent {
                     .await;
                 return Ok(JobEnd::Shutdown);
             }
-            JobEnd::Finished | JobEnd::Provider | JobEnd::Stuck { .. } => {}
+            JobEnd::Finished | JobEnd::Provider | JobEnd::Infra { .. } | JobEnd::Stuck { .. } => {}
         }
 
         if let Ok(Ok(LogUpload {
@@ -1512,9 +1537,32 @@ impl Agent {
                 outcome: Outcome::Failed(FailureClass::Provider),
                 exit_code: None,
                 summary,
+                failure_reason: None,
                 cancelled: false,
                 stuck_mode: None,
                 retry_after_secs: reiki_retry_after,
+                applied_inputs: &applied,
+            })
+            .await?;
+            return Ok(JobEnd::Finished);
+        }
+
+        if let JobEnd::Infra { reason } = end {
+            self.finish(&Finish {
+                job_id: &job_id,
+                epoch,
+                spec: &spec,
+                model: model.as_deref(),
+                staged: &staged,
+                workspace: &workspace,
+                started,
+                outcome: Outcome::Failed(FailureClass::Node),
+                exit_code: None,
+                summary: format!("node infrastructure failure: {}", reason.as_str()),
+                failure_reason: Some(reason),
+                cancelled: false,
+                stuck_mode: None,
+                retry_after_secs: None,
                 applied_inputs: &applied,
             })
             .await?;
@@ -1537,6 +1585,7 @@ impl Agent {
                 outcome: Outcome::Failed(class),
                 exit_code: None,
                 summary: format!("stuck for {secs}s, stopped"),
+                failure_reason: None,
                 cancelled: false,
                 retry_after_secs: None,
                 stuck_mode: Some(policy),
@@ -1552,7 +1601,7 @@ impl Agent {
         if crashed {
             self.harness_ok.store(false, Ordering::SeqCst);
         }
-        let (outcome, exit_code, reason) = classify(outcome, &text, elapsed);
+        let (outcome, exit_code, detect_reason, reason) = classify(outcome, &text, elapsed);
         if outcome == Outcome::Done {
             self.harness_ok.store(true, Ordering::SeqCst);
         }
@@ -1571,6 +1620,7 @@ impl Agent {
             outcome,
             exit_code,
             summary,
+            failure_reason: detect_reason,
             cancelled: false,
             stuck_mode: None,
             retry_after_secs: None,
@@ -1597,6 +1647,19 @@ impl Agent {
         class: FailureClass,
         workspace: &WorkspaceFinish<'_>,
     ) -> Result<(), AgentError> {
+        self.complete_failure_with_reason(job_id, epoch, summary, class, None, workspace)
+            .await
+    }
+
+    async fn complete_failure_with_reason(
+        &self,
+        job_id: &JobId,
+        epoch: u64,
+        summary: &str,
+        class: FailureClass,
+        failure_reason: Option<NodeFailureReason>,
+        workspace: &WorkspaceFinish<'_>,
+    ) -> Result<(), AgentError> {
         workspace.complete(Outcome::Failed(class));
         let completion = Completion {
             job_id: job_id.clone(),
@@ -1604,6 +1667,7 @@ impl Agent {
             outcome: Outcome::Failed(class),
             exit_code: None,
             summary: Some(summarise(summary)),
+            failure_reason,
             retry_after_secs: None,
             stuck_mode: None,
             expect_failed: false,
@@ -1624,6 +1688,22 @@ impl Agent {
         };
         self.release_pending();
         result
+    }
+
+    /// Completes a failure that happened before the harness produced a verdict, carrying the
+    /// machine-readable reason when the node's filesystem or container runtime caused it.
+    async fn complete_pre_verdict(
+        &self,
+        job_id: &JobId,
+        epoch: u64,
+        summary: &str,
+        fault: PreVerdict<'_>,
+        workspace: &WorkspaceFinish<'_>,
+    ) -> Result<(), AgentError> {
+        let class = pre_verdict_class(fault);
+        let reason = pre_verdict_reason(fault);
+        self.complete_failure_with_reason(job_id, epoch, summary, class, reason, workspace)
+            .await
     }
 
     async fn apply_dependencies(
@@ -1796,6 +1876,7 @@ impl Agent {
             outcome,
             exit_code: finish.exit_code,
             summary: Some(summarise(&summary)),
+            failure_reason: finish.failure_reason,
             retry_after_secs: finish.retry_after_secs,
             stuck_mode: finish.stuck_mode,
             expect_failed,
@@ -1852,6 +1933,7 @@ struct Finish<'a> {
     outcome: Outcome,
     exit_code: Option<i32>,
     summary: String,
+    failure_reason: Option<NodeFailureReason>,
     cancelled: bool,
     retry_after_secs: Option<u64>,
     stuck_mode: Option<StuckPolicy>,
@@ -2498,12 +2580,27 @@ fn crash_banner(text: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-/// Maps a supervisor outcome to the wire outcome, an exit code, and a fallback summary.
+/// Maps a supervisor outcome to the wire outcome, exit code, node reason and fallback summary.
 fn classify(
     outcome: SuperviseOutcome,
     tail: &str,
     elapsed: Duration,
-) -> (Outcome, Option<i32>, String) {
+) -> (Outcome, Option<i32>, Option<NodeFailureReason>, String) {
+    let failed = !matches!(outcome, SuperviseOutcome::Exited(0));
+    if failed {
+        if let Some(reason) = infra::classify_tail(tail) {
+            let exit_code = match outcome {
+                SuperviseOutcome::Exited(code) => Some(code),
+                _ => None,
+            };
+            return (
+                Outcome::Failed(FailureClass::Node),
+                exit_code,
+                Some(reason),
+                format!("node infrastructure failure: {}", reason.as_str()),
+            );
+        }
+    }
     if harness_crash(&outcome, tail, elapsed) {
         let exit_code = match outcome {
             SuperviseOutcome::Exited(code) => Some(code),
@@ -2517,67 +2614,85 @@ fn classify(
         return (
             Outcome::Failed(FailureClass::Node),
             exit_code,
+            None,
             format!("harness crashed at launch: {line}"),
         );
     }
-    match outcome {
-        SuperviseOutcome::Exited(0) => {
-            (Outcome::Done, Some(0), "harness exited cleanly".to_owned())
-        }
+    let (wire, code, reason, summary) = match outcome {
+        SuperviseOutcome::Exited(0) => (
+            Outcome::Done,
+            Some(0),
+            None,
+            "harness exited cleanly".to_owned(),
+        ),
         SuperviseOutcome::Exited(code) if provider_marker(tail) => (
             Outcome::Failed(FailureClass::Provider),
             Some(code),
+            None,
             format!("provider unavailable (exit {code})"),
         ),
         SuperviseOutcome::Exited(code) => (
             Outcome::Failed(FailureClass::Execution),
             Some(code),
+            None,
             format!("harness exited with {code}"),
         ),
         SuperviseOutcome::Signalled(signal) => (
             Outcome::Failed(FailureClass::Execution),
+            None,
             None,
             format!("harness was killed by signal {signal}"),
         ),
         SuperviseOutcome::WallTimeout => (
             Outcome::Failed(FailureClass::Execution),
             None,
+            None,
             "harness exceeded its wall-clock timeout".to_owned(),
         ),
         SuperviseOutcome::IdleTimeout => (
             Outcome::Failed(FailureClass::Execution),
+            None,
             None,
             "harness produced no output before its idle timeout".to_owned(),
         ),
         SuperviseOutcome::OutputLimit => (
             Outcome::Failed(FailureClass::Execution),
             None,
+            None,
             "harness produced more output than the agent accepts".to_owned(),
         ),
         SuperviseOutcome::Stopped => (
             Outcome::Failed(FailureClass::Execution),
             None,
+            None,
             "harness was stopped".to_owned(),
         ),
-        SuperviseOutcome::SpawnFailed(message) => (
-            Outcome::Failed(pre_verdict_class(PreVerdict::Spawn)),
-            None,
-            format!(
-                "harness could not be started: {}",
-                truncate_chars(&printable(&message), 300)
-            ),
-        ),
-    }
+        SuperviseOutcome::SpawnFailed(message) => {
+            let text = message.to_owned();
+            let reason = infra::classify_tail(&text);
+            (
+                Outcome::Failed(pre_verdict_class(PreVerdict::Spawn)),
+                None,
+                reason,
+                format!(
+                    "harness could not be started: {}",
+                    truncate_chars(&printable(&text), 300)
+                ),
+            )
+        }
+    };
+    (wire, code, reason, summary)
 }
 
 /// Why a job stopped before the harness produced a verdict, for one retry-class table.
+#[derive(Clone, Copy)]
 enum PreVerdict<'a> {
     /// The supervisor could not start the harness process at all.
     Spawn,
     /// Staging the checkout failed, with this message (a prefix the caller adds is harmless).
     Stage(&'a str),
-    /// The staged tree could not be prepared for the harness (share with the group, task file).
-    Prepare,
+    /// The staged tree could not be prepared for the harness, with this message.
+    Prepare(&'a str),
 }
 
 /// The class for a job that stopped before the harness ran. A node failure is retried on
@@ -2590,9 +2705,23 @@ enum PreVerdict<'a> {
 /// | A staging error that names a missing ref, an authentication failure or an unknown repository | `Execution` |
 fn pre_verdict_class(fault: PreVerdict<'_>) -> FailureClass {
     match fault {
-        PreVerdict::Spawn | PreVerdict::Prepare => FailureClass::Node,
+        PreVerdict::Spawn | PreVerdict::Prepare(_) => FailureClass::Node,
         PreVerdict::Stage(message) if stage_names_task_fault(message) => FailureClass::Execution,
         PreVerdict::Stage(_) => FailureClass::Node,
+    }
+}
+
+/// The node reason for a pre-verdict failure. Only explicit ENOSPC during staging or workspace
+/// preparation is named; other staging errors keep the class but carry no reason.
+fn pre_verdict_reason(fault: PreVerdict<'_>) -> Option<NodeFailureReason> {
+    match fault {
+        PreVerdict::Spawn => None,
+        PreVerdict::Stage(message) | PreVerdict::Prepare(message)
+            if infra::workspace_enospc(message) =>
+        {
+            Some(NodeFailureReason::WorkspaceEnospc)
+        }
+        PreVerdict::Stage(_) | PreVerdict::Prepare(_) => None,
     }
 }
 
@@ -2873,7 +3002,10 @@ mod pre_verdict_tests {
     #[test]
     fn spawn_and_prepare_rows_pick_node() {
         assert_eq!(pre_verdict_class(PreVerdict::Spawn), FailureClass::Node);
-        assert_eq!(pre_verdict_class(PreVerdict::Prepare), FailureClass::Node);
+        assert_eq!(
+            pre_verdict_class(PreVerdict::Prepare("workspace")),
+            FailureClass::Node
+        );
     }
 
     #[test]

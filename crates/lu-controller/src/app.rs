@@ -336,16 +336,51 @@ pub async fn maintenance_tick(state: &Arc<AppState>) {
         let store = Arc::clone(&state.store);
         let grace = state.recovery_grace_ms;
         let max = state.max_retries;
-        move || store.requeue_recovering(n2, grace, max)
+        let node_attempts = state.node_attempts;
+        move || {
+            let before = store
+                .list_jobs(Some(lu_proto::JobState::Recovering), 10_000, None)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|rec| (rec.id, rec.excluded_nodes))
+                .collect::<Vec<_>>();
+            let moved = store.requeue_recovering(n2, grace, max, node_attempts)?;
+            let mut excluded = Vec::new();
+            for id in &moved {
+                if let Ok(rec) = store.get_job(id) {
+                    let prior = before
+                        .iter()
+                        .find(|(prior_id, _)| prior_id == id)
+                        .map(|(_, nodes)| nodes);
+                    for node in rec
+                        .excluded_nodes
+                        .into_iter()
+                        .filter(|node| prior.is_none_or(|nodes| !nodes.contains(node)))
+                    {
+                        excluded.push((id.clone(), node));
+                    }
+                }
+            }
+            Result::<_, lu_store::StoreError>::Ok((moved, excluded))
+        }
     })
     .await;
     match requeued {
-        Ok(Ok(v)) => {
+        Ok(Ok((v, excluded))) => {
             if !v.is_empty() {
                 changed = true;
                 for id in &v {
                     state.waiters.notify_job(id.as_ref());
                 }
+            }
+            for (id, node) in excluded {
+                state.record_audit(
+                    lu_audit::Event::NodeExcluded,
+                    Some(id.as_str()),
+                    Some(node.as_str()),
+                    "maintenance",
+                    lu_audit::Data::new().text(lu_audit::Field::ExcludedNode, node.as_str()),
+                );
             }
         }
         Ok(Err(e)) => tracing::warn!(?e, "requeue_recovering failed"),
@@ -504,6 +539,7 @@ mod tests {
             _: Option<(FailureClass, Option<String>)>,
             _: Now,
             _: u32,
+            _: u32,
             _: u64,
         ) -> Result<JobRecord, StoreError> {
             unimplemented!()
@@ -511,7 +547,13 @@ mod tests {
         fn expire_leases(&self, _: Now) -> Result<Vec<JobId>, StoreError> {
             unimplemented!()
         }
-        fn requeue_recovering(&self, _: Now, _: u64, _: u32) -> Result<Vec<JobId>, StoreError> {
+        fn requeue_recovering(
+            &self,
+            _: Now,
+            _: u64,
+            _: u32,
+            _: u32,
+        ) -> Result<Vec<JobId>, StoreError> {
             unimplemented!()
         }
         fn recover_on_boot(&self, _: Now) -> Result<u64, StoreError> {
@@ -563,6 +605,7 @@ mod tests {
             artifacts_dir: tmp.path().join("artifacts").display().to_string(),
             lease_secs: 6,
             max_retries: 1,
+            node_attempts: 2,
             provider_cooldown_secs: 60,
             recovery_grace_secs: 1,
             max_connections: 8,

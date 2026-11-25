@@ -21,7 +21,7 @@ pub mod version;
 pub mod view;
 
 pub use event::{AgentEvent, Completion, CompletionError, LogChunk, LogChunkError, Outcome};
-pub use failure::{FailureClass, ParseFailureClassError};
+pub use failure::{FailureClass, NodeFailureReason, ParseFailureClassError};
 pub use ids::{JobId, JobIdError, NodeName, NodeNameError};
 pub use label::{valid_label, HARNESS_OK_FALSE, LABEL_SOURCE_PROBED};
 pub use limits::{

@@ -156,7 +156,8 @@ Two detectors can stop a running job:
 | Reiki health | Two consecutive fresh readings from the local Reiki show the job's provider `cooling` or `disabled`. The watch ticks every 5 seconds but counts only new health snapshots, which refresh every 10 seconds. | Job completes as `Failed(Provider)` with a summary naming the provider and the soonest return time. With a reported time, the cordon uses it plus a 60-second buffer; otherwise `provider_cooldown_secs` applies. |
 | Harness output | The newest line matches an opencode "every key in this stream's chain is unavailable", quota, `HTTP 429` or rate-limit message, and the harness then produces no output for 120 seconds. Any other output disarms the watch. | Job completes as `Failed(Provider)` with a summary naming the marker. The cordon uses `provider_cooldown_secs`. |
 
-Provider failures requeue while `attempt <= 100`; `max_retries` is not consulted. While attempts
+Provider failures requeue while `attempt <= 100`; `max_retries` is not consulted. A stored
+`diff.patch` or a cancellation request blocks this automatic requeue too. While attempts
 remain, `lu show` can therefore show a queued job that still carries the failure:
 
 ```text

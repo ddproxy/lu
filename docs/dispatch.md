@@ -44,6 +44,22 @@ A cordon is a `(node, provider)` block. Dispatch skips that pair on that node, s
 
 `lu nodes` shows cordoned providers in the `CORDONS` column as `!provider`; `lu top` marks the provider chip with `!` and a `~` suffix for Reiki-derived cordons, then lists both kinds with their reason and remaining time or lift count. `lu node <name>` prints the same details with the age of each cordon. An operator can clear a cordon early with `lu uncordon <node> [<provider>]`, which calls `POST /v1/nodes/{name}/uncordon`; omitting the provider clears every cordon on that node. Boot still clears all stored cordons, so a controller restart never blocks dispatch with stale deadlines.
 
+## Node exclusions
+
+A node-class failure adds the reporting node to that job's `excluded_nodes` list. Dispatch never
+assigns a queued job to a node on its own exclusion list, so a node requeue always tries a
+different machine. Recovery timeouts exclude the lost node the same way. The maximum number of
+nodes a job may try is `min(max_retries + 1, node_attempts)` from `[controller]`; `node_attempts`
+defaults to 2 and is allowed from 1 to 4. When the budget is spent, or when every eligible node is
+excluded, the job stops retrying; a queued job in the latter case reports
+`waiting_reason: "all eligible nodes are excluded for this job"`.
+
+Exclusions are per job and are shown in job views and audit records; they are not global cordons
+and have no separate clear command. An operator `lu retry` clears the reason and the list so the
+job may run again on any eligible node. A stored `diff.patch` or a cancellation request blocks
+automatic requeues before any node is excluded. See
+[lifecycle.md](lifecycle.md#node-infrastructure-failures) for the recognized reasons.
+
 ## Taints and tolerations
 
 A node can refuse work unless a job opts in. An agent lists up to 8 opaque taints in `[agent].taints`; a job names up to 8 with `--tolerate`. Dispatch gives a job only to a node whose every taint the job tolerates, so a node reserved for one kind of work never receives anything else. A taint is compared exactly and never interpreted. `lu nodes` shows taints first with a `!` prefix.
