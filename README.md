@@ -8,7 +8,7 @@ A job queue and dispatcher for finite coding-agent work against git repositories
 [![Release](https://img.shields.io/github/v/release/ddproxy/tuishou-lu)](https://github.com/ddproxy/tuishou-lu/releases/latest)
 [![License: MIT](https://img.shields.io/github/license/ddproxy/tuishou-lu)](LICENSE)
 
-Status: stable — 0.7.0, store schema 8. Controllers and agents of adjacent releases interoperate;
+Status: stable — 0.8.0, store schema 8. Controllers and agents of adjacent releases interoperate;
 the wire rules are in [Compatibility](docs/compatibility.md).
 
 ## What and why
@@ -365,7 +365,7 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 Download the archive, its `.sha256` file and the CycloneDX SBOM from the release, then:
 
 ```sh
-tag=v0.7.0
+tag=v0.8.0
 target=x86_64-unknown-linux-musl
 asset="lu-${tag}-${target}.tar.gz"
 
@@ -375,7 +375,7 @@ gh attestation verify "$asset" --repo ddproxy/tuishou-lu
 
 ## Compatibility matrix
 
-Last checked with release 0.7.0, Rust 1.99 and store schema 8.
+Last checked with release 0.8.0, Rust 1.99 and store schema 8.
 
 | Area | Checked against | Notes |
 | --- | --- | --- |
