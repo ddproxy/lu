@@ -58,6 +58,25 @@ const MAX_GROUP_RUNNING: usize = 64;
 pub const MAX_GATEWAY_FAULT_MARKERS: usize = 16;
 pub const MAX_GATEWAY_FAULT_MARKER_BYTES: usize = 64;
 
+/// Limits for named harness command profiles. The built-in `opencode` profile counts towards
+/// the profile limit; field-level overrides do not create a second profile.
+const MAX_HARNESS_PROFILES: usize = 16;
+const MAX_HARNESS_ARGV: usize = 64;
+const MAX_HARNESS_ARGV_BYTES: usize = 16 * 1024;
+const MAX_HARNESS_ARG_BYTES: usize = 4096;
+const MAX_HARNESS_FRAGMENT: usize = 16;
+const MAX_HARNESS_MESSAGE_BYTES: usize = 4096;
+const MAX_HARNESS_ENV: usize = 32;
+const MAX_HARNESS_SECRET_ENV: usize = 8;
+const MAX_HARNESS_MARKERS: usize = 16;
+const MAX_HARNESS_MARKER_BYTES: usize = 64;
+const MAX_HARNESS_SERVER_BYTES: usize = 2048;
+const MAX_HARNESS_RESULT_FILE_BYTES: usize = 4096;
+
+/// Environment names a harness profile may never copy from the agent process. Controller
+/// credentials are supplied outside the harness child and are never injected into it.
+const CONTROLLER_CREDENTIAL_ENV: [&str; 4] = ["LU_URL", "LU_TOKEN", "LU_TOKEN_FILE", "LU_CA_FILE"];
+
 const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
 
 const MIN_STUCK_AFTER_SECS: u64 = 60;
@@ -926,6 +945,175 @@ pub struct ProviderModelConfig {
     pub model: String,
 }
 
+/// How a harness receives the job's task text on stdin.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HarnessStdin {
+    /// The child gets no input, as in earlier releases.
+    #[default]
+    Null,
+    /// Write the task text to the child's stdin, then close the pipe.
+    Task,
+}
+
+/// One named harness command profile. Fields are optional so an operator can override individual
+/// fields of the built-in `opencode` profile. Profiles with any other name must set `argv` and
+/// `message`; validation checks the merged result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessProfileConfig {
+    #[serde(default)]
+    pub argv: Option<Vec<String>>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub wrapper: Option<Vec<String>>,
+    #[serde(default)]
+    pub model_args: Option<Vec<String>>,
+    #[serde(default)]
+    pub provider_args: Option<Vec<String>>,
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default)]
+    pub server_args: Option<Vec<String>>,
+    #[serde(default)]
+    pub env: Option<Vec<String>>,
+    #[serde(default)]
+    pub secret_env: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub stdin: Option<HarnessStdin>,
+    #[serde(default)]
+    pub result_file: Option<String>,
+    #[serde(default)]
+    pub provider_markers: Option<Vec<String>>,
+    #[serde(default)]
+    pub needs_input_markers: Option<Vec<String>>,
+}
+
+/// A profile after built-in defaults and operator overrides have been applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedHarnessProfile {
+    pub name: String,
+    pub argv: Vec<String>,
+    pub message: String,
+    pub wrapper: Vec<String>,
+    pub model_args: Vec<String>,
+    pub provider_args: Vec<String>,
+    pub server: Option<String>,
+    pub server_args: Vec<String>,
+    pub env: Vec<String>,
+    pub secret_env: BTreeMap<String, String>,
+    pub stdin: HarnessStdin,
+    pub result_file: Option<String>,
+    pub provider_markers: Vec<String>,
+    pub needs_input_markers: Vec<String>,
+}
+
+/// The compiled-in profile keeps the command line used before profiles existed. It holds no
+/// credential path and no server endpoint; both are operator overrides in the same table.
+fn builtin_opencode_profile() -> HarnessProfileConfig {
+    HarnessProfileConfig {
+        argv: Some(vec![
+            "opencode".to_owned(),
+            "run".to_owned(),
+            "{server_args}".to_owned(),
+            "--auto".to_owned(),
+            "{model_args}".to_owned(),
+            "-f".to_owned(),
+            "{task_file}".to_owned(),
+            "{message}".to_owned(),
+        ]),
+        message: Some("Follow the task in the provided file.{context_warning}".to_owned()),
+        wrapper: Some(Vec::new()),
+        model_args: Some(vec!["-m".to_owned(), "{model}".to_owned()]),
+        provider_args: Some(Vec::new()),
+        server: None,
+        server_args: Some(vec!["--server".to_owned(), "{server}".to_owned()]),
+        env: Some(Vec::new()),
+        secret_env: Some(BTreeMap::new()),
+        stdin: Some(HarnessStdin::Null),
+        result_file: None,
+        provider_markers: Some(vec![
+            "every key in this stream's chain is unavailable".to_owned(),
+            "quota".to_owned(),
+            "http 429".to_owned(),
+            "429 too many requests".to_owned(),
+            "rate limit".to_owned(),
+        ]),
+        needs_input_markers: Some(Vec::new()),
+    }
+}
+
+fn merge_harness_profile(
+    name: &str,
+    override_profile: &HarnessProfileConfig,
+) -> ResolvedHarnessProfile {
+    let builtin = if name == "opencode" {
+        builtin_opencode_profile()
+    } else {
+        HarnessProfileConfig::default()
+    };
+    let argv = override_profile
+        .argv
+        .clone()
+        .or(builtin.argv)
+        .unwrap_or_default();
+    let message = override_profile
+        .message
+        .clone()
+        .or(builtin.message)
+        .unwrap_or_default();
+    let server = override_profile.server.clone().or(builtin.server);
+    ResolvedHarnessProfile {
+        name: name.to_owned(),
+        argv,
+        message,
+        wrapper: override_profile
+            .wrapper
+            .clone()
+            .or(builtin.wrapper)
+            .unwrap_or_default(),
+        model_args: override_profile
+            .model_args
+            .clone()
+            .or(builtin.model_args)
+            .unwrap_or_default(),
+        provider_args: override_profile
+            .provider_args
+            .clone()
+            .or(builtin.provider_args)
+            .unwrap_or_default(),
+        server,
+        server_args: override_profile
+            .server_args
+            .clone()
+            .or(builtin.server_args)
+            .unwrap_or_default(),
+        env: override_profile
+            .env
+            .clone()
+            .or(builtin.env)
+            .unwrap_or_default(),
+        secret_env: override_profile
+            .secret_env
+            .clone()
+            .or(builtin.secret_env)
+            .unwrap_or_default(),
+        stdin: override_profile.stdin.or(builtin.stdin).unwrap_or_default(),
+        result_file: override_profile.result_file.clone().or(builtin.result_file),
+        provider_markers: override_profile
+            .provider_markers
+            .clone()
+            .or(builtin.provider_markers)
+            .unwrap_or_default(),
+        needs_input_markers: override_profile
+            .needs_input_markers
+            .clone()
+            .or(builtin.needs_input_markers)
+            .unwrap_or_default(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -934,11 +1122,17 @@ pub struct AgentConfig {
     pub token_file: String,
     pub ca_file: Option<String>,
     pub work_dir: String,
+    /// Parse-only compatibility alias. It has no execution meaning: the job spec's `harness`
+    /// selects a profile. Kept for one release so mixed-version nodes can share a config file.
+    #[serde(default)]
     pub harness: String,
     /// How to obtain a job's base tree. Defaults to `auto`.
     #[serde(default)]
     pub base_source: BaseSource,
-    pub opencode_server: Option<String>,
+    /// Named harness command profiles. The built-in `opencode` profile is always available;
+    /// an entry with that name overrides individual fields.
+    #[serde(default)]
+    pub harness_profiles: BTreeMap<String, HarnessProfileConfig>,
     /// A group (name or number) given write access to each job's working tree, for a harness
     /// that runs as another account, such as a container. Never covers `.git`.
     pub workspace_group: Option<String>,
@@ -956,15 +1150,6 @@ pub struct AgentConfig {
     /// nothing about who is on the other end; by default the agent refuses the job instead.
     #[serde(default)]
     pub allow_shared_uid_scope: bool,
-    /// A private file holding the opencode server's password, passed to the harness as
-    /// `OPENCODE_SERVER_PASSWORD`. The same rules as `token_file`: a regular file owned by the
-    /// agent's account with no group or other access.
-    pub opencode_password_file: Option<String>,
-    /// A command that wraps the harness, such as `["podman", "exec", "-i", "--workdir", "{cwd}",
-    /// "--env", "OPENCODE_SERVER_PASSWORD", "opencode-agent"]`, so it runs inside a container.
-    /// `{cwd}` becomes the job's working tree. Empty runs the harness directly.
-    #[serde(default)]
-    pub harness_wrapper: Vec<String>,
     #[serde(default = "default_heartbeat_secs")]
     pub heartbeat_secs: u64,
     /// Default for jobs that do not set `on_stuck`.
@@ -2020,34 +2205,7 @@ impl AgentConfig {
             validate_abs_no_dotdot("[agent]", "ca_file", ca)?;
         }
         validate_abs_no_dotdot("[agent]", "work_dir", &self.work_dir)?;
-        if self.harness.is_empty() {
-            return invalid("[agent]", "harness must not be empty".to_owned());
-        }
-        if let Some(s) = &self.opencode_server {
-            if s.is_empty() {
-                return invalid("[agent]", "opencode_server must not be empty".to_owned());
-            }
-        }
-        if let Some(file) = &self.opencode_password_file {
-            if file.is_empty() {
-                return invalid(
-                    "[agent]",
-                    "opencode_password_file must not be empty".to_owned(),
-                );
-            }
-            validate_abs_no_dotdot("[agent]", "opencode_password_file", file)?;
-        }
-        if self
-            .harness_wrapper
-            .iter()
-            .any(|a| a.is_empty() || a.chars().any(char::is_control))
-        {
-            return invalid(
-                "[agent]",
-                "harness_wrapper entries must be non-empty text without control characters"
-                    .to_owned(),
-            );
-        }
+        self.validate_harness_profiles()?;
         if let Some(group) = &self.workspace_group {
             let ok = !group.is_empty()
                 && group.len() <= 32
@@ -2294,6 +2452,312 @@ impl AgentConfig {
     }
 }
 
+/// Whole-element placeholders. They replace a substring of one argv element, so no word
+/// splitting is involved. Task text is deliberately not among them.
+const HARNESS_WHOLE_PLACEHOLDERS: [&str; 9] = [
+    "cwd",
+    "task_file",
+    "message",
+    "job_socket",
+    "result_file",
+    "server",
+    "provider",
+    "model",
+    "timeout_secs",
+];
+/// Fragment placeholders expand to zero or more argv elements, and only as a whole element.
+const HARNESS_FRAGMENT_PLACEHOLDERS: [&str; 3] = ["model_args", "provider_args", "server_args"];
+const HARNESS_MESSAGE_PLACEHOLDERS: [&str; 2] = ["task_file", "context_warning"];
+const HARNESS_CWD_PLACEHOLDERS: [&str; 1] = ["cwd"];
+
+impl AgentConfig {
+    /// The built-in `opencode` profile plus operator tables, with fields merged in.
+    pub fn harness_profiles(&self) -> BTreeMap<String, ResolvedHarnessProfile> {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "opencode".to_owned(),
+            merge_harness_profile("opencode", &HarnessProfileConfig::default()),
+        );
+        for (name, table) in &self.harness_profiles {
+            profiles.insert(name.clone(), merge_harness_profile(name, table));
+        }
+        profiles
+    }
+
+    fn validate_harness_profiles(&self) -> Result<(), ConfigError> {
+        for name in self.harness_profiles.keys() {
+            validate_harness_profile_name(name)?;
+        }
+        let merged = self.harness_profiles();
+        if merged.len() > MAX_HARNESS_PROFILES {
+            return invalid(
+                "[agent]",
+                format!(
+                    "harness_profiles must name at most {MAX_HARNESS_PROFILES} profiles, including the built-in opencode profile (got {})",
+                    merged.len()
+                ),
+            );
+        }
+        for (name, profile) in &merged {
+            validate_resolved_harness_profile(name, profile)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_resolved_harness_profile(
+    name: &str,
+    profile: &ResolvedHarnessProfile,
+) -> Result<(), ConfigError> {
+    let table = format!("[agent.harness_profiles.{name}]");
+    if profile.argv.is_empty() || profile.argv.len() > MAX_HARNESS_ARGV {
+        return invalid(
+            &table,
+            format!(
+                "argv must hold 1 to {MAX_HARNESS_ARGV} entries (got {})",
+                profile.argv.len()
+            ),
+        );
+    }
+    let argv_bytes = profile.argv.iter().map(String::len).sum::<usize>();
+    if argv_bytes > MAX_HARNESS_ARGV_BYTES {
+        return invalid(
+            &table,
+            format!(
+                "argv must hold at most {MAX_HARNESS_ARGV_BYTES} bytes in total (got {argv_bytes})"
+            ),
+        );
+    }
+    for arg in &profile.argv {
+        harness_text(
+            &table,
+            "argv",
+            arg,
+            &HARNESS_WHOLE_PLACEHOLDERS,
+            &HARNESS_FRAGMENT_PLACEHOLDERS,
+        )?;
+    }
+    if profile.message.is_empty()
+        || profile.message.len() > MAX_HARNESS_MESSAGE_BYTES
+        || profile.message.chars().any(char::is_control)
+    {
+        return invalid(
+            &table,
+            format!(
+                "message must be 1 to {MAX_HARNESS_MESSAGE_BYTES} bytes without control characters (got {})",
+                profile.message.len()
+            ),
+        );
+    }
+    harness_check_placeholders(
+        &table,
+        "message",
+        &profile.message,
+        &HARNESS_MESSAGE_PLACEHOLDERS,
+        &[],
+    )?;
+    for (field, values) in [
+        ("wrapper", profile.wrapper.as_slice()),
+        ("model_args", profile.model_args.as_slice()),
+        ("provider_args", profile.provider_args.as_slice()),
+        ("server_args", profile.server_args.as_slice()),
+    ] {
+        if values.len() > MAX_HARNESS_FRAGMENT {
+            return invalid(
+                &table,
+                format!(
+                    "{field} must hold at most {MAX_HARNESS_FRAGMENT} entries (got {})",
+                    values.len()
+                ),
+            );
+        }
+        let (allowed, fragments): (&[&str], &[&str]) = if field == "wrapper" {
+            (&HARNESS_CWD_PLACEHOLDERS, &[])
+        } else {
+            (&HARNESS_WHOLE_PLACEHOLDERS, &HARNESS_FRAGMENT_PLACEHOLDERS)
+        };
+        for value in values {
+            harness_text(&table, field, value, allowed, fragments)?;
+        }
+    }
+    if profile.env.len() > MAX_HARNESS_ENV {
+        return invalid(
+            &table,
+            format!(
+                "env must name at most {MAX_HARNESS_ENV} variables (got {})",
+                profile.env.len()
+            ),
+        );
+    }
+    for name in &profile.env {
+        validate_harness_env_name(&table, "env", name)?;
+    }
+    if profile.secret_env.len() > MAX_HARNESS_SECRET_ENV {
+        return invalid(
+            &table,
+            format!(
+                "secret_env must name at most {MAX_HARNESS_SECRET_ENV} variables (got {})",
+                profile.secret_env.len()
+            ),
+        );
+    }
+    for (env_name, path) in &profile.secret_env {
+        validate_harness_env_name(&table, "secret_env", env_name)?;
+        if path.is_empty()
+            || path.len() > MAX_HARNESS_ARG_BYTES
+            || path.chars().any(char::is_control)
+        {
+            return invalid(
+                &table,
+                format!(
+                    "secret_env {env_name:?} must name a non-empty path without control characters"
+                ),
+            );
+        }
+    }
+    if let Some(path) = &profile.result_file {
+        let value = Path::new(path);
+        if path.is_empty()
+            || path.len() > MAX_HARNESS_RESULT_FILE_BYTES
+            || path.chars().any(char::is_control)
+            || value.is_absolute()
+            || value.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return invalid(
+                &table,
+                "result_file must be a relative path without '..' or control characters".to_owned(),
+            );
+        }
+    }
+    for (field, markers) in [
+        ("provider_markers", profile.provider_markers.as_slice()),
+        (
+            "needs_input_markers",
+            profile.needs_input_markers.as_slice(),
+        ),
+    ] {
+        if markers.len() > MAX_HARNESS_MARKERS {
+            return invalid(
+                &table,
+                format!(
+                    "{field} must hold at most {MAX_HARNESS_MARKERS} entries (got {})",
+                    markers.len()
+                ),
+            );
+        }
+        for marker in markers {
+            if marker.is_empty()
+                || marker.len() > MAX_HARNESS_MARKER_BYTES
+                || marker.chars().any(char::is_control)
+            {
+                return invalid(
+                    &table,
+                    format!("{field} entries must be 1 to {MAX_HARNESS_MARKER_BYTES} bytes without control characters"),
+                );
+            }
+        }
+    }
+    if let Some(server) = &profile.server {
+        if server.is_empty()
+            || server.len() > MAX_HARNESS_SERVER_BYTES
+            || server.starts_with('-')
+            || server
+                .chars()
+                .any(|ch| ch.is_control() || ch.is_whitespace())
+            || !(server.starts_with("http://") || server.starts_with("https://"))
+        {
+            return invalid(
+                &table,
+                "server must be an http:// or https:// URL without whitespace or control characters, no leading '-', and at most 2048 bytes".to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn harness_text(
+    table: &str,
+    field: &str,
+    value: &str,
+    allowed: &[&str],
+    fragments: &[&str],
+) -> Result<(), ConfigError> {
+    if value.is_empty()
+        || value.len() > MAX_HARNESS_ARG_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return invalid(
+            table,
+            format!("{field} entries must be 1 to {MAX_HARNESS_ARG_BYTES} bytes without control characters"),
+        );
+    }
+    harness_check_placeholders(table, field, value, allowed, fragments)
+}
+
+fn harness_check_placeholders(
+    table: &str,
+    field: &str,
+    value: &str,
+    whole: &[&str],
+    fragments: &[&str],
+) -> Result<(), ConfigError> {
+    let mut rest = value;
+    while let Some(start) = rest.find('{') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            return invalid(table, format!("{field} has an unmatched '{{'"));
+        };
+        let name = &after[..end];
+        if name.is_empty() || name.contains('{') || name.contains('}') {
+            return invalid(table, format!("{field} has a malformed placeholder"));
+        }
+        if whole.contains(&name) {
+            rest = &after[end + 1..];
+            continue;
+        }
+        if fragments.contains(&name) {
+            if value != format!("{{{name}}}") {
+                return invalid(
+                    table,
+                    format!("{{{name}}} must be the whole {field} element"),
+                );
+            }
+            rest = &after[end + 1..];
+            continue;
+        }
+        return invalid(table, format!("{field} has unknown placeholder {{{name}}}"));
+    }
+    if rest.contains('}') {
+        return invalid(table, format!("{field} has an unmatched '}}'"));
+    }
+    Ok(())
+}
+
+fn validate_harness_env_name(table: &str, field: &str, name: &str) -> Result<(), ConfigError> {
+    let mut chars = name.chars();
+    let first = chars.next();
+    let ok = matches!(first, Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ok {
+        return invalid(
+            table,
+            format!("{field} names must match [A-Za-z_][A-Za-z0-9_]*"),
+        );
+    }
+    if name.starts_with("LU_") || CONTROLLER_CREDENTIAL_ENV.contains(&name) {
+        return invalid(
+            table,
+            format!("{field} may not name a controller credential or an LU_ variable"),
+        );
+    }
+    Ok(())
+}
+
 impl HousekeepingConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.scratch_globs.len() > 8 {
@@ -2403,6 +2867,21 @@ fn invalid(table: &str, reason: String) -> Result<(), ConfigError> {
         table: table.to_owned(),
         reason,
     })
+}
+
+fn validate_harness_profile_name(name: &str) -> Result<(), ConfigError> {
+    let table = "[agent.harness_profiles]";
+    let first_ok = name
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if !first_ok || !validate_name(table, name).is_ok() {
+        return invalid(
+            table,
+            "name must be 1 to 64 characters from A-Z a-z 0-9 _ . - and start with a letter, digit or _".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_name(table: &str, name: &str) -> Result<(), ConfigError> {
@@ -3486,14 +3965,33 @@ heartbeat_secs = 15
     }
 
     #[test]
-    fn an_opencode_password_file_must_not_be_empty() {
-        let base = |val: &str| {
-            format!(
-                "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\nopencode_password_file={val}\n"
-            )
-        };
-        assert!(Config::parse(&base("\"/etc/lu/opencode.password\"")).is_ok());
-        expect_table(&base("\"\""), "[agent]");
+    fn the_builtin_profile_is_always_available() {
+        let agent = Config::parse(&agent_only()).unwrap().agent.unwrap();
+        let profiles = agent.harness_profiles();
+        let builtin = profiles.get("opencode").expect("built-in profile");
+        assert_eq!(builtin.argv[0], "opencode");
+        assert!(builtin.secret_env.is_empty());
+        assert!(builtin.server.is_none());
+        assert_eq!(builtin.stdin, HarnessStdin::Null);
+        assert_eq!(builtin.provider_markers.len(), 5);
+    }
+
+    #[test]
+    fn a_profile_override_merges_individual_fields() {
+        let text = format!(
+            "{}\n[agent.harness_profiles.opencode]\nserver=\"https://example.net\"\n",
+            agent_only()
+        );
+        let agent = Config::parse(&text).unwrap().agent.unwrap();
+        let builtin = agent.harness_profiles();
+        let profile = &builtin["opencode"];
+        assert_eq!(profile.server.as_deref(), Some("https://example.net"));
+        assert_eq!(profile.argv[0], "opencode");
+        assert_eq!(
+            profile.message,
+            "Follow the task in the provided file.{context_warning}"
+        );
+        assert_eq!(profile.provider_markers.len(), 5);
     }
 
     #[test]
@@ -3943,10 +4441,16 @@ heartbeat_secs = 15
                 "token_file must",
             );
             expect_reason(&agent("ca_file"), "ca_file must");
-            expect_reason(
-                &agent("opencode_password_file"),
-                "opencode_password_file must",
-            );
+            for removed in [
+                "opencode_server",
+                "opencode_password_file",
+                "harness_wrapper",
+            ] {
+                assert!(
+                    matches!(Config::parse(&agent(removed)), Err(ConfigError::Parse(_))),
+                    "{removed} should be an unknown key"
+                );
+            }
         }
         expect_reason(
             &format!(

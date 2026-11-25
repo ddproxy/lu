@@ -1,6 +1,6 @@
 //! Unit tests for the agent loop. Uses a scripted `Controller` and a `sh -c` harness.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lu_client::{ApiError, Controller, DependencyView, PollRequest};
-use lu_config::{BaseSource, StackConfig};
+use lu_config::{BaseSource, ResolvedHarnessProfile, StackConfig};
 use lu_proto::{
     AgentEvent, ArtifactName, Completion, ExpectMode, ExpectSpec, FailureClass, HarnessState,
     HostStats, JobId, JobSpec, JobState, LogChunk, NodeName, OnConflict, Outcome, StuckPolicy,
@@ -451,6 +451,32 @@ fn test_spec(repo: &str) -> JobSpec {
     }
 }
 
+/// The built-in profile, resolved the same way production resolves it.
+fn test_profiles() -> BTreeMap<String, ResolvedHarnessProfile> {
+    let text = "[agent]\nname = \"node-a\"\ncontroller_url = \"https://lu.example.net\"\ntoken_file = \"/etc/ting/ting.token\"\nwork_dir = \"/var/lib/ting/work\"\n";
+    lu_config::Config::parse(text)
+        .unwrap()
+        .agent
+        .unwrap()
+        .harness_profiles()
+}
+
+/// Adds one operator profile to an agent, as configuration would have resolved it.
+fn agent_with_profile(mut agent: Agent, name: &str, body: &str) -> Agent {
+    let text = format!(
+        "[agent]\nname = \"node-a\"\ncontroller_url = \"https://lu.example.net\"\ntoken_file = \"/etc/ting/ting.token\"\nwork_dir = \"/var/lib/ting/work\"\n{body}"
+    );
+    let profile = lu_config::Config::parse(&text)
+        .unwrap()
+        .agent
+        .unwrap()
+        .harness_profiles()
+        .remove(name)
+        .unwrap();
+    agent.harness_profiles.insert(name.to_owned(), profile);
+    agent
+}
+
 /// Creates an agent with the fake controller and a scripted harness command.
 fn make_agent(
     work_dir: &std::path::Path,
@@ -488,21 +514,16 @@ fn make_agent(
         harness_ok: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         provider_marker_grace: super::PROVIDER_MARKER_GRACE,
         provider_health_watch_period: super::PROVIDER_HEALTH_WATCH_PERIOD,
-        opencode_server: None,
+        harness_profiles: test_profiles(),
         workspace_gid: None,
         harness_owner: None,
-        opencode_password: None,
         workspaces,
         provider_health_probe: None,
         gateway_fault_markers: Arc::new(Vec::new()),
         health: Default::default(),
         provider_models: Arc::new(Vec::new()),
-        harness: "opencode".to_owned(),
-        harness_wrapper: Vec::new(),
         allow_shared_uid_scope: true,
-        builder: Arc::new(move |task_file, _model, _server, _message| {
-            Ok(harness_script(task_file))
-        }),
+        builder: Arc::new(move |invocation| Ok(harness_script(&invocation.task_file))),
         housekeeper: None,
         gc_counters: Arc::new(housekeeping::GcCounters::default()),
     }
@@ -1104,16 +1125,16 @@ async fn summarise_caps_at_max_summary_bytes() {
     assert!(summary.len() <= MAX_SUMMARY_BYTES);
 }
 
-#[tokio::test]
-async fn provider_marker_detects_various_patterns() {
-    assert!(super::provider_marker(
-        "every key in this stream's chain is unavailable"
-    ));
-    assert!(super::provider_marker("QUOTA exceeded"));
-    assert!(super::provider_marker("HTTP 429"));
-    assert!(super::provider_marker("429 Too Many Requests"));
-    assert!(super::provider_marker("rate limit hit"));
-    assert!(!super::provider_marker("normal output"));
+#[test]
+fn builtin_provider_markers_detect_various_patterns() {
+    let markers = test_profiles().remove("opencode").unwrap().provider_markers;
+    let matches = |text: &str| super::marker_matches(text, &markers);
+    assert!(matches("every key in this stream's chain is unavailable"));
+    assert!(matches("QUOTA exceeded"));
+    assert!(matches("HTTP 429"));
+    assert!(matches("429 Too Many Requests"));
+    assert!(matches("rate limit hit"));
+    assert!(!matches("normal output"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2225,9 +2246,9 @@ async fn job_uses_the_assigned_model() {
     let seen = Arc::new(Mutex::new(None));
     let recorder = Arc::clone(&seen);
     let agent = make_agent(&f.work_dir, controller.clone(), success_harness).with_command_builder(
-        move |task_file, model, _server, _message| {
-            *recorder.lock().unwrap() = model.map(str::to_owned);
-            Ok(success_harness(task_file))
+        move |invocation| {
+            *recorder.lock().unwrap() = invocation.model.clone();
+            Ok(success_harness(&invocation.task_file))
         },
     );
     let calls = run_job(
@@ -2437,23 +2458,96 @@ async fn job_child_env_is_allowlisted() {
 }
 
 #[tokio::test]
-async fn job_harness_gets_the_opencode_password_only_when_one_is_configured() {
+async fn the_job_spec_selects_the_harness_profile() {
     let f = fixture();
     let job_id = JobId::new();
-    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
-    let mut agent = fast_agent(&f.work_dir, controller.clone(), sh("env"));
-    agent.opencode_password = Some(Arc::from("test-password-value"));
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.harness = "fake".to_owned();
+    let controller = assigned_controller(&job_id, spec);
+    let mut agent = fast_agent(&f.work_dir, controller.clone(), success_harness);
+    let text = "[agent]\nname = \"node-a\"\ncontroller_url = \"https://lu.example.net\"\ntoken_file = \"/etc/ting/ting.token\"\nwork_dir = \"/var/lib/ting/work\"\n[agent.harness_profiles.fake]\nargv = [\"/bin/true\"]\nmessage = \"go\"\n";
+    let profile = lu_config::Config::parse(text)
+        .unwrap()
+        .agent
+        .unwrap()
+        .harness_profiles()
+        .remove("fake")
+        .unwrap();
+    agent.harness_profiles.insert("fake".to_owned(), profile);
+    let seen = Arc::new(Mutex::new(None));
+    let recorder = Arc::clone(&seen);
+    agent.builder = Arc::new(move |invocation| {
+        *recorder.lock().unwrap() = Some(invocation.profile.name.clone());
+        Ok(success_harness(&invocation.task_file))
+    });
     let calls = run_job(
         &controller,
         agent,
         job_finished(f.work_dir.join(job_id.as_str())),
     )
     .await;
-    let log = log_text(&calls);
+    assert_eq!(*seen.lock().unwrap(), Some("fake".to_owned()));
+    assert_eq!(completions(&calls)[0].outcome, Outcome::Done);
+}
+
+#[tokio::test]
+async fn a_profile_result_file_is_read_after_a_clean_exit() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.harness = "fake".to_owned();
+    let controller = assigned_controller(&job_id, spec);
+    let agent = agent_with_profile(
+        fast_agent(&f.work_dir, controller.clone(), |_task_file| {
+            CommandSpec::new("sh")
+                .arg("-c")
+                .arg("printf 'final answer' > result.txt; echo done")
+        }),
+        "fake",
+        "\n[agent.harness_profiles.fake]\nargv = [\"/bin/true\"]\nmessage = \"go\"\nresult_file = \"result.txt\"\n",
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+    let done = &completions(&calls)[0];
+    assert_eq!(done.outcome, Outcome::Done);
     assert!(
-        log.lines()
-            .any(|line| line == "OPENCODE_SERVER_PASSWORD=test-password-value"),
-        "the harness did not get the password: {log}"
+        done.summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("result: final answer"),
+        "{done:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_profile_provider_marker_classifies_the_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.harness = "fake".to_owned();
+    let controller = assigned_controller(&job_id, spec);
+    let agent = agent_with_profile(
+        fast_agent(&f.work_dir, controller.clone(), |_task_file| {
+            CommandSpec::new("sh")
+                .arg("-c")
+                .arg("echo PROVIDER SAYS NO; exit 7")
+        }),
+        "fake",
+        "\n[agent.harness_profiles.fake]\nargv = [\"/bin/true\"]\nmessage = \"go\"\nprovider_markers = [\"provider says no\"]\n",
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+    assert_eq!(
+        completions(&calls)[0].outcome,
+        Outcome::Failed(FailureClass::Provider)
     );
 }
 
@@ -3126,6 +3220,75 @@ fn assert_stuck_summary(completion: &Completion, secs: u64) {
     assert_eq!(
         completion.summary.as_deref(),
         Some(format!("stuck for {secs}s, stopped").as_str())
+    );
+}
+
+/// Like `run_stuck_case`, but with an operator profile supplying the marker vocabulary.
+async fn run_stuck_case_with_profile(
+    mut spec: JobSpec,
+    harness: fn(&Path) -> CommandSpec,
+    profile_name: &str,
+    profile_body: &str,
+) -> Completion {
+    let tmp = TempDir::new().unwrap();
+    let work_dir = tmp.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir(&repo_dir).unwrap();
+    create_git_repo(&repo_dir);
+    spec.repo = repo_dir.to_string_lossy().into_owned();
+    spec.source.repo = repo_dir.to_string_lossy().into_owned();
+
+    let controller = controller_with_assign(JobId::new(), EPOCH, spec);
+    let agent = agent_with_profile(
+        make_agent(&work_dir, controller.clone(), harness),
+        profile_name,
+        profile_body,
+    )
+    .with_stuck_timing_for_tests(
+        2,
+        Duration::from_millis(2),
+        Some(5),
+        Arc::new(SteppingClock::new(1)),
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        agent
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+    let completion = wait_for_completion(&controller).await;
+    let _ = shutdown_tx.send(());
+    handle.await.unwrap().unwrap();
+    completion
+}
+
+#[tokio::test]
+async fn stuck_summary_names_a_profile_needs_input_marker() {
+    let mut spec = test_spec("");
+    spec.harness = "fake".to_owned();
+    spec.on_stuck = Some(StuckPolicy::Cancel);
+    spec.stuck_after_secs = Some(60);
+    let completion = run_stuck_case_with_profile(
+        spec,
+        |_task_file| {
+            CommandSpec::new("sh")
+                .arg("-c")
+                .arg("echo waiting for input; sleep 10")
+        },
+        "fake",
+        "\n[agent.harness_profiles.fake]\nargv = [\"/bin/true\"]\nmessage = \"go\"\nneeds_input_markers = [\"waiting for input\"]\n",
+    )
+    .await;
+    assert!(
+        completion
+            .summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("harness appears to need input"),
+        "{completion:?}"
     );
 }
 

@@ -161,10 +161,12 @@ Every staging `git` invocation, including three-way applies, runs with prompts d
 restricted transport allowlist (`file`, `https`, `ssh`), system and global config skipped, hooks
 disabled, and inherited config, askpass, proxy and repository-location environment scrubbed. The
 harness is launched directly in its own
-process group with an inherited environment of `PATH`, `HOME` and `LANG`, stdin closed, and
-capped output. Timeouts and idle-output detection bound a harness that never finishes. Those
-controls apply at the process and filesystem level. A harness needing a stronger boundary runs
-inside a container or VM through `harness_wrapper`.
+process group with a cleared environment rebuilt from `PATH`, `HOME`, `LANG`, the selected
+profile's explicit `env` and `secret_env` values, stdin closed unless the profile selects task
+stdin, and capped output. Timeouts and idle-output detection bound a harness that never finishes.
+Those controls apply at the process and filesystem level. A harness needing a stronger boundary
+runs through a profile `wrapper` that starts a separate runner; the wrapper is direct argv, never a
+shell. See [Harness profiles](config.md#harness-profiles) for the validated fields.
 
 The controller uses the agent's report as the record of what its harness did. An agent reads the
 job's task and repository content and produces the diff, log and report, so operators open those
@@ -261,8 +263,8 @@ The contributed units use a separate `lu` service account and create an unprivil
 that account: the agent launches it as its own user unless a separate runner is configured.
 
 - `lu` runs the controller or agent and owns the token file, mode `0600`;
-- `lu-harness` can run the coding-agent process through a separate-account runner such as
-  `harness_wrapper` with `[agent] workspace_group`; only then is it kept away from the token,
+- `lu-harness` can run the coding-agent process through a separate-account runner configured as a
+  profile `wrapper` with `[agent] workspace_group`; only then is it kept away from the token,
   the controller config and the TLS key;
 - the shared staging root can be group-writable by `lu-harness`, while each job directory is
   created mode `0700`.
@@ -277,17 +279,18 @@ seconds.
 **Without it:** the harness runs as the agent's own user. The harness gets a minimal
 environment and never receives the token as an argument or variable, but it can read any file
 the agent can, including the token file. Run the agent as a dedicated account that holds no other
-secrets, and treat a job's harness as able to act with that account's rights. Use
-`harness_wrapper` to start the harness in another account when that boundary is needed.
+secrets, and treat a job's harness as able to act with that account's rights. Use a profile
+`wrapper` to start the harness in another account when that boundary is needed.
 
 ## Credentials stay on the leaf
 
 Provider credentials (API keys and similar) belong to the harness on the agent/leaf host. The
-controller stores the provider name and model in the job spec. The agent can read an opencode
-server password from `opencode_password_file` (at most 4 KiB) and, when set, pass it to the harness
-as `OPENCODE_SERVER_PASSWORD`; that variable is an opencode server password, not a general
-provider-key channel. The agent clears the child environment and adds only `PATH`, `HOME`, `LANG`,
-the explicit `CommandSpec::env` entries, and that password.
+controller stores the provider name and model in the job spec. A selected profile may name private
+files in `secret_env`; each is read at job start (at most 4 KiB, trailing CR/LF trimmed) and passed
+under the configured variable name. Those values are harness credentials, not a controller
+credential channel. The agent clears the child environment and adds only `PATH`, `HOME`, `LANG`,
+the profile's explicit `env` values and the `secret_env` values. Names may not be controller
+credential names or start with `LU_`.
 
 A task, repository file, command line, model response or harness log can contain a secret, and
 that text is stored in `run.log`, `diff.patch`, `report.json` or SQLite. Logs and artifacts are
@@ -356,13 +359,13 @@ provide the boundaries below.
 
 | Limit | What the code does | What follows | Do this |
 | --- | --- | --- | --- |
-| Harness runs as the agent user | `ting` launches the harness as its own OS user; there is no `setuid`, namespace, container or VM switch in the launcher. | A harness can open every file that account can, including the agent token and any controller TLS key readable by it. | Run the agent as a dedicated account; use `harness_wrapper` with `workspace_group` for tree access. |
+| Harness runs as the agent user | `ting` launches the harness as its own OS user; there is no `setuid`, namespace, container or VM switch in the launcher. | A harness can open every file that account can, including the agent token and any controller TLS key readable by it. | Run the agent as a dedicated account; use a profile `wrapper` with `workspace_group` for tree access. |
 | Token file is readable by that user | A token file must be a regular file owned by the reader, mode `0600` or tighter, with no symlink or FIFO. | Mode `0600` protects against other accounts, not against the agent user or a harness running as that user. | Treat the agent account as holding the token; rotate on suspicion, see [Tokens and TLS](tokens-and-tls.md#rotation). |
 | Artifacts and backups carry source and secrets | `diff.patch`, `run.log` and `report.json` report what the harness printed; `lu backup` copies SQLite as ordinary files. | Downloads and backups are as sensitive as every repository and credential the jobs used. | Store them with the same care as the live artifact directory; see [Operations](operations.md#backup-and-restore). |
-| Provider keys live on the node | The controller stores provider and model names, not keys. `OPENCODE_SERVER_PASSWORD` is an opencode server password, not a provider-key channel. | A node, its harness or its logs can expose keys; the controller cannot audit or revoke them. | Keep provider credentials on dedicated nodes and out of task text. |
-| No per-job isolation | One agent runs one job at a time in a process group with run, idle and output limits; `workspace_group` is group sharing, not a separate user or filesystem. | Jobs on a node share the agent account, environment and files. | Use `harness_wrapper` with a container or VM when jobs must not share a trust domain; see [Configuration](config.md). |
+| Provider keys live on the node | The controller stores provider and model names, not keys. Profile `secret_env` values are harness-side values, not a controller credential channel. | A node, its harness or its logs can expose keys; the controller cannot audit or revoke them. | Keep provider credentials on dedicated nodes and out of task text. |
+| No per-job isolation | One agent runs one job at a time in a process group with run, idle and output limits; `workspace_group` is group sharing, not a separate user or filesystem. | Jobs on a node share the agent account, environment and files. | Use a profile `wrapper` that starts a separate runner when jobs must not share a trust domain; see [Configuration](config.md#harness-profiles). |
 | Cordons are dispatch hints | A provider cordon blocks one `(node, provider)` pair; a job with no provider is not blocked. | A cordon is not access control or proof that a provider is safe. | Use labels and taints for placement and read `lu nodes --json`; see [Dispatch](dispatch.md#cordons). |
-| No general live reload | Config, token hashes, TLS material and agent secrets are read at start; `SIGHUP` is not handled. Only `POST /v1/schedule/reload` swaps in a schedule. | Other file changes, including a mid-job agent change, take effect after a restart. | Restart the affected process; see [Time-aware scheduling](scheduling.md#inspecting-scheduling). |
+| No general live reload | Config, token hashes, TLS material and the agent token are read at start; profile `secret_env` files are read at each job start; `SIGHUP` is not handled. Only `POST /v1/schedule/reload` swaps in a schedule. | Other file changes, including a profile change or a mid-job agent change, take effect after a restart. | Restart the affected process; see [Time-aware scheduling](scheduling.md#inspecting-scheduling). |
 | Runtime group caps are memory-only | `PUT /v1/groups/{name}/limit` changes the active controller-process cap; `[[controller.groups]]` is durable. | A runtime cap returns to its configured value, or disappears, on restart. | Put a required cap in config as well; see [Dispatch](dispatch.md#priority-and-groups). |
 
 Fail-open cases leave a job waiting rather than failing: an unmatched label, an untolerated taint or

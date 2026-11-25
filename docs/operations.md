@@ -44,9 +44,10 @@ valid token used for another node gets `403`. To add a node:
    table, using the node name the agent will report. Keep the plaintext file on the node with
    private permissions and out of version control; see [Tokens and TLS](tokens-and-tls.md).
 2. Restart the controller, since token hashes are read at startup.
-3. Write the node's `[agent]` config with `name`, `controller_url`, `work_dir`, `harness` and
-   `token_file`; add labels, taints or provider models as needed, and check the config with
-   `lu check --config <path>`.
+3. Write the node's `[agent]` config with `name`, `controller_url`, `work_dir` and `token_file`.
+   The built-in `opencode` profile needs no agent-side entry; add `[agent.harness_profiles.*]` only
+   for overrides or extra profiles, then add labels, taints or provider models as needed and check
+   the config with `lu check --config <path>`.
 4. Start `ting` with that config. It heartbeats and polls the controller.
 5. Verify with `lu nodes` that the node is online with the expected version and labels, then submit
    a small test job. An unmatched label or provider leaves the job queued until a matching node
@@ -56,6 +57,35 @@ Keep agent binaries at a version compatible with the controller; see
 [compatibility](compatibility.md). A node can take itself out of service for maintenance with
 `ting drain` and `ting wait-idle`; see [Updating a node](../README.md#updating-a-node) and the
 [`ting` reference](cli.md#ting-reference).
+
+## Harness profiles at run time
+
+Each job carries a harness name (`--harness` on `lu submit`, default `opencode`). The agent resolves
+that name against its loaded profiles: the built-in `opencode` profile is always present, and a
+`[agent.harness_profiles.opencode]` table overrides individual fields. An unknown name fails the
+job as `execution` with `unsupported harness profile "<name>"`. A command that cannot be compiled,
+including a failed `secret_env` read, also fails as `execution`; the error never contains secret
+content. Profiles are loaded when `ting` starts, so a profile change needs an agent restart. No wire
+or store-schema field changes with this contract.
+
+The configured argv is expanded and run directly, with an optional wrapper prepended, in the staged
+tree. There is no shell. The child starts with `PATH`, `HOME`, `LANG`, selected `env` values and
+`secret_env` values only; `stdin` is closed unless the profile selects the staged task file, capped
+at 256 KiB. Run, idle and output limits are unchanged. Key defaults and every validation rule are in
+[Harness profiles](config.md#harness-profiles).
+
+When a profile sets `result_file`, the agent reads it only after the harness exits `0`. The path is
+relative to the staged tree; its text is appended to the job summary as `result: <text>`, after any
+log tail, and is truncated to 16 KiB. A missing, unreadable, non-UTF-8 or oversize file fails the
+job as `execution` with a summary that names the relative path. A non-file at that path is reported
+as too large.
+
+Provider markers come from the selected profile and are matched case-insensitively in harness
+output; the built-in `opencode` list keeps the earlier provider-unavailable strings. They still
+drive the two-reading provider failure described below. `needs_input_markers` are also
+case-insensitive and only annotate a stuck summary: when a marker appears in the output tail, the
+summary is `stuck for <n>s, stopped; harness appears to need input`. Stuck policy, failure class and
+metrics are unchanged.
 
 ## Backup and restore
 
@@ -230,7 +260,7 @@ Failure classes, retry budgets and cancellation are in [lifecycle.md](lifecycle.
 
 When a job resolves to a `provider` (the assigned choice, or the primary when the job names one), the agent checks it against its node's provider gateway health feed every five seconds, but acts only on a new reading. The feed itself refreshes every ten seconds. The gateway is the authority on keys, so this works for any harness: when two fresh readings in a row show the provider cooling or disabled (no usable key), the agent stops the job like a cancel and completes it as `Failed(Provider)`, with a summary that names the provider and the soonest return time the gateway reported. The completion carries that time plus a 60-second buffer as `retry_after_secs`; see [Dispatch](dispatch.md#cordons) for the resulting cordon.
 
-As a fallback for a job with no provider, or a node without a provider gateway feed, the agent watches a running harness's output. If the newest line matches a provider-unavailable marker (the opencode message about every key in the stream's chain, a quota message, a 429, or a rate limit) and the harness then produces no output for 120 seconds, the agent stops it the same way and completes the job as `Failed(Provider)`, with a summary naming the marker. Any other output after the marker disarms the watch.
+As a fallback for a job with no provider, or a node without a provider gateway feed, the agent watches a running harness's output. If the newest line matches a `provider_markers` substring from the selected profile (the built-in `opencode` list covers the message about every key in the stream's chain, a quota message, a 429, and a rate limit) and the harness then produces no output for 120 seconds, the agent stops it the same way and completes the job as `Failed(Provider)`, with a summary naming the marker. Any other output after the marker disarms the watch.
 
 ## Stuck jobs
 
@@ -239,8 +269,10 @@ CPU for more than 300 seconds — the same observation `lu node` reports as `stu
 has a stuck policy, the agent counts how long that observation has been continuous; any output or
 CPU activity resets the timer. Once it reaches `stuck_after_secs` (60 to 86400 seconds, default
 1800), the agent stops the harness process group through the cancel stop path, uploads the log,
-diff and report, and completes the job. The summary is exactly `stuck for <n>s, stopped`, where
-`<n>` is the continuous stuck time.
+diff and report, and completes the job. The summary is `stuck for <n>s, stopped`, where `<n>` is the
+continuous stuck time. A selected profile's `needs_input_markers` add
+`; harness appears to need input` when one matches the output tail, as described in
+[Harness profiles at run time](#harness-profiles-at-run-time).
 
 `on_stuck` is `none` (default), `cancel` or `retry`. `cancel` completes as `failed` with
 `failure_class: "execution"`; `retry` completes with `failure_class: "node"`, so the controller

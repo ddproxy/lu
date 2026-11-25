@@ -30,7 +30,7 @@ token_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 # controller_url = "https://lu.example.net:7600"
 # token_file = "/etc/ting/ting.token"   # mode 0600 or tighter
 # work_dir = "/srv/work/lu"
-# harness = "opencode"
+# Jobs select a harness profile; the built-in opencode profile needs no entry here.
 
 # Controller-side scrubbing is on by default. Add operator patterns like this:
 # [artifacts]

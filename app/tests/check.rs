@@ -280,9 +280,9 @@ fn check_reports_intake_bounds_and_path_errors() {
             "ca_file must not contain '..'",
         ),
         (
-            "agent-password",
-            agent("opencode_password_file = \"relative.password\"\n"),
-            "opencode_password_file must be an absolute path",
+            "agent-profile-server",
+            agent("[agent.harness_profiles.opencode]\nserver = \"ftp://example.net\"\n"),
+            "server must be an http:// or https:// URL",
         ),
         (
             "gateway-token",

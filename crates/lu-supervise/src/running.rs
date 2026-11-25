@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustix::process::{kill_process_group, Pid, Signal};
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, ChildStderr, ChildStdout};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::command::{build, CommandSpec};
@@ -46,6 +46,7 @@ impl Supervisor {
     /// A spawn failure is not an error here: it is reported by the returned
     /// [`Running::wait`] as [`Outcome::SpawnFailed`].
     pub fn spawn(spec: CommandSpec, limits: Limits) -> Running {
+        let stdin_bytes = spec.stdin.clone();
         let mut command = build(&spec);
         let (out_tx, out_rx) = mpsc::channel::<OutputChunk>(CHANNEL_CAPACITY);
         let control = Arc::new(Control {
@@ -61,6 +62,7 @@ impl Supervisor {
                     .and_then(Pid::from_raw);
                 let stdout = child.stdout.take();
                 let stderr = child.stderr.take();
+                let stdin = child.stdin.take();
                 let (trip_tx, trip_rx) = mpsc::unbounded_channel();
                 let (outcome_tx, outcome_rx) = oneshot::channel();
                 match pgid {
@@ -78,6 +80,8 @@ impl Supervisor {
                             outcome_tx,
                             stdout,
                             stderr,
+                            stdin,
+                            stdin_bytes,
                         };
                         tokio::spawn(supervise(job));
                         Running {
@@ -229,6 +233,8 @@ struct Job {
     outcome_tx: oneshot::Sender<Outcome>,
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
+    stdin: Option<ChildStdin>,
+    stdin_bytes: Option<Vec<u8>>,
 }
 
 /// How the wait loop ended.
@@ -252,9 +258,17 @@ async fn supervise(job: Job) {
         outcome_tx,
         stdout,
         stderr,
+        stdin,
+        stdin_bytes,
     } = job;
 
     let mut readers = Vec::new();
+    if let (Some(mut pipe), Some(bytes)) = (stdin, stdin_bytes) {
+        readers.push(tokio::spawn(async move {
+            let _ = pipe.write_all(&bytes).await;
+            let _ = pipe.shutdown().await;
+        }));
+    }
     if let Some(stdout) = stdout {
         readers.push(tokio::spawn(pump(
             stdout,

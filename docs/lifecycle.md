@@ -17,7 +17,7 @@ dial out with a token bound to their node, and operators use a separate token ([
 | **Controller** | The HTTP(S) service owning state, leases, retries, cordons, mirrors and artifacts; job records live in SQLite and files under `artifacts_dir`. |
 | **Agent / node** | A named `ting` process with one job slot, advertising labels and staging each job in its work directory. |
 | **Operator** | Any caller using `lu`, `lu mcp` or a direct HTTP client with an operator token. |
-| **Harness** | The process doing the coding, by default `opencode run`, optionally prefixed by `harness_wrapper`. |
+| **Harness** | The process doing the coding. A job names a validated profile; the built-in `opencode` profile runs `opencode run`, and a profile's `wrapper` may prefix the command. |
 | **Artifacts** | Exactly three controller-named files per job: `diff.patch`, `run.log` and `report.json`. |
 | **Lease** | A time-limited claim; a missed renewal moves the job to `recovering`. |
 | **Epoch** | A fencing counter incremented on each assignment; stale writes are refused. |

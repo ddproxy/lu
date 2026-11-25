@@ -21,6 +21,8 @@ pub struct CommandSpec {
     pub cwd: Option<PathBuf>,
     /// Extra environment entries added on top of [`BASE_ENV`].
     pub env: Vec<(OsString, OsString)>,
+    /// Bytes written to the child's stdin before it is closed. `None` gives it `/dev/null`.
+    pub stdin: Option<Vec<u8>>,
 }
 
 impl CommandSpec {
@@ -31,6 +33,7 @@ impl CommandSpec {
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
+            stdin: None,
         }
     }
 
@@ -61,6 +64,12 @@ impl CommandSpec {
         self.env.push((key.into(), value.into()));
         self
     }
+
+    /// Sends these bytes to the child's stdin, then closes it.
+    pub fn stdin(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(bytes.into());
+        self
+    }
 }
 
 /// Builds the tokio command: direct exec, own process group, explicit environment.
@@ -79,8 +88,12 @@ pub(crate) fn build(spec: &CommandSpec) -> Command {
     for (key, value) in &spec.env {
         cmd.env(key, value);
     }
-    // No terminal input: a harness that waits on input hits the idle-output timeout.
-    cmd.stdin(Stdio::null());
+    // A harness without a task on stdin sees no terminal input and hits the idle-output timeout.
+    if spec.stdin.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     // Own process group, so a signal reaches the whole tree.

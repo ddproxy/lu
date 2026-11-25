@@ -211,13 +211,18 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         work_dir: work_dir.display().to_string(),
         harness: "opencode".to_owned(),
         base_source: BaseSource::Controller,
-        opencode_server: None,
+        harness_profiles: {
+            let text = "[agent]\nname = \"node-a\"\ncontroller_url = \"http://127.0.0.1:1\"\ntoken_file = \"/etc/ting/ting.token\"\nwork_dir = \"/var/lib/ting/work\"\n";
+            lu_config::Config::parse(text)
+                .unwrap()
+                .agent
+                .unwrap()
+                .harness_profiles
+        },
         workspace_group: None,
         harness_uid: None,
         harness_gid: None,
         allow_shared_uid_scope: false,
-        opencode_password_file: None,
-        harness_wrapper: Vec::new(),
         heartbeat_secs: 3,
         on_stuck: lu_config::StuckPolicy::None,
         stuck_after_secs: 1_800,
@@ -289,7 +294,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
     let script = format!("echo ok > '{}'", harness_marker.display());
     let agent = Agent::new(config, controller)
         .unwrap()
-        .with_command_builder(move |_task_file, _model, _server, _message| {
+        .with_command_builder(move |_invocation| {
             Ok(CommandSpec::new("/bin/sh").arg("-c").arg(&script))
         });
 

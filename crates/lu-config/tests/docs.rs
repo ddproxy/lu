@@ -92,7 +92,7 @@ fn scheduling_examples_are_valid_config() {
         "agent.controller_url",
         "agent.token_file",
         "agent.work_dir",
-        "agent.harness",
+        "agent.harness_profiles.opencode.stdin",
         "schedule.horizon_secs",
         "schedule.step_budget",
         "schedule.staging_secs",

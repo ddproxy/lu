@@ -5,6 +5,22 @@ versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `[agent.harness_profiles]` names validated command profiles; a job's `harness` selects one.
+- Profiles compile argv, wrappers, placeholders, env, secret_env, stdin, result files and output markers.
+- `scripts/check-harness-profiles.sh` proves validation, exact argv, stdin and fake-harness behaviour.
+
+### Changed
+
+- Built-in `opencode` keeps the former command line and provider markers.
+- A successful profile result file is appended to the job summary; needs-input markers annotate stuck summaries.
+- No wire or store-schema change.
+- Breaking: `[agent] harness` is now a parse-only compatibility alias with no effect.
+- Breaking: removed `[agent] opencode_server`; set `[agent.harness_profiles.opencode].server`.
+- Breaking: removed `[agent] opencode_password_file` and its password injection; use profile `secret_env`.
+- Breaking: removed `[agent] harness_wrapper`; use `[agent.harness_profiles.<name>].wrapper`.
+
 ## [0.8.0]
 
 ### Changed

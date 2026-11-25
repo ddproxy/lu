@@ -1247,7 +1247,9 @@ dependencies = [
 name = "lu-supervise"
 version = "0.8.0"
 dependencies = [
+ "lu-config",
  "rustix",
+ "tempfile",
  "tokio",
 ]
 
