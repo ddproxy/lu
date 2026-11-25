@@ -3,6 +3,40 @@
 A job moves through a small, explicit state machine. The controller owns every transition; agents
 only propose starts, renewals, uploads and completions, all fenced by the job's epoch.
 
+## Model and ownership
+
+Lu coordinates finite coding-agent jobs around git repositories. The controller is the only writer
+of job state; agents poll it, run a harness locally and report back. Operators submit jobs and read
+results through the HTTP API used by the CLI. The controller never connects to an agent: agents
+dial out with a token bound to their node, and operators use a separate token ([Tokens and TLS](tokens-and-tls.md)).
+
+| Term | Meaning |
+| --- | --- |
+| **Job** | A persisted record with a 26-character id, a state, an `attempt` and an `epoch`, created from a spec. |
+| **Spec** | The stored request: repo, ref, task, harness, optional provider/model, timeouts, `after` dependencies, labels, key and `collect`. `lu edit` can change part of a queued or blocked job in place. |
+| **Controller** | The HTTP(S) service owning state, leases, retries, cordons, mirrors and artifacts; job records live in SQLite and files under `artifacts_dir`. |
+| **Agent / node** | A named `ting` process with one job slot, advertising labels and staging each job in its work directory. |
+| **Operator** | Any caller using `lu`, `lu mcp` or a direct HTTP client with an operator token. |
+| **Harness** | The process doing the coding, by default `opencode run`, optionally prefixed by `harness_wrapper`. |
+| **Artifacts** | Exactly three controller-named files per job: `diff.patch`, `run.log` and `report.json`. |
+| **Lease** | A time-limited claim; a missed renewal moves the job to `recovering`. |
+| **Epoch** | A fencing counter incremented on each assignment; stale writes are refused. |
+| **Dependency** | An `after` entry that must be `done` first; see [Dependencies](dependencies.md). |
+| **Label** | An opaque string of at most 64 bytes advertised by an agent and required by a job. |
+| **Cordon** | A `(node, provider)` suppression; see [Dispatch](dispatch.md#cordons). |
+| **Idempotency key** | A stable spec name; resubmitting the same key and spec returns the existing job. |
+| **Recovery grace** | The window after a lease loss in which the original agent may resume. |
+
+| Concern | Owner | Read it on |
+| --- | --- | --- |
+| State and legal transitions | Controller store | [Transition reference](#transition-reference) |
+| Batch input to specs | CLI or MCP planner, before any request | [Submitting work](submitting.md#batch-submissions) |
+| Which queued job goes where | Controller dispatch | [Dispatch](dispatch.md) |
+| Retry versus terminal failure | Controller, from failure class and attempt count | [Failure classes](#failure-classes-and-retries) |
+| Checkout, patch stacking, harness supervision | Agent | [Dependencies](dependencies.md) |
+| Authentication, TLS, token storage | Controller config and clients | [Tokens and TLS](tokens-and-tls.md) |
+| Routes and response shapes | Controller API | [HTTP API](api.md) |
+
 ```mermaid
 stateDiagram-v2
     [*] --> draft: intake or operator submits a draft
@@ -150,8 +184,9 @@ Draft text has two provenance classes. `task` is operator-authored (an intake ru
 an operator-written `task_template`); `context` is external data copied from the event. The agent
 stages `context` as `.lu/inputs/context.md` under an **UNTRUSTED EXTERNAL TEXT** header and the
 prompt tells the harness to treat it as data. `context` is capped at 32 KiB with a truncation
-marker. The operator commands, API routes and MCP access are in [drafts.md](drafts.md); the event
-rules that create drafts are in [intake.md](intake.md).
+marker. The operator commands, API routes and MCP access are in
+[Submitting work](submitting.md#drafts); the event rules that create drafts are in
+[intake.md](intake.md).
 
 ## Failure classes and retries
 
@@ -196,7 +231,7 @@ Markers are set with `[agent] gateway_fault_markers`; an empty list classifies n
 
 Every new exclusion writes a `node_excluded` audit record with the node and, when known, the
 reason. A completion records the reporting node as actor; a recovery timeout uses actor
-`maintenance`. See [audit.md](audit.md) and
+`maintenance`. See the [Audit record](security.md#audit-record) and
 [dispatch.md](dispatch.md#node-exclusions). The failure summary also names the reason code.
 
 A failure before the harness produced a verdict is classified by the agent, one row per case:
@@ -215,8 +250,9 @@ heartbeats. The taint dispatches no further harness jobs to that node unless a j
 tolerates `harness_ok=false`; a later successful harness run clears both. This uses the ordinary
 [node labels and taints](dispatch.md#taints-and-tolerations) mechanism and needs no extra schema.
 
-Provider-failure detection and cordon behaviour during an outage are in
-[operations.md](operations.md#provider-cordons-and-node-drains).
+Provider-failure detection during an outage is in
+[operations.md](operations.md#provider-failure-detection); cordon behaviour is in
+[dispatch.md](dispatch.md#cordons).
 
 ## Stuck jobs
 

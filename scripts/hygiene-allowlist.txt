@@ -12,4 +12,3 @@ app/tests/hygiene.rs	homelab	scanner pattern
 crates/lu-config/src/lib.rs	reiki	former config keys rejected by a parse test
 crates/lu-proto/src/node.rs	reiki	former heartbeat field ignored by a parse test
 crates/lu-store/src/sqlite.rs	reiki	schema 7 column name kept for migration detection
-NOTES.md	reiki	compatibility names recorded for maintainers

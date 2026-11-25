@@ -1,11 +1,11 @@
 # Time-aware scheduling
 
-Phase-1 scheduling controls **when a queued job may start**. It is configured on the controller with
+Scheduling controls **when a queued job may start**. It is configured on the controller with
 `[schedule]`, `[[calendar]]` and `[[attach]]`, and requested per job with `JobSpec.schedule`. It does
 not change which repo a job uses or how the harness runs.
 
-This is the phase-1 feature set: no cron expressions, timezone database, DST, cost weights or burst
-limits. Calendar offsets are UTC or fixed offsets only.
+There are no cron expressions, timezone database, DST, cost weights or burst limits. Calendar
+offsets are UTC or fixed offsets only.
 
 ## What is and is not in the CLI
 

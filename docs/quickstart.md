@@ -190,7 +190,7 @@ EOF
 
 The dry run prints one row per task and sends no request. The real run returns a row per job with
 its key, id, state and source name. Rerunning it with the same prefix returns the same jobs. See
-[Batch submissions](batch.md).
+[Batch submissions](submitting.md#batch-submissions).
 
 ## 4. Fetch and verify
 
@@ -237,10 +237,9 @@ The controller stops accepting connections on `SIGTERM` and drains in-flight req
 ## Limits of this demo
 
 - The harness runs as your user and can read your agent token. See
-  [What Lu does not protect against](limits.md).
+  [What Lu does not protect against](security.md#what-lu-does-not-protect-against).
 - The task needs a working provider. A provider failure requeues while the attempt budget allows,
-  then fails the job; `lu show` reports `failure provider`. See
-  [Running the opencode harness](opencode-harness.md).
+  then fails the job; `lu show` reports `failure provider`.
 - There is no general config reload. Restart `lu serve` after editing config or token hashes, and
   restart `ting` after editing its config. The schedule alone can be swapped with
   `POST /v1/schedule/reload`; see [Time-aware scheduling](scheduling.md#inspecting-scheduling).

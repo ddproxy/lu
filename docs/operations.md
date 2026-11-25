@@ -1,8 +1,8 @@
 # Operations
 
-This is the operator runbook for a packaged controller: upgrades, backup and restore, restart
-behaviour, provider cordons and node drains, and how to read node state. Installation and the
-systemd units are in [install.md](install.md); the agent's isolation model is in
+This is the operator runbook for a packaged controller: node onboarding, upgrades, backup and
+restore, restart behaviour, node drains, and how to read node state. Installation and the systemd
+units are in [install.md](install.md); the agent's isolation model is in
 [security.md](security.md).
 
 | Topic | Read it on |
@@ -15,16 +15,17 @@ systemd units are in [install.md](install.md); the agent's isolation model is in
 | Dependency stacking and the job graph | [dependencies.md](dependencies.md) |
 | Node workspace retention and disk pressure | [workspaces.md](workspaces.md) |
 | Provider and label dispatch | [dispatch.md](dispatch.md) |
-| MCP tools | [mcp.md](mcp.md) |
+| MCP tools | [cli.md](cli.md#mcp-tools) |
 | HTTP routes and limits | [api.md](api.md) |
-| Node self-service commands | [ting.md](ting.md) |
+| Node self-service commands | [cli.md](cli.md#ting-reference) |
 | Configuration keys | [config.md](config.md) |
 
 ## Upgrade
 
-For the agent-host half of an upgrade, see [Updating a node](../README.md#updating-a-node): the node
-drains itself with `ting drain`, waits with `ting wait-idle`, is updated and health-checked, then
-undrains with `ting undrain`. That needs only the node's own token.
+Upgrade the controller before replacing agent binaries; see [compatibility](compatibility.md) for
+the wire rules. For the agent-host half, see [Updating a node](../README.md#updating-a-node): the
+node drains itself with `ting drain`, waits with `ting wait-idle`, is updated and health-checked,
+then undrains with `ting undrain`. That needs only the node's own token.
 
 1. Read `CHANGELOG.md` and back up the database and artifacts ([below](#backup-and-restore)).
 2. Stop the controller: `systemctl stop lu-controller.service`.
@@ -32,19 +33,29 @@ undrains with `ting undrain`. That needs only the node's own token.
 4. Run `lu check --config /etc/lu/lu.toml` to validate config values and database health, then start the controller.
 5. Check `/v1/health`, `journalctl -u lu-controller`, `lu ls` and `lu nodes`. Full config and secret-file validation happens when the controller starts.
 
-The store uses schema version 8. It creates the schema for a new database and migrates schema 1 to 7 databases in place on startup, adding the scrubbing, lineage, publish, stacked-chain and node-failure columns (`staged_commit`, `blocked_reason`, `blocked_since`, `eligible_since`, `failure_reason`, `excluded_nodes_json`), the per-row `version` used by `If-Match`, the renamed cordon health flag column `health_derived`, and the additive `request_keys` table for HTTP idempotency. Any other schema version is refused with a clear message. Downgrades are not supported. Backups and restores require exactly the current schema version (8), so take a fresh backup after upgrading. An older backup must first be used as a database path and migrated by startup before it can be restored.
-
 There is no general online config reload. `SIGHUP` is not handled; restart the controller after changing config, TLS files or token hashes. The exception is `POST /v1/schedule/reload`, which an operator with `schedule = true` can use to swap in the schedule from the controller config file without a restart; see [Time-aware scheduling](scheduling.md#inspecting-scheduling). For the `HOME` and `PATH` settings needed by the contributed unit, see [Running the controller under systemd](install.md#running-the-controller-under-systemd).
 
-## Upgrading the controller
+## Node onboarding
 
-A controller of a newer release starts on the previous release's database and migrates it forward in place; there is no separate migration command. To upgrade:
+Each node has a unique name and its own agent token; an agent token is bound to that name and a
+valid token used for another node gets `403`. To add a node:
 
-1. Take a backup with `lu backup --out <file>` (see [Backup and restore](#backup-and-restore)); the rolling-update playbook also keeps a dated copy of the database file.
-2. Stop the controller, replace the binaries, and start it. Agents of the old and the new release can stay connected throughout; see [compatibility](compatibility.md).
-3. Confirm the result with `lu status --json`: `version` is the new release and `schema_version` equals the schema the release notes name (8 for this release).
+1. Generate a token for the node and add its hash to the controller's `[[controller.agents]]`
+   table, using the node name the agent will report. Keep the plaintext file on the node with
+   private permissions and out of version control; see [Tokens and TLS](tokens-and-tls.md).
+2. Restart the controller, since token hashes are read at startup.
+3. Write the node's `[agent]` config with `name`, `controller_url`, `work_dir`, `harness` and
+   `token_file`; add labels, taints or provider models as needed, and check the config with
+   `lu check --config <path>`.
+4. Start `ting` with that config. It heartbeats and polls the controller.
+5. Verify with `lu nodes` that the node is online with the expected version and labels, then submit
+   a small test job. An unmatched label or provider leaves the job queued until a matching node
+   reports in; see [Dispatch](dispatch.md).
 
-The migration only moves forward. To go back to an older release, stop the controller and restore the backup taken in step 1 (or the dated database copy); do not start an older binary on a migrated database, which refuses a schema version it does not know.
+Keep agent binaries at a version compatible with the controller; see
+[compatibility](compatibility.md). A node can take itself out of service for maintenance with
+`ting drain` and `ting wait-idle`; see [Updating a node](../README.md#updating-a-node) and the
+[`ting` reference](cli.md#ting-reference).
 
 ## Backup and restore
 
@@ -217,7 +228,7 @@ lists, and uncovered paths fail closed. See
 
 Failure classes, retry budgets and cancellation are in [lifecycle.md](lifecycle.md#failure-classes-and-retries); provider choice and fallbacks are in [dispatch.md](dispatch.md). Two agent-side detections matter when reading a stalled job.
 
-When a job resolves to a `provider` (the assigned choice, or the primary when the job names one), the agent checks it against its node's provider gateway health feed every five seconds, but acts only on a new reading. The feed itself refreshes every ten seconds. The gateway is the authority on keys, so this works for any harness: when two fresh readings in a row show the provider cooling or disabled (no usable key), the agent stops the job like a cancel and completes it as `Failed(Provider)`, with a summary that names the provider and the soonest return time the gateway reported. The completion carries that time plus a 60-second buffer as `retry_after_secs`, and the controller cordons that provider on the node for that long instead of the configured cordon length. Two consecutive healthy provider heartbeats after the failure clear that cordon; a non-healthy reading resets the streak.
+When a job resolves to a `provider` (the assigned choice, or the primary when the job names one), the agent checks it against its node's provider gateway health feed every five seconds, but acts only on a new reading. The feed itself refreshes every ten seconds. The gateway is the authority on keys, so this works for any harness: when two fresh readings in a row show the provider cooling or disabled (no usable key), the agent stops the job like a cancel and completes it as `Failed(Provider)`, with a summary that names the provider and the soonest return time the gateway reported. The completion carries that time plus a 60-second buffer as `retry_after_secs`; see [Dispatch](dispatch.md#cordons) for the resulting cordon.
 
 As a fallback for a job with no provider, or a node without a provider gateway feed, the agent watches a running harness's output. If the newest line matches a provider-unavailable marker (the opencode message about every key in the stream's chain, a quota message, a 429, or a rate limit) and the harness then produces no output for 120 seconds, the agent stops it the same way and completes the job as `Failed(Provider)`, with a summary naming the marker. Any other output after the marker disarms the watch.
 
@@ -242,21 +253,19 @@ The controller counts successful stuck completions in
 `lu_jobs_stuck_stopped_total{mode="cancel"|"retry"}`, reset on restart. See
 [monitoring.md](monitoring.md#series).
 
-## Provider cordons and node drains
+## Node drains
 
-These are separate mechanisms:
+A drain stops a node taking any new job. It is set by `POST /v1/nodes/{name}/drain` or `lu drain
+<node>` and cleared by `/undrain` or `lu undrain <node>`; the flag is stored with the node and
+survives a controller restart. A node must have sent a heartbeat at least once to exist; draining an
+unknown node returns `404 not_found`.
 
-- **Drain** stops a node taking any new job. It is set by `POST /v1/nodes/{name}/drain` and cleared by `/undrain`, and is stored in the `nodes` table. It survives a controller restart. A node must have sent a heartbeat at least once to exist; draining an unknown node returns `404 not_found`. An operator drain is operator-owned: the agent's `POST /v1/agent/undrain` refuses it with `409 conflict` and the node view reports `drain_origin: "operator"`. A node can instead drain itself with `POST /v1/agent/drain` and clear that drain with `POST /v1/agent/undrain`, reported as `drain_origin: "agent"`. See [Updating a node](../README.md#updating-a-node) for the self-service update sequence and [the `ting` reference](ting.md) for the CLI.
-- **Cordon** stops a node taking jobs whose chosen provider is cordoned. It is created when a retryable provider failure completes, keyed by the pair actually assigned rather than necessarily the primary. A completion with `retry_after_secs` creates a health-derived cordon that lifts after two consecutive healthy provider heartbeats; any other provider failure uses `provider_cooldown_secs` and a fixed expiry. A job with no provider is not blocked by a cordon.
-
-Cordon expiry is stored as monotonic milliseconds internally so dispatch behaviour is unchanged,
-while `cordon_details` exposes a wall-clock `until` for fixed cooldowns. Health-derived cordons expose
-`until: null`, `lifts_after_healthy_heartbeats: 2` and a zero-second remaining-time metric.
-`lu nodes --json` shows the active cordons in `cordon_details`; human output is described below.
-Clearing a cordon early needs no database edit: run `lu uncordon <node> [<provider>]`, or call
-`POST /v1/nodes/{name}/uncordon`. Boot recovery deletes every cordon row on each controller start,
-because a monotonic deadline from the previous process has no meaning for the new clock. Provider
-gateway health and new provider failures set them again.
+An operator drain is operator-owned: the agent's `POST /v1/agent/undrain` refuses it with `409
+conflict` and the node view reports `drain_origin: "operator"`. A node can instead drain itself with
+`ting drain` and clear that drain with `ting undrain`, reported as `drain_origin: "agent"`. See
+[Updating a node](../README.md#updating-a-node) for the self-service update sequence and the
+[`ting` reference](cli.md#ting-reference) for the CLI. Provider cordons are a separate dispatch
+hint; see [Dispatch](dispatch.md#cordons).
 
 ## Reading `lu nodes`
 
@@ -264,14 +273,14 @@ For the one-shot controller summary, see [`lu status` on the monitoring page](mo
 
 ```text
 NAME    VERSION  HARNESS  LABELS                        CORDONS      LAST_SEEN            DRAINED
-node-a  0.4.0   idle     !lab,gpu,php8.3,region=eu   !zen,!mistral 2026-11-21 09:12:00Z no
+node-a  0.4.0   idle     !lab,gpu,php8.3,region=eu   -            2026-11-21 09:12:00Z no
 ```
 
 - `NAME` is the node name bound to the agent token.
 - `VERSION` is the agent version from its latest heartbeat, or `-` for an older agent.
 - `HARNESS` is the last reported harness state (`idle`, `busy`, or `-` if unknown).
 - `LABELS` is the comma-separated label list from the latest heartbeat, with each taint shown first with a `!` prefix, or `-` for none. A label published by a probe is followed by ` (probed)`. A long list is cut to fit the column and ends with `+N` for the hidden entries.
-- `CORDONS` is the comma-separated list of cordoned providers, each with a `!` prefix, or `-` for none. It is separate from taints because a cordon can be cleared by an operator or healthy heartbeats.
+- `CORDONS` is the comma-separated list of cordoned providers, each with a `!` prefix, or `-` for none. See [Dispatch](dispatch.md#cordons) for the cordon rules.
 - `LAST_SEEN` is the last heartbeat time in UTC.
 - `DRAINED` shows the drain flag from the controller's node view.
 
@@ -280,14 +289,15 @@ There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full 
 next heartbeat), `draining`, `drain_origin` (`"operator"` or `"agent"` while drained, absent otherwise),
 `providers`, `provider_models`, `labels`, `label_sources`, `taints`,
 `current_job`, `cordon_details`, `version` and the opaque provider-health document. `label_sources` maps a
-probed label to `probed`; other labels have no entry. Each `cordon_details` entry carries its
-provider, source, reason, set time, expiry or healthy-lift count.
+probed label to `probed`; other labels have no entry.
 
-A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job, is missing from the list, lacks a required label, reports a taint the job does not tolerate, or (when the job names a provider) cannot serve any of its provider/model choices, including a matching provider cordon, will not be assigned one. `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
+A node with no current job and `harness: idle` can take work. A node that is `busy`, draining, has a held job or is missing from the list will not be assigned one. Label, taint and provider rules are in [Dispatch](dispatch.md). `current_job` stays set while the job is `recovering`, so a node that lost a lease is still shown as holding that job and cannot take another.
 
 ## Reading `lu node`
 
-`lu node <name>` prints the latest host and job stats the node reported, then its cordon details from the controller's node view. The controller keeps only the most recent heartbeat's stats in memory, so they survive neither a controller restart nor an agent restart until the next heartbeat.
+`lu node <name>` prints the latest host and job stats the node reported. The controller keeps only
+the most recent heartbeat's stats in memory, so they survive neither a controller restart nor an
+agent restart until the next heartbeat.
 
 ```text
 node  node-a
@@ -313,12 +323,6 @@ gc_bytes_freed_total 1073741824
 job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
   PID   PPID  STATE  CPU_S  RSS_KB  AGE_S  FILES  COMMAND
   4242  1     S      7      1024    90     3      opencode run
-
-cordons
-  zen [failure] 1m10s ago; 10m0s left
-      Provider zen failed: timeout
-  mistral [gateway] 20s ago; lifts on 2 healthy
-      Provider gateway cooldown for mistral
 ```
 
 - `labels` lists the node's current labels; a probed one is followed by ` (probed)`. `lu node <name> --json` includes `labels` and `label_sources` in the stats body.
@@ -326,9 +330,6 @@ cordons
 - The five `workspace_*` rows are the node's latest workspace counters. They describe agent-local workspaces under `work_dir`, not controller artifacts; see [workspaces.md](workspaces.md). `gc_removed_total` and `gc_bytes_freed_total` count scratch directories and bytes removed by housekeeping since the agent started.
 - Each job is a running job owned by that node. `pgid` is the harness process group, and the process table is capped at the 64 busiest members. `COMMAND` is the first 80 characters of the command line with control characters replaced.
 - `output_idle` is seconds since the harness last wrote output; `cpu_idle` is seconds since any process in the job tree last used CPU. `stuck yes` means both are above 300 seconds while the job is still running.
-- The `cordons` section lists each active provider with its source, how long ago it was set and
-  either its remaining time or its healthy-heartbeat lift count. The indented line is the stored
-  reason. `-` means no active cordons.
 - A node that has not sent stats prints `host  -` and `jobs  -`. An unknown node is a 404 and exits `1`.
 - `lu node <name> --json` prints the exact `GET /v1/nodes/{name}/stats` body, including an empty `{}` for a known node with no stats.
 - `lu node <name> --workspaces` prints the agent's oldest-first `JOB`, `STATE`, `BYTES`, `AGE` and `POLICY` listing. It uses the node view, so it also comes from the last heartbeat.
@@ -457,7 +458,7 @@ The job list uses the same colours. The graph shows at most 6 components and 40 
 
 ## Repository mirrors
 
-Mirror configuration, sync rules and the `lu repos` / `lu sync` commands are in [config.md](config.md) and the [client guide](client-guide.md#command-map); route details are in [api.md](api.md).
+Mirror configuration, sync rules and the `lu repos` / `lu sync` commands are in [config.md](config.md) and the [client guide](cli.md#command-map); route details are in [api.md](api.md).
 
 ## Troubleshooting
 

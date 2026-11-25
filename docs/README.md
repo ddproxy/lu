@@ -8,45 +8,30 @@ proof. For a condensed index, see [llms.txt](../llms.txt).
 - [Quickstart](quickstart.md) — one machine, one job, expected output.
 - [Install](install.md) — release archives, source builds and service layout.
 - [Configuration](config.md) — every config table, rules and validated examples.
-- [Troubleshooting](troubleshooting.md) — exact errors and fixes.
+- [Troubleshooting](troubleshooting.md) — quick answers, exact errors and fixes.
 
-## Concepts
+## Using Lu
 
-- [Concepts](concepts.md)
-- [Job Lifecycle](lifecycle.md)
-- [Dependencies](dependencies.md)
-- [Batch submissions](batch.md)
-- [Drafts](drafts.md)
-- [Publishing](publish.md)
-- [Node Workspaces](workspaces.md)
-- [Dispatch](dispatch.md)
+- [Job lifecycle](lifecycle.md) — states, ownership, failure classes and retries.
+- [Submitting work](submitting.md) — batch submissions and drafts.
+- [Dependencies](dependencies.md) — chaining, collection and blocked dependents.
+- [Publishing](publish.md) — publishing a finished diff.
+- [Node workspaces](workspaces.md) — checkout staging and workspace policies.
+- [Dispatch](dispatch.md) — labels, taints, providers, exclusions and cordons.
+- [Time-aware scheduling](scheduling.md) — scheduling windows.
+- [Scope](scope.md) — harness child-job scope and boundaries.
+- [Worked examples](examples.md) — end-to-end task examples.
 
 ## Operate
 
-- [Operations](operations.md)
-- [Monitoring](monitoring.md)
-- [Audit record](audit.md)
-- [Adding a node safely](onboarding-nodes.md)
-- [Ting migration note](migration-ting.md)
-- [Compatibility between releases](compatibility.md)
-- [What Lu does not protect against](limits.md)
-
-## Security
-
-- [Security](security.md)
-- [Tokens and TLS](tokens-and-tls.md)
-- [Security scanning](security-scanning.md)
-- [Scope](scope.md), [container scope](scope-container.md), [Ansible scope](scope-ansible.md)
+- [Operations](operations.md) — node onboarding, drains, upgrade, rollback, backup and restore.
+- [Monitoring](monitoring.md) — metrics and node contribution statistics.
+- [Security](security.md) — controller boundary, limits, audit record and intake signing.
+- [Tokens and TLS](tokens-and-tls.md) — file rules, rotation and transport security.
+- [Compatibility between releases](compatibility.md) — wire rules and release update order.
 
 ## Reference
 
-- [HTTP API](api.md)
-- [`ting` reference](ting.md)
-- [Client guide](client-guide.md)
-- [MCP server](mcp.md)
-- [opencode harness](opencode-harness.md)
-- [Provider cordons](dispatch.md#cordons)
-- [Signed intake](intake.md)
-- [Worked examples](examples.md)
-- [FAQ](faq.md)
-- [Agent self-drain notes](../NOTES.md)
+- [HTTP API](api.md) — routes, request and response shapes.
+- [CLI and MCP](cli.md) — client guide, `ting` reference and MCP server.
+- [Intake](intake.md) — signed webhook intake rules.

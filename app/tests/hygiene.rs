@@ -1,6 +1,6 @@
 //! Repository hygiene: retired product names, internal hosts and development node names must not
 //! appear in tracked docs, sources or tests. Compatibility literals are listed in
-//! `scripts/hygiene-allowlist.txt` and recorded in NOTES.md.
+//! `scripts/hygiene-allowlist.txt`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

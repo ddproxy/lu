@@ -2779,8 +2779,7 @@ impl Store for SqliteStore {
         expected_version: Option<i64>,
     ) -> Result<JobRecord, StoreError> {
         // The guard and the approval transition are checked in the same store transaction when
-        // there is no edit. An edit writes first, so its check-then-write window is documented in
-        // NOTES.md rather than hidden.
+        // there is no edit. An edit writes first, so its check-then-write window is explicit.
         {
             let mut conn = self.conn.lock().map_err(|_| internal("mutex poisoned"))?;
             let tx = conn

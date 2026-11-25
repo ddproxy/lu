@@ -27,11 +27,6 @@ Older releases are not supported: upgrade to the latest release.
 | Latest release | yes |
 | Older releases | no |
 
-## Security scanning
-
-The scanning workflows, where their findings appear, and how to verify a release are described in
-[Security scanning](docs/security-scanning.md).
-
 ## Scope
 
 In scope:

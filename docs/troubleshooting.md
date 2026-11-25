@@ -16,12 +16,26 @@ flowchart TD
     F -->|terminal| K[ Read logs and artifacts ]
 ```
 
+## Quick answers
+
+| Question | What it means | Check / action |
+| --- | --- | --- |
+| Why `401` with the right token? | Missing, malformed, unknown or wrong-scope tokens all return the same `401` with `WWW-Authenticate: Bearer`. Compare file bytes with `token_sha256` and restart the controller after changing its hash. | Use an operator token for `lu` and `lu mcp`; see [Tokens and TLS](tokens-and-tls.md#token-files-and-hashes). |
+| Why is a job blocked forever? | An `after` dependency is unfinished; a failed predecessor adds `blocked_reason: "predecessor failed"` and a `blocked_until` deadline, after which the dependent fails with class `dependency`. | Follow the chain with `lu show <id>` and `lu graph <id>`; retry the predecessor with `lu retry <dep-id>` or `--chain`; see [Dependencies](dependencies.md#waiting-and-promotion). |
+| Why did a dependency conflict fail the job? | The default `on_conflict = "fail"` stops before the harness and never retries; disagreeing chain bases can name two commits. | Read `lu show` and `lu logs`, fix the base or ref, or resubmit with `--collect files`, `--on-conflict markers` or `--on-conflict skip`; see [Dependencies](dependencies.md#one-base-per-chain). |
+| Why does submit return `429`? | Ten failed token checks in 60 seconds block an address for the window; mirror syncs and base packs have their own budgets. The MCP submission cap is a tool error, not HTTP `429`. | Fix the token and wait `Retry-After`; see [Security](security.md#throttling). |
+| Why does a node never take work? | The job cannot be placed: the node may be offline, busy, draining, holding a `recovering` job, missing a label, tainted, without a healthy provider or cordoned for that provider. | Read `waiting` in `lu show <id>` and `lu nodes --json`; see [Dispatch](dispatch.md). |
+| Why will a cordon not lift? | A cordon blocks one `(node, provider)` pair until its deadline, two healthy provider heartbeats, a controller restart or `lu uncordon`. | Check `cordon_details` and provider health; see [Dispatch](dispatch.md#cordons). |
+
+Read and clear cordons with `lu nodes --json` and `lu uncordon`; drains use `lu drain` and
+`lu undrain`.
+
 ## Command and connection
 
 | Symptom | Check | Action |
 | --- | --- | --- |
 | `lu serve` exits with a config error | `lu check --config …` | The error names the table. Fix that table before starting. |
-| `no controller URL: set LU_URL …` | Environment, then operator files | Set `LU_URL` and `LU_TOKEN_FILE` (optional `LU_CA_FILE`), or write `url` and `token_file` (optional `ca_file`) in `~/.config/lu/operator.toml` or `/etc/lu/operator.toml`. `--config` never supplies operator credentials and has no `[agent]` fallback. See [client guide](client-guide.md). |
+| `no controller URL: set LU_URL …` | Environment, then operator files | Set `LU_URL` and `LU_TOKEN_FILE` (optional `LU_CA_FILE`), or write `url` and `token_file` (optional `ca_file`) in `~/.config/lu/operator.toml` or `/etc/lu/operator.toml`. `--config` never supplies operator credentials and has no `[agent]` fallback. See [CLI and MCP clients](cli.md). |
 | Token file refused | Owner, mode, type | Regular file, owned by the effective user, mode `0600` or tighter, no symlink or FIFO; at most 64 KiB for an agent token, 8 KiB for an operator token. |
 | `401 unauthorized` | Token value, scope, hash | Missing, unknown and wrong-scope tokens all return `401`. Use an operator token for CLI/MCP and an agent token for agent routes. |
 | `403 forbidden` | Node binding | A valid agent token is bound to one node; another node's job or heartbeat is refused. |
@@ -46,7 +60,7 @@ credentials from `LU_URL`/`LU_TOKEN_FILE` (or an operator file), not from `--con
 
 | Symptom | Check | Action |
 | --- | --- | --- |
-| `lu: batch validation failed:` | The listed errors cover duplicate keys, empty or oversized tasks, bad TOML, unknown keys, missing `repo`/`ref` and invalid `after` hints. | Fix every listed issue and retry. Nothing was submitted. See [Batch submissions](batch.md#validation-and-failures). |
+| `lu: batch validation failed:` | The listed errors cover duplicate keys, empty or oversized tasks, bad TOML, unknown keys, missing `repo`/`ref` and invalid `after` hints. | Fix every listed issue and retry. Nothing was submitted. See [Batch submissions](submitting.md#dry-run-and-failures). |
 | `duplicate key` | Two task files or checklist items share a slug. | Rename one source, or use another `--key-prefix`. A repeated slug is an error even with different task text. |
 | `unknown key` in `after` | The key is not an earlier job in this batch and was not found on the controller. | Put the prerequisite earlier in the input, or submit it first with that key. |
 | `group cap conflict` | `--max-parallel` was used with jobs in different groups. | Give all jobs the same `group`, or omit `--max-parallel`. |
@@ -68,7 +82,7 @@ State definitions, legal transitions and the full state table are in
 | `recovering` | Agent heartbeat and `recovery_grace_secs`; a late write with an old epoch is discarded. |
 | `done`, `failed`, `cancelled` | `lu logs <id>` and `lu fetch <id>`; `lu retry <id>` requeues the same job. (not for `done`) |
 
-A queued job that cannot be placed shows the first blocking reason in `lu show` and `lu top`: a full group cap, then a missing label, an untolerated taint or no healthy provider pair. For what a drain or provider cordon does, see [Provider cordons and node drains](operations.md#provider-cordons-and-node-drains).
+A queued job that cannot be placed shows the first blocking reason in `lu show` and `lu top`: a full group cap, then a missing label, an untolerated taint or no healthy provider pair. For what a drain or provider cordon does, see [Cordons](dispatch.md#cordons).
 
 Worked example — diagnose a queued job:
 
@@ -149,7 +163,7 @@ Operator clean commands and safety rules are in [operations.md](operations.md#wo
 
 | Symptom | Cause | Action |
 | --- | --- | --- |
-| `-32602` | Unknown argument, missing argument or bad bound. | Compare the call with the tool table in [mcp.md](mcp.md). |
+| `-32602` | Unknown argument, missing argument or bad bound. | Compare the call with the tool table in [MCP server](cli.md#mcp-tools). |
 | `isError: true` with job text | Job or controller failure. | Read `structuredContent.error`. |
 | `isError: true` on every call | Controller unreachable when the server started. | Fix connection settings and restart `lu mcp`. |
 | `submission limit reached` | More than 30 submissions in a rolling minute. | Wait the reported number of seconds. `lu_submit`, `lu_submit_many`, `lu_submit_batch` and `lu_retry` share the budget. |

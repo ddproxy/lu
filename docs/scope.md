@@ -8,8 +8,8 @@ the harness.
 
 The capability is off by default. An operator grants it at submit time with
 `lu submit --allow-spawn`; a job cannot grant the right to itself. See
-[Configuration](config.md#scope) for the limits and [MCP server](mcp.md#scoped-mcp-ting-mcp) for
-the harness-facing command.
+[Configuration](config.md#scope) for the limits and
+[MCP server](cli.md#scoped-mcp-ting-mcp) for the harness-facing command.
 
 ## Threat model
 
@@ -117,8 +117,7 @@ A child starts from its parent's spec with the harness-facing choices clamped by
 
 ## Lineage and operator views
 
-Jobs carry `parent_job_id`, `root_job_id` and `depth` (top-level jobs are depth 0). These columns
-are part of the baseline since schema 4; older databases gain them in place at startup. Operators
+Jobs carry `parent_job_id`, `root_job_id` and `depth` (top-level jobs are depth 0). Operators
 retain full visibility: `lu ls --tree` groups jobs by parent, `lu show` prints parent, root, depth
 and the spawn settings, and `lu top` marks a spawned job with `scope:d<depth>`.
 
@@ -149,9 +148,11 @@ contains task text, prompts, artifact content or tokens. `/metrics` exports
 exposes the `scope_*` settings, and `lu show` prints the `audit_write_errors` counter for the job,
 as it does for other controller actions.
 
-## Deployment examples
+## Container harness
 
-- [Container harness bind mount](scope-container.md) — keep `SO_PEERCRED` working when the harness
-  runs in a container.
-- [Ansible example](scope-ansible.md) — create the private account and directories, set `[scope]`
-  and install the container helper.
+When the harness runs in a container, bind-mount the job's socket directory from the node's
+`<work_dir>/scope` into the container at a private path and set `LU_JOB_SOCKET` to that path. The
+uid inside the container must be the same as `[agent] harness_uid`, and the mount must preserve
+Unix socket peer credentials; a bind mount does, a proxied or forwarded socket may not. Do not
+mount the agent's config, token file or whole `work_dir` into the harness container. Keep the mount
+read-only apart from the socket path and remove it when the job ends.

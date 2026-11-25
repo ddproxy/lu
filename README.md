@@ -16,7 +16,7 @@ the wire rules are in [Compatibility](docs/compatibility.md).
 An operator submits a repo, ref and task. The controller stores the job in SQLite and hands out
 leases; a `ting` agent stages a checkout, runs the `opencode` harness and uploads a diff, log and
 report. Agents dial out to the controller, which never connects back to them. Signed HTTP intake
-can propose [drafts](docs/drafts.md) for an operator to approve. Lu is for bounded tasks that end
+can propose [drafts](docs/submitting.md#drafts) for an operator to approve. Lu is for bounded tasks that end
 in a reviewable diff, not for interactive sessions or long-running services.
 
 ```mermaid
@@ -54,9 +54,8 @@ make build && make install
 
 `make build` produces release binaries, with the `tui` feature for `lu`. `make install` puts them
 in `$(PREFIX)/bin`, defaulting to `/usr/local` for root and `$HOME/.local` otherwise; `PREFIX` and
-`DESTDIR` can be overridden. Root installs also install the `contrib/` systemd units. Upgrading an
-existing agent host must follow the [Ting migration note](docs/migration-ting.md); there is no
-compatibility shim.
+`DESTDIR` can be overridden. Root installs also install the `contrib/` systemd units. Upgrade the
+controller before agent hosts; see [Upgrade](docs/operations.md#upgrade).
 
 ## Quickstart
 
@@ -184,7 +183,8 @@ job that merges, tests or reviews those inputs. See [Dependencies](docs/dependen
 4. The agent uploads `diff.patch`, `run.log` and `report.json`. Failure classes, retries, cordons
    and blocked dependents are recorded in the store and shown by `lu show`.
 5. Operators inspect or fetch the result with `lu`, `lu mcp`, the [HTTP API](docs/api.md) or the
-   optional hash-chained [audit record](docs/audit.md). See [Concepts](docs/concepts.md) and
+   optional hash-chained [audit record](docs/security.md#audit-record). See the
+   [model and ownership](docs/lifecycle.md#model-and-ownership) and
    [Job Lifecycle](docs/lifecycle.md).
 
 ## Configuration
@@ -222,7 +222,7 @@ The minimal controller and agent examples in [Configuration examples](docs/confi
 both pass `lu check --config`; the docs check also validates the repository's `lu.toml` and the
 `contrib/` deployment samples. Full key-by-key reference: [Configuration](docs/config.md).
 Operator connection settings (`LU_URL`, `LU_TOKEN_FILE`, `LU_CA_FILE` or an operator file) are
-separate from `--config`; see [Client guide](docs/client-guide.md).
+separate from `--config`; see the [Client guide](docs/cli.md#client-guide).
 
 ## Updating a node
 
@@ -240,8 +240,8 @@ ting undrain                                 # allow new assignments again
 `ting` reads `/etc/ting/ting.toml` by default; pass `--config <path>` if the file lives elsewhere.
 `wait-idle` exits `0` when drained and idle and `3` on timeout. `status --json` prints the node's
 own fixed-shape view. A drain started by an operator cannot be cleared by `ting undrain`; the
-operator must clear it with `lu undrain <node>`. See [the `ting` reference](docs/ting.md),
-[Updating in operations](docs/operations.md#upgrade) and the
+operator must clear it with `lu undrain <node>`. See the [`ting` reference](docs/cli.md#ting-reference),
+[Upgrading a node](docs/operations.md#upgrade) and the
 [agent self-service API](docs/api.md#agent).
 
 ## Commands
@@ -263,12 +263,12 @@ Global flags: `--config <path>` (default `lu.toml`), `--json` (print the raw con
 | `lu sync <name>` | Fetch one configured repository mirror and print its last sync time and branch heads. `--json` prints the raw response. |
 | `lu serve` | Run the HTTP(S) controller. This is the default when no subcommand is given. |
 | `lu top [--once]` | Live view of the nodes and recent jobs, including the draft count and oldest draft age, refreshed every two seconds, with a compact bordered dependency-graph panel under the job table. Job rows show priority in the `PRI` column after `STATE`. The Nodes, Jobs and Graph panes take focus in turn (`Tab` / `Shift+Tab`); the graph shares its selected job with the Jobs table and can be navigated with `h`/`l` (parent/child), `j`/`k` (sibling) and `Home`/`End`. In the Nodes and Jobs panes `s`/`S` cycle the sort column forwards/backwards and `r` reverses the direction; clicking a header sorts by that column, and the active sort is indicated in the header. Selection follows the same job or node across refreshes and re-sorts. Mouse clicks select rows or nodes, double clicks open a job's log, and the wheel scrolls the focused pane. Mouse capture is released when the TUI exits, so terminal copy and paste keep working. `--once` prints one snapshot as text and exits; global `--json` prints one snapshot as JSON and cannot be combined with `--once`. Only in a build with `--features tui`. |
-| `ting` | Run the node agent loop (separate binary). It needs an `[agent]` config. The `mcp` subcommand serves the scoped harness tools; `drain`, `undrain`, `status [--json]` and `wait-idle --timeout` are the node's self-service commands ([reference](docs/ting.md)). |
+| `ting` | Run the node agent loop (separate binary). It needs an `[agent]` config. The `mcp` subcommand serves the scoped harness tools; `drain`, `undrain`, `status [--json]` and `wait-idle --timeout` are the node's self-service commands ([reference](docs/cli.md#ting-reference)). |
 | `lu submit` | Submit a job. In single-task mode, `--repo` and `--ref` are required. The task comes from `--task`, `--task-file` or stdin. Flags: `--harness` (default `opencode`), `--provider` (`any` picks a healthy provider published by the node), `--model`, `--timeout` (default `3600`; seconds or an `s`/`m`/`h` suffix), `--idle-timeout` (same syntax, 1 to 86400 seconds; omitted by default), `--on-stuck` (`none`, `cancel` or `retry`), `--stuck-after` (60 to 86400 seconds), `--after`, `--after-key`, `--collect`, `--on-conflict`, `--include-failed`, `--allow-empty`, `--expect-file`, `--expect-changed`, `--forbid-changed`, `--min-diff-bytes`, `--max-diff-bytes`, `--expect-mode`, `--workspace` (`ephemeral`, `keep_on_failure` or `keep`), `--cache-dir` (repeatable relative build-cache path), `--require`, `--tolerate`, `--fallback`, `--priority` (0 to 9, default 5; higher first), `--group` (1 to 64 letters, digits, `.`, `_` or `-`), `--allow-spawn`, `--spawn-inherit`, repeatable `--spawn-repo`, `--key` and `--wait`. `--allow-spawn` lets the harness submit children through its scoped socket; `--spawn-inherit` lets children submit their own children; `--spawn-repo` names an extra repository a child may use. `--tolerate` is repeatable, at most 8 taints. `--allow-empty` suppresses the `no changes` outcome note. `--fallback provider:model` is repeatable, at most 4; a fallback with only a provider keeps the job's model. `--after` and `--after-key` are repeatable, at most 16 dependencies in total; a key resolves to the newest job submitted with it. `--require` is repeatable, at most 8 labels. `--collect <mode>` selects `none`, `files`, `apply` or `both` (default `apply`; other spellings are refused); `files` and `both` write `.lu/inputs` before the harness starts. `--on-conflict <fail|markers|skip>` handles patches that do not apply; the default is `fail`. `--include-failed` accepts failed or cancelled dependencies as inputs when they stored a diff. `--wait` polls until the job is terminal. |
-| `lu drafts [--limit <n>]` | List unapproved drafts, oldest first; expired drafts are counted in metrics but not listed. `lu show <draft>` shows one draft's spec, origin and context metadata. See [Drafts](docs/drafts.md). |
+| `lu drafts [--limit <n>]` | List unapproved drafts, oldest first; expired drafts are counted in metrics but not listed. `lu show <draft>` shows one draft's spec, origin and context metadata. See [Drafts](docs/submitting.md#drafts). |
 | `lu approve <draft> [--edit]` | Approve a draft: it becomes `queued`, or `blocked` if dependencies are unmet. `--edit` edits before approving. |
 | `lu reject <draft> [--reason <text>]` | Reject a draft, cancelling it. The optional reason is stored as a coarse audit code, not job text. |
-| `lu submit --batch <path> --key-prefix <prefix>` | Submit one idempotent job per task in a directory or Markdown checklist. `--defaults <file.toml>` supplies shared fields; `--chain` depends each job on all earlier jobs; `--max-parallel N` sets a runtime group cap; `--dry-run` prints the plan without contacting the controller or reading a token. Keys are `<prefix>-<slug>`, so a rerun targets the same jobs. See [Batch submissions](docs/batch.md). |
+| `lu submit --batch <path> --key-prefix <prefix>` | Submit one idempotent job per task in a directory or Markdown checklist. `--defaults <file.toml>` supplies shared fields; `--chain` depends each job on all earlier jobs; `--max-parallel N` sets a runtime group cap; `--dry-run` prints the plan without contacting the controller or reading a token. Keys are `<prefix>-<slug>`, so a rerun targets the same jobs. See [Batch submissions](docs/submitting.md#batch-submissions). |
 | `lu retry <id>` | Requeue a failed, cancelled, expired or deadline-missed job in place: it keeps its id, its attempt is incremented and its outcome is cleared. Plain output is `retried <id>; requeued N dependents`, plus `waiting_dependents N` when some remain blocked; with `--json` the reply has `job`, `requeued` and `waiting_dependents`. `--chain` restores blocked dependents transitively, keeping their ids. `--provider` and `--model` replace those fields; `--after` and `--after-key` replace the dependency list; `--require` replaces the label requirements and `--no-require` clears them; `--tolerate` replaces the tolerated taints and `--no-tolerate` clears them; `--fallback` replaces the provider choices and `--no-fallbacks` clears them. `--collect`, `--on-conflict` and `--include-failed` replace the collect mode, conflict policy and failed-input opt-in. `--on-stuck` and `--stuck-after` replace the stuck policy and interval. `--priority` and `--group` replace those fields and `--no-group` clears the group. `--expect-file`, `--expect-changed`, `--forbid-changed`, `--min-diff-bytes`, `--max-diff-bytes` and `--expect-mode` change the expectation; omitted expectation fields stay as they are. `--key` updates the idempotency mapping for this attempt, and `--wait` polls until it is terminal. A job in any other state (including `done`) or an unknown `--after-key` is a usage error. |
 | `lu edit <id>` | Change a `queued` or `blocked` job in place; it keeps its id and dependents. For a draft it also changes task text, provider, model, priority, source ref and publish settings. `--provider` and `--model` replace those fields; `--fallback`/`--no-fallbacks`, `--require`/`--no-require` and `--tolerate`/`--no-tolerate` replace or clear the lists; `--after` and `--after-key` replace the dependencies, at most 16 and without a cycle. `--collect`, `--on-conflict` and `--include-failed` replace the collect mode, conflict policy and failed-input opt-in. `--on-stuck` and `--stuck-after` replace the stuck policy and interval. `--priority` and `--group` replace those fields and `--no-group` clears the group. `--expect-file`, `--expect-changed`, `--forbid-changed`, `--min-diff-bytes`, `--max-diff-bytes` and `--expect-mode` change the expectation; omitted fields stay as they are. `--provider any` cannot be combined with `--model` or `--fallback`. A job in another state, a cyclic dependency or a bad spec is an error. |
 | `lu collect <key-or-id>...` | Create one job that merges, tests or reviews collected inputs. `--repo` and `--ref` are required; each positional argument resolves like `--after-key`. The job uses `collect = both`, `on_conflict = markers` and `include_failed` only when an input is failed with a stored diff. `--template <merge|test|review>` (default `merge`) picks the prompt; `--task-file F` appends extra instructions. Override a template with `$XDG_CONFIG_HOME/lu/templates/<name>.md` or `$HOME/.config/lu/templates/<name>.md` (64 KiB cap). `--key`, `--provider`, `--model`, `--timeout`, `--workspace`, `--cache-dir` and `--wait` behave as on `lu submit`; the new job id is printed. |
@@ -304,7 +304,7 @@ Operator connection settings come from `LU_URL` with `LU_TOKEN_FILE` and optiona
 claude mcp add lu -- lu mcp
 ```
 
-The server uses the operator connection settings above. A connection failure at startup is reported by each tool call as an `isError` result, so an agent can see why the controller is unavailable. A harness inside a job uses the separate, credential-free `ting mcp` server instead; see [the scoped MCP server](docs/mcp.md#scoped-mcp-ting-mcp).
+The server uses the operator connection settings above. A connection failure at startup is reported by each tool call as an `isError` result, so an agent can see why the controller is unavailable. A harness inside a job uses the separate, credential-free `ting mcp` server instead; see [the scoped MCP server](docs/cli.md#scoped-mcp-ting-mcp).
 
 Read tools: `lu_status`, `lu_jobs`, `lu_job`, `lu_logs`, `lu_nodes`, `lu_node`, `lu_graph`, `lu_result`, `lu_drafts`. `lu_drafts` is operator-only and shows the draft inventory; job-scoped agent paths cannot see drafts.
 
@@ -312,7 +312,7 @@ Write tools: `lu_submit`, `lu_submit_many`, `lu_submit_batch`, `lu_cancel`, `lu_
 
 - `lu_submit` takes `repo`, `ref` and inline `task` text, plus optional `provider`, `model`, `priority`, `group`, `require`, `fallbacks`, `after`, `after_keys`, `collect`, `on_conflict`, `include_failed`, `on_stuck`, `stuck_after`/`stuck_after_secs`, `harness`, `timeout`/`timeout_secs`, `idle_timeout`/`idle_timeout_secs`, the expectation fields and `key`. When `key` is absent the server derives `mcp-` followed by 16 hex characters of the spec's SHA-256, so repeating the same submission is idempotent.
 - `lu_submit_many` submits up to 12 named jobs in order. Each job accepts the same spec fields as `lu_submit`, plus `name` and `after_names`. A job's `after_names` may refer only to earlier jobs in the same call; duplicate, unknown, forward or cyclic names are rejected before any request is sent. A failure partway through reports which jobs were submitted and which were not.
-- `lu_submit_batch` reads a directory of task files or a Markdown checklist on the MCP host. Its arguments are `path` and `key_prefix`, plus optional `repo`, `ref`, `defaults`, `chain`, `max_parallel` and `dry_run`. It uses the same planner and submission helpers as `lu submit --batch`; see [Batch submissions](docs/batch.md).
+- `lu_submit_batch` reads a directory of task files or a Markdown checklist on the MCP host. Its arguments are `path` and `key_prefix`, plus optional `repo`, `ref`, `defaults`, `chain`, `max_parallel` and `dry_run`. It uses the same planner and submission helpers as `lu submit --batch`; see [Batch submissions](docs/submitting.md#batch-submissions).
 - `lu_retry` accepts the same override fields as `lu_submit`, including `collect`, `on_conflict`, `include_failed`, `on_stuck` and `stuck_after`/`stuck_after_secs`; absent fields are inherited from the finished job's spec.
 - `lu_result` returns a finished job's summary, report, diff stats and a page of the diff. It defaults to 24 KiB and accepts `offset` and `max_bytes` (at most 32 KiB); follow `next_offset` until `done` is true.
 - `on_stuck` is `none` (default), `cancel` or `retry`; `stuck_after`/`stuck_after_secs` is 60 to 86400 seconds. Absent values use the agent defaults.
@@ -330,7 +330,7 @@ Write tools: `lu_submit`, `lu_submit_many`, `lu_submit_batch`, `lu_cancel`, `lu_
 | Upgrade | Drain the nodes, update the controller first (schema migrates forward), then replace each agent binary; see [Upgrade](docs/operations.md#upgrade). |
 | Rollback | Restore the dated pre-upgrade database copy with the older binary. Never run an older controller on a migrated database; see [Compatibility](docs/compatibility.md). |
 | Change config or secrets | Restart the affected process; there is no live reload. |
-| Node maintenance | See [Updating a node](#updating-a-node) and [Adding a node safely](docs/onboarding-nodes.md). |
+| Node maintenance | See [Updating a node](#updating-a-node) and [Adding a node safely](docs/operations.md#node-onboarding). |
 
 Common failures, with the exact message and fix:
 
@@ -355,11 +355,10 @@ reads them. Scoped harness tools use a local socket and carry no controller cred
 Lu does **not** isolate jobs by OS user, redact task text or artifacts, manage provider credentials
 or turn a cordon into access control. Run agents as dedicated accounts, keep provider credentials
 on the nodes, and treat fetched artifacts and backups as sensitive. The full boundary list is in
-[What Lu does not protect against](docs/limits.md) and [Security](docs/security.md).
+[What Lu does not protect against](docs/security.md#what-lu-does-not-protect-against) and
+[Security](docs/security.md).
 
-Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). The scanning
-workflows, where their findings appear, and the release verification steps are in
-[Security scanning](docs/security-scanning.md).
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ### Verify a release
 
@@ -381,14 +380,14 @@ Last checked with release 0.7.0, Rust 1.99 and store schema 8.
 | Area | Checked against | Notes |
 | --- | --- | --- |
 | Release | `Cargo.toml` workspace version | The docs check asserts this README's status line matches. |
-| Store schema | `SCHEMA_VERSION = 6` | Forward-only migration from 5; a docs test rejects a different current version. |
+| Store schema | Schema version 8 (`SCHEMA_VERSION = 8`). | Forward-only migration from 7; a docs test rejects a different current version. |
 | Wire protocol | Two previous stable releases | CI runs `scripts/compat-test.sh` in both directions for each: older agent with new controller, and newer agent with old controller. |
 | Release platforms | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | Static archives; CI smoke-builds the musl target before release. |
 | Source build | Rust 1.99 | Workspace `rust-version`; CI installs 1.99 with rustfmt and clippy. |
 | Harness | `opencode` | Default harness; job children use the credential-free `ting mcp` socket. |
 | Provider health | Local provider gateway health URL | The health URL must be loopback; see [configuration](docs/config.md#agent). |
 
-Details and rollout order are in [Compatibility between releases](docs/compatibility.md).
+Wire rules and release compatibility are in [Compatibility between releases](docs/compatibility.md).
 
 ## Limits and non-goals
 
@@ -403,7 +402,8 @@ untolerated taint or no healthy pair for `--provider any` leaves it `queued` wit
 reason, and a failing detection probe removes a label. **Fail-closed** means the request or startup
 is refused: bad config, an unknown or wrong-scope token (`401`), a token bound to another node
 (`403`), or a scrubbed or secret-hit patch used as a collect input without the opt-in flag. See
-[What Lu does not protect against](docs/limits.md) and [Troubleshooting](docs/troubleshooting.md).
+[What Lu does not protect against](docs/security.md#what-lu-does-not-protect-against) and
+[Troubleshooting](docs/troubleshooting.md).
 
 ## Contributing
 
@@ -448,56 +448,36 @@ MIT. See [LICENSE](LICENSE).
 A compact index for agents is in [llms.txt](llms.txt); the page-by-page index is
 [docs/README.md](docs/README.md).
 
-### Quickstart
+### Start here
 
 - [Quickstart](#quickstart)
+- [Install](docs/install.md)
+- [Configuration](docs/config.md)
+- [Troubleshooting](docs/troubleshooting.md)
 - [Worked examples](docs/examples.md)
 
-### Concepts
+### Using Lu
 
-- [Concepts](docs/concepts.md)
-- [Job Lifecycle](docs/lifecycle.md)
-- [Drafts](docs/drafts.md)
-- [Publishing](docs/publish.md)
-- [Node Workspaces](docs/workspaces.md)
+- [Job lifecycle](docs/lifecycle.md)
+- [Submitting work](docs/submitting.md)
 - [Dependencies](docs/dependencies.md)
-- [Batch submissions](docs/batch.md)
-- [Choosing where a job runs](docs/dispatch.md)
+- [Publishing](docs/publish.md)
+- [Node workspaces](docs/workspaces.md)
+- [Dispatch](docs/dispatch.md)
 - [Time-aware scheduling](docs/scheduling.md)
-
-### Install
-
-- [Install](docs/install.md)
-- [Ting migration note](docs/migration-ting.md)
-
-### Configuration
-
-- [Configuration](docs/config.md)
-- [Webhook intake](docs/intake.md)
-- [Running the opencode harness](docs/opencode-harness.md)
+- [Scope](docs/scope.md)
 
 ### Operate
 
-- [Provider cordons](docs/dispatch.md#cordons)
 - [Operations](docs/operations.md)
-- [Adding a node safely](docs/onboarding-nodes.md)
 - [Monitoring](docs/monitoring.md)
-- [Audit record](docs/audit.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [What Lu does not protect against](docs/limits.md)
-
-### Security
-
-- [Tokens and TLS](docs/tokens-and-tls.md)
 - [Security](docs/security.md)
-- [Security scanning](docs/security-scanning.md)
+- [Tokens and TLS](docs/tokens-and-tls.md)
+- [Compatibility between releases](docs/compatibility.md)
 
 ### Reference
 
 - [HTTP API](docs/api.md)
-- [Compatibility between releases](docs/compatibility.md)
-- [`ting` reference](docs/ting.md)
-- [Agent self-drain notes](NOTES.md)
-- [Client guide](docs/client-guide.md)
-- [MCP server](docs/mcp.md)
-- [FAQ](docs/faq.md)
+- [CLI and MCP](docs/cli.md)
+- [Intake](docs/intake.md)
+- [Documentation index](docs/README.md)

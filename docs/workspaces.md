@@ -43,42 +43,8 @@ When disk use is above the high-water mark, or total workspace bytes are above `
 
 Deletion walks with `symlink_metadata`: symlinks are unlinked as links and never followed. Paths are confined to the canonical workspace root, the root itself is never deleted, and a failed deletion is logged, counted and retried with exponential backoff capped at 64 seconds.
 
-## Ansible example
-
-Keep secrets and agent tokens in your existing secret handling; this only manages the workspace settings.
-
-```yaml
----
-- name: Configure Ting workspace lifecycle
-  hosts: lu_nodes
-  become: true
-  vars:
-    ting_config: /etc/ting/ting.toml
-
-  tasks:
-    - name: Set workspace retention and pressure limits
-      ansible.builtin.blockinfile:
-        path: "{{ ting_config }}"
-        marker: "# {mark} lu workspace lifecycle"
-        block: |
-          [workspace]
-          default = ephemeral
-          failed_ttl = 6h
-          keep_ttl = 48h
-          max_bytes = 53687091200
-          low_water_percent = 65
-          high_water_percent = 80
-          sweep_interval = 60s
-      notify: Restart Ting
-
-  handlers:
-    - name: Restart Ting
-      ansible.builtin.systemd:
-        name: ting
-        state: restarted
-```
-
-Set `max_bytes` to a value appropriate for the node's disk; omit it when disk watermarks alone should control eviction. The `[agent] work_dir` itself is set in the agent's base configuration.
+Set `max_bytes` to a value appropriate for the node's disk; omit it when disk watermarks alone
+should control eviction. The `[agent] work_dir` itself is set in the agent's base configuration.
 
 ## Observing and cleaning workspaces
 

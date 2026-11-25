@@ -90,9 +90,3 @@ modes. The former plural and nested table names, the calendar `dates` field and 
 aliases are refused with the accepted spelling in the error. Config and jobs that use those
 spellings must be updated before the 0.8.0 controller reads them; unlike the node wire field, they
 are not ignored.
-
-## Updating a fleet
-
-Because of the rule above, the order of a rollout does not matter for correctness. Updating the
-controller first is still the quietest order (the controller migrates its schema once, then agents
-follow), and `tuishou` updates each node independently when it is enabled.

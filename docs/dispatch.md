@@ -37,12 +37,12 @@ For a controller on a non-loopback address, add a `[tls]` table with `cert` and 
 
 ## Cordons
 
-A cordon is a `(node, provider)` block. Dispatch skips that pair on that node, so fallbacks, other nodes and other providers remain available. A job with no provider is not affected.
+A cordon is a `(node, provider)` block. Dispatch skips that pair on that node, so fallbacks, other nodes and other providers remain available. A job with no provider is not affected. A cordon is a dispatch hint, not a security boundary; see [What Lu does not protect against](security.md#what-lu-does-not-protect-against). A node drain is a separate mechanism described in [Operations](operations.md#node-drains).
 
-- **Health-derived**: the agent reports two consecutive unhealthy gateway readings and completes the job as `Failed(Provider)` with `retry_after_secs`. The cordon uses a distinct health-derived source value, records the gateway's estimated return time in its reason, and lifts after two consecutive healthy provider heartbeats. Its API `until` is null because the end time is not fixed.
-- **Failure-derived**: any other retryable provider failure uses `provider_cooldown_secs`. The cordon has source `failure`, a reason naming the provider and failure summary, and a fixed wall-clock expiry.
+- **Health-derived**: the agent reports two consecutive unhealthy gateway readings and completes the job as `Failed(Provider)` with `retry_after_secs`. The cordon uses a distinct health-derived source value, records the gateway's estimated return time in its reason, and lifts after two consecutive healthy provider heartbeats; a non-healthy reading resets the streak. Its API `until` is null because the end time is not fixed, and its remaining-time metric is zero.
+- **Failure-derived**: any other retryable provider failure uses `provider_cooldown_secs` (or the agent's `retry_after_secs`, clamped to 5 seconds through 24 hours). The cordon has source `failure`, a reason naming the provider and failure summary, and a fixed wall-clock expiry. It does not clear on healthy heartbeats.
 
-`lu nodes` shows cordoned providers in the `CORDONS` column as `!provider`; `lu top` marks the provider chip with `!` and a `~` suffix for health-derived cordons, then lists both kinds with their reason and remaining time or lift count. `lu node <name>` prints the same details with the age of each cordon. An operator can clear a cordon early with `lu uncordon <node> [<provider>]`, which calls `POST /v1/nodes/{name}/uncordon`; omitting the provider clears every cordon on that node. Boot still clears all stored cordons, so a controller restart never blocks dispatch with stale deadlines.
+`lu nodes` shows cordoned providers in the `CORDONS` column as `!provider`; `lu top` marks the provider chip with `!` and a `~` suffix for health-derived cordons, then lists both kinds with their reason and remaining time or lift count. `lu node <name>` prints the same details with each cordon's age. `lu nodes --json` carries `cordon_details` with provider, source, reason, set time, expiry or healthy-lift count. An operator clears a cordon early with `lu uncordon <node> [<provider>]`, which calls `POST /v1/nodes/{name}/uncordon`; omitting the provider clears every cordon on that node. No database edit is needed. Expiry is stored as monotonic milliseconds internally; boot recovery deletes every cordon because a deadline from the previous process has no meaning for the new clock. Provider health and new failures set cordons again.
 
 ## Node exclusions
 
@@ -72,4 +72,4 @@ lu submit --repo /path/to/repository --ref main --task "build the lab image" --t
 
 An agent can publish labels from commands it runs itself: up to 16 `[[agent.detect]]` entries run an argv command at start and every `every_secs`. Exit status 0 publishes the entry's label; any other exit withdraws it. Probes run off the heartbeat path with a wall timeout and a minimal environment, and `lu nodes` marks a published label as `(probed)`. Config keys are in [config.md](config.md).
 
-See [Concepts](concepts.md) for the vocabulary and [Job lifecycle](lifecycle.md) for what happens when no node qualifies.
+Vocabulary and ownership are in [Job lifecycle](lifecycle.md#model-and-ownership).

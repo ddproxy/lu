@@ -72,7 +72,7 @@ fn readme_has_the_required_sections() {
 
 #[test]
 fn documentation_links_resolve() {
-    let mut paths = vec![root().join("README.md")];
+    let mut paths = vec![root().join("README.md"), root().join("llms.txt")];
     for entry in fs::read_dir(root().join("docs")).expect("read docs/") {
         let path = entry.expect("docs entry").path();
         if path.extension().is_some_and(|ext| ext == "md") {
@@ -110,6 +110,20 @@ fn documentation_links_resolve() {
         }
     }
     assert!(broken.is_empty(), "broken links:\n{}", broken.join("\n"));
+}
+
+#[test]
+fn docs_page_count_is_consolidated() {
+    let pages: Vec<_> = fs::read_dir(root().join("docs"))
+        .expect("read docs/")
+        .map(|entry| entry.expect("docs entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    assert!(
+        pages.len() <= 22,
+        "docs/ has {} pages, expected at most 22",
+        pages.len()
+    );
 }
 
 fn help_commands(binary: &str) -> Vec<String> {
@@ -255,7 +269,7 @@ fn check_proof_lines_match_the_binary() {
 
 #[test]
 fn connection_and_validation_docs_state_the_behaviour() {
-    let guide = read("docs/client-guide.md");
+    let guide = read("docs/cli.md");
     assert!(
         guide.contains("There is no fallback to `[agent]` in `--config`"),
         "client guide must rule out the agent credential fallback"
@@ -291,7 +305,7 @@ fn documented_node_failure_contract_matches_code() {
     let readme = read("README.md");
     let lifecycle = read("docs/lifecycle.md");
     let api = read("docs/api.md");
-    let audit = read("docs/audit.md");
+    let security = read("docs/security.md");
     let dispatch = read("docs/dispatch.md");
 
     assert!(config.contains(&format!(
@@ -308,7 +322,7 @@ fn documented_node_failure_contract_matches_code() {
         assert!(api.contains(reason.as_str()), "api omits {reason}");
     }
     for field in ["node_excluded", "excluded_node"] {
-        assert!(audit.contains(field), "audit omits {field}");
+        assert!(security.contains(field), "security omits {field}");
     }
     assert!(dispatch.contains("## Node exclusions"));
 }

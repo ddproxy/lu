@@ -30,13 +30,17 @@ fn mentions(line: &str) -> Vec<i64> {
 
 #[test]
 fn docs_name_the_current_schema_version() {
-    let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let docs = root.join("docs");
+    let mut paths: Vec<_> = std::fs::read_dir(&docs)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "md"))
+        .collect();
+    paths.push(root.join("README.md"));
+    paths.push(root.join("llms.txt"));
     let mut stale = Vec::new();
-    for entry in std::fs::read_dir(&docs).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_none_or(|e| e != "md") {
-            continue;
-        }
+    for path in paths {
         let text = std::fs::read_to_string(&path).unwrap();
         for (number, line) in text.lines().enumerate() {
             // Judge each sentence on its own, so a migration remark in one sentence does not
