@@ -438,6 +438,46 @@ async fn tolerations_are_validated() {
 }
 
 #[tokio::test]
+async fn idle_timeout_is_stored_validated_and_returned() {
+    let srv = start_server().await;
+    let mut spec = sample_spec(None);
+    spec.timeout_secs = 600;
+    spec.idle_timeout_secs = Some(120);
+    let created = submit_spec(srv.addr, &spec).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let view: serde_json::Value = serde_json::from_str(body_str(&created)).unwrap();
+    let id = view["id"].as_str().unwrap();
+    assert_eq!(view["spec"]["timeout_secs"], 600);
+    assert_eq!(view["spec"]["idle_timeout_secs"], 120);
+
+    let read = raw_request(
+        srv.addr,
+        &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status(&read), 200, "{read}");
+    let read: serde_json::Value = serde_json::from_str(body_str(&read)).unwrap();
+    assert_eq!(read["spec"]["idle_timeout_secs"], 120);
+
+    let mut too_long = spec.clone();
+    too_long.timeout_secs = 60;
+    too_long.idle_timeout_secs = Some(120);
+    let accepted = submit_spec(srv.addr, &too_long).await;
+    assert_eq!(status(&accepted), 201, "{accepted}");
+
+    let mut zero = spec;
+    zero.idle_timeout_secs = Some(0);
+    let refused = submit_spec(srv.addr, &zero).await;
+    assert_eq!(status(&refused), 422, "{refused}");
+    assert!(
+        body_str(&refused).contains("idle_timeout_secs"),
+        "{}",
+        body_str(&refused)
+    );
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
 async fn tainted_nodes_are_shown_and_explained() {
     let srv = start_server().await;
     let mut spec = sample_spec(None);
