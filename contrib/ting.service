@@ -8,7 +8,7 @@ Type=simple
 User=ting
 Group=ting
 # The agent needs the shared staging group. This unit still runs the harness as ting
-# unless harness_wrapper starts a separate-account runner; workspace_group only
+# unless a profile wrapper starts a separate-account runner; workspace_group only
 # shares the working tree, not the agent's token.
 SupplementaryGroups=lu-harness
 WorkingDirectory=/var/lib/ting/work

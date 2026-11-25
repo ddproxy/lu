@@ -74,6 +74,14 @@ async fn a_normal_exit_reports_its_code() {
 }
 
 #[tokio::test]
+async fn stdin_bytes_are_written_then_closed() {
+    let mut run = Supervisor::spawn(sh("cat; exit 0").stdin(b"task text\n"), limits());
+    let drained = tokio::spawn(drain(run.output()));
+    assert_eq!(run.wait().await, Outcome::Exited(0));
+    assert_eq!(drained.await.expect("drain"), b"task text\n");
+}
+
+#[tokio::test]
 async fn a_signal_death_reports_the_signal() {
     let mut run = Supervisor::spawn(sh("kill -TERM $$"), limits());
     assert_eq!(run.wait().await, Outcome::Signalled(15));

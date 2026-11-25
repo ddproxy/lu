@@ -300,6 +300,83 @@ fn connection_and_validation_docs_state_the_behaviour() {
 }
 
 #[test]
+fn documented_harness_profile_contract_matches_code() {
+    let config = read("docs/config.md");
+    let operations = read("docs/operations.md");
+    let readme = read("README.md");
+    let security = read("docs/security.md");
+    let lifecycle = read("docs/lifecycle.md");
+
+    assert!(config.contains("### Harness profiles"));
+    assert!(operations.contains("## Harness profiles at run time"));
+    assert!(config.contains(
+        "argv = [\"opencode\", \"run\", \"{server_args}\", \"--auto\", \"{model_args}\", \"-f\", \"{task_file}\", \"{message}\"]"
+    ));
+    for term in [
+        "result_file",
+        "provider_markers",
+        "needs_input_markers",
+        "secret_env",
+        "stdin = \"null\"",
+        "UNVERIFIED",
+    ] {
+        assert!(config.contains(term), "config docs omit {term}");
+    }
+    assert!(operations.contains("unsupported harness profile"));
+    assert!(operations.contains("result: <text>"));
+    assert!(
+        operations.contains("stuck for <n>s, stopped; harness appears to need input"),
+        "operations must state the needs-input summary"
+    );
+    assert!(readme.contains("docs/config.md#harness-profiles"));
+    assert!(security.contains("config.md#harness-profiles"));
+    assert!(!lifecycle.contains("harness_wrapper"));
+
+    let removed = [
+        "opencode_server",
+        "opencode_password_file",
+        "OPENCODE_SERVER_PASSWORD",
+        "harness_wrapper",
+    ];
+    for path in [
+        "README.md",
+        "docs/config.md",
+        "docs/operations.md",
+        "docs/security.md",
+        "docs/lifecycle.md",
+        "lu.toml",
+        "contrib/ting.toml",
+        "contrib/ting.service",
+    ] {
+        let text = read(path);
+        for term in removed {
+            assert!(!text.contains(term), "{path} still documents {term}");
+        }
+    }
+
+    let changelog = read("CHANGELOG.md");
+    let unreleased = changelog
+        .split("## [0.8.0]")
+        .next()
+        .expect("unreleased changelog section");
+    let breaking: Vec<_> = unreleased
+        .lines()
+        .filter(|line| line.contains("Breaking: removed"))
+        .collect();
+    for term in [
+        "opencode_server",
+        "opencode_password_file",
+        "harness_wrapper",
+    ] {
+        assert!(
+            breaking.iter().any(|line| line.contains(term)),
+            "changelog must record the removal of {term}"
+        );
+    }
+    assert!(unreleased.contains("Breaking: `[agent] harness`"));
+}
+
+#[test]
 fn documented_node_failure_contract_matches_code() {
     let config = read("docs/config.md");
     let readme = read("README.md");

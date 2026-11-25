@@ -146,15 +146,12 @@ The `[agent]` table describes an agent host. Operator commands never read it: th
 | `token_file` | yes | — | Non-empty absolute path without `..`. On `load`, it must be a regular file, owned by the effective user, with no group or other permission bits, no symlink and no FIFO; at most 64 KiB. The CLI trims trailing CR/LF from the token text. |
 | `ca_file` | no | — | Non-empty absolute path without `..` when set. On `load`, the client reads up to 1 MiB of PEM certificates and adds them to the system trust roots; it does not replace the system roots. `lu check` does not read it. |
 | `work_dir` | yes | — | Absolute path; must not contain `..`. The agent creates it recursively with mode `0700` at start when it is missing. An existing path must be a real directory, not a symlink; staging rejects `/` and bare top-level directories such as `/srv`. It is also the root for the job workspaces described in [workspaces.md](workspaces.md). |
-| `harness` | yes | — | Non-empty. The agent runs `opencode` job specs only; a spec naming another harness fails with `execution`. A non-`opencode` configured value is ignored with a warning. |
+| `harness_profiles` | no | built-in `opencode` | Named command profiles under `[agent.harness_profiles.<name>]`; see [Harness profiles](#harness-profiles). The job spec's `harness` selects one at run time. |
 | `base_source` | no | `auto` | `clone`, `controller` or `auto`. For a job with `base_commit`, `controller` fetches a pack from the controller and fails the job on `404`; `auto` falls back to cloning the spec's `repo` on `404`; `clone` never asks. Local bases come from paths under `local_repo_roots`; roots and candidates are canonicalised so symlinks cannot escape. |
-| `opencode_server` | no | — | Config requires a non-empty value. When a job starts, the opencode launcher also requires `http://` or `https://`, no whitespace or control characters, no leading `-`, and at most 2048 bytes. |
 | `workspace_group` | no | — | A group name or number, 1 to 32 letters, digits, `_`, `-` or `.`. Each job's working tree is given to this group with group read, write and the setgid bit; `.git` is left as git made it. It supports a harness that runs as another account while the agent runs as the account that can use git. Resolved from `/etc/group` at start; an unknown group stops the agent. |
 | `harness_uid` | no | — | Numeric uid of the account the harness runs as. When set, the agent chowns the per-job socket root and each private socket directory/socket to this account and checks `SO_PEERCRED` against it. Unset means the harness shares the agent's uid. The agent needs `CAP_CHOWN` (or root) to use a different uid. |
 | `allow_shared_uid_scope` | no | `false` | Lets a job with `allow_spawn` start while `harness_uid` is unset, so the harness shares the agent's uid and can read what the agent can. Off by default: the job is refused with a `conflict`. |
 | `harness_gid` | no | `workspace_group` or `harness_uid` | Numeric gid for the per-job socket files and directories. Requires `harness_uid`. |
-| `opencode_password_file` | no | — | Absolute path without `..` naming a private file (a regular file owned by the agent's account, no group or other access) whose single line is the opencode server's password. The agent reads up to 4 KiB at start, trims trailing CR/LF, rejects control characters and passes it to the harness as `OPENCODE_SERVER_PASSWORD`. Its contents are checked at agent start, not by config validation. |
-| `harness_wrapper` | no | `[]` | A command that wraps the harness, for example `["podman", "exec", "-i", "--workdir", "{cwd}", "--env", "OPENCODE_SERVER_PASSWORD", "opencode-agent"]`, so it runs inside a container. `{cwd}` becomes the job's working tree. Entries must be non-empty text without control characters. The wrapper runs directly, never through a shell. |
 | `heartbeat_secs` | no | `15` | Integer `2` to `300`. When a `[controller]` table is also present, `heartbeat_secs * 2` must be strictly less than `lease_secs`. |
 | `on_stuck` | no | `none` | One of `none`, `cancel`, `retry`. Default response for jobs whose spec omits `on_stuck`; `none` leaves stuck jobs running. |
 | `stuck_after_secs` | no | `1800` | Integer `60` to `86400`. Default continuous stuck interval for jobs whose spec omits `stuck_after_secs`. |
@@ -167,6 +164,70 @@ The `[agent]` table describes an agent host. Operator commands never read it: th
 | `detect` | no | `[]` | Up to 16 `[[agent.detect]]` entries; labels must be valid and unique. See below. |
 | `taints` | no | `[]` | At most 8 taints. Each is a label with the same syntax as `labels`. A tainted node takes only jobs that tolerate every taint. Sent with every heartbeat and replaced on change. |
 | `housekeeping` | no | — | Optional `[agent.housekeeping]` table. Without it the agent removes nothing. |
+
+The former `[agent] harness` key is accepted as a parse-only compatibility alias. Lu does not read,
+validate or warn about it, and it does not select a harness; omit it from new configurations. The
+old launcher-specific server, password-file and wrapper keys are unknown keys; their replacements
+are profile fields below.
+
+### Harness profiles
+
+A profile is a named, validated command recipe. The job spec's `harness` names the profile to run;
+the built-in `opencode` profile is always available, and a table of the same name overrides its
+fields. Any other profile must set `argv` and `message`. At most 16 profiles exist in total,
+including the built-in one. Names are 1 to 64 characters from `A-Z a-z 0-9 . _ -` and must start
+with a letter, digit or `_`. Duplicate names and unknown profile fields are refused.
+
+| Field | Built-in `opencode` default | Validation and meaning |
+| --- | --- | --- |
+| `argv` | see below | 1 to 64 entries, at most 16384 bytes in total; each entry is 1 to 4096 bytes without control characters. Direct argv: no shell. |
+| `message` | `Follow the task in the provided file.{context_warning}` | 1 to 4096 bytes without control characters. It is substituted into `{message}`; the warning suffix is present only when the job supplied external context. |
+| `wrapper` | `[]` | At most 16 entries, each 1 to 4096 bytes without control characters. Prepended to the compiled command; only `{cwd}` may appear in a wrapper entry. |
+| `server` | unset | Optional `http://` or `https://` URL, at most 2048 bytes, with no whitespace, control characters or leading `-`. Empty or other schemes are refused. |
+| `server_args`, `model_args`, `provider_args` | `["--server", "{server}"]`, `["-m", "{model}"]`, `[]` | At most 16 entries each. The matching fragment expands to zero elements when `server`, `model` or `provider` is absent. |
+| `env` | `[]` | At most 32 variable names. An unset variable is skipped, not passed as an empty value. |
+| `secret_env` | `{}` | At most 8 name-to-path entries. Paths are read only when a job starts; no example keys or values belong in config. |
+| `stdin` | `"null"` | Exactly `"null"` or `"task"`. With `"task"`, the staged task file is written to the child's stdin and the pipe is closed; files over 256 KiB are refused. |
+| `result_file` | unset | A relative path of at most 4096 bytes, without `..`, a root/prefix component or control characters; resolved below the staged tree. |
+| `provider_markers` | built-in provider-unavailable list | At most 16 case-insensitive output substrings, each 1 to 64 bytes. |
+| `needs_input_markers` | `[]` | At most 16 case-insensitive output substrings, each 1 to 64 bytes. They annotate a stuck summary; they do not change state. |
+
+The compiled built-in command is exactly:
+
+```toml
+argv = ["opencode", "run", "{server_args}", "--auto", "{model_args}", "-f", "{task_file}", "{message}"]
+server_args = ["--server", "{server}"]
+model_args = ["-m", "{model}"]
+provider_args = []
+stdin = "null"
+```
+
+Ordinary placeholders are `{cwd}`, `{task_file}`, `{message}`, `{job_socket}`, `{result_file}`,
+`{server}`, `{provider}`, `{model}` and `{timeout_secs}`. A fragment placeholder must be a whole
+argv element: `{server_args}`, `{model_args}` or `{provider_args}`. `message` accepts only
+`{task_file}` and `{context_warning}`; `wrapper` accepts only `{cwd}`. Unknown, malformed or
+unmatched placeholders are refused. `env` and `secret_env` names must match
+`[A-Za-z_][A-Za-z0-9_]*`; they may not be `LU_*`, `LU_URL`, `LU_TOKEN`, `LU_TOKEN_FILE` or
+`LU_CA_FILE`, so a profile cannot copy controller credentials into the child.
+
+The child environment is cleared and rebuilt with `PATH`, `HOME`, `LANG`, the `env` variables that
+exist in the agent process, and the `secret_env` values. Each `secret_env` path is opened once with
+`O_NOFOLLOW`, must be a regular file owned by the agent account with no group or other access, and
+may hold at most 4 KiB; trailing CR/LF are trimmed before the value is passed to the child. A failed
+read fails the job as `execution`. Credentials belong in private files on the node, never in this
+document or a job task.
+
+One short UNVERIFIED preset sketch is included below. Its flags are not checked by Lu and must be
+confirmed against the installed command before use:
+
+```toml
+[agent.harness_profiles.peng]
+argv = ["peng", "run", "--task-file", "{task_file}", "--message", "{message}"]
+message = "Follow the task in the provided file.{context_warning}"
+```
+
+Runtime behaviour, result files and output markers are described in
+[Harness profiles at run time](operations.md#harness-profiles-at-run-time).
 
 Gateway fault markers are ordinary substrings, chosen by the operator; Lu does not ship a
 built-in list. For example, a health `503` whose body says `store offline` is a node fault, while
@@ -590,9 +651,9 @@ unsafe_inline = false
 
 ## Paths and secret files
 
-- Every configured file path, including `db`, `artifacts_dir`, `work_dir`, `[audit] path`, `[log] file`, `[tls] cert`, `[tls] key`, every `token_file`, `ca_file`, `provider_gateway_token_file`, `credential_file`, `[mirror.credentials]` token file, `[publish.remotes.<name>]` token file, `[[intake.sources]].secret_file`, `opencode_password_file`, `local_repo_roots` entry, `label_files` entry, `scratch_globs` pattern and `extra_roots` entry, must be absolute and must not contain a `..` component.
+- Every configured file path, including `db`, `artifacts_dir`, `work_dir`, `[audit] path`, `[log] file`, `[tls] cert`, `[tls] key`, every `token_file`, `ca_file`, `provider_gateway_token_file`, `credential_file`, `[mirror.credentials]` token file, `[publish.remotes.<name>]` token file, `[[intake.sources]].secret_file`, `local_repo_roots` entry, `label_files` entry, `scratch_globs` pattern and `extra_roots` entry, must be absolute and must not contain a `..` component. A profile's `result_file` is the exception: it must be relative. A profile's `secret_env` paths are read as private files when a job starts, not checked as config paths.
 - `file://` repository and publish test URLs must name an absolute path without `..`, and controller URLs must not contain `.` or `..` path segments. `lu check` applies these rules without opening the files.
-- Each secret read opens the path once with `O_NOFOLLOW` and `O_NONBLOCK`, then checks the open handle; a startup check and later use may open the same file separately. Secret files must be regular files, owned by the effective user, with no group or other permission bits (mode `0600` or tighter). A file with mode `0640` is refused for a secret. `lu serve` and `ting` check `[tls] key`, `token_file`, `provider_gateway_token_file`, `credential_file`, publish token files and intake signing keys on load; `opencode_password_file` is checked when the agent starts.
+- Each secret read opens the path once with `O_NOFOLLOW` and `O_NONBLOCK`, then checks the open handle; a startup check and later use may open the same file separately. Secret files must be regular files, owned by the effective user, with no group or other permission bits (mode `0600` or tighter). A file with mode `0640` is refused for a secret. `lu serve` and `ting` check `[tls] key`, `token_file`, `provider_gateway_token_file`, `credential_file`, publish token files and intake signing keys on load; a selected profile's `secret_env` files are checked when each job starts.
 - The config file itself has no secret-file mode check; it normally contains only hashes and paths. Protect it anyway because it names the token and TLS key locations.
 
 ## Examples
@@ -631,5 +692,4 @@ name = "node-a"
 controller_url = "https://lu.example.net:7600"
 token_file = "/etc/ting/ting.token"
 work_dir = "/var/lib/ting/work"
-harness = "opencode"
 ```

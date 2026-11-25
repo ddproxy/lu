@@ -1,8 +1,8 @@
 # Sample agent config. Copy to /etc/ting/ting.toml on the agent host.
 #
 #   This release includes the `ting` binary. Fill in the values below, check the token
-#   file permissions, then enable ting.service. The [agent] table is unchanged from
-#   the old agent config.
+#   file permissions, then enable ting.service. Jobs select a harness profile; only
+#   overrides and extra profiles belong under [agent.harness_profiles].
 #
 # The token file contains the plaintext agent token, not its hash. It must be a
 # regular file owned by ting with mode 0600 or tighter.
@@ -16,16 +16,19 @@ name = "node-a"
 controller_url = "https://lu.example.net:7600"
 token_file = "/etc/ting/ting.token"
 work_dir = "/var/lib/ting/work"
-harness = "opencode"
 heartbeat_secs = 15
 
 # Optional: a private CA to add to the system trust roots. Do not use this to
 # disable verification; the client always verifies the controller certificate.
 # ca_file = "/etc/ting/tls/ca.pem"
 
-# Optional harness endpoint and health check. The health URL must be loopback,
+# Optional override of the built-in opencode profile. Do not put credential
+# values here; a profile's secret_env names a private file on the node instead.
+# [agent.harness_profiles.opencode]
+# server = "http://127.0.0.1:4096"
+#
+# Optional harness endpoint health check. The health URL must be loopback,
 # and its token file follows the same private-file rules as token_file.
-# opencode_server = "http://127.0.0.1:4096"
 # provider_gateway_health_url = "http://127.0.0.1:9000/health"
 # provider_gateway_token_file = "/etc/ting/provider-gateway.token"
 

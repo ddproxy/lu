@@ -186,7 +186,7 @@ async fn a_job_runs_from_submit_to_diff() {
     let controller: Arc<dyn Controller> = Arc::new(Client::new(&url, AGENT_TOKEN, None).unwrap());
     let agent = Agent::new(agent_config, controller)
         .unwrap()
-        .with_command_builder(|_task_file, _model, _server, _message| {
+        .with_command_builder(|_invocation| {
             Ok(lu_supervise::CommandSpec::new("sh")
                 .arg("-c")
                 .arg("echo working; echo 'added by the harness' >> hello.txt; echo done"))

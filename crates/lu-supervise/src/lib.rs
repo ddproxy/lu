@@ -16,13 +16,13 @@
 #![cfg(unix)]
 
 mod command;
+mod harness;
 mod limits;
-mod opencode;
 mod output;
 mod running;
 
 pub use command::CommandSpec;
+pub use harness::{harness_command, HarnessCommandContext, InvalidArgument, CONTEXT_WARNING};
 pub use limits::Limits;
-pub use opencode::{opencode_command, InvalidArgument};
 pub use output::{OutputChunk, Stream};
 pub use running::{Outcome, Running, Supervisor};

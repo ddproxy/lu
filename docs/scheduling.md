@@ -134,7 +134,9 @@ name = "node-a"
 controller_url = "http://127.0.0.1:7600"
 token_file = "/etc/ting/ting.token"
 work_dir = "/var/lib/ting/work"
-harness = "opencode"
+
+[agent.harness_profiles.opencode]
+stdin = "null"
 
 [schedule]
 horizon_secs = 31622400
@@ -183,7 +185,6 @@ name = "node-a"
 controller_url = "http://127.0.0.1:7600"
 token_file = "/etc/ting/ting.token"
 work_dir = "/var/lib/ting/work"
-harness = "opencode"
 
 [[calendar]]
 name = "provider-maintenance"

@@ -60,7 +60,7 @@ controller before agent hosts; see [Upgrade](docs/operations.md#upgrade).
 ## Quickstart
 
 This runs a controller, one agent and the operator CLI on one machine. Prerequisites: `make`, a
-Rust toolchain, `git`, `opencode` on `PATH` (or a `harness_wrapper` that starts it), a local git
+Rust toolchain, `git`, `opencode` on `PATH` (or a profile `wrapper` that starts it), a local git
 repository, and three shells. Replace `/home/you` with your home directory and
 `/home/you/src/demo` with your repository path. The commands use the binary from `make build`;
 put `target/release` on `PATH` or run `make install` first.
@@ -90,7 +90,6 @@ put `target/release` on `PATH` or run `make install` first.
    name = "node-a"
    controller_url = "http://127.0.0.1:7600"
    work_dir = "/home/you/lu-demo/work"
-   harness = "opencode"
 
    [log]
    level = "info"
@@ -179,9 +178,10 @@ job that merges, tests or reviews those inputs. See [Dependencies](docs/dependen
 2. The controller stores the job in SQLite, assigns a lease and a fencing epoch, and makes it
    `queued` when its dependencies are `done`. A late write from an old epoch is discarded.
 3. The `ting` agent polls the controller over HTTPS (or loopback HTTP), stages a checkout in its
-   `work_dir`, and runs the harness with run, idle and output caps.
-4. The agent uploads `diff.patch`, `run.log` and `report.json`. Failure classes, retries, cordons
-   and blocked dependents are recorded in the store and shown by `lu show`.
+   `work_dir`, and runs the job's selected harness profile with run, idle and output caps.
+4. The agent uploads `diff.patch`, `run.log` and `report.json`, adding a successful profile result
+   file to the summary when one is configured. Failure classes, retries, cordons and blocked
+   dependents are recorded in the store and shown by `lu show`.
 5. Operators inspect or fetch the result with `lu`, `lu mcp`, the [HTTP API](docs/api.md) or the
    optional hash-chained [audit record](docs/security.md#audit-record). See the
    [model and ownership](docs/lifecycle.md#model-and-ownership) and
@@ -205,7 +205,8 @@ Config is TOML. `lu --config` defaults to `lu.toml`; `ting --config` defaults to
 | `[controller] max_connections`, `max_connections_per_addr` | `256`, `64` | Listener connection caps. |
 | `[controller] blocked_dependent_ttl` | `"24h"` | How long a dependent waits after a predecessor fails. |
 | `[controller] read_per_minute` | `1200` | Read requests allowed per source address per minute. |
-| `[agent] name`, `controller_url`, `token_file`, `work_dir`, `harness` | required | Node identity, controller address, private token file, staging root and harness name. |
+| `[agent] name`, `controller_url`, `token_file`, `work_dir` | required | Node identity, controller address, private token file and staging root. |
+| `[agent] harness_profiles` | built-in `opencode` | Named validated commands; a job's `harness` selects one. See [Harness profiles](docs/config.md#harness-profiles). |
 | `[agent] heartbeat_secs` | `15` | Heartbeat interval, 2 to 300. |
 | `[agent] base_source` | `"auto"` | Checkout source: `clone`, `controller` or `auto`. |
 | `[agent] on_stuck`, `stuck_after_secs` | `"none"`, `1800` | Stuck policy and continuous-stuck threshold, 60 to 86400. |
@@ -394,8 +395,8 @@ Wire rules and release compatibility are in [Compatibility between releases](doc
 Lu is not a general CI system, a hosted UI, a managed-worker service or a broadcast runner. It
 schedules finite tasks that end in a reviewable diff; long-running services and interactive
 sessions belong elsewhere. There is no per-job OS isolation: the harness runs as the agent user,
-so use a wrapper to run it in another account or container. Cordons and drains are dispatch hints,
-not access control, and config changes need a process restart.
+so use a profile `wrapper` to run it through another account or container. Cordons and drains are
+dispatch hints, not access control, and config changes need a process restart.
 
 In plain words, **fail-open** means the job waits rather than fails: an unmatched label, an
 untolerated taint or no healthy pair for `--provider any` leaves it `queued` with a `waiting`
