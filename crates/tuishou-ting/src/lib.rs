@@ -68,8 +68,8 @@ pub const PROVIDER_MARKER_GRACE: Duration = Duration::from_secs(120);
 /// output and CPU idle for [`proc::STUCK_AFTER_SECS`] before a sample counts as stuck.
 const STUCK_POLL_PERIOD: Duration = Duration::from_secs(10);
 
-/// How often a running job's provider is checked against the node's Reiki reading.
-const REIKI_WATCH_PERIOD: Duration = Duration::from_secs(5);
+/// How often a running job's provider is checked against the node's gateway health reading.
+const PROVIDER_HEALTH_WATCH_PERIOD: Duration = Duration::from_secs(5);
 
 /// How often a finished workspace retries the controller's release check. The registry backs
 /// each refused check off, so this is cheap even when dependants keep a tree for a long time.
@@ -79,11 +79,11 @@ const WORKSPACE_RELEASE_PERIOD: Duration = Duration::from_secs(1);
 /// that node, and the job must be retried elsewhere.
 const HARNESS_CRASH_WINDOW: Duration = Duration::from_secs(3);
 
-/// Added to Reiki's cooldown estimate before the controller cordons the provider, since the
+/// Added to the gateway's cooldown estimate before the controller cordons the provider, since the
 /// reading may be several seconds old and keys sometimes fail again right after a cooldown.
 const COOLDOWN_BUFFER_SECS: u64 = 60;
 /// Fresh readings in a row that must show the provider unusable before the job is stopped.
-const REIKI_UNAVAILABLE_READS: u32 = 2;
+const PROVIDER_HEALTH_UNAVAILABLE_READS: u32 = 2;
 
 /// Output quoted on a completion summary. Kept small and independent of the log cap.
 const SUMMARY_TAIL_BYTES: usize = 16 * 1024;
@@ -167,7 +167,7 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// The configured pairs whose provider the Reiki feed currently reports healthy.
+/// The configured pairs whose provider the gateway health feed currently reports healthy.
 fn offered_provider_models(
     config: &[lu_config::ProviderModelConfig],
     providers: &[ProviderStatus],
@@ -242,7 +242,7 @@ pub struct Agent {
     stuck_clock: Arc<dyn proc::Clock>,
     /// How long the harness may stay silent after a provider marker before it is stopped.
     provider_marker_grace: Duration,
-    reiki_watch_period: Duration,
+    provider_health_watch_period: Duration,
     opencode_server: Option<String>,
     /// The group that may write each job's working tree, resolved once at start.
     workspace_gid: Option<u32>,
@@ -250,8 +250,8 @@ pub struct Agent {
     harness_owner: Option<(u32, u32)>,
     /// The opencode server password, kept out of `Debug` and logs.
     opencode_password: Option<Arc<str>>,
-    /// The local Reiki's health URL and token, when configured.
-    reiki_probe: Option<(String, Arc<str>)>,
+    /// The local provider gateway's health URL and token, when configured.
+    provider_health_probe: Option<(String, Arc<str>)>,
     /// Operator-configured body markers for classifying a gateway health `503` as a node fault.
     gateway_fault_markers: Arc<Vec<String>>,
     /// The last health read from it, sent with every heartbeat.
@@ -349,18 +349,21 @@ impl Agent {
         let gc_counters = housekeeper
             .as_ref()
             .map_or_else(Default::default, housekeeping::Housekeeper::counters);
-        let reiki_probe = match (
-            config.reiki_health_url.as_deref(),
-            config.reiki_token_file.as_deref(),
+        let provider_health_probe = match (
+            config.provider_gateway_health_url.as_deref(),
+            config.provider_gateway_token_file.as_deref(),
         ) {
             (Some(url), Some(file)) => {
-                let text =
-                    lu_config::read_private_file("[agent] reiki_token_file", Path::new(file), 4096)
-                        .map_err(|error| AgentError::Config(error.to_string()))?;
+                let text = lu_config::read_private_file(
+                    "[agent] provider_gateway_token_file",
+                    Path::new(file),
+                    4096,
+                )
+                .map_err(|error| AgentError::Config(error.to_string()))?;
                 let token = text.trim_end_matches(['\r', '\n']);
                 if token.is_empty() || token.chars().any(char::is_control) {
                     return Err(AgentError::Config(
-                        "reiki_token_file must hold one line of text".to_owned(),
+                        "provider_gateway_token_file must hold one line of text".to_owned(),
                     ));
                 }
                 Some((url.to_owned(), Arc::from(token)))
@@ -382,12 +385,12 @@ impl Agent {
             stuck_after_override: None,
             stuck_clock: Arc::new(proc::RealClock),
             provider_marker_grace: PROVIDER_MARKER_GRACE,
-            reiki_watch_period: REIKI_WATCH_PERIOD,
+            provider_health_watch_period: PROVIDER_HEALTH_WATCH_PERIOD,
             opencode_server: config.opencode_server,
             workspace_gid,
             harness_owner,
             opencode_password,
-            reiki_probe,
+            provider_health_probe,
             gateway_fault_markers: Arc::new(config.gateway_fault_markers),
             health: health::Shared::default(),
             provider_models: Arc::new(config.provider_models),
@@ -408,7 +411,7 @@ impl Agent {
         })
     }
 
-    /// The shared Reiki reading, for tests that stand in for the refresher.
+    /// The shared gateway health reading, for tests that stand in for the refresher.
     #[doc(hidden)]
     pub fn clone_health_for_tests(&self) -> health::Shared {
         Arc::clone(&self.health)
@@ -484,7 +487,7 @@ impl Agent {
             .map(AbortOnDrop)
             .collect();
         // Ends with the agent: the guard aborts the task when `run` returns.
-        let _health_task = this.reiki_probe.as_ref().map(|(url, token)| {
+        let _health_task = this.provider_health_probe.as_ref().map(|(url, token)| {
             AbortOnDrop(health::spawn_refresher(
                 url.clone(),
                 Arc::clone(token),
@@ -648,7 +651,7 @@ impl Agent {
             version: Some(TING_VERSION.to_owned()),
             providers: current.providers,
             provider_models,
-            reiki: current.reiki,
+            provider_health: current.provider_health,
             host,
             harness_ok: Some(self.harness_ok.load(Ordering::SeqCst)),
             disk_free_pct: pct,
@@ -1314,16 +1317,16 @@ impl Agent {
         let mut end = JobEnd::Finished;
         let mut marker_line: Option<String> = None;
         let mut marker_deadline: Option<Instant> = None;
-        // Reiki says the job's provider has no usable key: the signal is Reiki's, not scraped
-        // from harness output, so it works for any harness.
-        let mut watch = tokio::time::interval(self.reiki_watch_period);
+        // The gateway says the job's provider has no usable key: the signal comes from the
+        // health feed, not from harness output, so it works for any harness.
+        let mut watch = tokio::time::interval(self.provider_health_watch_period);
         watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         watch.tick().await;
         let first_health = health::snapshot(&self.health);
         let mut seen_seq = first_health.seq;
         let mut unavailable_reads = 0u32;
-        let mut reiki_reason: Option<String> = None;
-        let mut reiki_retry_after: Option<u64> = None;
+        let mut provider_health_reason: Option<String> = None;
+        let mut provider_retry_after: Option<u64> = None;
         if first_health.infra_reason.is_some() {
             // Force the first watch tick to re-read a fault reported before this job started.
             seen_seq = first_health.seq.saturating_sub(1);
@@ -1432,17 +1435,17 @@ impl Agent {
                             match status {
                                 Some(p) if matches!(p.state, ProviderState::Cooling | ProviderState::Disabled) => {
                                     unavailable_reads += 1;
-                                    if unavailable_reads >= REIKI_UNAVAILABLE_READS {
-                                        reiki_retry_after = p
+                                    if unavailable_reads >= PROVIDER_HEALTH_UNAVAILABLE_READS {
+                                        provider_retry_after = p
                                             .soonest_secs
                                             .map(|secs| secs.saturating_add(COOLDOWN_BUFFER_SECS));
-                                        reiki_reason = Some(match p.soonest_secs {
+                                        provider_health_reason = Some(match p.soonest_secs {
                                             Some(secs) => format!(
-                                                "Reiki reports provider {wanted} has no usable key; the soonest returns in {secs}s"
+                                                "Provider gateway reports provider {wanted} has no usable key; the soonest returns in {secs}s"
                                             ),
-                                            None => format!("Reiki reports provider {wanted} has no usable key"),
+                                            None => format!("Provider gateway reports provider {wanted} has no usable key"),
                                         });
-                                        info!(job = %job_id, provider = %wanted, "Reiki reports no usable key; stopping");
+                                        info!(job = %job_id, provider = %wanted, "provider gateway reports no usable key; stopping");
                                         running.stop();
                                         end = JobEnd::Provider;
                                         break;
@@ -1523,7 +1526,7 @@ impl Agent {
         }
 
         if end == JobEnd::Provider {
-            let summary = match &reiki_reason {
+            let summary = match &provider_health_reason {
                 Some(reason) => reason.clone(),
                 None => {
                     let line = marker_line.as_deref().unwrap_or("provider unavailable");
@@ -1544,7 +1547,7 @@ impl Agent {
                 failure_reason: None,
                 cancelled: false,
                 stuck_mode: None,
-                retry_after_secs: reiki_retry_after,
+                retry_after_secs: provider_retry_after,
                 applied_inputs: &applied,
             })
             .await?;
@@ -2436,7 +2439,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                     version: Some(TING_VERSION.to_owned()),
                     providers: current.providers,
                     provider_models,
-                    reiki: current.reiki,
+                    provider_health: current.provider_health,
                     host,
                     harness_ok: Some(harness_ok.load(Ordering::SeqCst)),
                     disk_free_pct: pct,

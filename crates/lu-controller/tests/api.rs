@@ -446,7 +446,7 @@ async fn tolerations_are_validated() {
         (0..=MAX_TOLERATES)
             .map(|index| format!("taint-{index}"))
             .collect::<Vec<_>>(),
-        vec!["homelab".to_owned(), "homelab".to_owned()],
+        vec!["lab".to_owned(), "lab".to_owned()],
         vec!["bad taint".to_owned()],
     ] {
         let mut spec = sample_spec(None);
@@ -512,7 +512,7 @@ async fn tainted_nodes_are_shown_and_explained() {
         "node": "node-a",
         "harness": "idle",
         "labels": ["gpu"],
-        "taints": ["homelab"],
+        "taints": ["lab"],
     });
     let r = poll_with(srv.addr, AGENT_A_TOKEN, &hb).await;
     assert_eq!(status(&r), 204, "{r}");
@@ -521,7 +521,7 @@ async fn tainted_nodes_are_shown_and_explained() {
     assert_eq!(status(&r), 200, "{r}");
     let job: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
     assert_eq!(
-        job["waiting_reason"], "only tainted nodes are free: homelab",
+        job["waiting_reason"], "only tainted nodes are free: lab",
         "{r}"
     );
 
@@ -534,7 +534,7 @@ async fn tainted_nodes_are_shown_and_explained() {
         .iter()
         .find(|node| node["name"] == "node-a")
         .unwrap();
-    assert_eq!(node["taints"], json!(["homelab"]), "{r}");
+    assert_eq!(node["taints"], json!(["lab"]), "{r}");
 
     let _ = srv.shutdown.send(());
 }
@@ -724,7 +724,7 @@ async fn post_edit_changes_a_queued_job_and_rejects_bad_states() {
         requires: Some(vec!["gpu".to_owned()]),
         on_stuck: None,
         stuck_after_secs: None,
-        tolerates: Some(vec!["homelab".to_owned()]),
+        tolerates: Some(vec!["lab".to_owned()]),
         after: None,
         priority: None,
         group: None,
@@ -748,7 +748,7 @@ async fn post_edit_changes_a_queued_job_and_rejects_bad_states() {
     assert_eq!(job["spec"]["model"], "m2", "{job}");
     assert_eq!(job["spec"]["fallbacks"][0]["provider"], "p3", "{job}");
     assert_eq!(job["spec"]["requires"][0], "gpu", "{job}");
-    assert_eq!(job["spec"]["tolerates"][0], "homelab", "{job}");
+    assert_eq!(job["spec"]["tolerates"][0], "lab", "{job}");
 
     let r = raw_request(srv.addr, &format!("GET /v1/jobs/{id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\n\r\n")).await;
     let stored: serde_json::Value = serde_json::from_str(body_str(&r)).unwrap();
@@ -2363,8 +2363,8 @@ async fn node_views_expose_cordon_details_and_uncordon_clears_them() {
         .set_cordon(
             &node,
             "p2",
-            CordonSource::Reiki,
-            "Reiki cooldown for p2",
+            CordonSource::Health,
+            "Provider gateway cooldown for p2",
             1_700_000_001,
             120_000,
         )
@@ -2895,7 +2895,7 @@ async fn log_append_100_bytes_below_the_cap_keeps_the_marker() {
 }
 
 #[tokio::test]
-async fn reiki_cordon_yields_to_two_healthy_heartbeats_and_flagless_does_not() {
+async fn health_cordon_yields_to_two_healthy_heartbeats_and_flagless_does_not() {
     let srv = start_server().await;
     let healthy =
         json!({"node": "node-a", "harness": "idle", "providers": [{"name": "p1", "state": "ok"}]});

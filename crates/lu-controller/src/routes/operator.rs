@@ -449,17 +449,16 @@ pub fn cordon_views(cordons: &[Cordon], at: Now) -> Vec<CordonView> {
     cordons
         .iter()
         .map(|c| {
-            let (source, until, lifts_after_healthy_heartbeats) = match c.source {
-                CordonSource::Reiki => ("reiki", None, Some(2)),
+            let (until, lifts_after_healthy_heartbeats) = match c.source {
+                CordonSource::Health => (None, Some(2)),
                 CordonSource::Failure => (
-                    "failure",
                     c.until_mono_ms.map(|until| cordon_until_wall(until, at)),
                     None,
                 ),
             };
             CordonView {
                 provider: c.provider.clone(),
-                source: source.to_owned(),
+                source: c.source.as_str().to_owned(),
                 reason: c.reason.clone(),
                 set_at: c.set_at_unix,
                 until,
@@ -497,7 +496,7 @@ fn node_view(
         taints: n.heartbeat.taints.clone(),
         current_job: n.current_job.clone(),
         cordon_details: cordons,
-        reiki: n.heartbeat.reiki.clone(),
+        provider_health: n.heartbeat.provider_health.clone(),
         load1: host.map(|host| host.load1),
         mem_available_kb: host.map(|host| host.mem_available_kb),
         mem_total_kb: host.map(|host| host.mem_total_kb),

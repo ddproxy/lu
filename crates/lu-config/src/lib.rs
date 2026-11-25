@@ -972,8 +972,14 @@ pub struct AgentConfig {
     /// Default continuous stuck interval for jobs that do not set `stuck_after_secs`.
     #[serde(default = "default_stuck_after_secs")]
     pub stuck_after_secs: u64,
-    pub reiki_health_url: Option<String>,
-    pub reiki_token_file: Option<String>,
+    /// Loopback URL of the local provider gateway health endpoint. The legacy spelling remains
+    /// accepted so existing agent configs keep working.
+    #[serde(alias = "reiki_health_url")]
+    pub provider_gateway_health_url: Option<String>,
+    /// Private file holding the provider gateway bearer token. The legacy spelling remains
+    /// accepted so existing agent configs keep working.
+    #[serde(alias = "reiki_token_file")]
+    pub provider_gateway_token_file: Option<String>,
     /// Case-insensitive body substrings that classify a `503` from the configured gateway health
     /// endpoint as a node-side gateway fault. Empty by default: without a marker match, a `503`
     /// stays an ordinary failed health read.
@@ -2218,23 +2224,28 @@ impl AgentConfig {
                 );
             }
         }
-        match (&self.reiki_health_url, &self.reiki_token_file) {
+        match (
+            &self.provider_gateway_health_url,
+            &self.provider_gateway_token_file,
+        ) {
             (Some(url), Some(file)) => {
-                validate_loopback_http_url("[agent]", "reiki_health_url", url)?;
+                validate_loopback_http_url("[agent]", "provider_gateway_health_url", url)?;
                 if file.is_empty() {
-                    return invalid("[agent]", "reiki_token_file must not be empty".to_owned());
+                    return invalid(
+                        "[agent]",
+                        "provider_gateway_token_file must not be empty".to_owned(),
+                    );
                 }
             }
-            (Some(_), None) => {
-                return invalid(
-                    "[agent]",
-                    "reiki_token_file is required when reiki_health_url is set".to_owned(),
-                )
-            }
+            (Some(_), None) => return invalid(
+                "[agent]",
+                "provider_gateway_token_file is required when provider_gateway_health_url is set"
+                    .to_owned(),
+            ),
             (None, Some(_)) => {
                 return invalid(
                     "[agent]",
-                    "reiki_token_file requires reiki_health_url".to_owned(),
+                    "provider_gateway_token_file requires provider_gateway_health_url".to_owned(),
                 )
             }
             (None, None) => {}
@@ -2794,8 +2805,12 @@ pub fn check_secrets(config: &Config) -> Result<(), ConfigError> {
             Path::new(&agent.token_file),
             MAX_CONFIG_BYTES,
         )?;
-        if let Some(rt) = &agent.reiki_token_file {
-            secret::read_private_file("[agent] reiki_token_file", Path::new(rt), MAX_CONFIG_BYTES)?;
+        if let Some(token_file) = &agent.provider_gateway_token_file {
+            secret::read_private_file(
+                "[agent] provider_gateway_token_file",
+                Path::new(token_file),
+                MAX_CONFIG_BYTES,
+            )?;
         }
     }
     if let Some(publish) = &config.publish {
@@ -3513,7 +3528,7 @@ heartbeat_secs = 15
                 .join(",")
         );
         expect_table(&base("taints", &too_many_taints), "[agent]");
-        assert!(Config::parse(&base("taints", r#"["homelab"]"#)).is_ok());
+        assert!(Config::parse(&base("taints", r#"["lab"]"#)).is_ok());
         for bad in [r#"["relative/labels"]"#, r#"["/srv/../labels"]"#] {
             expect_table(&base("label_files", bad), "[agent] label_files #0");
         }
@@ -3689,9 +3704,9 @@ heartbeat_secs = 15
             "[agent]\nname=\"a\"\ncontroller_url=\"{url}\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n"
         )
         };
-        let reiki = |url: &str| {
+        let gateway = |url: &str| {
             format!(
-            "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\nreiki_health_url=\"{url}\"\nreiki_token_file=\"/rt\"\n"
+            "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\nprovider_gateway_health_url=\"{url}\"\nprovider_gateway_token_file=\"/rt\"\n"
         )
         };
         // refused
@@ -3706,7 +3721,7 @@ heartbeat_secs = 15
             "http://2130706433",
         ] {
             expect_table(&agent(url), "[agent]");
-            expect_table(&reiki(url), "[agent]");
+            expect_table(&gateway(url), "[agent]");
         }
         // accepted
         for url in [
@@ -3716,7 +3731,10 @@ heartbeat_secs = 15
             "http://[::1]:4100",
         ] {
             assert!(Config::parse(&agent(url)).is_ok(), "agent accepted: {url}");
-            assert!(Config::parse(&reiki(url)).is_ok(), "reiki accepted: {url}");
+            assert!(
+                Config::parse(&gateway(url)).is_ok(),
+                "gateway accepted: {url}"
+            );
         }
         assert!(
             Config::parse(&agent("https://lu.example.net:7600")).is_ok(),
@@ -3807,15 +3825,30 @@ heartbeat_secs = 15
     }
 
     #[test]
-    fn reiki_rules() {
+    fn provider_gateway_rules() {
         let base = "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n";
         expect_table(
-            &format!("{base}reiki_health_url=\"http://127.0.0.1:4100/v1/health\"\n"),
+            &format!("{base}provider_gateway_health_url=\"http://127.0.0.1:4100/v1/health\"\n"),
             "[agent]",
         );
-        assert!(Config::parse(&format!("{base}reiki_health_url=\"http://127.0.0.1:4100/v1/health\"\nreiki_token_file=\"/rt\"\n")).is_ok());
-        expect_table(&format!("{base}reiki_health_url=\"http://example.net:4100/v1/health\"\nreiki_token_file=\"/rt\"\n"), "[agent]");
-        expect_table(&format!("{base}reiki_token_file=\"/rt\"\n"), "[agent]");
+        assert!(Config::parse(&format!("{base}provider_gateway_health_url=\"http://127.0.0.1:4100/v1/health\"\nprovider_gateway_token_file=\"/rt\"\n")).is_ok());
+        expect_table(&format!("{base}provider_gateway_health_url=\"http://example.net:4100/v1/health\"\nprovider_gateway_token_file=\"/rt\"\n"), "[agent]");
+        expect_table(
+            &format!("{base}provider_gateway_token_file=\"/rt\"\n"),
+            "[agent]",
+        );
+    }
+
+    #[test]
+    fn legacy_provider_gateway_keys_are_accepted() {
+        let base = "[agent]\nname=\"a\"\ncontroller_url=\"https://example.net\"\ntoken_file=\"/t\"\nwork_dir=\"/w\"\nharness=\"opencode\"\n";
+        let legacy = format!("{base}reiki_health_url=\"http://127.0.0.1:4100/v1/health\"\nreiki_token_file=\"/rt\"\n");
+        let agent = Config::parse(&legacy).unwrap().agent.unwrap();
+        assert_eq!(
+            agent.provider_gateway_health_url.as_deref(),
+            Some("http://127.0.0.1:4100/v1/health")
+        );
+        assert_eq!(agent.provider_gateway_token_file.as_deref(), Some("/rt"));
     }
 
     #[test]

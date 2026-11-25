@@ -456,7 +456,7 @@ async fn submit_passes_tolerations() {
             "--task",
             "go",
             "--tolerate",
-            "homelab",
+            "lab",
             "--tolerate",
             "garage",
         ],
@@ -467,7 +467,7 @@ async fn submit_passes_tolerations() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), id);
     let spec: Value = serde_json::from_slice(&server.records.lock().unwrap()[0].body).unwrap();
-    assert_eq!(spec["tolerates"], json!(["homelab", "garage"]));
+    assert_eq!(spec["tolerates"], json!(["lab", "garage"]));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1367,7 +1367,7 @@ async fn nodes_and_drain_render_aligned_text() {
             "last_seen": 10,
             "draining": true,
             "labels": ["gpu", "php8.3", "ubuntu22.04", "x86_64", "region=eu", "tier=gold"],
-            "taints": ["homelab"],
+            "taints": ["lab"],
             "cordon_details": [
                 {"provider": "zen", "source": "failure", "reason": "cooldown", "set_at": 0, "until": 20, "lifts_after_healthy_heartbeats": null},
                 {"provider": "openrouter", "source": "failure", "reason": "cooldown", "set_at": 0, "until": 20, "lifts_after_healthy_heartbeats": null}
@@ -1401,7 +1401,7 @@ async fn nodes_and_drain_render_aligned_text() {
     assert!(text.contains("node-a"), "{text}");
     assert!(text.contains("0.1.10"), "{text}");
     assert!(
-        text.contains("!homelab,gpu,php8.3,ubuntu22.04,x86_64+2"),
+        text.contains("!lab,gpu,php8.3,ubuntu22.04,x86_64+2"),
         "{text}"
     );
     assert!(text.contains("!zen,!openrouter"), "{text}");
@@ -1430,7 +1430,7 @@ async fn nodes_and_drain_render_aligned_text() {
     assert!(output.status.success(), "{}", stderr(&output));
     let raw = stdout(&output);
     assert!(raw.contains("\"labels\":[\"gpu\""), "{raw}");
-    assert!(raw.contains("\"taints\":[\"homelab\"]"), "{raw}");
+    assert!(raw.contains("\"taints\":[\"lab\"]"), "{raw}");
 
     let records = server.records.lock().unwrap();
     let paths: Vec<&str> = records.iter().map(|record| record.path.as_str()).collect();
@@ -1731,7 +1731,7 @@ async fn node_prints_host_numbers_and_indented_process_tree() {
             {
                 "provider": "p2",
                 "source": "reiki",
-                "reason": "Reiki cooldown for p2",
+                "reason": "Provider gateway cooldown for p2",
                 "set_at": wall - 5,
                 "until": null,
                 "lifts_after_healthy_heartbeats": 2
@@ -1772,12 +1772,12 @@ async fn node_prints_host_numbers_and_indented_process_tree() {
     assert!(failure.contains("ago;"), "{failure:?}");
     assert!(failure.contains("left"), "{failure:?}");
     assert!(text.contains("Provider p1 failed: timeout"), "{text}");
-    let reiki = text
+    let cordon = text
         .lines()
-        .find(|line| line.contains("p2 [reiki]"))
+        .find(|line| line.contains("p2 [gateway]"))
         .unwrap();
-    assert!(reiki.contains("ago;"), "{reiki:?}");
-    assert!(reiki.contains("lifts on 2 healthy"), "{reiki:?}");
+    assert!(cordon.contains("ago;"), "{cordon:?}");
+    assert!(cordon.contains("lifts on 2 healthy"), "{cordon:?}");
     let process_line = text
         .lines()
         .find(|line| line.trim_start().starts_with("4242"))
@@ -1966,14 +1966,7 @@ async fn retry_replaces_or_clears_tolerations() {
     let env = env_for(&server, &token);
 
     let output = run_with_env(
-        &[
-            "retry",
-            &id,
-            "--tolerate",
-            "homelab",
-            "--tolerate",
-            "garage",
-        ],
+        &["retry", &id, "--tolerate", "lab", "--tolerate", "garage"],
         &env,
         None,
         &dir,
@@ -1988,7 +1981,7 @@ async fn retry_replaces_or_clears_tolerations() {
         .filter(|record| record.method == "POST")
         .map(|record| serde_json::from_slice(&record.body).unwrap())
         .collect();
-    assert_eq!(posts[0]["tolerates"], json!(["homelab", "garage"]));
+    assert_eq!(posts[0]["tolerates"], json!(["lab", "garage"]));
     assert!(posts[1].get("tolerates").is_none(), "{}", posts[1]);
     drop(records);
     let _ = std::fs::remove_dir_all(&dir);
@@ -2358,7 +2351,7 @@ async fn edit_sends_the_patch_to_the_edit_route() {
             "--require",
             "gpu",
             "--tolerate",
-            "homelab",
+            "lab",
             "--after",
             &dep,
         ],
@@ -2380,7 +2373,7 @@ async fn edit_sends_the_patch_to_the_edit_route() {
         json!([{"provider": "peer-c", "model": "fallback-model"}])
     );
     assert_eq!(patch["requires"], json!(["gpu"]));
-    assert_eq!(patch["tolerates"], json!(["homelab"]));
+    assert_eq!(patch["tolerates"], json!(["lab"]));
     assert_eq!(patch["after"], json!([dep]));
     drop(records);
     let _ = std::fs::remove_dir_all(&dir);
@@ -2937,7 +2930,7 @@ async fn audit_cli_verifies_tails_and_prints_the_head() {
         Some("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
         None,
         "operator",
-        Data::new().text(Field::Provider, "reiki"),
+        Data::new().text(Field::Provider, "provider-x"),
     );
     writer.record(
         Event::Started,

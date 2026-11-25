@@ -1,5 +1,5 @@
-//! Node heartbeat: what a peer says about itself. The forwarded Reiki document is opaque and
-//! capped, and provider names are checked with the same rule as node names.
+//! Node heartbeat: what a peer says about itself. The forwarded provider-health document is opaque
+//! and capped, and provider names are checked with the same rule as node names.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -11,7 +11,7 @@ use crate::ids::{is_name_byte, JobId, NodeName};
 use crate::label::{valid_label, LABEL_SOURCE_PROBED};
 use crate::limits::{
     MAX_LABEL_BYTES, MAX_MODEL_BYTES, MAX_NAME_BYTES, MAX_NODE_LABELS, MAX_PROVIDERS,
-    MAX_REIKI_BYTES, MAX_STATS_BYTES, MAX_TAINTS, MAX_VERSION_BYTES, MAX_WORKSPACES,
+    MAX_PROVIDER_HEALTH_BYTES, MAX_STATS_BYTES, MAX_TAINTS, MAX_VERSION_BYTES, MAX_WORKSPACES,
 };
 use crate::view::WorkspaceView;
 
@@ -247,7 +247,8 @@ pub struct NodeStats {
 pub const DEFAULT_MIN_DISK_FREE_PCT: u8 = 8;
 
 /// A periodic message from an agent. Receivers ignore fields they do not know, so an agent may be
-/// newer than its controller; only add optional fields. `reiki` is the opaque health document, forwarded unchanged.
+/// newer than its controller; only add optional fields. The provider-health field is an opaque
+/// document, forwarded unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Heartbeat {
     pub node: NodeName,
@@ -259,8 +260,8 @@ pub struct Heartbeat {
     /// Provider/model pairs this node offers to provider-agnostic jobs, in preference order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_models: Vec<ProviderModel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reiki: Option<serde_json::Value>,
+    #[serde(default, rename = "reiki", skip_serializing_if = "Option::is_none")]
+    pub provider_health: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostStats>,
     /// False when the agent's harness is unhealthy. Absent means healthy for older agents.
@@ -318,8 +319,8 @@ struct RawHeartbeat {
     /// Provider/model pairs this node offers to provider-agnostic jobs, in preference order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_models: Vec<ProviderModel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reiki: Option<serde_json::Value>,
+    #[serde(default, rename = "reiki", skip_serializing_if = "Option::is_none")]
+    pub provider_health: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<HostStats>,
     /// False when the agent's harness is unhealthy. Absent means healthy for older agents.
@@ -365,7 +366,7 @@ impl TryFrom<RawHeartbeat> for Heartbeat {
             version: raw.version,
             providers: raw.providers,
             provider_models: raw.provider_models,
-            reiki: raw.reiki,
+            provider_health: raw.provider_health,
             host: raw.host,
             harness_ok: raw.harness_ok,
             disk_free_pct: raw.disk_free_pct,
@@ -552,12 +553,12 @@ impl Heartbeat {
                 });
             }
         }
-        if let Some(reiki) = &self.reiki {
-            let size = serde_json::to_vec(reiki)
-                .map_err(|_| HeartbeatError::ReikiNotSerializable)?
+        if let Some(provider_health) = &self.provider_health {
+            let size = serde_json::to_vec(provider_health)
+                .map_err(|_| HeartbeatError::ProviderHealthNotSerializable)?
                 .len();
-            if size > MAX_REIKI_BYTES {
-                return Err(HeartbeatError::ReikiTooLarge { got: size });
+            if size > MAX_PROVIDER_HEALTH_BYTES {
+                return Err(HeartbeatError::ProviderHealthTooLarge { got: size });
             }
         }
         Ok(())
@@ -583,8 +584,8 @@ pub enum HeartbeatError {
     Taint { value: String },
     TooManyWorkspaces { got: usize },
     WorkspaceJobKey { index: usize, key: String },
-    ReikiTooLarge { got: usize },
-    ReikiNotSerializable,
+    ProviderHealthTooLarge { got: usize },
+    ProviderHealthNotSerializable,
 }
 
 impl std::fmt::Display for HeartbeatError {
@@ -653,12 +654,12 @@ impl std::fmt::Display for HeartbeatError {
                 f,
                 "workspace #{index} has an invalid job key {key:?}"
             ),
-            Self::ReikiTooLarge { got } => write!(
+            Self::ProviderHealthTooLarge { got } => write!(
                 f,
-                "the forwarded reiki document is larger than {MAX_REIKI_BYTES} bytes (got {got})"
+                "the forwarded provider-health document is larger than {MAX_PROVIDER_HEALTH_BYTES} bytes (got {got})"
             ),
-            Self::ReikiNotSerializable => {
-                f.write_str("the forwarded reiki document could not be serialised")
+            Self::ProviderHealthNotSerializable => {
+                f.write_str("the forwarded provider-health document could not be serialised")
             }
         }
     }
@@ -687,7 +688,7 @@ mod tests {
                 soonest_secs: None,
             }],
             provider_models: Vec::new(),
-            reiki: None,
+            provider_health: None,
             host: None,
             harness_ok: None,
             disk_free_pct: None,
@@ -746,7 +747,7 @@ mod tests {
         beat.harness = HarnessState::Busy;
         beat.providers[0].state = ProviderState::Cooling;
         beat.providers[0].soonest_secs = Some(30);
-        beat.reiki = Some(serde_json::json!({"status": "ok"}));
+        beat.provider_health = Some(serde_json::json!({"status": "ok"}));
         assert!(beat.validate().is_ok());
         let json = serde_json::to_string(&beat).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
@@ -758,7 +759,7 @@ mod tests {
         let json = r#"{"node":"peer-a","harness":"idle"}"#;
         let beat: Heartbeat = serde_json::from_str(json).unwrap();
         assert!(beat.providers.is_empty());
-        assert!(beat.reiki.is_none());
+        assert!(beat.provider_health.is_none());
         assert!(beat.validate().is_ok());
         let out = serde_json::to_string(&beat).unwrap();
         assert!(!out.contains("providers"), "{out}");
@@ -923,7 +924,7 @@ mod tests {
     fn node_taints_round_trip_and_are_omitted_when_empty() {
         let mut beat = heartbeat();
         assert!(!serde_json::to_string(&beat).unwrap().contains("taints"));
-        beat.taints = vec!["homelab".to_owned(), "region=eu".to_owned()];
+        beat.taints = vec!["lab".to_owned(), "region=eu".to_owned()];
         let json = serde_json::to_string(&beat).unwrap();
         let parsed: Heartbeat = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.taints, beat.taints);
@@ -983,12 +984,14 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_reiki_document_is_refused() {
+    fn an_oversized_provider_health_document_is_refused() {
         let mut beat = heartbeat();
-        beat.reiki = Some(serde_json::Value::String("a".repeat(MAX_REIKI_BYTES)));
+        beat.provider_health = Some(serde_json::Value::String(
+            "a".repeat(MAX_PROVIDER_HEALTH_BYTES),
+        ));
         assert!(matches!(
             beat.validate().unwrap_err(),
-            HeartbeatError::ReikiTooLarge { .. }
+            HeartbeatError::ProviderHealthTooLarge { .. }
         ));
     }
 

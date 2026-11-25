@@ -386,7 +386,7 @@ Last checked with release 0.7.0, Rust 1.99 and store schema 8.
 | Release platforms | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` | Static archives; CI smoke-builds the musl target before release. |
 | Source build | Rust 1.99 | Workspace `rust-version`; CI installs 1.99 with rustfmt and clippy. |
 | Harness | `opencode` | Default harness; job children use the credential-free `ting mcp` socket. |
-| Provider health | Reiki loopback health URL | The health URL must be loopback; see [Reiki](docs/reiki.md). |
+| Provider health | Local provider gateway health URL | The health URL must be loopback; see [configuration](docs/config.md#agent). |
 
 Details and rollout order are in [Compatibility between releases](docs/compatibility.md).
 
@@ -478,7 +478,7 @@ A compact index for agents is in [llms.txt](llms.txt); the page-by-page index is
 
 ### Operate
 
-- [Lu with Reiki](docs/reiki.md)
+- [Provider cordons](docs/dispatch.md#cordons)
 - [Operations](docs/operations.md)
 - [Adding a node safely](docs/onboarding-nodes.md)
 - [Monitoring](docs/monitoring.md)

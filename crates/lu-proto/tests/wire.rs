@@ -126,7 +126,7 @@ fn a_heartbeat_carries_a_capped_forwarded_document() {
             soonest_secs: Some(15),
         }],
         provider_models: Vec::new(),
-        reiki: Some(serde_json::json!({"providers": ["peer-a"]})),
+        provider_health: Some(serde_json::json!({"providers": ["peer-a"]})),
         host: None,
         harness_ok: Some(false),
         disk_free_pct: Some(7),
@@ -406,7 +406,7 @@ fn job_and_node_views_match_the_documented_json() {
         }],
         labels: vec!["gpu".to_owned()],
         label_sources: std::collections::BTreeMap::from([("gpu".to_owned(), "probed".to_owned())]),
-        taints: vec!["homelab".to_owned()],
+        taints: vec!["lab".to_owned()],
         current_job: Some(job_id()),
         cordon_details: vec![
             CordonView {
@@ -420,13 +420,13 @@ fn job_and_node_views_match_the_documented_json() {
             CordonView {
                 provider: "peer-d".to_owned(),
                 source: "reiki".to_owned(),
-                reason: "Reiki cooldown for provider peer-d (retry after 300s)".to_owned(),
+                reason: "Provider gateway cooldown for peer-d (retry after 300s)".to_owned(),
                 set_at: 1_700_000_025,
                 until: None,
                 lifts_after_healthy_heartbeats: Some(2),
             },
         ],
-        reiki: Some(serde_json::json!({"status": "ok"})),
+        provider_health: Some(serde_json::json!({"status": "ok"})),
         load1: Some(1.5),
         mem_available_kb: Some(8192),
         mem_total_kb: Some(16_384),
@@ -460,7 +460,7 @@ fn job_and_node_views_match_the_documented_json() {
         "provider_models": [{"provider": "peer-b", "model": "other-model"}],
         "labels": ["gpu"],
         "label_sources": {"gpu": "probed"},
-        "taints": ["homelab"],
+        "taints": ["lab"],
         "current_job": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
         "cordon_details": [
             {
@@ -474,7 +474,7 @@ fn job_and_node_views_match_the_documented_json() {
             {
                 "provider": "peer-d",
                 "source": "reiki",
-                "reason": "Reiki cooldown for provider peer-d (retry after 300s)",
+                "reason": "Provider gateway cooldown for peer-d (retry after 300s)",
                 "set_at": 1_700_000_025,
                 "until": null,
                 "lifts_after_healthy_heartbeats": 2

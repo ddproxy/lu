@@ -2243,7 +2243,7 @@ mod tests {
         assert_eq!(error_field(&spec), "tolerates");
 
         spec = sample();
-        spec.tolerates = vec!["homelab".to_owned(), "homelab".to_owned()];
+        spec.tolerates = vec!["lab".to_owned(), "lab".to_owned()];
         assert_eq!(error_field(&spec), "tolerates");
 
         spec = sample();
@@ -2623,7 +2623,7 @@ mod tests {
     fn tolerations_round_trip_and_are_omitted_when_empty() {
         let mut spec = sample();
         assert!(!spec.canonical_json().contains("tolerates"));
-        spec.tolerates = vec!["homelab".to_owned(), "region=eu".to_owned()];
+        spec.tolerates = vec!["lab".to_owned(), "region=eu".to_owned()];
         assert!(spec.validate().is_ok());
         let json = spec.canonical_json();
         assert!(json.contains("\"tolerates\""));
@@ -2710,7 +2710,7 @@ mod tests {
             model: None,
         }];
         spec.requires = vec!["gpu".to_owned()];
-        spec.tolerates = vec!["homelab".to_owned()];
+        spec.tolerates = vec!["lab".to_owned()];
         let edit = JobEdit {
             task: None,
             source_ref: None,

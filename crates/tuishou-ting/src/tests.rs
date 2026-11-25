@@ -487,13 +487,13 @@ fn make_agent(
         taints: Arc::new(Vec::new()),
         harness_ok: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         provider_marker_grace: super::PROVIDER_MARKER_GRACE,
-        reiki_watch_period: super::REIKI_WATCH_PERIOD,
+        provider_health_watch_period: super::PROVIDER_HEALTH_WATCH_PERIOD,
         opencode_server: None,
         workspace_gid: None,
         harness_owner: None,
         opencode_password: None,
         workspaces,
-        reiki_probe: None,
+        provider_health_probe: None,
         gateway_fault_markers: Arc::new(Vec::new()),
         health: Default::default(),
         provider_models: Arc::new(Vec::new()),
@@ -2113,7 +2113,7 @@ async fn job_that_recovers_after_a_marker_is_not_killed_when_it_goes_quiet() {
 }
 
 #[tokio::test]
-async fn job_whose_provider_goes_unusable_in_reiki_fails_as_provider() {
+async fn job_whose_provider_goes_unusable_in_gateway_health_fails_as_provider() {
     let f = fixture();
     let job_id = JobId::new();
     let mut spec = test_spec(&f.repo_dir.to_string_lossy());
@@ -2124,7 +2124,7 @@ async fn job_whose_provider_goes_unusable_in_reiki_fails_as_provider() {
         controller.clone(),
         sh("echo started; sleep 30"),
     );
-    agent.reiki_watch_period = Duration::from_millis(100);
+    agent.provider_health_watch_period = Duration::from_millis(100);
     let health = agent.clone_health_for_tests();
     let publisher = tokio::spawn(async move {
         for _ in 0..40 {
@@ -2157,7 +2157,7 @@ async fn job_whose_provider_goes_unusable_in_reiki_fails_as_provider() {
     assert_eq!(
         done[0].retry_after_secs,
         Some(150),
-        "90s from Reiki plus the buffer"
+        "90s from the gateway plus the buffer"
     );
 }
 
@@ -2173,7 +2173,7 @@ async fn job_survives_a_provider_that_recovers_between_readings() {
         controller.clone(),
         sh("echo started; sleep 1.4; exit 0"),
     );
-    agent.reiki_watch_period = Duration::from_millis(40);
+    agent.provider_health_watch_period = Duration::from_millis(40);
     let health = agent.clone_health_for_tests();
     let publisher = tokio::spawn(async move {
         for i in 0..12 {
@@ -2458,7 +2458,7 @@ async fn job_harness_gets_the_opencode_password_only_when_one_is_configured() {
 }
 
 #[tokio::test]
-async fn heartbeats_carry_the_providers_the_local_reiki_reports() {
+async fn heartbeats_carry_the_providers_the_local_gateway_reports() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -2488,7 +2488,7 @@ async fn heartbeats_carry_the_providers_the_local_reiki_reports() {
         controller.push_poll(Ok(Vec::new()));
     }
     let mut agent = make_agent(&f.work_dir, controller.clone(), sh("true"));
-    agent.reiki_probe = Some((
+    agent.provider_health_probe = Some((
         format!("http://127.0.0.1:{port}/v1/health"),
         Arc::from("probe-token"),
     ));
@@ -2512,7 +2512,10 @@ async fn heartbeats_carry_the_providers_the_local_reiki_reports() {
     let names: Vec<&str> = carried.providers.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["zen", "openrouter"]);
     assert_eq!(carried.providers[1].soonest_secs, Some(60));
-    assert!(carried.reiki.is_some(), "the document is forwarded too");
+    assert!(
+        carried.provider_health.is_some(),
+        "the document is forwarded too"
+    );
     let _ = stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 }

@@ -161,8 +161,8 @@ The `[agent]` table describes an agent host. Operator commands never read it: th
 | `heartbeat_secs` | no | `15` | Integer `2` to `300`. When a `[controller]` table is also present, `heartbeat_secs * 2` must be strictly less than `lease_secs`. |
 | `on_stuck` | no | `none` | One of `none`, `cancel`, `retry`. Default response for jobs whose spec omits `on_stuck`; `none` leaves stuck jobs running. |
 | `stuck_after_secs` | no | `1800` | Integer `60` to `86400`. Default continuous stuck interval for jobs whose spec omits `stuck_after_secs`. |
-| `reiki_health_url` | no | — | Loopback `http` or `https` URL with no credentials, query or fragment. Requires `reiki_token_file`. The agent reads the local Reiki's peer health (`GET /v1/health`) every 10 seconds and sends each upstream as a provider (`ok`, `cooling` with seconds left, `disabled` or `unknown`) with every heartbeat, plus the document itself. A job that names a `provider` goes only to nodes that report it. After three failed reads the node reports no providers. |
-| `reiki_token_file` | no | — | Non-empty when set; required when `reiki_health_url` is set, and rejected when set alone. Checked like `token_file` on `load`; the agent reads at most 4 KiB. |
+| `provider_gateway_health_url` | no | — | Loopback `http` or `https` URL with no credentials, query or fragment. Requires `provider_gateway_token_file`. The agent reads the local provider gateway's health (`GET /v1/health`) every 10 seconds and sends each upstream as a provider (`ok`, `cooling` with seconds left, `disabled` or `unknown`) with every heartbeat, plus the document itself. A job that names a `provider` goes only to nodes that report it. After three failed reads the node reports no providers. |
+| `provider_gateway_token_file` | no | — | Non-empty when set; required when `provider_gateway_health_url` is set, and rejected when set alone. Checked like `token_file` on `load`; the agent reads at most 4 KiB. |
 | `gateway_fault_markers` | no | `[]` | At most 16 case-insensitive body substrings, each 1 to 64 bytes, validated when the config loads. Optional and agent-side; it needs no health URL. A `503` from the node's configured gateway health endpoint is a node-class `gateway_unavailable` fault only when its body contains a marker. With an empty list, a `503` is an ordinary failed health read. |
 | `provider_models` | no | `[]` | Up to 64 `[[agent.provider_models]]` pairs, in preference order. Each provider is 1 to 64 characters from `A-Z a-z 0-9 . _ -`; each model is 1 to 128 bytes; provider names are unique. See below. |
 | `labels` | no | `[]` | At most 32 labels. Each is 1 to 64 characters from `A-Z a-z 0-9 . _ - /`, with at most one `=`. Lu never interprets them; a job's `requires` must match every label exactly. |
@@ -181,6 +181,19 @@ the same body with an empty marker list is only a failed health read.
 gateway_fault_markers = ["store OFFLINE", "capacity exhausted"]
 ```
 
+### Provider gateway health
+
+The optional health feed is a local gateway's `GET /v1/health` response. The agent reads it every
+10 seconds with a 3-second timeout, refuses redirects and ignores a reply over 256 KiB. It takes
+the first 64 valid `upstreams[]` entries, each with a `name` and the counts `healthy_keys`,
+`cooling_keys` and `disabled_keys`. A positive healthy count means `ok`; otherwise a positive
+cooling count means `cooling` with `soonest_cooldown_seconds` when present, a positive disabled
+count means `disabled`, and the rest are `unknown`. The agent forwards the document itself only
+when it serialises to at most 48 KiB; the controller rejects larger documents. Three failed reads
+in a row clear the provider list. A `503` is a node-class `gateway_unavailable` fault only when its
+body contains one of `gateway_fault_markers`. See
+[provider failure detection](operations.md#provider-failure-detection).
+
 An explicit job spec field overrides both stuck defaults. Stuck uses the same output/CPU
 observation as `lu node`: both idle counters must exceed 300 seconds, and that observation must
 stay continuous for `stuck_after_secs` before the agent acts. See
@@ -194,7 +207,7 @@ machine property. For example:
 # ...
 labels = ["gpu", "php8.3", "region=eu"]
 label_files = ["/etc/lu/labels.d/installed-software"]
-taints = ["homelab"]
+taints = ["lab"]
 ```
 
 ### `[[agent.provider_models]]`
@@ -204,7 +217,7 @@ taints = ["homelab"]
 | `provider` | yes | — | 1 to 64 characters from `A-Z a-z 0-9 . _ -`; unique among pairs. |
 | `model` | yes | — | 1 to 128 bytes. |
 
-Pairs are published with every heartbeat only while Reiki reports the named provider healthy. Dispatch tries them in configuration order for jobs submitted with `--provider any`. No schema change: pairs live in the stored heartbeat.
+Pairs are published with every heartbeat only while the provider gateway reports the named provider healthy. Dispatch tries them in configuration order for jobs submitted with `--provider any`. No schema change: pairs live in the stored heartbeat.
 
 ```toml
 [[agent.provider_models]]
@@ -581,8 +594,8 @@ unsafe_inline = false
 ## Paths and secret files
 
 - `db`, `artifacts_dir`, `work_dir`, `[audit] path`, each `local_repo_roots` entry, each `label_files` entry, each `scratch_globs` pattern and each `extra_roots` entry must be absolute and must not contain a `..` component.
-- `[tls] cert`, `[tls] key`, `token_file`, `ca_file`, `reiki_token_file`, `credential_file`, `[mirror.credentials]` token files, `[publish.remotes.<name>]` token files, each `[[intake.sources]].secret_file`, `opencode_password_file` and `[log] file` need not be absolute. Publish token files are the exception: their own table requires an absolute path.
-- Each secret read opens the path once with `O_NOFOLLOW` and `O_NONBLOCK`, then checks the open handle; a startup check and later use may open the same file separately. Secret files must be regular files, owned by the effective user, with no group or other permission bits (mode `0600` or tighter). A file with mode `0640` is refused for a secret. `lu serve` and `ting` check `[tls] key`, `token_file`, `reiki_token_file`, `credential_file`, publish token files and intake signing keys on load; `opencode_password_file` is checked when the agent starts.
+- `[tls] cert`, `[tls] key`, `token_file`, `ca_file`, `provider_gateway_token_file`, `credential_file`, `[mirror.credentials]` token files, `[publish.remotes.<name>]` token files, each `[[intake.sources]].secret_file`, `opencode_password_file` and `[log] file` need not be absolute. Publish token files are the exception: their own table requires an absolute path.
+- Each secret read opens the path once with `O_NOFOLLOW` and `O_NONBLOCK`, then checks the open handle; a startup check and later use may open the same file separately. Secret files must be regular files, owned by the effective user, with no group or other permission bits (mode `0600` or tighter). A file with mode `0640` is refused for a secret. `lu serve` and `ting` check `[tls] key`, `token_file`, `provider_gateway_token_file`, `credential_file`, publish token files and intake signing keys on load; `opencode_password_file` is checked when the agent starts.
 - The config file itself has no secret-file mode check; it normally contains only hashes and paths. Protect it anyway because it names the token and TLS key locations.
 
 ## Examples

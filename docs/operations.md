@@ -217,9 +217,9 @@ lists, and uncovered paths fail closed. See
 
 Failure classes, retry budgets and cancellation are in [lifecycle.md](lifecycle.md#failure-classes-and-retries); provider choice and fallbacks are in [dispatch.md](dispatch.md). Two agent-side detections matter when reading a stalled job.
 
-When a job resolves to a `provider` (the assigned choice, or the primary when the job names one), the agent checks it against its node's Reiki reading every five seconds, but acts only on a new reading. The feed itself refreshes every ten seconds. Reiki is the authority on keys, so this works for any harness: when two fresh readings in a row show the provider cooling or disabled (no usable key), the agent stops the job like a cancel and completes it as `Failed(Provider)`, with a summary that names the provider and the soonest return time Reiki reported. The completion carries that time plus a 60-second buffer as `retry_after_secs`, and the controller cordons that provider on the node for that long instead of the configured cordon length. Two consecutive healthy provider heartbeats after the failure clear that cordon; a non-healthy reading resets the streak.
+When a job resolves to a `provider` (the assigned choice, or the primary when the job names one), the agent checks it against its node's provider gateway health feed every five seconds, but acts only on a new reading. The feed itself refreshes every ten seconds. The gateway is the authority on keys, so this works for any harness: when two fresh readings in a row show the provider cooling or disabled (no usable key), the agent stops the job like a cancel and completes it as `Failed(Provider)`, with a summary that names the provider and the soonest return time the gateway reported. The completion carries that time plus a 60-second buffer as `retry_after_secs`, and the controller cordons that provider on the node for that long instead of the configured cordon length. Two consecutive healthy provider heartbeats after the failure clear that cordon; a non-healthy reading resets the streak.
 
-As a fallback for a job with no provider, or a node without a Reiki feed, the agent watches a running harness's output. If the newest line matches a provider-unavailable marker (the opencode message about every key in the stream's chain, a quota message, a 429, or a rate limit) and the harness then produces no output for 120 seconds, the agent stops it the same way and completes the job as `Failed(Provider)`, with a summary naming the marker. Any other output after the marker disarms the watch.
+As a fallback for a job with no provider, or a node without a provider gateway feed, the agent watches a running harness's output. If the newest line matches a provider-unavailable marker (the opencode message about every key in the stream's chain, a quota message, a 429, or a rate limit) and the harness then produces no output for 120 seconds, the agent stops it the same way and completes the job as `Failed(Provider)`, with a summary naming the marker. Any other output after the marker disarms the watch.
 
 ## Stuck jobs
 
@@ -247,16 +247,16 @@ The controller counts successful stuck completions in
 These are separate mechanisms:
 
 - **Drain** stops a node taking any new job. It is set by `POST /v1/nodes/{name}/drain` and cleared by `/undrain`, and is stored in the `nodes` table. It survives a controller restart. A node must have sent a heartbeat at least once to exist; draining an unknown node returns `404 not_found`. An operator drain is operator-owned: the agent's `POST /v1/agent/undrain` refuses it with `409 conflict` and the node view reports `drain_origin: "operator"`. A node can instead drain itself with `POST /v1/agent/drain` and clear that drain with `POST /v1/agent/undrain`, reported as `drain_origin: "agent"`. See [Updating a node](../README.md#updating-a-node) for the self-service update sequence and [the `ting` reference](ting.md) for the CLI.
-- **Cordon** stops a node taking jobs whose chosen provider is cordoned. It is created when a retryable provider failure completes, keyed by the pair actually assigned rather than necessarily the primary. A completion with `retry_after_secs` creates a Reiki-derived cordon that lifts after two consecutive healthy provider heartbeats; any other provider failure uses `provider_cooldown_secs` and a fixed expiry. A job with no provider is not blocked by a cordon.
+- **Cordon** stops a node taking jobs whose chosen provider is cordoned. It is created when a retryable provider failure completes, keyed by the pair actually assigned rather than necessarily the primary. A completion with `retry_after_secs` creates a health-derived cordon that lifts after two consecutive healthy provider heartbeats; any other provider failure uses `provider_cooldown_secs` and a fixed expiry. A job with no provider is not blocked by a cordon.
 
 Cordon expiry is stored as monotonic milliseconds internally so dispatch behaviour is unchanged,
-while `cordon_details` exposes a wall-clock `until` for fixed cooldowns. Reiki cordons expose
+while `cordon_details` exposes a wall-clock `until` for fixed cooldowns. Health-derived cordons expose
 `until: null`, `lifts_after_healthy_heartbeats: 2` and a zero-second remaining-time metric.
 `lu nodes --json` shows the active cordons in `cordon_details`; human output is described below.
 Clearing a cordon early needs no database edit: run `lu uncordon <node> [<provider>]`, or call
 `POST /v1/nodes/{name}/uncordon`. Boot recovery deletes every cordon row on each controller start,
-because a monotonic deadline from the previous process has no meaning for the new clock. Reiki
-health and new provider failures set them again.
+because a monotonic deadline from the previous process has no meaning for the new clock. Provider
+gateway health and new provider failures set them again.
 
 ## Reading `lu nodes`
 
@@ -264,7 +264,7 @@ For the one-shot controller summary, see [`lu status` on the monitoring page](mo
 
 ```text
 NAME    VERSION  HARNESS  LABELS                        CORDONS      LAST_SEEN            DRAINED
-node-a  0.4.0   idle     !homelab,gpu,php8.3,region=eu   !zen,!mistral 2026-11-21 09:12:00Z no
+node-a  0.4.0   idle     !lab,gpu,php8.3,region=eu   !zen,!mistral 2026-11-21 09:12:00Z no
 ```
 
 - `NAME` is the node name bound to the agent token.
@@ -279,7 +279,7 @@ There is no `ONLINE` column in the table. Use `lu nodes --json` to see the full 
 `online` (seen within two lease periods; nodes are offline after a controller restart until their
 next heartbeat), `draining`, `drain_origin` (`"operator"` or `"agent"` while drained, absent otherwise),
 `providers`, `provider_models`, `labels`, `label_sources`, `taints`,
-`current_job`, `cordon_details`, `version` and the opaque `reiki` document. `label_sources` maps a
+`current_job`, `cordon_details`, `version` and the opaque provider-health document. `label_sources` maps a
 probed label to `probed`; other labels have no entry. Each `cordon_details` entry carries its
 provider, source, reason, set time, expiry or healthy-lift count.
 
@@ -317,8 +317,8 @@ job 01J...  pgid 4242  output_idle 400s  cpu_idle 350s  stuck yes
 cordons
   zen [failure] 1m10s ago; 10m0s left
       Provider zen failed: timeout
-  mistral [reiki] 20s ago; lifts on 2 healthy
-      Reiki cooldown for mistral
+  mistral [gateway] 20s ago; lifts on 2 healthy
+      Provider gateway cooldown for mistral
 ```
 
 - `labels` lists the node's current labels; a probed one is followed by ` (probed)`. `lu node <name> --json` includes `labels` and `label_sources` in the stats body.

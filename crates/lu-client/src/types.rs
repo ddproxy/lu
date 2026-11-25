@@ -163,8 +163,8 @@ pub struct PollRequest {
     /// Provider/model pairs the agent can serve for `provider = "any"` jobs.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub provider_models: Vec<ProviderModel>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reiki: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "reiki")]
+    pub provider_health: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<HostStats>,
     /// False when the agent's harness is unhealthy. Absent means healthy for older agents.
@@ -221,7 +221,7 @@ impl From<Heartbeat> for PollRequest {
             version: beat.version,
             providers: beat.providers,
             provider_models: beat.provider_models,
-            reiki: beat.reiki,
+            provider_health: beat.provider_health,
             host: beat.host,
             harness_ok: beat.harness_ok,
             disk_free_pct: beat.disk_free_pct,
@@ -450,13 +450,13 @@ mod tests {
     #[test]
     fn poll_requests_carry_node_taints() {
         let request = PollRequest {
-            taints: vec!["homelab".to_owned()],
+            taints: vec!["lab".to_owned()],
             ..PollRequest::default()
         };
         let json = serde_json::to_string(&request).unwrap();
-        assert_eq!(json, r#"{"taints":["homelab"]}"#);
+        assert_eq!(json, r#"{"taints":["lab"]}"#);
         let parsed: PollRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.taints, vec!["homelab"]);
+        assert_eq!(parsed.taints, vec!["lab"]);
     }
 
     #[test]
@@ -474,7 +474,7 @@ mod tests {
             version: None,
             providers: Vec::new(),
             provider_models: Vec::new(),
-            reiki: None,
+            provider_health: None,
             host: None,
             harness_ok: Some(true),
             disk_free_pct: Some(42),
@@ -571,9 +571,8 @@ mod tests {
         assert_eq!(node.labels, vec!["gpu".to_owned(), "php8.3".to_owned()]);
 
         let node: NodeView =
-            serde_json::from_str(r#"{"name":"node-a","labels":["gpu"],"taints":["homelab"]}"#)
-                .unwrap();
-        assert_eq!(node.taints, vec!["homelab".to_owned()]);
+            serde_json::from_str(r#"{"name":"node-a","labels":["gpu"],"taints":["lab"]}"#).unwrap();
+        assert_eq!(node.taints, vec!["lab".to_owned()]);
     }
 
     #[test]

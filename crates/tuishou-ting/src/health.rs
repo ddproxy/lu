@@ -1,4 +1,4 @@
-//! The node's Reiki health, read from the local Reiki peer endpoint and sent with each
+//! The node's provider health, read from the local provider gateway endpoint and sent with each
 //! heartbeat, so the controller and `lu top` can show which providers a node can use.
 
 use std::sync::{Arc, Mutex, PoisonError};
@@ -11,11 +11,11 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-/// How often the local Reiki is asked. A heartbeat reuses the last answer.
+/// How often the local provider gateway is asked. A heartbeat reuses the last answer.
 const REFRESH: Duration = Duration::from_secs(10);
 /// A reply larger than this is ignored; a health document is a few kilobytes.
 const MAX_REPLY_BYTES: usize = 256 * 1024;
-/// The controller refuses a `reiki` field over 64 KiB; stay well under it.
+/// The controller refuses a forwarded health document over 64 KiB; stay well under it.
 const MAX_FORWARDED_BYTES: usize = 48 * 1024;
 /// Failed reads in a row before the node reports its health as unknown.
 const STALE_AFTER_FAILURES: u32 = 3;
@@ -24,7 +24,7 @@ const STALE_AFTER_FAILURES: u32 = 3;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Health {
     pub providers: Vec<ProviderStatus>,
-    pub reiki: Option<Value>,
+    pub provider_health: Option<Value>,
     /// A node fault reported by the configured gateway health endpoint, never inferred from
     /// harness output.
     pub infra_reason: Option<NodeFailureReason>,
@@ -42,7 +42,7 @@ pub fn snapshot(shared: &Shared) -> Health {
         .clone()
 }
 
-/// Turns a Reiki peer document into a heartbeat's provider list. Anything unreadable is
+/// Turns a provider gateway document into a heartbeat's provider list. Anything unreadable is
 /// skipped, never guessed: the document comes from a local process but is still parsed
 /// defensively.
 pub fn parse(doc: &Value) -> Health {
@@ -62,7 +62,7 @@ pub fn parse(doc: &Value) -> Health {
         .unwrap_or(false);
     Health {
         providers,
-        reiki: forwarded.then(|| doc.clone()),
+        provider_health: forwarded.then(|| doc.clone()),
         infra_reason: None,
         seq: 0,
     }
@@ -141,7 +141,7 @@ async fn fetch(client: &reqwest::Client, url: &str, token: &str, markers: &[Stri
     }
 }
 
-/// Reads the local Reiki every few seconds into `shared` until the task is aborted.
+/// Reads the local provider gateway every few seconds into `shared` until the task is aborted.
 pub fn spawn_refresher(
     url: String,
     token: Arc<str>,
@@ -156,7 +156,7 @@ pub fn spawn_refresher(
         {
             Ok(client) => client,
             Err(error) => {
-                warn!(%error, "cannot build the Reiki health client; provider health stays unknown");
+                warn!(%error, "cannot build the provider health client; provider health stays unknown");
                 return;
             }
         };
@@ -181,7 +181,7 @@ pub fn spawn_refresher(
                 }
                 Fetch::Failed => {
                     failures = failures.saturating_add(1);
-                    debug!(failures, "could not read the local Reiki health");
+                    debug!(failures, "could not read the local provider gateway health");
                     if failures == STALE_AFTER_FAILURES {
                         let mut guard = shared.lock().unwrap_or_else(PoisonError::into_inner);
                         let seq = guard.seq;
@@ -227,7 +227,7 @@ mod tests {
                 ("empty", ProviderState::Unknown, None),
             ]
         );
-        assert!(health.reiki.is_some());
+        assert!(health.provider_health.is_some());
     }
 
     #[test]
@@ -270,7 +270,7 @@ mod tests {
             MAX_PROVIDERS
         );
         let big = json!({"upstreams": [], "padding": "x".repeat(MAX_FORWARDED_BYTES + 1)});
-        assert!(parse(&big).reiki.is_none());
+        assert!(parse(&big).provider_health.is_none());
     }
 
     async fn fetch_with_reply(

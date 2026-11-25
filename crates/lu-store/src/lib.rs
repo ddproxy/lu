@@ -85,18 +85,19 @@ pub struct ScopeLimits {
     pub max_descendants: u64,
 }
 
-/// Where a provider cordon came from. Reiki-derived cordons lift after healthy heartbeats;
+/// Where a provider cordon came from. Health-derived cordons lift after healthy heartbeats;
 /// failure-derived cordons run for their time limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CordonSource {
-    Reiki,
+    Health,
     Failure,
 }
 
 impl CordonSource {
     pub fn as_str(self) -> &'static str {
         match self {
-            CordonSource::Reiki => "reiki",
+            // Legacy wire value: older controllers and clients compare this exactly.
+            CordonSource::Health => "reiki",
             CordonSource::Failure => "failure",
         }
     }
@@ -900,7 +901,7 @@ pub trait Store: Send + Sync + 'static {
 
     /// All cordons, or just one node's when `node` is `Some`.
     fn cordons(&self, node: Option<&NodeName>) -> Result<Vec<Cordon>, StoreError>;
-    /// Creates or replaces a provider cordon. Reiki cordons lift after two healthy heartbeats;
+    /// Creates or replaces a provider cordon. Health-derived cordons lift after two healthy heartbeats;
     /// failure cordons rely on `until_mono_ms`.
     fn set_cordon(
         &self,

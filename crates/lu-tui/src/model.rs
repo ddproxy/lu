@@ -8,6 +8,10 @@ use crate::sanitize::printable;
 use lu_proto::limits::MAX_VERSION_BYTES;
 use lu_proto::{same_build, HarnessState, JobState, NodeHealth, NodeHealthLevel, ProviderState};
 
+/// Legacy wire value for a health-derived cordon. Older controllers send this string; newer ones
+/// keep it so mixed-version fleets agree on the source.
+pub(crate) const HEALTH_CORDON_SOURCE: &str = "reiki";
+
 /// Reduces a source repository URL or absolute path to `owner/name`, dropping the scheme,
 /// credentials, host, query, fragment and a trailing `.git`. Unusable values become `-`; none of
 /// the discarded parts can reach the screen.
@@ -67,7 +71,7 @@ pub struct ProviderCell {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CordonCell {
     pub provider: String,
-    /// `reiki` or `failure`.
+    /// `gateway` for health-derived cordons or `failure` for fixed cooldowns.
     pub source: String,
     pub reason: String,
     /// None when the cordon lifts on healthy heartbeats instead of a deadline.
@@ -1109,7 +1113,7 @@ fn provider_text(cell: &ProviderCell, cordon: Option<&CordonCell>) -> (String, T
         (Err(_), _) => (format!("{name} {}", printable(&cell.state)), Tone::Dim),
     };
     match cordon {
-        Some(c) if c.source == "reiki" => (format!("!{name}~"), Tone::Blocked),
+        Some(c) if c.source == HEALTH_CORDON_SOURCE => (format!("!{name}~"), Tone::Blocked),
         Some(_) => (format!("!{name}"), Tone::Blocked),
         None => (text, tone),
     }
@@ -1166,7 +1170,7 @@ fn waiting_on_providers(snapshot: &Snapshot) -> String {
 fn cordon_pane_view(node: &NodeRow) -> ProcessPaneView {
     let mut lines = Vec::new();
     for cordon in &node.cordons {
-        let (mark, tone) = if cordon.source == "reiki" {
+        let (mark, tone) = if cordon.source == HEALTH_CORDON_SOURCE {
             ("~", Tone::Warn)
         } else {
             ("!", Tone::Blocked)
@@ -2074,8 +2078,8 @@ mod tests {
             },
             CordonCell {
                 provider: "openrouter".to_owned(),
-                source: "reiki".to_owned(),
-                reason: "Reiki cooldown".to_owned(),
+                source: HEALTH_CORDON_SOURCE.to_owned(),
+                reason: "Provider gateway cooldown".to_owned(),
                 remaining_secs: None,
                 lifts_after_healthy_heartbeats: Some(2),
             },
@@ -2101,12 +2105,12 @@ mod tests {
             .find(|segment| segment.text == "!zen")
             .unwrap();
         assert_eq!(chip.tone, Tone::Blocked);
-        let reiki_chip = node_line
+        let health_chip = node_line
             .segments
             .iter()
             .find(|segment| segment.text == "!openrouter~")
             .unwrap();
-        assert_eq!(reiki_chip.tone, Tone::Blocked);
+        assert_eq!(health_chip.tone, Tone::Blocked);
 
         let pane = view.cordon_pane.as_ref().unwrap();
         let failure = pane
@@ -2115,12 +2119,12 @@ mod tests {
             .find(|line| line.text.contains("zen"))
             .unwrap();
         assert_eq!(failure.tone, Tone::Blocked);
-        let reiki = pane
+        let health = pane
             .lines
             .iter()
             .find(|line| line.text.contains("openrouter"))
             .unwrap();
-        assert_eq!(reiki.tone, Tone::Warn);
+        assert_eq!(health.tone, Tone::Warn);
     }
 
     #[test]

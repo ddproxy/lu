@@ -1,0 +1,24 @@
+# Hygiene exceptions, one per line: <repo-relative path><TAB><lowercased banned term><TAB><reason>.
+# Only compatibility spellings required by older peers, and the scanner's own patterns, belong here.
+app/tests/cli.rs	reiki	legacy cordon source in a stored API fixture
+app/tests/hygiene.rs	reiki	scanner pattern
+app/tests/hygiene.rs	toolgate	scanner pattern
+app/tests/hygiene.rs	nadi	scanner pattern
+app/tests/hygiene.rs	siglint	scanner pattern
+app/tests/hygiene.rs	worklog	scanner pattern
+app/tests/hygiene.rs	axiom	scanner pattern
+app/tests/hygiene.rs	code.ddproxy.net	scanner pattern
+app/tests/hygiene.rs	dev-ct-	scanner pattern
+app/tests/hygiene.rs	homelab	scanner pattern
+crates/lu-client/src/client.rs	reiki	legacy heartbeat field written for older controllers
+crates/lu-client/src/types.rs	reiki	legacy poll field name in serde rename
+crates/lu-config/src/lib.rs	reiki	legacy config keys accepted as aliases
+crates/lu-controller/tests/api.rs	reiki	legacy cordon source assertion
+crates/lu-proto/src/node.rs	reiki	legacy heartbeat field name in serde rename
+crates/lu-proto/src/view.rs	reiki	legacy node-view field name in serde rename
+crates/lu-proto/tests/wire.rs	reiki	legacy wire spellings under test
+crates/lu-store/src/lib.rs	reiki	legacy cordon source emitted by the enum
+crates/lu-store/src/sqlite.rs	reiki	legacy stored column name
+crates/lu-tui/src/model.rs	reiki	legacy cordon source used to read stored state
+docs/opencode-harness.md	reiki	legacy cordon source in a compatibility example
+NOTES.md	reiki	compatibility spellings recorded for maintainers

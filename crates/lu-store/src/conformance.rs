@@ -80,7 +80,7 @@ pub fn hb(name: &str, harness: HarnessState, providers: Vec<(&str, ProviderState
             })
             .collect(),
         provider_models: Vec::new(),
-        reiki: None,
+        provider_health: None,
         host: None,
         harness_ok: None,
         disk_free_pct: None,
@@ -155,7 +155,7 @@ pub fn run_all<S: Store>(make: impl Fn() -> S) {
     retry_clears_node_exclusions(&make());
     recovery_excludes_the_lost_node(&make());
     complete_and_retry_cordon(&make());
-    reiki_cordon_yields_to_live_health(&make());
+    health_cordon_yields_to_live_health(&make());
     cordon_details_and_uncordon(&make());
     conflict_failure_class_round_trips(&make());
     stale_epoch_rejected(&make());
@@ -1794,7 +1794,7 @@ fn taint_tolerations_route_and_explain<S: Store>(s: &S) {
     s.heartbeat(&hb("plain", HarnessState::Idle, vec![]), now(1, 1))
         .unwrap();
     let mut beat = hb("tainted", HarnessState::Idle, vec![]);
-    beat.taints = vec!["homelab".to_owned()];
+    beat.taints = vec!["lab".to_owned()];
     s.heartbeat(&beat, now(1, 1)).unwrap();
 
     // A job tolerating nothing skips the tainted node; the untainted node is unaffected.
@@ -1813,7 +1813,7 @@ fn taint_tolerations_route_and_explain<S: Store>(s: &S) {
 
     // Tolerating the taint makes the node eligible.
     let mut tolerant = spec("https://x/tolerant.git", None);
-    tolerant.tolerates = vec!["homelab".to_owned()];
+    tolerant.tolerates = vec!["lab".to_owned()];
     let (tol, _) = s.create_job(&tolerant, now(4, 4)).unwrap();
     let assigned = s
         .next_assignment(&tainted, now(5, 5), 60_000)
@@ -1844,7 +1844,7 @@ fn taint_tolerations_route_and_explain<S: Store>(s: &S) {
     // Every taint must be tolerated; tolerating only one is not enough.
     let multi = node("multi");
     let mut beat = hb("multi", HarnessState::Idle, vec![]);
-    beat.taints = vec!["rack".to_owned(), "homelab".to_owned()];
+    beat.taints = vec!["rack".to_owned(), "lab".to_owned()];
     s.heartbeat(&beat, now(11, 11)).unwrap();
     let mut partial = spec("https://x/partial.git", None);
     partial.tolerates = vec!["rack".to_owned()];
@@ -1854,7 +1854,7 @@ fn taint_tolerations_route_and_explain<S: Store>(s: &S) {
         .unwrap()
         .is_none());
     let mut both = spec("https://x/both.git", None);
-    both.tolerates = vec!["rack".to_owned(), "homelab".to_owned()];
+    both.tolerates = vec!["rack".to_owned(), "lab".to_owned()];
     let (all, _) = s.create_job(&both, now(14, 14)).unwrap();
     let assigned = s
         .next_assignment(&multi, now(15, 15), 60_000)
@@ -1880,7 +1880,7 @@ fn taint_tolerations_route_and_explain<S: Store>(s: &S) {
         .unwrap();
     let mut beat = hb("special", HarnessState::Idle, vec![]);
     beat.labels = vec!["gpu".to_owned()];
-    beat.taints = vec!["homelab".to_owned()];
+    beat.taints = vec!["lab".to_owned()];
     s.heartbeat(&beat, now(16, 16)).unwrap();
     let mut labelled = spec("https://x/tainted-label.git", None);
     labelled.requires = vec!["gpu".to_owned()];
@@ -1896,10 +1896,10 @@ fn taint_tolerations_route_and_explain<S: Store>(s: &S) {
     let nodes = s.nodes(now(18, 18), 60_000).unwrap();
     assert_eq!(
         crate::waiting_reason(&waiting, &nodes).as_deref(),
-        Some("only tainted nodes are free: homelab")
+        Some("only tainted nodes are free: lab")
     );
     let mut labelled_tolerant = labelled.clone();
-    labelled_tolerant.tolerates = vec!["homelab".to_owned()];
+    labelled_tolerant.tolerates = vec!["lab".to_owned()];
     let (tol_labelled, _) = s.create_job(&labelled_tolerant, now(19, 19)).unwrap();
     let assigned = s
         .next_assignment(&special, now(20, 20), 60_000)
@@ -2459,17 +2459,17 @@ fn complete_and_retry_cordon<S: Store>(s: &S) {
     assert_eq!(rec3.state, JobState::Done);
 }
 
-fn reiki_cordon_yields_to_live_health<S: Store>(s: &S) {
-    let n = node("node-reiki");
+fn health_cordon_yields_to_live_health<S: Store>(s: &S) {
+    let n = node("node-health");
     let healthy = || {
         hb(
-            "node-reiki",
+            "node-health",
             HarnessState::Idle,
             vec![("p1", ProviderState::Ok)],
         )
     };
     s.heartbeat(&healthy(), now(1, 1)).unwrap();
-    let mut sp = spec("https://x/reiki.git", None);
+    let mut sp = spec("https://x/provider.git", None);
     sp.provider = Some("p1".to_owned());
     let (j, _) = s.create_job(&sp, now(1, 1)).unwrap();
     let a = s.next_assignment(&n, now(2, 2), 60_000).unwrap().unwrap();
@@ -2497,16 +2497,16 @@ fn reiki_cordon_yields_to_live_health<S: Store>(s: &S) {
     assert_eq!(s.nodes(now(5, 5), 60_000).unwrap()[0].cordons, vec!["p1"]);
     let details = s.cordons(Some(&n)).unwrap();
     assert_eq!(details.len(), 1);
-    assert_eq!(details[0].source, CordonSource::Reiki);
+    assert_eq!(details[0].source, CordonSource::Health);
     assert!(details[0]
         .reason
-        .starts_with("Reiki cooldown for provider p1"));
+        .starts_with("Provider gateway cooldown for p1"));
     assert!(details[0].reason.contains("3600s"));
     assert_eq!(details[0].set_at_unix, 4);
     // A non-healthy reading breaks the streak; two healthy ones after it clear the cordon.
     s.heartbeat(
         &hb(
-            "node-reiki",
+            "node-health",
             HarnessState::Idle,
             vec![("p1", ProviderState::Cooling)],
         ),
@@ -2528,8 +2528,15 @@ fn cordon_details_and_uncordon<S: Store>(s: &S) {
         .unwrap();
     s.set_cordon(&n, "p1", CordonSource::Failure, "manual cordon", 42, 5_000)
         .unwrap();
-    s.set_cordon(&n, "p2", CordonSource::Reiki, "Reiki says cool", 43, 5_000)
-        .unwrap();
+    s.set_cordon(
+        &n,
+        "p2",
+        CordonSource::Health,
+        "gateway says cool",
+        43,
+        5_000,
+    )
+    .unwrap();
     let all = s.cordons(None).unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].provider, "p1");

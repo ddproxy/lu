@@ -33,7 +33,7 @@ and command list.
 - [Client guide](docs/client-guide.md): operator CLI and MCP client usage.
 - [MCP server](docs/mcp.md): operator tools and the scoped harness server.
 - [opencode harness](docs/opencode-harness.md): harness setup and provider credentials.
-- [Reiki](docs/reiki.md): provider health and cordon behaviour.
+- [Provider cordons](docs/dispatch.md#cordons): cordon behaviour and lift rules.
 - [Worked examples](docs/examples.md): end-to-end task examples.
 - [Intake](docs/intake.md): signed webhook intake rules.
 - [Adding a node](docs/onboarding-nodes.md): node onboarding steps.

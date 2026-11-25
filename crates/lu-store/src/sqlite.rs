@@ -102,7 +102,7 @@ fn node_retry_allowed(rec: &JobRecord, max_retries: u32, node_attempts: u32) -> 
 fn parse_cordon(r: &rusqlite::Row<'_>) -> rusqlite::Result<Cordon> {
     let node: String = r.get(0)?;
     let provider: String = r.get(1)?;
-    let reiki: i64 = r.get(2)?;
+    let health_derived: i64 = r.get(2)?;
     let reason: String = r.get(3)?;
     let set_at_unix: i64 = r.get(4)?;
     let until_mono_ms: i64 = r.get(5)?;
@@ -116,8 +116,8 @@ fn parse_cordon(r: &rusqlite::Row<'_>) -> rusqlite::Result<Cordon> {
     Ok(Cordon {
         node,
         provider,
-        source: if reiki != 0 {
-            CordonSource::Reiki
+        source: if health_derived != 0 {
+            CordonSource::Health
         } else {
             CordonSource::Failure
         },
@@ -518,12 +518,12 @@ fn cordon_reason(provider: &str, completion: &Completion, source: CordonSource) 
         detail
     };
     match source {
-        CordonSource::Reiki => {
+        CordonSource::Health => {
             let cooldown = completion
                 .retry_after_secs
                 .map(|s| format!(" (retry after {s}s)"))
                 .unwrap_or_default();
-            format!("Reiki cooldown for provider {provider}{cooldown}: {detail}")
+            format!("Provider gateway cooldown for {provider}{cooldown}: {detail}")
         }
         CordonSource::Failure => format!("Provider {provider} failed: {detail}"),
     }
@@ -1219,7 +1219,10 @@ fn node_offers_provider(hb: &Heartbeat, provider: &str) -> bool {
         .any(|p| p.name == provider && matches!(p.state, lu_proto::ProviderState::Ok))
 }
 
-fn refresh_reiki_cordons(tx: &rusqlite::Transaction<'_>, hb: &Heartbeat) -> Result<(), StoreError> {
+fn refresh_health_cordons(
+    tx: &rusqlite::Transaction<'_>,
+    hb: &Heartbeat,
+) -> Result<(), StoreError> {
     let cordons: Vec<(String, u64)> = {
         let mut stmt = tx
             .prepare(
@@ -2874,7 +2877,7 @@ impl Store for SqliteStore {
              ON CONFLICT(name) DO UPDATE SET heartbeat_json=excluded.heartbeat_json,last_seen_wall=excluded.last_seen_wall,last_seen_mono_ms=excluded.last_seen_mono_ms",
             params![hb.node.as_str(), hb_json, now.wall_unix, now.mono_ms as i64, draining],
         ).map_err(internal)?;
-        refresh_reiki_cordons(&tx, hb)?;
+        refresh_health_cordons(&tx, hb)?;
         tx.commit().map_err(internal)?;
         Ok(())
     }
@@ -3379,7 +3382,7 @@ impl Store for SqliteStore {
                         if let (Some(node), Some(p)) = (node_for_cordon, provider) {
                             let until = now.mono_ms.saturating_add(cordon_ms) as i64;
                             let source = if completion.retry_after_secs.is_some() {
-                                CordonSource::Reiki
+                                CordonSource::Health
                             } else {
                                 CordonSource::Failure
                             };
@@ -3394,7 +3397,7 @@ impl Store for SqliteStore {
                                     node.as_str(),
                                     p,
                                     until,
-                                    if source == CordonSource::Reiki { 1i64 } else { 0i64 },
+                                    if source == CordonSource::Health { 1i64 } else { 0i64 },
                                     reason,
                                     now.wall_unix
                                 ],
@@ -3534,7 +3537,7 @@ impl Store for SqliteStore {
         )
         .map_err(internal)?;
         // Cordon expiries are on the same monotonic clock: a row from the last run would look
-        // hours away against a fresh clock. Reiki health and new failures set them again.
+        // hours away against a fresh clock. Provider health and new failures set them again.
         tx.execute("DELETE FROM cordons", []).map_err(internal)?;
         // Node liveness uses that clock too. A persisted heartbeat stamp from the previous
         // process must not make a dead node look live: -1 means "not seen this process" and
@@ -3762,7 +3765,7 @@ impl Store for SqliteStore {
                 node.as_str(),
                 provider,
                 until_mono_ms,
-                if source == CordonSource::Reiki { 1i64 } else { 0i64 },
+                if source == CordonSource::Health { 1i64 } else { 0i64 },
                 reason,
                 set_at_unix
             ],
@@ -4936,7 +4939,7 @@ mod tests {
             let conn = store.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO cordons(node,provider,until_mono_ms,reiki_derived,healthy_hb_count) \
-                 VALUES('dev-ct-1','zen',70000000,0,0),('dev-ct-1','openrouter',90000000,1,0)",
+                 VALUES('node-old','zen',70000000,0,0),('node-old','openrouter',90000000,1,0)",
                 [],
             )
             .unwrap();

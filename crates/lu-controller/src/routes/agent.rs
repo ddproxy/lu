@@ -1055,9 +1055,9 @@ pub async fn complete_job(
                         .text(
                             Field::Source,
                             if retry_after_secs.is_some() {
-                                "reiki"
+                                lu_store::CordonSource::Health.as_str()
                             } else {
-                                "failure"
+                                lu_store::CordonSource::Failure.as_str()
                             },
                         )
                         .unsigned(Field::CordonMs, cordon_ms),
