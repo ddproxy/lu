@@ -252,6 +252,8 @@ pub struct Agent {
     opencode_password: Option<Arc<str>>,
     /// The local Reiki's health URL and token, when configured.
     reiki_probe: Option<(String, Arc<str>)>,
+    /// Operator-configured body markers for classifying a gateway health `503` as a node fault.
+    gateway_fault_markers: Arc<Vec<String>>,
     /// The last health read from it, sent with every heartbeat.
     health: health::Shared,
     /// Provider/model pairs from config, offered to provider-agnostic jobs when healthy.
@@ -386,6 +388,7 @@ impl Agent {
             harness_owner,
             opencode_password,
             reiki_probe,
+            gateway_fault_markers: Arc::new(config.gateway_fault_markers),
             health: health::Shared::default(),
             provider_models: Arc::new(config.provider_models),
             labels,
@@ -485,6 +488,7 @@ impl Agent {
             AbortOnDrop(health::spawn_refresher(
                 url.clone(),
                 Arc::clone(token),
+                Arc::clone(&this.gateway_fault_markers),
                 Arc::clone(&this.health),
             ))
         });
@@ -1418,7 +1422,7 @@ impl Agent {
                     if current.seq != seen_seq {
                         seen_seq = current.seq;
                         if let Some(reason) = current.infra_reason {
-                            info!(job = %job_id, reason = reason.as_str(), "Reiki gateway fault; stopping");
+                            info!(job = %job_id, reason = reason.as_str(), "Gateway fault; stopping");
                             running.stop();
                             end = JobEnd::Infra { reason };
                             break;

@@ -103,7 +103,7 @@ The full failure-class table, retry rules and agent-side classification are in
 before applying the checks below. A `dependency` failure now follows a blocked wait of up to
 `[controller] blocked_dependent_ttl`; see [Dependency chains](#dependency-chains).
 
-A `node` failure with a `failure_reason` points to the machine, not the task: `harness_unreachable`, `container_start`, `container_wait_timeout`, `reiki_gateway_503` or `workspace_enospc`. Check the node's harness, Podman storage, Reiki feed or workspace filesystem, then let the job requeue on another node. The failed node is in `excluded_nodes` in `lu show <id> --json`; `lu retry` clears it after the machine is fixed. Ordinary task output that mentions a socket or `ENOSPC` does not produce one of these codes.
+A `node` failure with a `failure_reason` points to the machine, not the task: `harness_unreachable`, `container_start`, `container_wait_timeout`, `gateway_unavailable` or `workspace_enospc`. Check the node's harness, Podman storage, gateway health endpoint or workspace filesystem, then let the job requeue on another node. The failed node is in `excluded_nodes` in `lu show <id> --json`; `lu retry` clears it after the machine is fixed. Ordinary task output that mentions a socket or `ENOSPC` does not produce one of these codes.
 
 A `409 stale_epoch` means the agent write came from an old lease; the controller ignores it. A log append at the wrong offset returns `409 conflict` with `{"error":"conflict","message":"conflict","length":L}`; resume from `L`. A `429` carries `Retry-After` seconds.
 

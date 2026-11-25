@@ -223,6 +223,7 @@ async fn staging_from_a_pack_needs_no_git_binary() {
         stuck_after_secs: 1_800,
         reiki_health_url: None,
         reiki_token_file: None,
+        gateway_fault_markers: Vec::new(),
         provider_models: Vec::new(),
         labels: Vec::new(),
         taints: Vec::new(),

@@ -180,7 +180,7 @@ work is never silently rerun.
 
 When the agent recognizes harness or host trouble, it sends a `node` completion with a fixed
 `failure_reason`. The codes are `harness_unreachable`, `container_start`,
-`container_wait_timeout`, `reiki_gateway_503` and `workspace_enospc`. The controller stores the
+`container_wait_timeout`, `gateway_unavailable` and `workspace_enospc`. The controller stores the
 code on the job and excludes the failed node from that job's future dispatch. A requeued job
 therefore goes to a different node; when every eligible node has been excluded, it stays `queued`
 with `waiting_reason: "all eligible nodes are excluded for this job"`. An operator `lu retry`
@@ -188,10 +188,11 @@ clears the reason and exclusions; automatic requeues do not.
 
 The agent uses high-confidence signatures so task output is not mistaken for a host fault. It
 recognizes an explicit harness-server connection failure, Podman start/create failures, the full
-overlay-storage wait timeout, a Reiki `503` body naming `gateway_store_unavailable` or
-`per-stream counters`, and a disk-full error while preparing a workspace or staging tree. A bare
-`connection refused`, `ENOSPC`, ordinary `no space left on device` or unnamed `503` in harness
-output is not enough. An ordinary provider outage remains `provider`, not `reiki_gateway_503`.
+overlay-storage wait timeout, a gateway health `503` whose body contains an operator-configured
+marker, and a disk-full error while preparing a workspace or staging tree. A bare
+`connection refused`, `ENOSPC`, ordinary `no space left on device` or unmarked `503` in harness
+output is not enough. An ordinary provider outage remains `provider`, not `gateway_unavailable`.
+Markers are set with `[agent] gateway_fault_markers`; an empty list classifies no `503`.
 
 Every new exclusion writes a `node_excluded` audit record with the node and, when known, the
 reason. A completion records the reporting node as actor; a recovery timeout uses actor

@@ -221,7 +221,7 @@ horizon; use `POST /v1/schedule/explain`. See [scheduling.md](scheduling.md).
 | `started_at` | integer or null | Unix seconds when the harness started. |
 | `finished_at` | integer or null | Unix seconds when the job reached a terminal state. |
 | `failure_class` | string or null | `node`, `provider`, `execution`, `dependency` or `conflict`. |
-| `failure_reason` | string or null | Fixed code for a `node` failure caused by harness or host trouble: `harness_unreachable`, `container_start`, `container_wait_timeout`, `reiki_gateway_503` or `workspace_enospc`. Omitted when absent or when the class is not `node`. It survives a requeue and is cleared by `lu retry`. |
+| `failure_reason` | string or null | Fixed code for a `node` failure caused by harness or host trouble: `harness_unreachable`, `container_start`, `container_wait_timeout`, `gateway_unavailable` or `workspace_enospc`. Omitted when absent or when the class is not `node`. It survives a requeue and is cleared by `lu retry`. |
 | `excluded_nodes` | array of strings | Nodes this job must not be dispatched to again after node-class failures, in exclusion order. Omitted when empty. Present on operator-facing and agent-facing job views, not in summary rows. |
 | `summary` | string or null | Last failure or completion summary. |
 | `exit_code` | integer or null | Harness exit code when known. |
