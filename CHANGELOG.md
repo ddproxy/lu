@@ -5,6 +5,8 @@ versioning.
 
 ## [Unreleased]
 
+## [0.8.0]
+
 ### Changed
 
 - Breaking: 0.8.0 removes legacy provider-health names, cordon source values and the former stored column name; schema 8 migrates databases 1–7 in place.
