@@ -36,14 +36,17 @@ a private directory under `<work_dir>/scope`: directory mode `0700`, socket mode
 `[agent] harness_uid` (and optionally `harness_gid`) when the harness runs as a different account;
 the agent then chowns the socket root and each per-job directory/socket to that account and checks
 `SO_PEERCRED` against its uid. Without `harness_uid` the agent refuses a job with `allow_spawn` (failure class `conflict`), because a harness that shares the agent's uid can read the agent's token and files; set `[agent] allow_shared_uid_scope = true` to accept that on a trusted node. The
-harness sees only `LU_JOB_SOCKET=<path>`; there is no token, controller URL or config path to read.
-A peer from another uid is refused even if it can reach the path.
+harness sees `LU_JOB_SOCKET=<path>` and `LU_JOB_SCOPE_CAPABILITY`, a random capability generated for
+that lease; there is no controller URL, controller token or config path to read. A peer from another
+uid, or a same-uid process that cannot present this job's capability, is refused. A same-uid process
+that can read another harness's environment is a limit of uid sharing, not a boundary this setting
+provides.
 
-The socket is a small attack surface: one bounded JSON line per request (the request envelope is
-capped at 272 KiB: `MAX_TASK_BYTES` plus a 16 KiB framing allowance), a request rate limit, no
-shelling out, and a shared strict decoder that is
-fuzzed on both the agent socket and the controller side. The workspace forbids `unsafe_code`; peer
-credentials come from a safe crate.
+The socket is a small attack surface: one bounded JSON line per frame (the frame is capped at 272
+KiB: `MAX_TASK_BYTES` plus a 16 KiB framing allowance), a request rate limit, no shelling out, and
+strict decoding. A frame carries the job's capability and one scope request; the capability is
+checked in constant time before the request is forwarded and is stripped before the controller
+call. The workspace forbids `unsafe_code`; peer credentials come from a safe crate.
 
 The socket dies when the job reaches a terminal state, loses its lease, changes epoch or is
 cancelled. A retry or a fresh attempt gets a fresh socket. Requests from a stale socket are refused
@@ -51,8 +54,10 @@ by the controller's lease and epoch checks.
 
 ## The six actions
 
-Every route accepts one bounded JSON request with the calling job's `job_id` and lease `epoch`, plus
-an optional action-specific payload. Results carry `source: "child_job"` and `untrusted: true`.
+The socket accepts one bounded JSON frame per call: the lease's capability plus a request with the
+calling job's `job_id` and lease `epoch` and an optional action-specific payload. The agent replaces
+both identity fields, so a harness cannot act as another job. Results carry `source: "child_job"`
+and `untrusted: true`.
 
 | Action | Input | Result |
 | --- | --- | --- |
@@ -102,7 +107,9 @@ Exceeding a hard limit returns `limit_exceeded` with the corresponding limit nam
 
 ## Submitting a child
 
-A child starts from its parent's spec with the harness-facing choices clamped by the controller:
+A child starts from its parent's spec with the harness-facing choices clamped by the controller.
+The `draft` marker is not inherited: a child of an approved draft is queued or blocked, never left
+in the draft queue.
 
 - `repo` stays the parent's unless the parent's `spawn_repos` allowlist names another one;
   `git_ref` and `base_commit` cannot be changed.
@@ -126,8 +133,8 @@ running; `cancel_child` uses the default cascade.
 
 ## MCP for the harness
 
-`ting mcp` is a stdio MCP server that reads
-`LU_JOB_SOCKET` and exposes only the six tools above. An opencode configuration uses:
+`ting mcp` is a stdio MCP server that reads `LU_JOB_SOCKET` and `LU_JOB_SCOPE_CAPABILITY` and
+exposes only the six tools above. It refuses to start without both. An opencode configuration uses:
 
 ```toml
 mcp = { lu = { command = ["ting","mcp"] } }
@@ -151,7 +158,8 @@ as it does for other controller actions.
 ## Container harness
 
 When the harness runs in a container, bind-mount the job's socket directory from the node's
-`<work_dir>/scope` into the container at a private path and set `LU_JOB_SOCKET` to that path. The
+`<work_dir>/scope` into the container at a private path and set `LU_JOB_SOCKET` and
+`LU_JOB_SCOPE_CAPABILITY` to that lease's values. The
 uid inside the container must be the same as `[agent] harness_uid`, and the mount must preserve
 Unix socket peer credentials; a bind mount does, a proxied or forwarded socket may not. Do not
 mount the agent's config, token file or whole `work_dir` into the harness container. Keep the mount

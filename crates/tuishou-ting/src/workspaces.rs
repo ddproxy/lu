@@ -1,13 +1,14 @@
 //! CI-style lifecycle for the job workspaces under the agent's work directory.
 //!
 //! Only direct children named by a [`JobId`] are ever considered. Deletion walks with
-//! `symlink_metadata`, so a symlink is removed as a link and never followed out of the root.
-//! A failed deletion is counted and retried with backoff; it never delays a job start.
+//! `symlink_metadata`, so a symlink is removed as a link and never followed out of the root, and
+//! re-checks every parent component for symlinks before opening or removing it. A failed deletion
+//! is counted and retried with backoff; it never delays a job start.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -622,6 +623,32 @@ pub fn tree_bytes(path: &Path) -> u64 {
     total
 }
 
+/// Refuses a path whose parent components are symlinks. The last component may be a symlink: the
+/// caller checks it with `symlink_metadata` and unlinks the link itself.
+fn verify_parents(root: &Path, relative: &Path) -> io::Result<()> {
+    let mut components = relative.components().peekable();
+    let mut current = root.to_path_buf();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        let Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "invalid workspace path",
+            ));
+        };
+        current.push(name);
+        if fs::symlink_metadata(&current)?.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "symlink in workspace path",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Removes one tree, refusing anything outside `root` and never removing `root` itself.
 pub fn remove_tree(root: &Path, path: &Path) -> io::Result<u64> {
     if path == root {
@@ -642,6 +669,7 @@ pub fn remove_tree(root: &Path, path: &Path) -> io::Result<u64> {
             "refusing to delete root",
         ));
     }
+    verify_parents(root, relative)?;
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
         let bytes = meta.len();
@@ -649,10 +677,12 @@ pub fn remove_tree(root: &Path, path: &Path) -> io::Result<u64> {
         return Ok(bytes);
     }
     let mut reclaimed = meta.len();
-    for child in fs::read_dir(path)? {
-        let child = child?;
+    let children: Vec<_> = fs::read_dir(path)?.collect::<io::Result<_>>()?;
+    verify_parents(root, relative)?;
+    for child in children {
         reclaimed = reclaimed.saturating_add(remove_tree(root, &child.path())?);
     }
+    verify_parents(root, relative)?;
     fs::remove_dir(path)?;
     Ok(reclaimed)
 }
@@ -974,6 +1004,27 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(outside.exists());
         assert!(remove_tree(&root, &root).is_err());
+    }
+
+    #[test]
+    fn symlinked_parent_components_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        let outer = root.join("outer");
+        fs::create_dir_all(&outer).unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("victim.txt"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, outer.join("link")).unwrap();
+
+        let target = outer.join("link").join("victim.txt");
+        let error = remove_tree(&root, &target).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(outside.join("victim.txt").exists());
+        assert!(fs::symlink_metadata(outer.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

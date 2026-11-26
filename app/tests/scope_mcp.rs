@@ -22,6 +22,10 @@ fn mcp_env(dir: &Path) -> Vec<(String, String)> {
             dir.join("job.sock").display().to_string(),
         ),
         (
+            "LU_JOB_SCOPE_CAPABILITY".to_owned(),
+            "fixture-capability".to_owned(),
+        ),
+        (
             "XDG_CONFIG_HOME".to_owned(),
             dir.join("config").display().to_string(),
         ),
@@ -88,6 +92,24 @@ fn ting_mcp_exposes_exactly_the_six_scoped_tools() {
         assert!(description.contains("untrusted"), "{description}");
         assert!(description.contains("child_job"), "{description}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scoped_server_refuses_without_a_socket_capability() {
+    let dir = scratch("ting-mcp-no-capability");
+    let mut envs = mcp_env(&dir);
+    envs.retain(|(key, _)| key != "LU_JOB_SCOPE_CAPABILITY");
+    let output = run_mcp("ting", &dir, &envs, &mcp_input());
+    assert!(
+        !output.status.success(),
+        "ting started without a capability"
+    );
+    assert!(
+        stderr(&output).contains("SCOPE_CAPABILITY"),
+        "{}",
+        stderr(&output)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

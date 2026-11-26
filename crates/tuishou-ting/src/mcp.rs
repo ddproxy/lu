@@ -40,7 +40,15 @@ pub async fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let host = Host { socket };
+    let capability = std::env::var("LU_JOB_SCOPE_CAPABILITY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    if capability.is_empty() {
+        eprintln!("ting mcp: LU_JOB_SCOPE_CAPABILITY is not set");
+        return ExitCode::FAILURE;
+    }
+    let host = Host { socket, capability };
     let (input, _) = stdin_stream();
     let (mut output, output_thread) = stdout_sink();
     let result = serve(input, &mut output, &host).await;
@@ -81,6 +89,7 @@ pub(crate) fn visible_operator_credentials(
 
 struct Host {
     socket: PathBuf,
+    capability: String,
 }
 
 impl Host {
@@ -97,7 +106,7 @@ impl Host {
             "cancel_child" => (ScopeAction::CancelChild, Some(child_payload(args, false)?)),
             _ => return Err(ToolError::Args(format!("unknown tool {name:?}"))),
         };
-        let request = scope::socket_request(action, payload);
+        let request = scope::socket_request(&self.capability, action, payload);
         let mut bytes = serde_json::to_vec(&request)
             .map_err(|error| ToolError::Failed(format!("could not encode request: {error}")))?;
         bytes.push(b'\n');
@@ -655,10 +664,12 @@ mod tests {
     }
 
     #[test]
-    fn host_uses_only_the_socket_path() {
+    fn host_carries_the_socket_path_and_capability() {
         let host = Host {
             socket: PathBuf::from("/tmp/job.sock"),
+            capability: "fixture-capability".to_owned(),
         };
         assert_eq!(host.socket, PathBuf::from("/tmp/job.sock"));
+        assert_eq!(host.capability, "fixture-capability");
     }
 }

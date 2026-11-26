@@ -45,11 +45,11 @@ pub use node::{
 pub use publish::{PublishGateRecord, PublishRecord};
 pub use sanitize::{printable, truncate_chars};
 pub use scope::{
-    decode_scope_request, decode_socket_line, short_summary, short_summary_with_limit, ScopeAction,
-    ScopeArtifact, ScopeChild, ScopeDecodeError, ScopeDependency, ScopeErrorDetail,
-    ScopeErrorResponse, ScopePayload, ScopeRequest, ScopeResponse, ScopeResult,
-    MAX_SCOPE_REPLY_BYTES, MAX_SCOPE_REQUEST_BYTES, MAX_SCOPE_SUMMARY_BYTES, SCOPE_LIMITS,
-    SCOPE_ROUTES, SCOPE_SOURCE,
+    decode_scope_request, decode_socket_line, scope_capability, short_summary,
+    short_summary_with_limit, ScopeAction, ScopeArtifact, ScopeChild, ScopeDecodeError,
+    ScopeDependency, ScopeErrorDetail, ScopeErrorResponse, ScopePayload, ScopeRequest,
+    ScopeResponse, ScopeResult, MAX_SCOPE_REPLY_BYTES, MAX_SCOPE_REQUEST_BYTES,
+    MAX_SCOPE_SUMMARY_BYTES, SCOPE_LIMITS, SCOPE_ROUTES, SCOPE_SOURCE,
 };
 pub use spec::{
     effective_stuck, redact_repo, valid_group, validate_idempotency_key, validate_stack_paths,

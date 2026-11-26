@@ -65,8 +65,10 @@ impl fmt::Display for ForkNotAllowed {
 
 impl std::error::Error for ForkNotAllowed {}
 
-/// A pure check over webhook-style pointers. Only fields a forge commonly supplies are read; when
-/// none are present the delivery is not treated as a fork, since there is nothing to compare.
+/// A pure check over webhook-style pointers. Only fields a forge commonly supplies are read. A
+/// pull request whose head cannot be identified is treated as a fork: with no comparison possible,
+/// a rule that forbids forks must not create a job from it. Push-shaped deliveries with no head
+/// pointers are not forks.
 pub fn fork_detected(body: &Value, base_repo: &str) -> bool {
     const BASE_POINTERS: [&str; 3] = [
         "/repository/full_name",
@@ -88,14 +90,21 @@ pub fn fork_detected(body: &Value, base_repo: &str) -> bool {
     if let Some(base) = repo_identity(base_repo) {
         bases.push(base);
     }
-    if bases.is_empty() {
-        return false;
-    }
-    HEAD_POINTERS
+    let heads: Vec<String> = HEAD_POINTERS
         .iter()
         .filter_map(|pointer| body.pointer(pointer).and_then(as_text))
         .filter_map(|text| repo_identity(&text))
-        .any(|head| !bases.iter().any(|base| same_repo(base, &head)))
+        .collect();
+    if bases.is_empty() || heads.is_empty() {
+        // An identifiable head is required to prove that a pull request is not a fork. The three
+        // pointers below mark PR-shaped deliveries; a plain push never claims a head repository.
+        return body.pointer("/pull_request").is_some()
+            || body.pointer("/head").is_some()
+            || body.pointer("/head_repository").is_some();
+    }
+    heads
+        .iter()
+        .any(|head| !bases.iter().any(|base| same_repo(base, head)))
 }
 
 /// Refuses a fork unless the intake rule explicitly allowed it. Intake can call this before it
@@ -196,6 +205,27 @@ mod tests {
             .to_string();
         assert!(!refusal.contains("contributor"), "{refusal}");
         assert!(!refusal.contains("base"), "{refusal}");
+    }
+
+    #[test]
+    fn a_pull_request_without_head_fields_is_refused() {
+        let unsigned_head = json!({
+            "action": "opened",
+            "repository": {"full_name": "org/base"},
+            "pull_request": {"number": 7}
+        });
+        assert!(fork_detected(
+            &unsigned_head,
+            "https://example.net/org/base.git"
+        ));
+        assert_eq!(
+            fork_refusal(&unsigned_head, "https://example.net/org/base.git", false),
+            Err(ForkNotAllowed)
+        );
+        assert!(fork_refusal(&unsigned_head, "https://example.net/org/base.git", true).is_ok());
+        let push = json!({"action": "push", "repository": {"full_name": "org/base"}});
+        assert!(!fork_detected(&push, "https://example.net/org/base.git"));
+        assert!(fork_refusal(&push, "https://example.net/org/base.git", false).is_ok());
     }
 
     #[test]

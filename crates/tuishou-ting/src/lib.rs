@@ -236,6 +236,15 @@ fn add_harness_status(labels: &mut Vec<String>, taints: &mut Vec<String>, ok: bo
     }
 }
 
+/// Publishes the node name as an ordinary label so a new-job retry can pin work with
+/// `node=<name>` without a dedicated spec field.
+fn add_node_label(labels: &mut Vec<String>, node: &str) {
+    let label = format!("node={node}");
+    if !labels.iter().any(|existing| existing == &label) && labels.len() < MAX_NODE_LABELS {
+        labels.push(label);
+    }
+}
+
 /// Free work-filesystem space as a percentage, clamped to 0-100. A missing or zero total means
 /// the platform could not sample the filesystem, so no health signal is published.
 fn disk_free_pct(host: Option<&HostStats>) -> Option<u8> {
@@ -650,6 +659,7 @@ impl Agent {
             &mut taints,
             self.harness_ok.load(Ordering::SeqCst),
         );
+        add_node_label(&mut labels, self.node.as_str());
         let ws = self.workspaces.stats();
         let gc = self.gc_counters.snapshot();
         let host = proc::host_stats(&self.work_dir);
@@ -1246,8 +1256,10 @@ impl Agent {
         // The compiler already sets this in production; scripted builders need it too.
         command = command.cwd(staged.path());
         if let Some(socket) = &job_socket {
-            // Nothing else is added: no controller URL, no token, no config path.
+            // Nothing else is added: no controller URL, no token, no config path. The capability
+            // authenticates this lease on the socket; it is not a controller credential.
             command = command.env("LU_JOB_SOCKET", socket.path().to_path_buf());
+            command = command.env("LU_JOB_SCOPE_CAPABILITY", socket.capability());
         }
 
         let mut running = Supervisor::spawn(
@@ -2447,6 +2459,7 @@ async fn control_loop(task: ControlTask, tx: mpsc::Sender<Control>) {
                     &mut beat_taints,
                     harness_ok.load(Ordering::SeqCst),
                 );
+                add_node_label(&mut beat_labels, node.as_str());
                 let ws = workspaces.stats();
                 let ws_list = workspaces.list();
                 let gc = gc.snapshot();
@@ -2675,6 +2688,20 @@ fn classify(
             None,
             "harness exceeded its wall-clock timeout".to_owned(),
         ),
+        SuperviseOutcome::IdleTimeout if marker_matches(tail, provider_markers) => {
+            let line = tail
+                .lines()
+                .rev()
+                .find(|line| marker_matches(line, provider_markers))
+                .map(|line| truncate_chars(&printable(line.trim()), 300))
+                .unwrap_or_else(|| "provider unavailable".to_owned());
+            (
+                Outcome::Failed(FailureClass::Provider),
+                None,
+                None,
+                format!("harness went silent after a provider failure marker: {line}"),
+            )
+        }
         SuperviseOutcome::IdleTimeout => (
             Outcome::Failed(FailureClass::Execution),
             None,

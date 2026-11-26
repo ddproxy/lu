@@ -127,13 +127,23 @@ Worked example — inspect a failure:
 lu show 01ARZ3NDEKTSV4RRFFQ69G5FAV
 lu logs 01ARZ3NDEKTSV4RRFFQ69G5FAV
 lu fetch 01ARZ3NDEKTSV4RRFFQ69G5FAV --out results
-lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --provider openai
+lu retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --model alternate-model
 ```
 
 `lu retry` requires a `failed`, `cancelled`, `expired` or `deadline_missed` job;
-any other state, including `done`, is a usage error. It keeps the same job id, so the printed id is the one to inspect
-and fetch. `--key` updates the stored idempotency mapping for this attempt; a request key replays
-the stored retry response.
+any other state, including `done`, is a usage error. Without steering flags it keeps the same job
+id, so the printed id is the one to inspect and fetch. `--key` updates the stored idempotency
+mapping for this attempt; a request key replays the stored retry response. An in-place retry clears
+the stored `diff.patch`; inspect or `lu fetch` partial work before retrying.
+
+To try a different provider or machine without losing the failed job's result, use
+`lu retry <id> --provider peer-b` or `lu retry <id> --node node-b`. These submit a new job, print
+its new id and keep the old job untouched. `--node NAME` requires the agent's automatic
+`node=NAME` label; `--chain` is not allowed with either flag. See
+[Dispatch](dispatch.md#labels-and-providers).
+
+A `done` job with an empty diff normally shows `no changes`. When its spec asked for a change, the
+note is `suspect`; check `lu show <id>` and the task output before treating it as a result.
 
 ## Logs and artifacts
 

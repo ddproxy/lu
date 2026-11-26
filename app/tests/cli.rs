@@ -49,7 +49,9 @@ async fn top_once_prints_tables_and_top_json_prints_one_object() {
         "last_seen": 20,
         "draining": false
     }]);
-    let jobs_body = json!({"jobs": [job_json(&id, "running")]});
+    let mut job = job_json(&id, "done");
+    job["outcome_note"] = json!("suspect");
+    let jobs_body = json!({"jobs": [job]});
     let server = start(move |record| {
         if record.path.contains("nodes") {
             Reply::json(&node_body)
@@ -70,6 +72,7 @@ async fn top_once_prints_tables_and_top_json_prints_one_object() {
     assert!(text.contains("NODE"), "{text}");
     assert!(text.contains("node-a"), "{text}");
     assert!(text.contains(&id[id.len() - 10..]), "{text}");
+    assert!(text.contains("suspect"), "{text}");
     assert!(!text.contains("lu top"), "{text}");
     assert!(!text.contains('\u{1b}'), "{text}");
 
@@ -693,11 +696,14 @@ async fn submit_allow_empty_sets_and_default_omits_the_field() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ls_prints_the_no_changes_note_column() {
     let noted_id = job_id();
+    let suspect_id = job_id();
     let plain_id = job_id();
     let mut noted = job_json(&noted_id, "done");
     noted["outcome_note"] = json!("no_changes");
+    let mut suspect = job_json(&suspect_id, "done");
+    suspect["outcome_note"] = json!("suspect");
     let plain = job_json(&plain_id, "done");
-    let body = json!({"jobs": [noted, plain]});
+    let body = json!({"jobs": [noted, suspect, plain]});
     let server = start(move |_| Reply::json(&body)).await;
     let dir = scratch("ls-note");
     let token = write_token(&dir, "operator.token", TOKEN);
@@ -709,6 +715,11 @@ async fn ls_prints_the_no_changes_note_column() {
     assert_eq!(header[7], "NOTE", "{text}");
     let noted_line = text.lines().find(|line| line.contains(&noted_id)).unwrap();
     assert!(noted_line.trim_end().ends_with("no changes"), "{text}");
+    let suspect_line = text
+        .lines()
+        .find(|line| line.contains(&suspect_id))
+        .unwrap();
+    assert!(suspect_line.trim_end().ends_with("suspect"), "{text}");
     let plain_line = text.lines().find(|line| line.contains(&plain_id)).unwrap();
     assert!(plain_line.trim_end().ends_with('-'), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -1329,6 +1340,12 @@ async fn a_failed_job_with_artifacts_can_be_fetched_and_shows_its_diff_size() {
     let text = stdout(&output);
     assert!(text.contains("failed"), "{text}");
     assert!(text.contains("1024"), "{text}");
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("diff_files")
+                && line.split_whitespace().nth(1) == Some("1")),
+        "{text}"
+    );
     assert!(text.contains("the prompt could not be answered"), "{text}");
 
     let list = json!({"jobs": [job], "future": true});
@@ -2059,8 +2076,6 @@ async fn retry_resubmits_the_finished_spec_and_applies_the_overrides() {
         &[
             "retry",
             &id,
-            "--provider",
-            "peer-b",
             "--model",
             "new-model",
             "--after",
@@ -2090,9 +2105,47 @@ async fn retry_resubmits_the_finished_spec_and_applies_the_overrides() {
     assert_eq!(spec["harness"], "opencode");
     assert_eq!(spec["timeout_secs"], 60);
     assert_eq!(spec["idle_timeout_secs"], 45);
-    assert_eq!(spec["provider"], "peer-b");
+    assert_eq!(spec["provider"], "peer-a");
     assert_eq!(spec["model"], "new-model");
     assert_eq!(spec["after"], json!([dep]));
+    drop(records);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_with_steering_submits_a_new_job() {
+    let old = job_id();
+    let new = job_id();
+    let finished = finished_job(&old, "failed");
+    let created = job_json(&new, "queued");
+    let server = start(move |record| {
+        if record.method == "POST" {
+            Reply::json(&created)
+        } else {
+            Reply::json(&finished)
+        }
+    })
+    .await;
+    let dir = scratch("retry-steering");
+    let token = write_token(&dir, "operator.token", TOKEN);
+    let output = run_with_env(
+        &["retry", &old, "--provider", "peer-b", "--node", "node-b"],
+        &env_for(&server, &token),
+        None,
+        &dir,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), new);
+    let records = server.records.lock().unwrap();
+    assert_eq!(records[0].method, "GET");
+    assert_eq!(records[0].path, format!("/v1/jobs/{old}"));
+    assert_eq!(records[1].method, "POST");
+    assert_eq!(records[1].path, "/v1/jobs");
+    assert!(!records.iter().any(|record| record.path.ends_with("/retry")));
+    let spec: Value = serde_json::from_slice(&records[1].body).unwrap();
+    assert_eq!(spec["provider"], json!("peer-b"));
+    assert_eq!(spec["model"], json!("old-model"));
+    assert_eq!(spec["requires"], json!(["old-label", "node=node-b"]));
     drop(records);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -766,6 +766,50 @@ async fn submit_child_clamps_policy_and_namespaces_idempotency() {
 }
 
 #[tokio::test]
+async fn a_child_of_an_approved_draft_is_queued() {
+    let srv = start_server(Some(scope_config())).await;
+    let mut spec = sample_spec();
+    spec.draft = true;
+    let created = submit_spec(srv.addr, &spec).await;
+    assert_eq!(status(&created), 201, "{created}");
+    let parent_id = json_body(&created)["id"].as_str().unwrap().to_owned();
+    let approve = raw_request(
+        srv.addr,
+        &format!(
+            "POST /v1/drafts/{parent_id}/approve HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: Bearer {OP_TOKEN}\r\nContent-Length: 0\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status(&approve), 200, "{approve}");
+
+    let (parent, epoch) = lease_as(&srv, AGENT_A_TOKEN, "node-a", &parent_id, &[]).await;
+    let child = scope_ok(
+        &srv,
+        ScopeAction::SubmitChild,
+        &parent,
+        epoch,
+        Some(ScopePayload {
+            task: Some("child task".to_owned()),
+            ..ScopePayload::default()
+        }),
+    )
+    .await;
+    let child_id = lu_proto::JobId::parse(child["job_id"].as_str().unwrap()).unwrap();
+    let record = srv.store.get_job(&child_id).unwrap();
+    assert!(!record.spec.draft, "child inherited draft from its parent");
+    assert!(
+        matches!(
+            record.state,
+            lu_proto::JobState::Queued | lu_proto::JobState::Blocked
+        ),
+        "child is not dispatchable: {}",
+        record.state.as_str()
+    );
+
+    let _ = srv.shutdown.send(());
+}
+
+#[tokio::test]
 async fn every_scope_limit_has_a_typed_error() {
     // Disabled by default, even when the caller is a valid leased agent.
     let srv = start_server(None).await;

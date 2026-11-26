@@ -163,6 +163,7 @@ async fn snapshot(client: &Client) -> Result<(Snapshot, u64), String> {
                         let mut note = match job.outcome_note.as_deref() {
                             Some("no_changes") => "no changes".to_owned(),
                             Some("expect_failed") => "expect failed".to_owned(),
+                            Some("suspect") => "suspect".to_owned(),
                             _ => match (&job.failure_class, &job.summary) {
                                 (Some(_), Some(summary)) => format!(
                                     "{}: {}",

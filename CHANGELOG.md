@@ -10,6 +10,7 @@ versioning.
 - `[agent.harness_profiles]` names validated command profiles; a job's `harness` selects one.
 - Profiles compile argv, wrappers, placeholders, env, secret_env, stdin, result files and output markers.
 - `scripts/check-harness-profiles.sh` proves validation, exact argv, stdin and fake-harness behaviour.
+- `lu show` reports `diff_files` for failed jobs with a stored partial diff; in-place retries do not keep results.
 
 ### Changed
 
@@ -20,6 +21,24 @@ versioning.
 - Breaking: removed `[agent] opencode_server`; set `[agent.harness_profiles.opencode].server`.
 - Breaking: removed `[agent] opencode_password_file` and its password injection; use profile `secret_env`.
 - Breaking: removed `[agent] harness_wrapper`; use `[agent.harness_profiles.<name>].wrapper`.
+- Login throttling stays keyed to the socket peer; forwarded headers are ignored.
+
+### Security
+
+- Breaking: the job socket requires a per-lease capability on every frame; `ting mcp` reads it from `LU_JOB_SCOPE_CAPABILITY`.
+
+### Fixed
+
+- Breaking: a signed pull request without an identifiable head repository is refused as a fork.
+- Breaking: workspace deletion refuses symlinked parent components instead of following them.
+- Scoped children no longer inherit an approved parent's `draft` flag.
+- Breaking: `lu retry --provider` or `--node` submits a new job; `--node` pins the agent's `node=NAME` label.
+
+### Fixed
+
+- Provider 4xx validation errors matching profile `provider_markers` now fail as `provider`, not `execution`.
+- A provider marker followed by output idleness stops the process group and fails as `provider` at the job's idle timeout.
+- An empty diff against a change expectation is noted `suspect` rather than `no changes`.
 
 ## [0.8.0]
 

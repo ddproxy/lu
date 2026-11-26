@@ -18,7 +18,9 @@ To pin work to nodes that advertise every named label, repeat `--require`:
 lu submit --repo /path/to/repository --ref main --task "run the PHP suite" --require php8.3 --require gpu
 ```
 
-Labels are opaque to Lu: an agent advertises them, a job requires them, and dispatch compares them exactly. A submit with a label no online node advertises still succeeds and prints a warning; a queued job that cannot be placed shows why in `lu show` and `lu top`.
+Labels are opaque to Lu: an agent advertises them, a job requires them, and dispatch compares them exactly. A submit with a label no online node advertises still succeeds and prints a warning; a queued job that cannot be placed shows why in `lu show` and `lu top`. Every agent also publishes the automatic label `node=<name>`, so a job can pin itself with `--require node=<name>`.
+
+`lu retry` normally requeues the same job in place. `--provider` or `--node` instead submits a new job built from the old spec, prints the new id and leaves the old job's state, artifacts and dependents untouched. `--node NAME` adds `node=NAME` to the new job's requirements; other retry overrides still apply. `--chain` is refused with either steering flag because the original dependents stay with the original job.
 
 To let a job run on another provider or model when its first choice is unavailable, repeat `--fallback`. The primary `--provider`/`--model` stays the first choice, and each fallback is tried in order after it:
 

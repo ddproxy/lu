@@ -403,3 +403,23 @@ fn documented_node_failure_contract_matches_code() {
     }
     assert!(dispatch.contains("## Node exclusions"));
 }
+
+#[test]
+fn documented_failure_result_and_retry_steering_match_code() {
+    let lifecycle = read("docs/lifecycle.md");
+    let dispatch = read("docs/dispatch.md");
+    let cli = read("docs/cli.md");
+    let troubleshooting = read("docs/troubleshooting.md");
+    let changelog = read("CHANGELOG.md");
+
+    assert!(lifecycle.contains("diff_files"));
+    assert!(lifecycle.contains("`--keep-result` retry flag"));
+    assert!(lifecycle.contains("`suspect`"));
+    assert!(dispatch.contains("node=<name>"));
+    assert!(dispatch.contains("`lu retry` normally requeues"));
+    assert!(cli.contains("--node node-b"));
+    assert!(troubleshooting.contains("--node node-b"));
+    for term in ["diff_files", "--node", "suspect"] {
+        assert!(changelog.contains(term), "changelog omits {term}");
+    }
+}

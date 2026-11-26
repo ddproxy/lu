@@ -248,6 +248,9 @@ fn build_child_spec(
     };
 
     let mut spec = parent.spec.clone();
+    // The parent may have been a draft that an operator approved. Approval changes the stored
+    // state, not the recorded spec, so clearing it here keeps a child out of the draft queue.
+    spec.draft = false;
     spec.task = task.to_owned();
     spec.repo = repo.to_owned();
     spec.source.repo = repo.to_owned();
