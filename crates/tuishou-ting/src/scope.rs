@@ -1,9 +1,10 @@
 //! Per-job Unix socket exposed to the harness.
 //!
-//! The harness sends small one-line JSON requests. The agent never trusts fields that identify
-//! the caller: `job_id` and `epoch` are overwritten here before forwarding, so a harness cannot
-//! use its socket to act as another job. Peer credentials are checked on every connection, and
-//! the listener is dropped as soon as the job loop ends.
+//! The harness sends small one-line JSON frames carrying a per-job capability and a scope request.
+//! The agent never trusts fields that identify the caller: `job_id` and `epoch` are overwritten
+//! here before forwarding, so a harness cannot use its socket to act as another job. Peer
+//! credentials and the capability are both checked on every connection, and the listener is dropped
+//! as soon as the job loop ends. The capability never reaches the controller.
 
 use std::collections::VecDeque;
 use std::io;
@@ -16,9 +17,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lu_client::{ApiError, Controller};
 use lu_proto::{
-    decode_socket_line, printable, truncate_chars, JobId, ScopeAction, ScopeErrorResponse,
+    printable, scope_capability, truncate_chars, JobId, ScopeAction, ScopeErrorResponse,
     ScopeRequest, MAX_SCOPE_REQUEST_BYTES,
 };
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
@@ -38,6 +40,7 @@ const WIRE_SLACK: usize = 4096;
 pub struct JobSocket {
     path: PathBuf,
     dir: PathBuf,
+    capability: String,
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
@@ -120,6 +123,7 @@ impl JobSocket {
             set_owner(&dir, uid, gid)?;
             ensure_private_dir(&dir)?;
         }
+        let capability = scope_capability()?;
         let path = dir.join("job.sock");
         let listener = UnixListener::bind(&path)
             .map_err(|error| format!("cannot bind job socket: {error}"))?;
@@ -144,12 +148,14 @@ impl JobSocket {
             job_id: job_id.clone(),
             epoch,
             uid,
+            capability: capability.clone(),
             rate: Mutex::new(VecDeque::new()),
         });
         let task = tokio::spawn(accept_loop(listener, state, stop_rx));
         Ok(Self {
             path,
             dir,
+            capability,
             stop,
             task,
         })
@@ -158,6 +164,12 @@ impl JobSocket {
     /// The path passed to the harness as `LU_JOB_SOCKET`. Never contains a token or controller URL.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The per-lease capability passed to the harness as `LU_JOB_SCOPE_CAPABILITY`. It is not a
+    /// controller credential and is never sent to the controller.
+    pub fn capability(&self) -> &str {
+        &self.capability
     }
 }
 
@@ -224,6 +236,7 @@ struct SocketState {
     job_id: JobId,
     epoch: u64,
     uid: u32,
+    capability: String,
     rate: Mutex<VecDeque<Instant>>,
 }
 
@@ -304,9 +317,14 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<SocketState>) {
         let _ = write_scope_error(&mut stream, error, None, None).await;
         return;
     }
-    let mut request = match decode_socket_line(&bytes) {
-        Ok(request) => request,
-        Err(_) => {
+    let (capability, mut request) = match decode_frame(&bytes) {
+        Ok(frame) => frame,
+        Err(FrameError::MissingCapability) => {
+            let error = ApiError::Forbidden;
+            let _ = write_scope_error(&mut stream, error, None, None).await;
+            return;
+        }
+        Err(FrameError::BadRequest) => {
             let error = ApiError::BadRequest {
                 status: 400,
                 message: "invalid scope request".to_owned(),
@@ -315,6 +333,10 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<SocketState>) {
             return;
         }
     };
+    if !capability_matches(&capability, &state.capability) {
+        let _ = write_scope_error(&mut stream, ApiError::Forbidden, None, None).await;
+        return;
+    }
     // The harness never supplies its identity. Both fields are replaced here, so a request cannot
     // be replayed against a different job or lease through this socket.
     request.job_id = state.job_id.clone();
@@ -410,17 +432,86 @@ fn api_limit(error: &ApiError) -> Option<String> {
     }
 }
 
-/// Builds a socket request for callers such as the scoped MCP server. Identity fields are
+/// One frame on the job socket: the lease's capability plus a scope request. The controller never
+/// sees this type; it receives only the inner request with its identity fields replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SocketFrame {
+    /// Per-job capability handed to this harness through its private environment.
+    pub capability: String,
+    /// The action the harness wants the agent to forward.
+    pub request: ScopeRequest,
+}
+
+/// Builds a socket frame for callers such as the scoped MCP server. Identity fields are
 /// placeholders; [`JobSocket`] replaces them before forwarding.
 pub fn socket_request(
+    capability: &str,
     action: ScopeAction,
     payload: Option<lu_proto::ScopePayload>,
-) -> ScopeRequest {
+) -> SocketFrame {
     let mut request = ScopeRequest::new(JobId::new(), 1, action);
     if let Some(payload) = payload {
         request = request.with_payload(payload);
     }
-    request
+    SocketFrame {
+        capability: capability.to_owned(),
+        request,
+    }
+}
+
+/// Decodes one socket frame. A missing capability is reported distinctly so callers can answer
+/// `forbidden` instead of treating it as a malformed request.
+fn decode_frame(input: &[u8]) -> Result<(String, ScopeRequest), FrameError> {
+    let line = input.strip_suffix(b"\n").unwrap_or(input);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.is_empty() || line.len() > MAX_SCOPE_REQUEST_BYTES || line.contains(&b'\n') {
+        return Err(FrameError::BadRequest);
+    }
+    let mut object =
+        match serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(line) {
+            Ok(object) => object,
+            Err(_) => return Err(FrameError::BadRequest),
+        };
+    let capability = object
+        .remove("capability")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    if capability.is_empty() {
+        return Err(FrameError::MissingCapability);
+    }
+    let Some(request_value) = object.remove("request") else {
+        return Err(FrameError::BadRequest);
+    };
+    if !object.is_empty() {
+        return Err(FrameError::BadRequest);
+    }
+    let request = match serde_json::from_value::<ScopeRequest>(request_value) {
+        Ok(request) => request,
+        Err(_) => return Err(FrameError::BadRequest),
+    };
+    if request.validate_shape().is_err() {
+        return Err(FrameError::BadRequest);
+    }
+    Ok((capability, request))
+}
+
+enum FrameError {
+    MissingCapability,
+    BadRequest,
+}
+
+/// Compares capabilities without an early exit on the first differing byte.
+fn capability_matches(provided: &str, expected: &str) -> bool {
+    let provided = provided.as_bytes();
+    let expected = expected.as_bytes();
+    let mut difference = provided.len() ^ expected.len();
+    for index in 0..provided.len().max(expected.len()) {
+        difference |= usize::from(
+            provided.get(index).copied().unwrap_or(0) ^ expected.get(index).copied().unwrap_or(0),
+        );
+    }
+    difference == 0
 }
 
 #[cfg(test)]
@@ -453,9 +544,10 @@ mod tests {
 
     #[test]
     fn socket_request_uses_a_placeholder_identity() {
-        let request = socket_request(ScopeAction::JobContext, None);
-        assert!(request.epoch > 0);
-        assert_eq!(request.action, ScopeAction::JobContext);
+        let frame = socket_request("fixture-capability", ScopeAction::JobContext, None);
+        assert_eq!(frame.capability, "fixture-capability");
+        assert!(frame.request.epoch > 0);
+        assert_eq!(frame.request.action, ScopeAction::JobContext);
     }
 
     async fn read_line(stream: &mut UnixStream) -> String {
@@ -493,14 +585,15 @@ mod tests {
         })));
         let mut stream = UnixStream::connect(socket.path()).await.unwrap();
         let mut forged = socket_request(
+            socket.capability(),
             ScopeAction::SubmitChild,
             Some(lu_proto::ScopePayload {
                 task: Some("child task".to_owned()),
                 ..lu_proto::ScopePayload::default()
             }),
         );
-        forged.job_id = JobId::new();
-        forged.epoch = 999;
+        forged.request.job_id = JobId::new();
+        forged.request.epoch = 999;
         let mut line = serde_json::to_vec(&forged).unwrap();
         line.push(b'\n');
         stream.write_all(&line).await.unwrap();
@@ -542,13 +635,72 @@ mod tests {
         assert_eq!(socket_meta.uid(), owner.0);
         assert_eq!(socket_meta.gid(), owner.1);
         let mut stream = UnixStream::connect(socket.path()).await.unwrap();
-        let mut line = serde_json::to_vec(&socket_request(ScopeAction::JobContext, None)).unwrap();
+        let mut line = serde_json::to_vec(&socket_request(
+            socket.capability(),
+            ScopeAction::JobContext,
+            None,
+        ))
+        .unwrap();
         line.push(b'\n');
         stream.write_all(&line).await.unwrap();
         stream.flush().await.unwrap();
         let reply = read_line(&mut stream).await;
         let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(value["source"], SCOPE_SOURCE);
+    }
+
+    #[tokio::test]
+    async fn a_same_uid_caller_without_the_capability_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = Arc::new(FakeController::new());
+        let socket =
+            JobSocket::start(controller.clone(), &JobId::new(), 4, tmp.path(), None).unwrap();
+        let mut stream = UnixStream::connect(socket.path()).await.unwrap();
+        let mut line = serde_json::to_vec(&lu_proto::ScopeRequest::new(
+            JobId::new(),
+            1,
+            ScopeAction::JobContext,
+        ))
+        .unwrap();
+        line.push(b'\n');
+        stream.write_all(&line).await.unwrap();
+        stream.flush().await.unwrap();
+        let reply = read_line(&mut stream).await;
+        let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value["error"]["code"], "forbidden", "{reply}");
+        controller.check(|calls| assert!(calls.is_empty(), "{calls:?}"));
+    }
+
+    #[tokio::test]
+    async fn a_same_uid_caller_with_a_foreign_capability_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let controller = Arc::new(FakeController::new());
+        let socket =
+            JobSocket::start(controller.clone(), &JobId::new(), 4, tmp.path(), None).unwrap();
+        let other = JobSocket::start(
+            Arc::new(FakeController::new()),
+            &JobId::new(),
+            4,
+            tmp.path(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(socket.capability(), other.capability());
+
+        let mut stream = UnixStream::connect(socket.path()).await.unwrap();
+        let mut line = serde_json::to_vec(&socket_request(
+            other.capability(),
+            ScopeAction::JobContext,
+            None,
+        ))
+        .unwrap();
+        line.push(b'\n');
+        stream.write_all(&line).await.unwrap();
+        stream.flush().await.unwrap();
+        let reply = read_line(&mut stream).await;
+        let value: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value["error"]["code"], "forbidden", "{reply}");
+        controller.check(|calls| assert!(calls.is_empty(), "{calls:?}"));
     }
 
     #[tokio::test]
@@ -599,6 +751,7 @@ mod tests {
             job_id: JobId::new(),
             epoch: 1,
             uid: expected,
+            capability: "fixture-capability".to_owned(),
             rate: Mutex::new(VecDeque::new()),
         });
         let task = tokio::spawn(handle_connection(server, state));
@@ -653,6 +806,7 @@ mod tests {
             job_id: JobId::new(),
             epoch: 1,
             uid: 0,
+            capability: "fixture-capability".to_owned(),
             rate: Mutex::new(VecDeque::new()),
         };
         for _ in 0..SOCKET_RATE_LIMIT {

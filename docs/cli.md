@@ -50,7 +50,8 @@ supported). The full command and flag table is in the [README](../README.md#comm
 | `lu status` | `lu status --json` | Uptime, schema, db size, queue and node counts. |
 | `lu submit` | `lu submit --repo /srv/app --ref main --task-file task.txt --wait` | Submits a job and waits for a terminal state. |
 | `lu submit --batch` | `lu submit --batch ./tasks --key-prefix release-1 --defaults ./defaults.toml` | Submits one idempotent job per task; see [Submitting work](submitting.md#batch-submissions). |
-| `lu retry` | `lu retry 01AR... --provider peer-a --key retry-2` | Requeues a terminal job in place, keeping its id. |
+| `lu retry` | `lu retry 01AR... --model peer-a --key retry-2` | Requeues a terminal job in place, keeping its id. |
+| `lu retry --node` | `lu retry 01AR... --node node-b --provider peer-c` | Submits a new job pinned to a node and provider; the old job is unchanged. |
 | `lu ls`, `lu show` | `lu show 01AR...` | Job list and one job with its dependencies. |
 | `lu graph` | `lu graph 01AR...` | Horizontal dependency graph for one component. |
 | `lu logs`, `lu fetch` | `lu fetch 01AR... --out results` | Read the log and save `diff.patch`, `run.log` and `report.json`. |
@@ -76,9 +77,13 @@ lu show 01ARZ3NDEKTSV4RRFFQ69G5FAV
 ```
 
 `lu retry <predecessor>` requeues a failed predecessor and restores waiting dependents;
-`--chain` also restores blocked dependents transitively without changing their ids. A plain
-`lu cancel` cancels waiting dependents unless `--keep-dependents` is set. See
-[Dependencies](dependencies.md#waiting-and-promotion).
+`--chain` also restores blocked dependents transitively without changing their ids. Adding
+`--provider` or `--node` changes the command to a new-job retry: it submits a fresh job from the
+old spec, prints the new id and leaves the original job and its dependents untouched. `--node NAME`
+requires the agent's automatic `node=NAME` label, and `--chain` cannot be combined with either
+steering flag. A plain `lu cancel` cancels waiting dependents unless `--keep-dependents` is set.
+See [Dependencies](dependencies.md#waiting-and-promotion) and
+[Dispatch](dispatch.md#labels-and-providers).
 
 ### Client behaviour and exit codes
 
@@ -272,7 +277,8 @@ have ANSI sequences removed.
 ### Scoped MCP: `ting mcp`
 
 `ting mcp` is a separate stdio server for a harness inside a job. It reads `LU_JOB_SOCKET`, the
-agent's per-job Unix socket, and sends no operator or agent token. An opencode configuration uses:
+agent's per-job Unix socket, and `LU_JOB_SCOPE_CAPABILITY`, that lease's socket capability; it
+refuses to start without either. It sends no operator or agent token. An opencode configuration uses:
 
 ```toml
 mcp = { lu = { command = ["ting","mcp"] } }

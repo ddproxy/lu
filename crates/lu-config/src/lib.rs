@@ -1039,6 +1039,7 @@ fn builtin_opencode_profile() -> HarnessProfileConfig {
             "http 429".to_owned(),
             "429 too many requests".to_owned(),
             "rate limit".to_owned(),
+            "validation error".to_owned(),
         ]),
         needs_input_markers: Some(Vec::new()),
     }
@@ -3973,7 +3974,7 @@ heartbeat_secs = 15
         assert!(builtin.secret_env.is_empty());
         assert!(builtin.server.is_none());
         assert_eq!(builtin.stdin, HarnessStdin::Null);
-        assert_eq!(builtin.provider_markers.len(), 5);
+        assert_eq!(builtin.provider_markers.len(), 6);
     }
 
     #[test]
@@ -3991,7 +3992,7 @@ heartbeat_secs = 15
             profile.message,
             "Follow the task in the provided file.{context_warning}"
         );
-        assert_eq!(profile.provider_markers.len(), 5);
+        assert_eq!(profile.provider_markers.len(), 6);
     }
 
     #[test]

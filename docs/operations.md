@@ -81,8 +81,9 @@ job as `execution` with a summary that names the relative path. A non-file at th
 as too large.
 
 Provider markers come from the selected profile and are matched case-insensitively in harness
-output; the built-in `opencode` list keeps the earlier provider-unavailable strings. They still
-drive the two-reading provider failure described below. `needs_input_markers` are also
+output; the built-in `opencode` list keeps the earlier provider-unavailable strings and a validation
+error marker, so a provider 4xx validation error on harness exit is `provider`, not `execution`.
+They still drive the two-reading provider failure described below. `needs_input_markers` are also
 case-insensitive and only annotate a stuck summary: when a marker appears in the output tail, the
 summary is `stuck for <n>s, stopped; harness appears to need input`. Stuck policy, failure class and
 metrics are unchanged.
@@ -260,7 +261,7 @@ Failure classes, retry budgets and cancellation are in [lifecycle.md](lifecycle.
 
 When a job resolves to a `provider` (the assigned choice, or the primary when the job names one), the agent checks it against its node's provider gateway health feed every five seconds, but acts only on a new reading. The feed itself refreshes every ten seconds. The gateway is the authority on keys, so this works for any harness: when two fresh readings in a row show the provider cooling or disabled (no usable key), the agent stops the job like a cancel and completes it as `Failed(Provider)`, with a summary that names the provider and the soonest return time the gateway reported. The completion carries that time plus a 60-second buffer as `retry_after_secs`; see [Dispatch](dispatch.md#cordons) for the resulting cordon.
 
-As a fallback for a job with no provider, or a node without a provider gateway feed, the agent watches a running harness's output. If the newest line matches a `provider_markers` substring from the selected profile (the built-in `opencode` list covers the message about every key in the stream's chain, a quota message, a 429, and a rate limit) and the harness then produces no output for 120 seconds, the agent stops it the same way and completes the job as `Failed(Provider)`, with a summary naming the marker. Any other output after the marker disarms the watch.
+As a fallback for a job with no provider, or a node without a provider gateway feed, the agent watches a running harness's output. If the newest line matches a `provider_markers` substring from the selected profile (the built-in `opencode` list covers the message about every key in the stream's chain, a quota message, a 429, a rate limit and a validation error) and the harness then produces no output for 120 seconds, the agent stops it the same way and completes the job as `Failed(Provider)`, with a summary naming the marker. Any other output after the marker disarms the watch. A job with `idle_timeout_secs` fails faster: the supervisor's idle timeout stops the whole process group, and a marker in the output at that point makes the completion `Failed(Provider)` instead of `Execution`. No new setting is involved.
 
 ## Stuck jobs
 

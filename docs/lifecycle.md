@@ -193,7 +193,7 @@ marker. The operator commands, API routes and MCP access are in
 | Class | Meaning | Requeue rule |
 | --- | --- | --- |
 | `node` | Agent lost, lease expired, harness spawn failed, harness crashed at launch (a crash banner within 3 seconds and before any harness output), workspace prepare failed, an ordinary staging error, recognized harness or host infrastructure trouble, or a stuck job with the retry policy. | Requeue on a different node while `attempt < min(max_retries + 1, node_attempts)` (defaults 1 and 2; allowed 0–3 and 1–4); otherwise fail with `node`. |
-| `provider` | All keys unavailable, a model limit, a 429, or a provider-failure marker followed by harness silence. | Requeue while `attempt <= 100`; `max_retries` is not consulted. At `attempt > 100` the job fails with `provider`. |
+| `provider` | All keys unavailable, a model limit, a 429, a provider 4xx validation error matched by a profile marker, or a provider-failure marker followed by harness silence or an idle timeout. | Requeue while `attempt <= 100`; `max_retries` is not consulted. At `attempt > 100` the job fails with `provider`. |
 | `execution` | Harness exited non-zero, timed out, produced no output, was stopped by the stuck cancel policy, or the task itself was invalid. Staging errors naming a missing ref, authentication failure or unknown repository are also `execution`. | Never requeue. |
 | `dependency` | A dependency finished `failed` or `cancelled` and the dependent's blocked-dependent TTL expired before a retry reattached it. | Never requeue. |
 | `conflict` | A dependency diff could not be applied to the dependent's base tree. | Never requeue. |
@@ -277,9 +277,11 @@ default) leaves the job running. Both active policies upload the usual artifacts
 ## Empty diffs
 
 A `done` job whose stored diff is empty gets `outcome_note: "no_changes"` in its `JobView`. It
-prints as `no changes` in `lu ls` and `lu show` and is marked in the TUI job list. Set
-`allow_empty: true` (`lu submit --allow-empty`) to suppress the note. The controller counts noted
-jobs in `lu_jobs_no_changes_total`, reset on restart.
+prints as `no changes` in `lu ls` and `lu show` and is marked in the TUI job list. When the spec
+asked for a change through `expect.changed`, `expect.files` or a positive `expect.min_diff_bytes`, the note is
+`suspect` instead, so a silently empty result stands out. Set `allow_empty: true`
+(`lu submit --allow-empty`) to suppress the note. The controller counts both notes in
+`lu_jobs_no_changes_total`, reset on restart.
 
 ## Expectations
 
@@ -294,14 +296,19 @@ prints as `expect failed` in `lu ls`, `lu show` and the TUI job list. The contro
 jobs in `lu_jobs_expect_failed_total`, reset on restart. In `fail` mode the job ends `failed` with
 failure class `execution` and a summary naming the first unmet expectation; it gets no note. A
 harness failure keeps its own class, and expectations are not evaluated. An empty diff gets
-`no_changes`, which takes precedence over `expect_failed` when both apply.
+`no_changes`, or `suspect` when the spec requires a change; either takes precedence over
+`expect_failed`.
 
 ## Partial diffs on terminal jobs
 
 The `done`, `failed` and `cancelled` `JobView`s carry `diff_bytes`: the size of the
 stored `diff.patch`, or `0` when none is stored. A job that wrote files before failing still keeps
 that diff, and `lu fetch` downloads it alongside the log and report; the job's `state` and
-`failure_class` still mark it unsuccessful. `lu show` prints `diff_bytes` as a row.
+`failure_class` still mark it unsuccessful. `lu show` prints `diff_bytes` and, for a failed job with
+a stored diff, `diff_files`, the number of `diff --git` entries in that patch. There is no
+`--keep-result` retry flag: an in-place `lu retry` clears the stored diff and artifacts, so partial
+work is kept for inspection and dependencies rather than replayed. To start again while keeping the
+old result, use a new-job retry as described in [Dispatch](dispatch.md#labels-and-providers).
 
 ## Workspace cleanup
 

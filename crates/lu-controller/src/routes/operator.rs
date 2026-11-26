@@ -31,7 +31,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Notes for terminal jobs. An empty diff takes precedence over unmet expectations: it says the
-/// run changed nothing at all, which is more specific than a missing expected change.
+/// run changed nothing at all. When the spec asked for a change, that empty diff is `suspect`
+/// rather than the ordinary `no_changes`.
 pub fn outcome_note(r: &JobRecord) -> Option<&'static str> {
     if r.state != lu_proto::JobState::Done {
         return None;
@@ -40,7 +41,11 @@ pub fn outcome_note(r: &JobRecord) -> Option<&'static str> {
         && r.artifacts.contains(&ArtifactName::DiffPatch)
         && r.diff_bytes == Some(0)
     {
-        return Some("no_changes");
+        return if r.spec.expect.as_ref().is_some_and(|e| e.expects_change()) {
+            Some("suspect")
+        } else {
+            Some("no_changes")
+        };
     }
     if r.expect_failed {
         return Some("expect_failed");
@@ -2360,6 +2365,18 @@ mod tests {
         let r = record(JobState::Done, false, Some(0), diff());
         assert_eq!(outcome_note(&r), Some("no_changes"));
         assert_eq!(job_view(&r).outcome_note.as_deref(), Some("no_changes"));
+    }
+
+    #[test]
+    fn an_empty_diff_against_an_expectation_is_suspect() {
+        let mut r = record(JobState::Done, false, Some(0), diff());
+        r.spec.expect = Some(lu_proto::ExpectSpec {
+            changed: vec!["*.rs".to_owned()],
+            ..Default::default()
+        });
+        r.expect_failed = true;
+        assert_eq!(outcome_note(&r), Some("suspect"));
+        assert_eq!(job_view(&r).outcome_note.as_deref(), Some("suspect"));
     }
 
     #[test]

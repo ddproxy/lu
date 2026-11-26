@@ -292,6 +292,49 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_headers_do_not_change_the_login_throttle_key() {
+        let (auth, token) = config();
+        let throttle = throttle();
+        let other_peer = PeerAddr(SocketAddr::from(([203, 0, 113, 9], 4321)));
+        let other = ['o', 't', 'h', 'e', 'r'].iter().collect::<String>();
+        let mut spoofed = headers(Some(&other));
+        spoofed.insert(
+            axum::http::HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("203.0.113.9"),
+        );
+        spoofed.insert(
+            axum::http::HeaderName::from_static("forwarded"),
+            HeaderValue::from_static("for=203.0.113.9"),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                authenticate_operator(&spoofed, peer(), &auth, &throttle)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Unauthorized
+            );
+        }
+
+        // The same headers from the real address named in them must not inherit the other
+        // peer's failures, and the blocked peer cannot reset its bucket by changing headers.
+        let mut allowed = headers(Some(&token));
+        allowed.insert(
+            axum::http::HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("203.0.113.9"),
+        );
+        assert_eq!(
+            authenticate_operator(&allowed, other_peer, &auth, &throttle).unwrap(),
+            "ops"
+        );
+        assert_eq!(
+            authenticate_operator(&allowed, peer(), &auth, &throttle)
+                .unwrap_err()
+                .code,
+            ErrorCode::RateLimited
+        );
+    }
+
+    #[test]
     fn wrong_tokens_keep_the_original_budget() {
         let (auth, token) = config();
         let throttle = throttle();

@@ -993,7 +993,7 @@ pub async fn complete_job(
     match res {
         Ok(Ok(rec)) => {
             match crate::routes::operator::outcome_note(&rec) {
-                Some("no_changes") => state.count_no_changes(),
+                Some("no_changes") | Some("suspect") => state.count_no_changes(),
                 Some("expect_failed") => state.count_expect_failed(),
                 _ => {}
             }

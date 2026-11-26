@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 
 use super::{
-    dependency_conflict_summary, disk_free_pct, evaluate_expect, housekeeping,
+    add_node_label, dependency_conflict_summary, disk_free_pct, evaluate_expect, housekeeping,
     workspaces::FsDeleter, workspaces::RealClock, workspaces::Registry, workspaces::Settings,
     Agent, AgentError, ConflictContext,
 };
@@ -1134,6 +1134,7 @@ fn builtin_provider_markers_detect_various_patterns() {
     assert!(matches("HTTP 429"));
     assert!(matches("429 Too Many Requests"));
     assert!(matches("rate limit hit"));
+    assert!(matches("provider 400 validation error"));
     assert!(!matches("normal output"));
 }
 
@@ -2056,6 +2057,29 @@ async fn job_provider_marker_completes_provider_failure() {
 }
 
 #[tokio::test]
+async fn a_provider_4xx_validation_error_exits_as_provider_failure() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let controller = assigned_controller(&job_id, test_spec(&f.repo_dir.to_string_lossy()));
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo 'provider 400 validation error: bad model'; exit 1"),
+    );
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Provider));
+    assert_eq!(done[0].exit_code, Some(1));
+}
+
+#[tokio::test]
 async fn job_provider_marker_then_silence_fails_as_provider() {
     let f = fixture();
     let job_id = JobId::new();
@@ -2066,6 +2090,36 @@ async fn job_provider_marker_then_silence_fails_as_provider() {
         sh("echo \"every key in this stream's chain is unavailable\"; sleep 30"),
     );
     agent.provider_marker_grace = Duration::from_millis(300);
+    let calls = run_job(
+        &controller,
+        agent,
+        job_finished(f.work_dir.join(job_id.as_str())),
+    )
+    .await;
+
+    let done = completions(&calls);
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert_eq!(done[0].outcome, Outcome::Failed(FailureClass::Provider));
+    assert_eq!(done[0].exit_code, None);
+    let summary = done[0].summary.clone().unwrap_or_default();
+    assert!(
+        summary.contains("every key in this stream's chain is unavailable"),
+        "{summary}"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_marker_uses_the_idle_timeout_to_fail_fast() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.idle_timeout_secs = Some(1);
+    let controller = assigned_controller(&job_id, spec);
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("echo \"every key in this stream's chain is unavailable\"; sleep 30"),
+    );
     let calls = run_job(
         &controller,
         agent,
@@ -2402,6 +2456,25 @@ async fn a_spawning_job_is_refused_when_the_harness_shares_the_agent_uid() {
     let summary = done[0].summary.clone().unwrap_or_default();
     assert!(summary.contains("harness_uid"), "{summary}");
     assert!(!log_text(&calls).contains("should not run"));
+}
+
+#[tokio::test]
+async fn a_spawning_harness_receives_the_socket_capability_name() {
+    let f = fixture();
+    let job_id = JobId::new();
+    let mut spec = test_spec(&f.repo_dir.to_string_lossy());
+    spec.allow_spawn = true;
+    let controller = assigned_controller(&job_id, spec);
+    let agent = fast_agent(
+        &f.work_dir,
+        controller.clone(),
+        sh("env | grep -o LU_JOB_SCOPE_CAPABILITY"),
+    );
+    let calls = run_job(&controller, agent, has_complete).await;
+    assert!(
+        log_text(&calls).contains("LU_JOB_SCOPE_CAPABILITY"),
+        "harness did not receive the capability environment name"
+    );
 }
 
 #[tokio::test]
@@ -3043,6 +3116,7 @@ async fn heartbeats_use_probe_results_without_waiting_for_the_command() {
     let request = agent.poll_request(lu_proto::HarnessState::Idle, 0);
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(request.version.as_deref(), Some(crate::TING_VERSION));
+    assert!(request.labels.iter().any(|label| label == "node=node-a"));
     assert!(!request.labels.iter().any(|label| label == "slow-probe"));
     assert!(request.label_sources.is_empty());
     for task in tasks {
@@ -3800,4 +3874,12 @@ fn disk_percentage_uses_work_filesystem_totals() {
     assert_eq!(disk_free_pct(Some(&host(10, 0))), None);
     assert_eq!(disk_free_pct(Some(&host(1, 4))), Some(25));
     assert_eq!(disk_free_pct(Some(&host(u64::MAX, 1))), Some(100));
+}
+
+#[test]
+fn node_label_is_published_once() {
+    let mut labels = vec!["gpu".to_owned()];
+    add_node_label(&mut labels, "node-a");
+    add_node_label(&mut labels, "node-a");
+    assert_eq!(labels, vec!["gpu", "node=node-a"]);
 }

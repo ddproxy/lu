@@ -4,6 +4,7 @@
 
 use std::io::Write;
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -234,6 +235,83 @@ async fn a_job_runs_from_submit_to_diff() {
     assert!(ended.is_ok(), "agent did not stop");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_job_keeps_its_partial_diff_for_show() {
+    let _serial = E2E_SERIAL.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let repo = repo_with_file(root, "hello.txt", "hello\n");
+    let port = free_port();
+    let url = format!("http://127.0.0.1:{port}");
+    let _server = spawn_controller(root, port, None);
+    let operator = ready(&url).await;
+    let created = operator
+        .submit(&spec(&repo, "leave work behind then fail"))
+        .await
+        .unwrap();
+    let (stop_tx, handle) = spawn_scripted_agent(
+        root,
+        &url,
+        "echo working; echo 'partial work' >> hello.txt; exit 1",
+    );
+
+    let job = wait_for(&operator, &created.id, JobState::Failed).await;
+    assert!(job.diff_bytes.unwrap_or(0) > 0, "{job:?}");
+    let patch = operator
+        .fetch_artifact(&job.id, ArtifactName::DiffPatch)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&patch).contains("+partial work"));
+
+    let operator_token = root.join("operator.token");
+    private_token(&operator_token, OPERATOR_TOKEN);
+    let text = show_text(&url, &operator_token, job.id.as_str()).await;
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("diff_files"))
+        .unwrap_or_else(|| panic!("no diff_files row in {text}"));
+    assert_eq!(line.split_whitespace().nth(1), Some("1"), "{text}");
+
+    let _ = stop_tx.send(());
+    let ended = tokio::time::timeout(Duration::from_secs(30), handle).await;
+    assert!(ended.is_ok(), "agent did not stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_done_job_with_an_empty_diff_and_a_change_expectation_is_suspect() {
+    let _serial = E2E_SERIAL.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let repo = repo_with_file(root, "hello.txt", "hello\n");
+    let port = free_port();
+    let url = format!("http://127.0.0.1:{port}");
+    let _server = spawn_controller(root, port, None);
+    let operator = ready(&url).await;
+    let mut job_spec = spec(&repo, "change nothing");
+    job_spec.expect =
+        Some(serde_json::from_value(serde_json::json!({"changed": ["*.txt"]})).unwrap());
+    let created = operator.submit(&job_spec).await.unwrap();
+    let (stop_tx, handle) = spawn_scripted_agent(root, &url, "echo done");
+
+    let job = wait_for(&operator, &created.id, JobState::Done).await;
+    assert_eq!(job.outcome_note.as_deref(), Some("suspect"), "{job:?}");
+    assert_eq!(job.diff_bytes, Some(0), "{job:?}");
+
+    let operator_token = root.join("operator.token");
+    private_token(&operator_token, OPERATOR_TOKEN);
+    let text = show_text(&url, &operator_token, job.id.as_str()).await;
+    assert!(text.contains("outcome_note"), "{text}");
+    assert!(
+        text.lines()
+            .any(|line| line.trim_start().starts_with("outcome_note") && line.ends_with("suspect")),
+        "{text}"
+    );
+
+    let _ = stop_tx.send(());
+    let ended = tokio::time::timeout(Duration::from_secs(30), handle).await;
+    assert!(ended.is_ok(), "agent did not stop");
+}
+
 fn controller_config(root: &Path, port: u16, audit_path: Option<&Path>) -> String {
     let mut text = format!(
         "[controller]\nlisten = \"127.0.0.1:{port}\"\ndb = \"{}\"\nartifacts_dir = \"{}\"\n\
@@ -275,6 +353,79 @@ async fn ready(url: &str) -> Client {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     client
+}
+
+fn private_token(path: &Path, token: &str) {
+    std::fs::write(path, token).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn repo_with_file(root: &Path, name: &str, contents: &str) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    std::fs::write(repo.join(name), contents).unwrap();
+    git(&repo, &["add", name]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    repo
+}
+
+/// Starts an agent whose harness runs `script` in the staged checkout.
+fn spawn_scripted_agent(
+    root: &Path,
+    url: &str,
+    script: &str,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), tuishou_ting::AgentError>>,
+) {
+    let work = root.join("work");
+    let token_file = root.join("agent.token");
+    private_token(&token_file, AGENT_TOKEN);
+    let agent_config = lu_config::Config::parse(&format!(
+        "[agent]\nname = \"node-a\"\ncontroller_url = \"{url}\"\ntoken_file = \"{tf}\"\n\
+         work_dir = \"{work}\"\nharness = \"opencode\"\nworkspace_group = \"{gid}\"\n",
+        tf = token_file.display(),
+        work = work.display(),
+        gid = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(root).unwrap()),
+    ))
+    .unwrap()
+    .agent
+    .unwrap();
+    let controller: Arc<dyn Controller> = Arc::new(Client::new(url, AGENT_TOKEN, None).unwrap());
+    let script = script.to_owned();
+    let agent = Agent::new(agent_config, controller)
+        .unwrap()
+        .with_command_builder(move |_invocation| {
+            Ok(lu_supervise::CommandSpec::new("sh")
+                .arg("-c")
+                .arg(script.clone()))
+        });
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        agent
+            .run(async move {
+                let _ = stop_rx.await;
+            })
+            .await
+    });
+    (stop_tx, handle)
+}
+
+async fn show_text(url: &str, token_file: &Path, id: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_lu"))
+        .arg("show")
+        .arg(id)
+        .env("LU_URL", url)
+        .env("LU_TOKEN_FILE", token_file)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "lu show failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
 }
 
 async fn submit(client: &Client, task: &str) {

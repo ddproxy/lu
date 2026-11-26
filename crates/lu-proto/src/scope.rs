@@ -24,6 +24,21 @@ pub const MAX_SCOPE_SUMMARY_BYTES: usize = 4096;
 /// The source tag attached to every result produced from child-job data.
 pub const SCOPE_SOURCE: &str = "child_job";
 
+/// Generates one capability for a job's scope socket. It is passed only through the harness's
+/// private environment, never through the controller API, a log or an artifact.
+pub fn scope_capability() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("cannot generate scope capability: {error}"))?;
+    let hex = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(hex[usize::from(byte >> 4)] as char);
+        out.push(hex[usize::from(byte & 0x0f)] as char);
+    }
+    Ok(out)
+}
+
 /// Every route accepted under `/v1/scope/`.
 pub const SCOPE_ROUTES: [&str; 6] = [
     "job_context",
@@ -477,6 +492,15 @@ mod tests {
 
     fn request(json: &str) -> Result<ScopeRequest, ScopeDecodeError> {
         decode_scope_request(json.as_bytes())
+    }
+
+    #[test]
+    fn scope_capabilities_are_distinct_and_hex_encoded() {
+        let first = scope_capability().unwrap();
+        let second = scope_capability().unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 
     #[test]

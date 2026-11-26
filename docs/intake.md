@@ -46,8 +46,9 @@ the intake route.
 
 A source must have at least one rule. Rules are tried in configuration order; the first rule whose
 `match` conditions all hold yields a draft, unless its `allow` conditions fail or a fork is detected
-with `allow_forks = false`, in which case the event is dropped and counted. An event that matches no
-rule is dropped.
+with `allow_forks = false`, in which case the event is dropped and counted. A pull request whose
+head repository cannot be identified is also treated as a fork. An event that matches no rule is
+dropped.
 
 ### `[[intake.sources.rules]]`
 

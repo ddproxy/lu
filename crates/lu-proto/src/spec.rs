@@ -652,6 +652,14 @@ impl<'de> Deserialize<'de> for ExpectSpec {
 }
 
 impl ExpectSpec {
+    /// Whether the spec asks a successful run to leave a change behind. Forbidden paths and an
+    /// upper diff bound alone do not require one.
+    pub fn expects_change(&self) -> bool {
+        !self.files.is_empty()
+            || !self.changed.is_empty()
+            || self.min_diff_bytes.is_some_and(|min| min > 0)
+    }
+
     /// Checks list sizes, path safety, glob syntax and diff bounds.
     pub fn validate(&self) -> Result<(), JobSpecError> {
         for (field, values, max_bytes, glob) in [
@@ -2901,6 +2909,23 @@ mod tests {
         assert!(!ExpectSpec::glob_matches("src/*.rs", "tests/lib.rs"));
         assert!(!ExpectSpec::glob_matches("src/file?.rs", "src/file12.rs"));
         assert!(!ExpectSpec::glob_matches("src/**", "tests/main.rs"));
+    }
+
+    #[test]
+    fn expects_change_only_for_requirements_that_need_a_diff() {
+        assert!(!ExpectSpec::default().expects_change());
+        let mut expect = ExpectSpec::default();
+        expect.forbid_changed.push("secret.txt".to_owned());
+        expect.max_diff_bytes = Some(1024);
+        assert!(!expect.expects_change());
+        expect.files.push("OUT.md".to_owned());
+        assert!(expect.expects_change());
+        expect.files.clear();
+        expect.changed.push("*.rs".to_owned());
+        assert!(expect.expects_change());
+        expect.changed.clear();
+        expect.min_diff_bytes = Some(1);
+        assert!(expect.expects_change());
     }
 
     #[test]

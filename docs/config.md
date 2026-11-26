@@ -189,7 +189,7 @@ with a letter, digit or `_`. Duplicate names and unknown profile fields are refu
 | `secret_env` | `{}` | At most 8 name-to-path entries. Paths are read only when a job starts; no example keys or values belong in config. |
 | `stdin` | `"null"` | Exactly `"null"` or `"task"`. With `"task"`, the staged task file is written to the child's stdin and the pipe is closed; files over 256 KiB are refused. |
 | `result_file` | unset | A relative path of at most 4096 bytes, without `..`, a root/prefix component or control characters; resolved below the staged tree. |
-| `provider_markers` | built-in provider-unavailable list | At most 16 case-insensitive output substrings, each 1 to 64 bytes. |
+| `provider_markers` | built-in provider-unavailable list, including validation errors | At most 16 case-insensitive output substrings, each 1 to 64 bytes. |
 | `needs_input_markers` | `[]` | At most 16 case-insensitive output substrings, each 1 to 64 bytes. They annotate a stuck summary; they do not change state. |
 
 The compiled built-in command is exactly:

@@ -233,9 +233,12 @@ pub struct RetryArgs {
     /// Restore blocked dependents transitively, keeping their job ids.
     #[arg(long)]
     pub chain: bool,
-    /// Replace the provider name.
-    #[arg(long)]
+    /// Submit a new job with this provider instead of requeuing the old job in place.
+    #[arg(long, conflicts_with = "chain")]
     pub provider: Option<String>,
+    /// Submit a new job pinned to this node instead of requeuing the old job in place.
+    #[arg(long, value_parser = parse_node, conflicts_with = "chain")]
+    pub node: Option<NodeName>,
     /// Replace the model name.
     #[arg(long)]
     pub model: Option<String>,
@@ -974,6 +977,7 @@ async fn resolve_after(
 }
 
 async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitCode, String> {
+    let new_job = args.provider.is_some() || args.node.is_some();
     let client = connect(config)?;
     let view = client
         .get_job(&args.id)
@@ -1014,6 +1018,12 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
     } else if args.no_require {
         spec.requires.clear();
     }
+    if let Some(node) = &args.node {
+        let label = format!("node={node}");
+        if !spec.requires.contains(&label) {
+            spec.requires.push(label);
+        }
+    }
     if !args.tolerate.is_empty() {
         spec.tolerates = args.tolerate;
     } else if args.no_tolerate {
@@ -1049,9 +1059,13 @@ async fn retry_inner(args: RetryArgs, config: &Path, json: bool) -> Result<ExitC
     }
     let merged_expect = expect.merged(spec.expect.as_ref());
     spec.expect = merged_expect;
-    // The job keeps its id; --key still updates the idempotency mapping for this attempt.
+    // An in-place retry updates the idempotency mapping; a steering retry submits a new job.
     spec.idempotency_key = args.key;
     spec.validate().map_err(|error| error.to_string())?;
+
+    if new_job {
+        return submit_and_report(&client, &spec, json, args.wait).await;
+    }
 
     let chain = args.chain;
     let reply = client
@@ -1415,7 +1429,18 @@ async fn show_inner(args: ShowArgs, config: &Path, json: bool) -> Result<ExitCod
         .get_job(&args.id)
         .await
         .map_err(|error| error.to_string())?;
-    print_job(&view);
+    let diff_files = if view.state == JobState::Failed && view.diff_bytes.unwrap_or(0) > 0 {
+        match client
+            .fetch_artifact(&view.id, ArtifactName::DiffPatch)
+            .await
+        {
+            Ok(patch) => Some(diff_file_count(&patch)),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    print_job(&view, diff_files);
     for id in &view.after {
         let state = match client.get_job(id).await {
             Ok(dep) => state_name(dep.state).to_owned(),
@@ -1546,7 +1571,7 @@ async fn cancel_inner(args: CancelArgs, config: &Path, json: bool) -> Result<Exi
         .cancel_with_options(&args.id, args.keep_children, args.keep_dependents)
         .await
         .map_err(|error| error.to_string())?;
-    print_job(&view);
+    print_job(&view, None);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2149,7 +2174,17 @@ fn print_job_tree(jobs: &[JobView]) {
     }
 }
 
-fn print_job(view: &JobView) {
+/// Counts the file headers in a stored `diff.patch`. The controller keeps patch bytes as an
+/// artifact, so `lu show` can count them through the existing artifact route without a new view
+/// field or a schema column.
+fn diff_file_count(patch: &[u8]) -> usize {
+    String::from_utf8_lossy(patch)
+        .lines()
+        .filter(|line| line.starts_with("diff --git "))
+        .count()
+}
+
+fn print_job(view: &JobView, diff_files: Option<usize>) {
     let fallbacks = view
         .spec
         .fallbacks
@@ -2315,6 +2350,12 @@ fn print_job(view: &JobView) {
             "diff_bytes",
             view.diff_bytes
                 .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+        ),
+        (
+            "diff_files",
+            diff_files
+                .map(|count| count.to_string())
                 .unwrap_or_else(|| "-".to_owned()),
         ),
         ("scrubbed_hits", view.scrubbed_hits.to_string()),
@@ -2911,6 +2952,7 @@ pub(crate) fn outcome_text(note: Option<&str>) -> String {
     match note {
         Some("no_changes") => "no changes".to_owned(),
         Some("expect_failed") => "expect failed".to_owned(),
+        Some("suspect") => "suspect".to_owned(),
         _ => "-".to_owned(),
     }
 }
@@ -3195,6 +3237,18 @@ mod time_tests {
         assert_eq!(time(0), "-");
         assert_eq!(time(1_794_818_368), "2026-11-16 08:39:28Z");
         assert_eq!(time(951_782_400), "2000-02-29 00:00:00Z");
+    }
+}
+
+#[cfg(test)]
+mod show_tests {
+    use super::diff_file_count;
+
+    #[test]
+    fn diff_file_count_counts_patch_headers() {
+        let patch = b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-p\n+q\n";
+        assert_eq!(diff_file_count(patch), 2);
+        assert_eq!(diff_file_count(b"not a patch\n"), 0);
     }
 }
 

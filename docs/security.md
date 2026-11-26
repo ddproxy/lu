@@ -87,7 +87,9 @@ limit of 100 in the same window. They never consume the wrong-token budget, so a
 client that lost its token cannot lock out other clients sharing the address; a full
 tokenless bucket throttles only further tokenless requests. IPv6 addresses are counted by
 `/64`, and an IPv4-mapped IPv6 address is counted as IPv4. A successful request does not reset
-either count.
+either count. The address is always the socket peer address; `Forwarded` and `X-Forwarded-For`
+headers are ignored, so a client cannot choose its bucket. Behind a reverse proxy all clients
+share the proxy's bucket.
 
 For token generation, hash configuration, private-file rules and rotation, see
 [Tokens and TLS](tokens-and-tls.md#token-files-and-hashes). The controller stores only SHA-256
